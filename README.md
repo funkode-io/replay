@@ -1,4 +1,4 @@
-# replay
+# Replay
 
 Event Sourcing and CQRS library
 
@@ -39,6 +39,7 @@ impl From<BankAccountUrn> for Urn {
         urn.0
     }
 }
+
 impl Stream for BankAccountStream {
    type Event = BankAccountEvent;
    type StreamId = BankAccountUrn;
