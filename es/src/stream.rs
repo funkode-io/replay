@@ -1,4 +1,5 @@
 use std::fmt::{self, Display};
+
 use urn::Urn;
 
 use super::Event;
@@ -13,7 +14,7 @@ use super::Event;
 /// # Example
 ///
 /// ```
-/// use replay_es::Stream;
+/// use replay_es::{Event, Stream};
 /// use replay_macros::Event;
 /// use serde::{Deserialize, Serialize};
 /// use urn::Urn;
@@ -60,11 +61,17 @@ use super::Event;
 /// ```
 pub trait Stream: Default + Sized {
     type Event: Event;
-    type StreamId: Into<Urn> + Clone + Sync + Send;
+    type StreamId: Into<Urn> + Clone + Sync + Send + PartialEq;
 
     fn stream_type() -> String;
 
     fn apply(&mut self, event: Self::Event);
+
+    fn apply_all(&mut self, events: Vec<Self::Event>) {
+        for event in events {
+            self.apply(event);
+        }
+    }
 }
 
 /// Stream state is a representation of the current state of a stream, every time an event is applied the state is updated and the version will increment.
