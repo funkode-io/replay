@@ -7,7 +7,7 @@ use urn::Urn;
 use uuid::Uuid;
 
 use crate::{
-    persistence::{EventStoreError, LocalEventStore, PersistedEvent, StreamFilter},
+    persistence::{EventStore, EventStoreError, PersistedEvent, StreamFilter},
     Event,
 };
 
@@ -20,19 +20,20 @@ pub struct InMemoryEventStore {
     events: RwLock<HashMap<Urn, Vec<PersistedEvent<Value>>>>,
 }
 
-impl LocalEventStore for InMemoryEventStore {
-    async fn store_events<E: Event>(
+impl EventStore for InMemoryEventStore {
+    async fn store_events<S: crate::Stream>(
         &self,
-        stream_id: &Urn,
+        stream_id: &S::StreamId,
         _stream_type: String,
         _metadata: crate::Metadata,
-        domain_events: &[E],
+        domain_events: &[S::Event],
         expected_version: Option<i64>,
     ) -> Result<(), EventStoreError> {
         let mut store = self.events.write().unwrap();
+        let stream_id: Urn = stream_id.clone().into();
 
         let mut last_version = store
-            .get(stream_id)
+            .get(&stream_id)
             .map(|events| events.last().map(|e| e.version).unwrap_or(0))
             .unwrap_or(0);
 
@@ -76,7 +77,7 @@ impl LocalEventStore for InMemoryEventStore {
     fn stream_events<E: Event>(
         &self,
         filter: StreamFilter,
-    ) -> impl TryStream<Ok = PersistedEvent<E>, Error = EventStoreError> {
+    ) -> impl TryStream<Ok = PersistedEvent<E>, Error = EventStoreError> + Send {
         // right now we only support filtering by stream id
 
         async_stream::stream! {
@@ -120,11 +121,11 @@ mod tests {
         pub balance: f64,
     }
 
-    // create bank account events enum: Deposit and Withdraw
+    // create bank account events enum: Deposited and Withdrawn
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
     enum BankAccountEvent {
-        Deposit { amount: f64 },
-        Withdraw { amount: f64 },
+        Deposited { amount: f64 },
+        Withdrawn { amount: f64 },
     }
 
     // bank account urn
@@ -148,10 +149,10 @@ mod tests {
 
         fn apply(&mut self, event: Self::Event) {
             match event {
-                BankAccountEvent::Deposit { amount } => {
+                BankAccountEvent::Deposited { amount } => {
                     self.balance += amount;
                 }
-                BankAccountEvent::Withdraw { amount } => {
+                BankAccountEvent::Withdrawn { amount } => {
                     self.balance -= amount;
                 }
             }
@@ -164,15 +165,15 @@ mod tests {
             events: RwLock::new(HashMap::new()),
         };
 
-        let stream_id = UrnBuilder::new("bank-account", "1").build().unwrap();
+        let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
 
         let events = vec![
-            BankAccountEvent::Deposit { amount: 100.0 },
-            BankAccountEvent::Withdraw { amount: 40.0 },
+            BankAccountEvent::Deposited { amount: 100.0 },
+            BankAccountEvent::Withdrawn { amount: 40.0 },
         ];
 
         store
-            .store_events(
+            .store_events::<BankAccountStream>(
                 &stream_id,
                 "BankAccount".to_string(),
                 crate::Metadata::default(),
@@ -183,7 +184,9 @@ mod tests {
             .unwrap();
 
         let stream_events = store
-            .stream_events::<BankAccountEvent>(StreamFilter::WithStreamId(stream_id))
+            .stream_events::<BankAccountEvent>(StreamFilter::with_stream_id::<BankAccountStream>(
+                &stream_id,
+            ))
             .map_ok(|persisted_event| persisted_event.data)
             .try_collect::<Vec<_>>()
             .await

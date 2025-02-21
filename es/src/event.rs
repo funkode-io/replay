@@ -7,7 +7,7 @@ use serde::{de::DeserializeOwned, Serialize};
 /// An event has to be able to be serialized and deserialized and it should have a type.
 /// You can derive `Event` on enums and structs that derive `Serialize`, `Deserialize`, `Clone`, `PartialEq`, `Debug`.
 ///
-/// In the example of a bank account, the events could be: Deposit, Withdraw, Transfer, etc.
+/// In the example of a bank account, the events could be: Deposited, Withdrawn, Transfer, etc.
 ///  
 /// # Example
 ///
@@ -19,11 +19,11 @@ use serde::{de::DeserializeOwned, Serialize};
 ///
 /// #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
 /// enum BankAccountEvent {
-///     Deposit { amount: f64 },
-///     Withdraw { amount: f64 },
+///     Deposited { amount: f64 },
+///     Withdrawn { amount: f64 },
 /// }
 ///
-/// assert_eq!(BankAccountEvent::Deposit { amount: 100.0 }.event_type(), "Deposit");
+/// assert_eq!(BankAccountEvent::Deposited { amount: 100.0 }.event_type(), "Deposited");
 /// ```
 ///
 pub trait Event:
@@ -70,37 +70,37 @@ mod tests {
         assert_eq!(event, deserialized);
     }
 
-    // create bank account events enum: Deposit and Withdraw
+    // create bank account events enum: Deposited and Withdrawn
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
     enum BankAccountEvent {
-        Deposit { amount: f64 },
-        Withdraw { amount: f64 },
+        Deposited { amount: f64 },
+        Withdrawn { amount: f64 },
     }
 
     #[test]
     fn test_bank_account_event() {
-        let deposit = BankAccountEvent::Deposit { amount: 100.0 };
-        let withdraw = BankAccountEvent::Withdraw { amount: 50.0 };
+        let deposited = BankAccountEvent::Deposited { amount: 100.0 };
+        let withdrawn = BankAccountEvent::Withdrawn { amount: 50.0 };
 
-        assert_eq!(deposit.event_type(), "Deposit");
-        assert_eq!(withdraw.event_type(), "Withdraw");
+        assert_eq!(deposited.event_type(), "Deposited");
+        assert_eq!(withdrawn.event_type(), "Withdrawn");
     }
 
     // test serialize and deserialize bank account event
     #[test]
     fn test_serialize_deserialize_bank_account_event() {
-        let deposit = BankAccountEvent::Deposit { amount: 100.0 };
-        let withdraw = BankAccountEvent::Withdraw { amount: 50.0 };
+        let deposited = BankAccountEvent::Deposited { amount: 100.0 };
+        let withdrawn = BankAccountEvent::Withdrawn { amount: 50.0 };
 
-        let deposit_serialized = serde_json::to_string(&deposit).unwrap();
-        let deposit_deserialized: BankAccountEvent =
-            serde_json::from_str(&deposit_serialized).unwrap();
+        let deposited_serialized = serde_json::to_string(&deposited).unwrap();
+        let deposited_deserialized: BankAccountEvent =
+            serde_json::from_str(&deposited_serialized).unwrap();
 
-        let withdraw_serialized = serde_json::to_string(&withdraw).unwrap();
-        let withdraw_deserialized: BankAccountEvent =
-            serde_json::from_str(&withdraw_serialized).unwrap();
+        let withdrawn_serialized = serde_json::to_string(&withdrawn).unwrap();
+        let withdrawn_deserialized: BankAccountEvent =
+            serde_json::from_str(&withdrawn_serialized).unwrap();
 
-        assert_eq!(deposit, deposit_deserialized);
-        assert_eq!(withdraw, withdraw_deserialized);
+        assert_eq!(deposited, deposited_deserialized);
+        assert_eq!(withdrawn, withdrawn_deserialized);
     }
 }

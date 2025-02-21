@@ -1,29 +1,34 @@
-use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use thiserror::Error;
+use tokio_test::assert_err;
 use urn::{Urn, UrnBuilder};
 
-use replay::{
-    persistence::{EventStore, StreamFilter},
-    Event, Stream,
-};
+use replay::{persistence::EventStore, Event};
 use replay_macros::Event;
 
 const POSTGRES_PORT: u16 = 5432;
 
 //  bank account stream (id of stream is not part of the model)
-#[derive(Default)]
-struct BankAccountStream {
+#[derive(Default, Serialize, Deserialize, Clone, PartialEq, Debug)]
+struct BankAccountAggregate {
     pub balance: f64,
 }
 
-// create bank account events enum: Deposit and Withdraw
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
-enum BankAccountEvent {
+// create bank account commands
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+enum BankAccountCommand {
     Deposit { amount: f64 },
     Withdraw { amount: f64 },
+}
+
+// create bank account events enum: Deposited and Withdrawn
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+enum BankAccountEvent {
+    Deposited { amount: f64 },
+    Withdrawn { amount: f64 },
 }
 
 // bank account urn
@@ -36,8 +41,20 @@ impl From<BankAccountUrn> for Urn {
     }
 }
 
+// bank account errors
+#[derive(Debug, Error)]
+enum BankAccountError {
+    #[error("Insufficient funds")]
+    InsufficientFunds,
+    #[error("Persistence error: {source}")]
+    PersistenceError {
+        #[from]
+        source: replay::persistence::EventStoreError,
+    },
+}
+
 // bank account stream
-impl replay::Stream for BankAccountStream {
+impl replay::Stream for BankAccountAggregate {
     type Event = BankAccountEvent;
     type StreamId = BankAccountUrn;
 
@@ -47,11 +64,39 @@ impl replay::Stream for BankAccountStream {
 
     fn apply(&mut self, event: Self::Event) {
         match event {
-            BankAccountEvent::Deposit { amount } => {
+            BankAccountEvent::Deposited { amount } => {
                 self.balance += amount;
             }
-            BankAccountEvent::Withdraw { amount } => {
+            BankAccountEvent::Withdrawn { amount } => {
                 self.balance -= amount;
+            }
+        }
+    }
+}
+
+impl replay::Aggregate for BankAccountAggregate {
+    type Command = BankAccountCommand;
+    type Error = BankAccountError;
+
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            BankAccountCommand::Deposit { amount } => {
+                let event = BankAccountEvent::Deposited { amount };
+                Ok(vec![event])
+            }
+            BankAccountCommand::Withdraw { amount } => {
+                if self.balance < amount {
+                    return Err(BankAccountError::InsufficientFunds);
+                }
+
+                let event = BankAccountEvent::Withdrawn { amount };
+                Ok(vec![event])
             }
         }
     }
@@ -87,37 +132,44 @@ async fn bank_account_postgres_test() {
 
     let store = replay::persistence::PostgresEventStore::new(pg_pool);
 
-    let stream_id = UrnBuilder::new("bank-account", "1").build().unwrap();
+    let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
 
-    let events = vec![
-        BankAccountEvent::Deposit { amount: 100.0 },
-        BankAccountEvent::Withdraw { amount: 40.0 },
+    let commands = vec![
+        BankAccountCommand::Deposit { amount: 100.0 },
+        BankAccountCommand::Withdraw { amount: 40.0 },
     ];
 
-    store
-        .store_events(
+    let mut bank_account: BankAccountAggregate = BankAccountAggregate::default();
+
+    let services = &();
+    let expected_version = None;
+
+    for command in commands {
+        bank_account = store
+            .apply_command_and_store_events(
+                &stream_id,
+                replay::Metadata::default(),
+                command,
+                services,
+                expected_version,
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(bank_account.balance, 60.0);
+
+    let result = store
+        .apply_command_and_store_events::<BankAccountAggregate>(
             &stream_id,
-            "BankAccount".to_string(),
             replay::Metadata::default(),
-            &events,
-            None,
+            BankAccountCommand::Withdraw { amount: 100f64 },
+            services,
+            expected_version,
         )
-        .await
-        .unwrap();
+        .await;
 
-    let stream_events = store
-        .stream_events::<BankAccountEvent>(StreamFilter::WithStreamId(stream_id))
-        .map_ok(|persisted_event| persisted_event.data)
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-
-    assert_eq!(stream_events.len(), 2);
-
-    let mut stream = BankAccountStream::default();
-    stream.apply_all(stream_events);
-
-    assert_eq!(stream.balance, 60.0);
+    assert_err!(result, "Insufficient funds");
 }
 
 async fn connect_to_postgres(host: String, port: u16) -> PgPool {
