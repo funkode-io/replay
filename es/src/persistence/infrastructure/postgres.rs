@@ -88,15 +88,16 @@ impl PostgresEventStore {
 }
 
 impl EventStore for PostgresEventStore {
-    async fn store_events<E: Event>(
+    async fn store_events<S: crate::Stream>(
         &self,
-        stream_id: &Urn,
+        stream_id: &S::StreamId,
         stream_type: String,
         metadata: crate::Metadata,
-        domain_events: &[E],
+        domain_events: &[S::Event],
         expected_version: Option<i64>,
     ) -> Result<(), EventStoreError> {
         let mut transaction = self.pool.begin().await.map_err(EventStoreError::from)?;
+        let stream_id: Urn = stream_id.clone().into();
 
         for event in domain_events {
             let event_type = event.event_type().clone();

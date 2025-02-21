@@ -26,8 +26,8 @@ use super::Event;
 ///
 /// #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
 /// enum BankAccountEvent {
-///     Deposit { amount: f64 },
-///     Withdraw { amount: f64 },
+///     Deposited { amount: f64 },
+///     Withdrawn { amount: f64 },
 /// }
 ///
 /// #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
@@ -49,10 +49,10 @@ use super::Event;
 ///
 ///    fn apply(&mut self, event: Self::Event) {
 ///        match event {
-///            BankAccountEvent::Deposit { amount } => {
+///            BankAccountEvent::Deposited { amount } => {
 ///                self.balance += amount;
 ///            }
-///            BankAccountEvent::Withdraw { amount } => {
+///            BankAccountEvent::Withdrawn { amount } => {
 ///                self.balance -= amount;
 ///            }
 ///        }
@@ -110,11 +110,11 @@ mod tests {
         pub balance: f64,
     }
 
-    // create bank account events enum: Deposit and Withdraw
+    // create bank account events enum: Deposited and Withdrawn
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
     enum BankAccountEvent {
-        Deposit { amount: f64 },
-        Withdraw { amount: f64 },
+        Deposited { amount: f64 },
+        Withdrawn { amount: f64 },
     }
 
     // bank account urn
@@ -138,10 +138,10 @@ mod tests {
 
         fn apply(&mut self, event: Self::Event) {
             match event {
-                BankAccountEvent::Deposit { amount } => {
+                BankAccountEvent::Deposited { amount } => {
                     self.balance += amount;
                 }
-                BankAccountEvent::Withdraw { amount } => {
+                BankAccountEvent::Withdrawn { amount } => {
                     self.balance -= amount;
                 }
             }
@@ -151,14 +151,14 @@ mod tests {
     #[test]
     fn test_bank_account_stream() {
         let mut bank_account = BankAccountStream::default();
-        let deposit_event = BankAccountEvent::Deposit { amount: 100.0 };
-        let withdraw_event = BankAccountEvent::Withdraw { amount: 50.0 };
+        let deposited_event = BankAccountEvent::Deposited { amount: 100.0 };
+        let withdrawn_event = BankAccountEvent::Withdrawn { amount: 50.0 };
 
         // check initial state
         assert_eq!(bank_account.balance, 0.0);
 
-        bank_account.apply(deposit_event);
-        bank_account.apply(withdraw_event);
+        bank_account.apply(deposited_event);
+        bank_account.apply(withdrawn_event);
 
         assert_eq!(bank_account.balance, 50.0);
     }
