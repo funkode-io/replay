@@ -1,5 +1,5 @@
 [package]
-name = "replay-es"
+name = "replay"
 version = "0.1.0"
 edition = "2021"
 
@@ -19,10 +19,27 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0.11"
 anyhow = "1.0.96"
 
-sqlx = "0.8.3"
+sqlx = { version = "0.8.3", features = [
+  "runtime-tokio",
+  "uuid",
+  "chrono",
+  "json",
+  "postgres",
+] }
 
 tokio = { version = "1.43.0", features = ["full"] }
 futures = "0.3.31"
 async-stream = "0.3.6"
 
 moka = { version = "0.12.8", features = ["future"] }
+tracing = "0.1.41"
+
+[dev-dependencies]
+log = "0.4.22"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-test = "0.4.4"
+testcontainers-modules = { version = "0.11.6", features = [
+  "postgres",
+  "blocking",
+] }
+dotenvy = "0.15.7"

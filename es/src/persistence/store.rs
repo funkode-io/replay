@@ -11,7 +11,7 @@ use super::{EventStoreError, PersistedEvent, StreamFilter};
 #[trait_variant::make(EventStore: Send)]
 pub trait LocalEventStore {
     fn store_events<E: Event>(
-        &mut self,
+        &self,
         stream_id: &Urn,
         stream_type: String,
         metadata: crate::Metadata,

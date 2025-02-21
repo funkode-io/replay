@@ -14,7 +14,7 @@ use super::Event;
 /// # Example
 ///
 /// ```
-/// use replay_es::{Event, Stream};
+/// use replay::{Event, Stream};
 /// use replay_macros::Event;
 /// use serde::{Deserialize, Serialize};
 /// use urn::Urn;

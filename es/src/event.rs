@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Serialize};
 /// ```
 /// use serde::{Deserialize, Serialize};
 ///
-/// use replay_es::Event;
+/// use replay::Event;
 /// use replay_macros::Event;
 ///
 /// #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
