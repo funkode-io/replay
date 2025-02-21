@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::RwLock};
 
 use chrono::Utc;
 use futures::TryStream;
@@ -7,7 +7,7 @@ use urn::Urn;
 use uuid::Uuid;
 
 use crate::{
-    persistance::{EventStore, EventStoreError, PersistedEvent, StreamFilter},
+    persistence::{EventStoreError, LocalEventStore, PersistedEvent, StreamFilter},
     Event,
 };
 
@@ -16,21 +16,22 @@ use crate::{
 /// It ignores stream type and metadata.
 ///
 /// It only supports filter by stream id.
-pub struct ESInMemoryStore {
-    events: HashMap<Urn, Vec<PersistedEvent<Value>>>,
+pub struct InMemoryEventStore {
+    events: RwLock<HashMap<Urn, Vec<PersistedEvent<Value>>>>,
 }
 
-impl EventStore for ESInMemoryStore {
+impl LocalEventStore for InMemoryEventStore {
     async fn store_events<E: Event>(
-        &mut self,
+        &self,
         stream_id: &Urn,
         _stream_type: String,
         _metadata: crate::Metadata,
         domain_events: &[E],
         expected_version: Option<i64>,
     ) -> Result<(), EventStoreError> {
-        let mut last_version = self
-            .events
+        let mut store = self.events.write().unwrap();
+
+        let mut last_version = store
             .get(stream_id)
             .map(|events| events.last().map(|e| e.version).unwrap_or(0))
             .unwrap_or(0);
@@ -66,7 +67,7 @@ impl EventStore for ESInMemoryStore {
             .collect::<Result<Vec<_>, EventStoreError>>();
 
         let events = serialized_events?;
-        let stream = self.events.entry(stream_id.clone()).or_default();
+        let stream = store.entry(stream_id.clone()).or_default();
 
         stream.extend(events);
         Ok(())
@@ -75,12 +76,13 @@ impl EventStore for ESInMemoryStore {
     fn stream_events<E: Event>(
         &self,
         filter: StreamFilter,
-    ) -> impl TryStream<Ok = PersistedEvent<E>, Error = EventStoreError> + Send {
+    ) -> impl TryStream<Ok = PersistedEvent<E>, Error = EventStoreError> {
         // right now we only support filtering by stream id
 
         async_stream::stream! {
+
             if let StreamFilter::WithStreamId(stream_id) = filter {
-                let stream = self.events.get(&stream_id).cloned().unwrap_or_default();
+                let stream = self.events.read().unwrap().get(&stream_id).cloned().unwrap_or_default();
 
                 for event in stream {
                     let data: E = serde_json::from_value(event.data).map_err(EventStoreError::deser_error)?;
@@ -105,7 +107,7 @@ impl EventStore for ESInMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{persistance::EventStore, Stream};
+    use crate::Stream;
 
     use futures::TryStreamExt;
     use replay_macros::Event;
@@ -158,8 +160,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_events() {
-        let mut store = ESInMemoryStore {
-            events: HashMap::new(),
+        let store = InMemoryEventStore {
+            events: RwLock::new(HashMap::new()),
         };
 
         let stream_id = UrnBuilder::new("bank-account", "1").build().unwrap();

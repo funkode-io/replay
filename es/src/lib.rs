@@ -1,6 +1,6 @@
 mod event;
 mod metadata;
-mod persistance;
+pub mod persistence;
 mod stream;
 
 pub use event::Event;

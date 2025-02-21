@@ -12,4 +12,14 @@ impl Metadata {
             value: serde_json::to_value(value).unwrap(),
         }
     }
+
+    pub fn to_json(&self) -> Value {
+        self.value.clone()
+    }
+}
+
+impl From<Metadata> for Value {
+    fn from(metadata: Metadata) -> Self {
+        metadata.to_json()
+    }
 }

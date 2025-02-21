@@ -14,7 +14,7 @@ Let's assume we have a bank account with a balance that is updated when there is
 Our domain would look something like this:
 
 ```rust
-use replay_es::Stream;
+use replay::Stream;
 use replay_macros::Event;
 use serde::{Deserialize, Serialize};
 use urn::Urn;
@@ -59,4 +59,56 @@ impl Stream for BankAccountStream {
        }
    }
 }
+```
+
+Now we can create a Postgres store and start creating streams:
+
+```rust
+// connect to Postgres
+let pg_pool = PgPoolOptions::new()
+    .max_connections(50)
+    .idle_timeout(std::time::Duration::from_secs(5))
+    .connect(&format!(
+        "postgres://postgres:postgres@{}:{}/postgres",
+        host, port
+    ))
+    .await
+    .expect("Failed to create postgres pool");
+
+// create an event store
+let store = replay::persistence::PostgresEventStore::new(pg_pool);
+
+// store events for your stream
+let stream_id = UrnBuilder::new("bank-account", "1").build().unwrap();
+
+let events = vec![
+    BankAccountEvent::Deposit { amount: 100.0 },
+    BankAccountEvent::Withdraw { amount: 40.0 },
+];
+
+store
+    .store_events(
+        &stream_id,
+        "BankAccount".to_string(),
+        replay::Metadata::default(),
+        &events,
+        None,
+    )
+    .await
+    .unwrap();
+
+// now you can recover your stream from the store
+let stream_events = store
+    .stream_events::<BankAccountEvent>(StreamFilter::WithStreamId(stream_id))
+    .map_ok(|persisted_event| persisted_event.data)
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+assert_eq!(stream_events.len(), 2);
+
+let mut stream = BankAccountStream::default();
+stream.apply_all(stream_events);
+
+assert_eq!(stream.balance, 60.0);
 ```
