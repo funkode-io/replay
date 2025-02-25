@@ -6,8 +6,8 @@ use thiserror::Error;
 use tokio_test::assert_err;
 use urn::{Urn, UrnBuilder};
 
-use replay::{persistence::EventStore, Event};
-use replay_macros::Event;
+use replay::{persistence::PersistedEvent, Event, StreamFilter};
+use replay_macros::{Event, Urn};
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -32,14 +32,8 @@ enum BankAccountEvent {
 }
 
 // bank account urn
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Urn)]
 struct BankAccountUrn(Urn);
-
-impl From<BankAccountUrn> for Urn {
-    fn from(urn: BankAccountUrn) -> Self {
-        urn.0
-    }
-}
 
 // bank account errors
 #[derive(Debug, Error)]
@@ -102,6 +96,60 @@ impl replay::Aggregate for BankAccountAggregate {
     }
 }
 
+struct BankAccountStatement {
+    bank_account: BankAccountUrn,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+    transactions: Vec<BankAccountEvent>,
+    balance_change: f64,
+    total_transactions: u64,
+}
+
+impl std::fmt::Display for BankAccountStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "Bank account: {}\nFrom: {}\nTo: {}\nTransactions: {:?}\nBalance change: {}\nTotal transactions: {}",
+            self.bank_account.0,
+            self.from,
+            self.to,
+            self.transactions,
+            self.balance_change,
+            self.total_transactions
+        )
+    }
+}
+
+impl replay::Query for BankAccountStatement {
+    type Event = BankAccountEvent;
+
+    fn stream_filter(&self) -> StreamFilter {
+        // filter by from / to dates
+        StreamFilter::with_stream_id::<BankAccountAggregate>(&self.bank_account)
+            .and_at_timestamp(self.from)
+    }
+
+    fn update(&mut self, event: PersistedEvent<Self::Event>) {
+        // right now we don't have filters for "after timestamp" so we need to apply here
+        if event.created > self.to {
+            return;
+        }
+
+        self.transactions.push(event.data.clone());
+
+        match event.data {
+            BankAccountEvent::Deposited { amount } => {
+                self.balance_change += amount;
+            }
+            BankAccountEvent::Withdrawn { amount } => {
+                self.balance_change -= amount;
+            }
+        }
+
+        self.total_transactions += 1;
+    }
+}
+
 #[tokio::test]
 async fn bank_account_postgres_test() {
     tracing_subscriber::fmt()
@@ -131,6 +179,7 @@ async fn bank_account_postgres_test() {
     println!("Connected to postgres and ran migrations");
 
     let store = replay::persistence::PostgresEventStore::new(pg_pool);
+    let cqrs = replay::persistence::Cqrs::new(store);
 
     let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
 
@@ -145,8 +194,8 @@ async fn bank_account_postgres_test() {
     let expected_version = None;
 
     for command in commands {
-        bank_account = store
-            .apply_command_and_store_events(
+        bank_account = cqrs
+            .execute(
                 &stream_id,
                 replay::Metadata::default(),
                 command,
@@ -159,8 +208,8 @@ async fn bank_account_postgres_test() {
 
     assert_eq!(bank_account.balance, 60.0);
 
-    let result = store
-        .apply_command_and_store_events::<BankAccountAggregate>(
+    let result = cqrs
+        .execute::<BankAccountAggregate>(
             &stream_id,
             replay::Metadata::default(),
             BankAccountCommand::Withdraw { amount: 100f64 },
@@ -170,6 +219,49 @@ async fn bank_account_postgres_test() {
         .await;
 
     assert_err!(result, "Insufficient funds");
+
+    // to test the query we get current time and sleep 50 ms, then do couple of transactions
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let from = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let commands = vec![
+        BankAccountCommand::Deposit { amount: 20.0 },
+        BankAccountCommand::Withdraw { amount: 40.0 },
+    ];
+
+    for command in commands {
+        bank_account = cqrs
+            .execute(
+                &stream_id,
+                replay::Metadata::default(),
+                command,
+                services,
+                expected_version,
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(bank_account.balance, 40.0);
+
+    // let's create a query for this stream using the from timestamp
+    let mut statement = BankAccountStatement {
+        bank_account: stream_id.clone(),
+        from,
+        to: chrono::Utc::now() + chrono::Duration::seconds(1),
+        transactions: Vec::new(),
+        balance_change: 0.0,
+        total_transactions: 0,
+    };
+
+    cqrs.run_query(&mut statement).await.unwrap();
+
+    tracing::info!("Statement: {}", statement);
+
+    assert_eq!(statement.transactions.len(), 2);
+    assert_eq!(statement.balance_change, -20.0);
+    assert_eq!(statement.total_transactions, 2);
 }
 
 async fn connect_to_postgres(host: String, port: u16) -> PgPool {

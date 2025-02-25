@@ -11,8 +11,8 @@ use urn::Urn;
 use uuid::Uuid;
 
 use crate::{
-    persistence::{EventStore, EventStoreError, PersistedEvent, StreamFilter},
-    Event,
+    persistence::{EventStore, EventStoreError, PersistedEvent},
+    Event, Metadata, StreamFilter,
 };
 
 pub struct PostgresEventStore {
@@ -126,7 +126,7 @@ impl EventStore for PostgresEventStore {
         filter: StreamFilter,
     ) -> impl TryStream<Ok = PersistedEvent<E>, Error = EventStoreError> + Send {
         async_stream::stream! {
-            let sql = "SELECT id, data, stream_id, type, version, created
+            let sql = "SELECT id, data, metadata, stream_id, type, version, created
                 FROM events 
                 WHERE " ;
 
@@ -180,6 +180,8 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
         let r#type: String = value.get("type");
         let version: i64 = value.get("version");
         let created: chrono::DateTime<Utc> = value.get("created");
+        let metadata: Value = value.get("metadata");
+        let metadata: Metadata = Metadata::new(metadata);
 
         Ok(PersistedEvent {
             id,
@@ -188,6 +190,7 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
             r#type,
             version,
             created,
+            metadata,
         })
     }
 }

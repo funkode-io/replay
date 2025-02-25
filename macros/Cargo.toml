@@ -10,3 +10,5 @@ proc-macro = true
 proc-macro2 = "1.0.93"
 syn = "2.0.98"
 quote = "1.0.38"
+
+urn = "0.7.0"
