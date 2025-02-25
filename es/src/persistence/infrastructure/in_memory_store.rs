@@ -7,8 +7,8 @@ use urn::Urn;
 use uuid::Uuid;
 
 use crate::{
-    persistence::{EventStore, EventStoreError, PersistedEvent, StreamFilter},
-    Event,
+    persistence::{EventStore, EventStoreError, PersistedEvent},
+    Event, StreamFilter,
 };
 
 /// In-memory event store implementation, only for testing purpose.
@@ -25,7 +25,7 @@ impl EventStore for InMemoryEventStore {
         &self,
         stream_id: &S::StreamId,
         _stream_type: String,
-        _metadata: crate::Metadata,
+        metadata: crate::Metadata,
         domain_events: &[S::Event],
         expected_version: Option<i64>,
     ) -> Result<(), EventStoreError> {
@@ -63,6 +63,7 @@ impl EventStore for InMemoryEventStore {
                     r#type,
                     version,
                     created,
+                    metadata: metadata.clone(),
                 })
             })
             .collect::<Result<Vec<_>, EventStoreError>>();
@@ -94,6 +95,7 @@ impl EventStore for InMemoryEventStore {
                         r#type: event.r#type,
                         version: event.version,
                         created: event.created,
+                        metadata: event.metadata,
                     });
                 }
 

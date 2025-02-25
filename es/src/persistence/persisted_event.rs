@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use urn::Urn;
 use uuid::Uuid;
 
-use crate::Event;
+use crate::{Event, Metadata};
 
 #[derive(Debug, Clone)]
 pub struct PersistedEvent<E> {
@@ -12,6 +12,7 @@ pub struct PersistedEvent<E> {
     pub r#type: String,
     pub version: i64,
     pub created: DateTime<Utc>,
+    pub metadata: Metadata,
 }
 
 impl<E> PersistedEvent<E> {
@@ -23,6 +24,7 @@ impl<E> PersistedEvent<E> {
             r#type: self.r#type,
             version: self.version,
             created: self.created,
+            metadata: self.metadata,
         }
     }
 
@@ -34,6 +36,7 @@ impl<E> PersistedEvent<E> {
             r#type: self.r#type,
             version: self.version,
             created: self.created,
+            metadata: self.metadata,
         }
     }
 }

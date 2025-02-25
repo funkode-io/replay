@@ -1,12 +1,11 @@
+mod cqrs;
 mod error;
-mod filters;
 mod infrastructure;
 mod persisted_event;
 mod store;
 
+pub use cqrs::Cqrs;
 pub use error::EventStoreError;
-pub use filters::StreamFilter;
+pub use infrastructure::{InMemoryEventStore, PostgresEventStore};
 pub use persisted_event::PersistedEvent;
 pub use store::EventStore;
-
-pub use infrastructure::{InMemoryEventStore, PostgresEventStore};
