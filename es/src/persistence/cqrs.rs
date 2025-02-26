@@ -6,6 +6,7 @@ use crate::{Aggregate, Event};
 
 use super::{EventStore, EventStoreError};
 
+#[derive(Clone)]
 pub struct Cqrs<ES: EventStore> {
     store: Arc<ES>,
 }
