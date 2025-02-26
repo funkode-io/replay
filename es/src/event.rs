@@ -35,6 +35,8 @@ pub trait Event:
 // tests
 #[cfg(test)]
 mod tests {
+    // hack to use macros inside this crate
+    use crate as replay;
     use replay_macros::Event;
     use serde::Deserialize;
 
