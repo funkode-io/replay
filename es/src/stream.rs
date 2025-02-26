@@ -98,6 +98,8 @@ impl Display for StreamState {
 
 #[cfg(test)]
 mod tests {
+    // hack to use macros inside this crate
+    use crate as replay;
     use replay_macros::Event;
     use serde::{Deserialize, Serialize};
     use urn::Urn;

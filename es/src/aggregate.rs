@@ -31,7 +31,6 @@ mod tests {
 
     use super::*;
     use crate::persistence::EventStoreError;
-    use crate::Event;
     use replay_macros::Event;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
@@ -42,6 +41,9 @@ mod tests {
         Deposit { amount: f64 },
         Withdraw { amount: f64 },
     }
+
+    // hack to use macros inside this crate
+    use crate as replay;
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
     enum BankAccountEvent {

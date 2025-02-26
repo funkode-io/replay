@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio_test::assert_err;
 use urn::{Urn, UrnBuilder};
 
-use replay::{persistence::PersistedEvent, Event, StreamFilter};
+use replay::{persistence::PersistedEvent, StreamFilter};
 use replay_macros::{Event, Urn};
 
 const POSTGRES_PORT: u16 = 5432;

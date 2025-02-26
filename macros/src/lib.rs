@@ -22,7 +22,7 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
             });
 
             quote! {
-                impl Event for #name {
+                impl replay::Event for #name {
                     fn event_type(&self) -> String {
                         match self {
                             #(#match_arms)*
@@ -34,7 +34,7 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
         // if it's an struct use the struct name
         Data::Struct(_data_struct) => {
             quote! {
-                impl Event for #name {
+                impl replay::Event for #name {
                     fn event_type(&self) -> String {
                         stringify!(#name).to_string()
                     }

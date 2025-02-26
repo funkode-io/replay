@@ -111,7 +111,8 @@ mod tests {
 
     use std::ops::Not;
 
-    use crate::Event;
+    // hack to use macros inside this crate
+    use crate as replay;
     use replay_macros::{Event, Urn};
     use serde_with::{DeserializeFromStr, SerializeDisplay};
     use urn::{Urn, UrnBuilder};

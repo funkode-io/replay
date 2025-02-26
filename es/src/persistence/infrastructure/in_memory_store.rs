@@ -113,6 +113,9 @@ mod tests {
     use crate::Stream;
 
     use futures::TryStreamExt;
+
+    // hack to use macros inside this crate
+    use crate as replay;
     use replay_macros::Event;
     use serde::{Deserialize, Serialize};
     use urn::{Urn, UrnBuilder};
