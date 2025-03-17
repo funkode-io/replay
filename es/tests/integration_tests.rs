@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio_test::assert_err;
 use urn::{Urn, UrnBuilder};
 
-use replay::{persistence::PersistedEvent, StreamFilter};
+use replay::StreamFilter;
 use replay_macros::{Event, Urn};
 
 const POSTGRES_PORT: u16 = 5432;
@@ -20,15 +20,36 @@ struct BankAccountAggregate {
 // create bank account commands
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 enum BankAccountCommand {
-    Deposit { amount: f64 },
-    Withdraw { amount: f64 },
+    Deposit {
+        effective_on: chrono::NaiveDate,
+        amount: f64,
+    },
+    Withdraw {
+        effective_on: chrono::NaiveDate,
+        amount: f64,
+    },
 }
 
 // create bank account events enum: Deposited and Withdrawn
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
 enum BankAccountEvent {
-    Deposited { amount: f64 },
-    Withdrawn { amount: f64 },
+    Deposited {
+        operation_date: chrono::NaiveDate,
+        amount: f64,
+    },
+    Withdrawn {
+        operation_date: chrono::NaiveDate,
+        amount: f64,
+    },
+}
+
+impl BankAccountEvent {
+    fn operation_date(&self) -> chrono::NaiveDate {
+        match self {
+            BankAccountEvent::Deposited { operation_date, .. } => *operation_date,
+            BankAccountEvent::Withdrawn { operation_date, .. } => *operation_date,
+        }
+    }
 }
 
 // bank account urn
@@ -58,10 +79,16 @@ impl replay::Stream for BankAccountAggregate {
 
     fn apply(&mut self, event: Self::Event) {
         match event {
-            BankAccountEvent::Deposited { amount } => {
+            BankAccountEvent::Deposited {
+                operation_date: _,
+                amount,
+            } => {
                 self.balance += amount;
             }
-            BankAccountEvent::Withdrawn { amount } => {
+            BankAccountEvent::Withdrawn {
+                operation_date: _,
+                amount,
+            } => {
                 self.balance -= amount;
             }
         }
@@ -80,16 +107,28 @@ impl replay::Aggregate for BankAccountAggregate {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
-            BankAccountCommand::Deposit { amount } => {
-                let event = BankAccountEvent::Deposited { amount };
+            BankAccountCommand::Deposit {
+                effective_on,
+                amount,
+            } => {
+                let event = BankAccountEvent::Deposited {
+                    operation_date: effective_on,
+                    amount,
+                };
                 Ok(vec![event])
             }
-            BankAccountCommand::Withdraw { amount } => {
+            BankAccountCommand::Withdraw {
+                effective_on,
+                amount,
+            } => {
                 if self.balance < amount {
                     return Err(BankAccountError::InsufficientFunds);
                 }
 
-                let event = BankAccountEvent::Withdrawn { amount };
+                let event = BankAccountEvent::Withdrawn {
+                    operation_date: effective_on,
+                    amount,
+                };
                 Ok(vec![event])
             }
         }
@@ -98,8 +137,8 @@ impl replay::Aggregate for BankAccountAggregate {
 
 struct BankAccountStatement {
     bank_account: BankAccountUrn,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
     transactions: Vec<BankAccountEvent>,
     balance_change: f64,
     total_transactions: u64,
@@ -126,22 +165,27 @@ impl replay::Query for BankAccountStatement {
     fn stream_filter(&self) -> StreamFilter {
         // filter by from / to dates
         StreamFilter::with_stream_id::<BankAccountAggregate>(&self.bank_account)
-            .and_at_timestamp(self.from)
     }
 
-    fn update(&mut self, event: PersistedEvent<Self::Event>) {
+    fn update(&mut self, event: Self::Event) {
         // right now we don't have filters for "after timestamp" so we need to apply here
-        if event.created > self.to {
+        if event.operation_date() > self.to || event.operation_date() < self.from {
             return;
         }
 
-        self.transactions.push(event.data.clone());
+        self.transactions.push(event.clone());
 
-        match event.data {
-            BankAccountEvent::Deposited { amount } => {
+        match event {
+            BankAccountEvent::Deposited {
+                operation_date: _,
+                amount,
+            } => {
                 self.balance_change += amount;
             }
-            BankAccountEvent::Withdrawn { amount } => {
+            BankAccountEvent::Withdrawn {
+                operation_date: _,
+                amount,
+            } => {
                 self.balance_change -= amount;
             }
         }
@@ -184,8 +228,16 @@ async fn bank_account_postgres_test() {
     let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
 
     let commands = vec![
-        BankAccountCommand::Deposit { amount: 100.0 },
-        BankAccountCommand::Withdraw { amount: 40.0 },
+        // create deposit for 1st Jan 2025
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        // create withdraw for 2nd Jan 2025
+        BankAccountCommand::Withdraw {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 40.0,
+        },
     ];
 
     let mut bank_account: BankAccountAggregate = BankAccountAggregate::default();
@@ -212,7 +264,11 @@ async fn bank_account_postgres_test() {
         .execute::<BankAccountAggregate>(
             &stream_id,
             replay::Metadata::default(),
-            BankAccountCommand::Withdraw { amount: 100f64 },
+            // create withdraw for 3rd Jan 2025
+            BankAccountCommand::Withdraw {
+                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(),
+                amount: 100f64,
+            },
             services,
             expected_version,
         )
@@ -220,14 +276,17 @@ async fn bank_account_postgres_test() {
 
     assert_err!(result, "Insufficient funds");
 
-    // to test the query we get current time and sleep 50 ms, then do couple of transactions
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let from = chrono::Utc::now();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let commands = vec![
-        BankAccountCommand::Deposit { amount: 20.0 },
-        BankAccountCommand::Withdraw { amount: 40.0 },
+        // create deposit for 5st Jan 2025
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 5).unwrap(),
+            amount: 20.0,
+        },
+        // create withdraw for 6th Jan 2025
+        BankAccountCommand::Withdraw {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 6).unwrap(),
+            amount: 40.0,
+        },
     ];
 
     for command in commands {
@@ -248,8 +307,9 @@ async fn bank_account_postgres_test() {
     // let's create a query for this stream using the from timestamp
     let mut statement = BankAccountStatement {
         bank_account: stream_id.clone(),
-        from,
-        to: chrono::Utc::now() + chrono::Duration::seconds(1),
+        // from 5th Jan 2025 to 6th Jan 2025
+        from: chrono::NaiveDate::from_ymd_opt(2025, 1, 5).unwrap(),
+        to: chrono::NaiveDate::from_ymd_opt(2025, 1, 6).unwrap(),
         transactions: Vec::new(),
         balance_change: 0.0,
         total_transactions: 0,
