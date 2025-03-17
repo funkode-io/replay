@@ -10,7 +10,6 @@ use crate::{persistence::EventStoreError, Stream};
 /// It extends the `Stream` trait and adds a `Command` type that represents the commands that can be applied to the aggregate.
 ///
 /// In the example of a bank account the aggregate can validate a withdraw command and return an error if the account has insufficient balance.
-
 pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send + Stream {
     type Command: Send + Sync;
 

@@ -80,7 +80,7 @@ impl<ES: EventStore> Cqrs<ES> {
         futures::pin_mut!(events);
 
         while let Some(Ok(event)) = events.next().await {
-            query.update(event);
+            query.update(event.data);
         }
 
         Ok(())
