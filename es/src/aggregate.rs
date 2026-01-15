@@ -3,7 +3,7 @@ use std::future::Future;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::{persistence::EventStoreError, Stream};
+use crate::{Error, Stream};
 
 /// An aggregate is a domain-driven design pattern that allows you to model a domain entity as a sequence of events.
 ///
@@ -13,7 +13,7 @@ use crate::{persistence::EventStoreError, Stream};
 pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send + Stream {
     type Command: Send + Sync;
 
-    type Error: std::error::Error + From<EventStoreError> + Send + Sync;
+    type Error: std::error::Error + From<Error> + Send + Sync;
     type Services: Send + Sync;
 
     fn handle(
@@ -29,14 +29,16 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::persistence::EventStoreError;
     use replay_macros::Event;
     use serde::{Deserialize, Serialize};
-    use thiserror::Error;
+    use tracing_test::traced_test;
     use urn::Urn;
+
+    // Initialize tracing subscriber for tests
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     enum BankAccountCommand {
+        OpenAccount { account_number: String },
         Deposit { amount: f64 },
         Withdraw { amount: f64 },
     }
@@ -46,22 +48,9 @@ mod tests {
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
     enum BankAccountEvent {
+        AccountOpened { account_number: String },
         Deposited { amount: f64 },
         Withdrawn { amount: f64 },
-    }
-
-    #[derive(Debug, Error)]
-    enum BankAccountError {
-        #[error("Insufficient balance")]
-        InsufficientBalance,
-        #[error("Aggregate store error: {0}")]
-        PersistenceError(EventStoreError),
-    }
-
-    impl From<EventStoreError> for BankAccountError {
-        fn from(error: EventStoreError) -> Self {
-            BankAccountError::PersistenceError(error)
-        }
     }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -69,6 +58,7 @@ mod tests {
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
     struct BankAccountAggregate {
+        pub account_number: String,
         pub balance: f64,
     }
 
@@ -91,6 +81,9 @@ mod tests {
 
         fn apply(&mut self, event: Self::Event) {
             match event {
+                BankAccountEvent::AccountOpened { account_number } => {
+                    self.account_number = account_number;
+                }
                 BankAccountEvent::Deposited { amount } => {
                     self.balance += amount;
                 }
@@ -103,7 +96,7 @@ mod tests {
 
     impl Aggregate for BankAccountAggregate {
         type Command = BankAccountCommand;
-        type Error = BankAccountError;
+        type Error = crate::Error;
         type Services = BankAccountServices;
 
         async fn handle(
@@ -112,13 +105,26 @@ mod tests {
             _services: &Self::Services,
         ) -> Result<Vec<Self::Event>, Self::Error> {
             match command {
+                BankAccountCommand::OpenAccount { account_number } => {
+                    Ok(vec![BankAccountEvent::AccountOpened { account_number }])
+                }
                 BankAccountCommand::Deposit { amount } => {
+                    if self.account_number.is_empty() {
+                        return Err(crate::Error::business_rule_violation("Account not opened")
+                            .with_operation("Deposit"));
+                    }
+
                     Ok(vec![BankAccountEvent::Deposited { amount }])
                 }
                 BankAccountCommand::Withdraw { amount } => {
                     // validate that the account has enough balance
                     if self.balance < amount {
-                        Err(BankAccountError::InsufficientBalance)
+                        Err(
+                            crate::Error::business_rule_violation("Insufficient balance")
+                                .with_operation("Withdraw")
+                                .with_context("account_number", &self.account_number)
+                                .with_context("amount_withdrawn", amount),
+                        )
                     } else {
                         Ok(vec![BankAccountEvent::Withdrawn { amount }])
                     }
@@ -128,15 +134,19 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_bank_account_aggregate() {
         let mut aggregate = BankAccountAggregate::default();
         let services = BankAccountServices;
 
+        let open_account = BankAccountCommand::OpenAccount {
+            account_number: "123456".to_string(),
+        };
         let deposit = BankAccountCommand::Deposit { amount: 100.0 };
         let withdraw = BankAccountCommand::Withdraw { amount: 60.0 };
 
         // for each command we handle the command and apply the events to the aggregate
-        for command in [deposit, withdraw] {
+        for command in [open_account, deposit, withdraw] {
             let events = aggregate.handle(command, &services).await.unwrap();
             aggregate.apply_all(events);
         }
@@ -145,13 +155,21 @@ mod tests {
     }
 
     // test that the aggregate returns an error when the account has insufficient balance
+    #[traced_test]
     #[tokio::test]
     async fn test_aggregate_with_insufficient_balance() {
         let mut aggregate = BankAccountAggregate::default();
         let services = BankAccountServices;
 
+        let open_account = BankAccountCommand::OpenAccount {
+            account_number: "123456".to_string(),
+        };
         let deposit = BankAccountCommand::Deposit { amount: 100.0 };
         let withdraw = BankAccountCommand::Withdraw { amount: 200.0 };
+
+        // open account
+        let events = aggregate.handle(open_account, &services).await.unwrap();
+        aggregate.apply_all(events);
 
         // deposit 100
         let events = aggregate.handle(deposit, &services).await.unwrap();
@@ -160,6 +178,10 @@ mod tests {
         // withdraw 200
         let result = aggregate.handle(withdraw, &services).await;
 
-        assert!(matches!(result, Err(BankAccountError::InsufficientBalance)));
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+        tracing::error!("Expected error: {}", error);
+        assert!(error.to_string().contains("Insufficient balance"));
+        assert!(error.is_permanent());
     }
 }

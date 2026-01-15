@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use urn::Urn;
 use uuid::Uuid;
 
-use crate::{Event, Metadata};
+use replay::{Event, Metadata};
 
 #[derive(Debug, Clone)]
 pub struct PersistedEvent<E> {

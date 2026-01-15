@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 
-use crate::{Aggregate, Event};
+use replay::{Aggregate, Event};
 
-use super::{EventStore, EventStoreError};
+use super::EventStore;
 
 #[derive(Clone)]
 pub struct Cqrs<ES: EventStore> {
@@ -43,7 +43,7 @@ impl<ES: EventStore> Cqrs<ES> {
     pub async fn execute<A: Aggregate>(
         &self,
         id: &A::StreamId,
-        metadata: crate::Metadata,
+        metadata: replay::Metadata,
         command: A::Command,
         services: &A::Services,
         expected_version: Option<i64>,
@@ -67,7 +67,7 @@ impl<ES: EventStore> Cqrs<ES> {
         Ok(aggregate)
     }
 
-    pub async fn run_query<'a, Q, E>(&'a self, query: &'a mut Q) -> Result<(), EventStoreError>
+    pub async fn run_query<'a, Q, E>(&'a self, query: &'a mut Q) -> Result<(), replay::Error>
     where
         E: Event + 'a,
         Q: crate::Query<Event = E>,

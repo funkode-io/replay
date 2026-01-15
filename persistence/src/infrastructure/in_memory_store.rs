@@ -6,10 +6,8 @@ use serde_json::Value;
 use urn::Urn;
 use uuid::Uuid;
 
-use crate::{
-    persistence::{EventStore, EventStoreError, PersistedEvent},
-    Event, StreamFilter,
-};
+use crate::{EventStore, PersistedEvent, StreamFilter};
+use replay::Event;
 
 /// In-memory event store implementation, only for testing purpose.
 ///
@@ -21,14 +19,14 @@ pub struct InMemoryEventStore {
 }
 
 impl EventStore for InMemoryEventStore {
-    async fn store_events<S: crate::Stream>(
+    async fn store_events<S: replay::Stream>(
         &self,
         stream_id: &S::StreamId,
         _stream_type: String,
-        metadata: crate::Metadata,
+        metadata: replay::Metadata,
         domain_events: &[S::Event],
         expected_version: Option<i64>,
-    ) -> Result<(), EventStoreError> {
+    ) -> Result<(), replay::Error> {
         let mut store = self.events.write().unwrap();
         let stream_id: Urn = stream_id.clone().into();
 
@@ -39,15 +37,15 @@ impl EventStore for InMemoryEventStore {
 
         if let Some(expected_version) = expected_version {
             if last_version != expected_version {
-                return Err(EventStoreError::ConcurrencyError {
-                    stream_id: stream_id.clone(),
+                return Err(crate::concurrency_error(
+                    stream_id.clone(),
                     expected_version,
-                    actual_version: last_version,
-                });
+                    last_version,
+                ));
             }
         }
 
-        let serialized_events: Result<Vec<PersistedEvent<Value>>, EventStoreError> = domain_events
+        let serialized_events: Result<Vec<PersistedEvent<Value>>, replay::Error> = domain_events
             .iter()
             .map(|event| {
                 let id = Uuid::new_v4();
@@ -55,7 +53,7 @@ impl EventStore for InMemoryEventStore {
                 let r#type = event.event_type();
                 let version = last_version + 1;
                 last_version = version;
-                let data = serde_json::to_value(event)?;
+                let data = serde_json::to_value(event).map_err(crate::ser_error)?;
                 Ok(PersistedEvent {
                     id,
                     data,
@@ -66,7 +64,7 @@ impl EventStore for InMemoryEventStore {
                     metadata: metadata.clone(),
                 })
             })
-            .collect::<Result<Vec<_>, EventStoreError>>();
+            .collect::<Result<Vec<_>, replay::Error>>();
 
         let events = serialized_events?;
         let stream = store.entry(stream_id.clone()).or_default();
@@ -78,7 +76,7 @@ impl EventStore for InMemoryEventStore {
     fn stream_events<E: Event>(
         &self,
         filter: StreamFilter,
-    ) -> impl TryStream<Ok = PersistedEvent<E>, Error = EventStoreError> + Send {
+    ) -> impl TryStream<Ok = PersistedEvent<E>, Error = replay::Error> + Send {
         // right now we only support filtering by stream id
 
         async_stream::stream! {
@@ -87,7 +85,7 @@ impl EventStore for InMemoryEventStore {
                 let stream = self.events.read().unwrap().get(&stream_id).cloned().unwrap_or_default();
 
                 for event in stream {
-                    let data: E = serde_json::from_value(event.data).map_err(EventStoreError::deser_error)?;
+                    let data: E = serde_json::from_value(event.data).map_err(crate::deser_error)?;
                     yield Ok(PersistedEvent {
                         id: event.id,
                         data,
@@ -100,7 +98,7 @@ impl EventStore for InMemoryEventStore {
                 }
 
             } else {
-                yield Err(EventStoreError::DatabaseError(anyhow::anyhow!("Unsupported filter")));
+                yield Err(replay::Error::internal("Unsupported filter").with_operation("stream_events"));
             };
         }
     }
@@ -110,12 +108,10 @@ impl EventStore for InMemoryEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Stream;
+    use replay::Stream;
 
     use futures::TryStreamExt;
 
-    // hack to use macros inside this crate
-    use crate as replay;
     use replay_macros::Event;
     use serde::{Deserialize, Serialize};
     use urn::{Urn, UrnBuilder};
@@ -144,7 +140,7 @@ mod tests {
     }
 
     // bank account stream
-    impl crate::Stream for BankAccountStream {
+    impl replay::Stream for BankAccountStream {
         type Event = BankAccountEvent;
         type StreamId = BankAccountUrn;
 
@@ -181,7 +177,7 @@ mod tests {
             .store_events::<BankAccountStream>(
                 &stream_id,
                 "BankAccount".to_string(),
-                crate::Metadata::default(),
+                replay::Metadata::default(),
                 &events,
                 None,
             )
