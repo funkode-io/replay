@@ -8,8 +8,8 @@ proc-macro = true
 
 [dependencies]
 replay = { path = "../es" }
-proc-macro2 = "1.0.93"
-syn = "2.0.98"
-quote = "1.0.38"
+proc-macro2 = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }
 
-urn = "0.7.0"
+urn = { workspace = true }

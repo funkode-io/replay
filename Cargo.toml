@@ -2,3 +2,46 @@
 resolver = "2"
 
 members = ["es", "macros"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_with = "3.16.1"
+serde_json = "1.0.149"
+
+urn = { version = "0.7.0", features = ["serde"] }
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
+
+chrono = { version = "0.4.43", features = ["serde"] }
+
+thiserror = "2.0.17"
+anyhow = "1.0.100"
+
+sqlx = { version = "0.8.6", features = [
+  "runtime-tokio",
+  "uuid",
+  "chrono",
+  "json",
+  "postgres",
+] }
+
+tokio = { version = "1.49.0", features = ["full"] }
+futures = "0.3.31"
+async-stream = "0.3.6"
+
+moka = { version = "0.12.12", features = ["future"] }
+tracing = "0.1.44"
+
+# Dev dependencies
+log = "0.4.29"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tokio-test = "0.4.5"
+testcontainers-modules = { version = "0.14.0", features = [
+  "postgres",
+  "blocking",
+] }
+dotenvy = "0.15.7"
+
+# Proc-macro dependencies
+proc-macro2 = "1.0.105"
+syn = "2.0.114"
+quote = "1.0.43"
