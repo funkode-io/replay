@@ -10,10 +10,8 @@ use sqlx::{
 use urn::Urn;
 use uuid::Uuid;
 
-use crate::{
-    persistence::{EventStore, EventStoreError, PersistedEvent},
-    Event, Metadata, StreamFilter,
-};
+use crate::{EventStore, PersistedEvent, StreamFilter};
+use replay::{Event, Metadata};
 
 pub struct PostgresEventStore {
     pool: Pool<Postgres>,
@@ -88,20 +86,20 @@ impl PostgresEventStore {
 }
 
 impl EventStore for PostgresEventStore {
-    async fn store_events<S: crate::Stream>(
+    async fn store_events<S: replay::Stream>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
-        metadata: crate::Metadata,
+        metadata: replay::Metadata,
         domain_events: &[S::Event],
         expected_version: Option<i64>,
-    ) -> Result<(), EventStoreError> {
-        let mut transaction = self.pool.begin().await.map_err(EventStoreError::from)?;
+    ) -> Result<(), replay::Error> {
+        let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
 
         for event in domain_events {
             let event_type = event.event_type().clone();
-            let event = serde_json::to_value(event).map_err(EventStoreError::from)?;
+            let event = serde_json::to_value(event).map_err(crate::ser_error)?;
 
             sqlx::query!(
                 "SELECT append_event($1, $2, $3, $4, $5, $6, $7) ",
@@ -115,16 +113,17 @@ impl EventStore for PostgresEventStore {
             )
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(EventStoreError::from)?;
+            .map_err(crate::db_error)?;
         }
 
-        transaction.commit().await.map_err(EventStoreError::from)
+        transaction.commit().await.map_err(crate::db_error)?;
+        Ok(())
     }
 
     fn stream_events<E: Event>(
         &self,
         filter: StreamFilter,
-    ) -> impl TryStream<Ok = PersistedEvent<E>, Error = EventStoreError> + Send {
+    ) -> impl TryStream<Ok = PersistedEvent<E>, Error = replay::Error> + Send {
         async_stream::stream! {
             let sql = "SELECT id, data, metadata, stream_id, type, version, created
                 FROM events 
@@ -133,14 +132,14 @@ impl EventStore for PostgresEventStore {
             let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(sql);
             Self::add_filters(&mut query_builder, filter.clone());
 
-            query_builder.push(" ORDER BY created, version ASC");
+            let query_builder = query_builder.push(" ORDER BY created, version ASC");
 
             //println!("Executing query: {}", query_builder.sql());
 
             let mut rows = query_builder
                 .build()
                 .fetch(&self.pool)
-                .map_err(EventStoreError::from)
+                .map_err(|e: sqlx::Error| crate::db_error(e).with_operation("fetching events from Postgres").with_context("filter", format!("{:?}", filter)))
                 .map(|result| async {
                     result.and_then(PersistedEvent::<E>::try_from)
                 }).buffered(4);
@@ -166,13 +165,17 @@ impl Clone for PostgresEventStore {
 }
 
 impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
-    type Error = EventStoreError;
+    type Error = replay::Error;
 
-    fn try_from(value: PgRow) -> Result<Self, EventStoreError> {
+    fn try_from(value: PgRow) -> Result<Self, replay::Error> {
         let id: Uuid = value.get("id");
 
-        let data: Value = value.get("data");
-        let data: D = serde_json::from_value(data).map_err(EventStoreError::from)?;
+        let data_raw: Value = value.get("data");
+        let data: D = serde_json::from_value(data_raw.clone()).map_err(|e| {
+            crate::deser_error(e)
+                .with_context("operation", "serde json from store")
+                .with_context("stored_json", data_raw.clone())
+        })?;
 
         // should not panic as we only store urns
         let stream_id_string: String = value.get("stream_id");

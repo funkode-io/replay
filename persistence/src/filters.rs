@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde::Serialize;
 use urn::Urn;
 
-use crate::persistence::PersistedEvent;
+use crate::PersistedEvent;
 
 #[derive(Debug, PartialEq, Default, Clone)]
 pub enum StreamFilter {
@@ -12,7 +12,7 @@ pub enum StreamFilter {
     All,
     WithStreamId(Urn),
     ForStreamTypes(Vec<String>),
-    WithMetadata(crate::Metadata),
+    WithMetadata(replay::Metadata),
     AfterVersion(i64),
     CreatedAfter(chrono::DateTime<Utc>),
     And(Box<StreamFilter>, Box<StreamFilter>),
@@ -21,7 +21,7 @@ pub enum StreamFilter {
 }
 
 impl StreamFilter {
-    pub fn passes<S: crate::Stream>(&self, event: &PersistedEvent<S::Event>) -> bool {
+    pub fn passes<S: replay::Stream>(&self, event: &PersistedEvent<S::Event>) -> bool {
         match self {
             StreamFilter::All => true,
             StreamFilter::WithStreamId(stream_id) => event.stream_id == *stream_id,
@@ -39,16 +39,16 @@ impl StreamFilter {
         StreamFilter::All
     }
 
-    pub fn with_stream_id<S: crate::Stream>(stream_id: &S::StreamId) -> StreamFilter {
+    pub fn with_stream_id<S: replay::Stream>(stream_id: &S::StreamId) -> StreamFilter {
         StreamFilter::WithStreamId(stream_id.clone().into())
     }
 
-    pub fn for_stream_type<S: crate::Stream>() -> StreamFilter {
+    pub fn for_stream_type<S: replay::Stream>() -> StreamFilter {
         StreamFilter::ForStreamTypes(vec![S::stream_type()])
     }
 
     pub fn with_metadata(metadata: impl Serialize) -> StreamFilter {
-        StreamFilter::WithMetadata(crate::Metadata::new(metadata))
+        StreamFilter::WithMetadata(replay::Metadata::new(metadata))
     }
 
     pub fn after_version(version: i64) -> StreamFilter {
@@ -112,12 +112,11 @@ mod tests {
     use std::ops::Not;
 
     // hack to use macros inside this crate
-    use crate as replay;
     use replay_macros::{Event, Urn};
     use serde_with::{DeserializeFromStr, SerializeDisplay};
     use urn::{Urn, UrnBuilder};
 
-    use crate::Metadata;
+    use replay::Metadata;
 
     // create bank account stream
     #[derive(Debug, Clone, PartialEq, Default)]
@@ -125,7 +124,7 @@ mod tests {
         pub balance: f64,
     }
 
-    impl crate::Stream for BankAccountStream {
+    impl replay::Stream for BankAccountStream {
         type Event = BankAccountEvent;
         type StreamId = BankAccountUrn;
 
@@ -176,7 +175,7 @@ mod tests {
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: bank_account_urn.clone().into(),
@@ -199,7 +198,7 @@ mod tests {
         let filter = super::StreamFilter::with_stream_id::<BankAccountStream>(&bank_account_urn);
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: bank_account_urn.clone().into(),
@@ -222,7 +221,7 @@ mod tests {
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: bank_account_urn.clone().into(),
@@ -246,7 +245,7 @@ mod tests {
         let filter = super::StreamFilter::with_metadata(metadata.clone());
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: metadata.bank_account.clone().into(),
@@ -266,7 +265,7 @@ mod tests {
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: bank_account_urn.clone().into(),
@@ -290,7 +289,7 @@ mod tests {
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: bank_account_urn.clone().into(),
@@ -314,7 +313,7 @@ mod tests {
             .and(super::StreamFilter::after_version(1));
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: bank_account_urn.clone().into(),
@@ -338,7 +337,7 @@ mod tests {
             .or(super::StreamFilter::after_version(1));
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: bank_account_urn.clone().into(),
@@ -362,7 +361,7 @@ mod tests {
             .and(super::StreamFilter::after_version(1).not());
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::persistence::PersistedEvent {
+        let persisted_event = crate::PersistedEvent {
             id: uuid::Uuid::new_v4(),
             data: event,
             stream_id: bank_account_urn.clone().into(),

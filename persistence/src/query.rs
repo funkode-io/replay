@@ -1,5 +1,5 @@
 pub trait Query: Sync + Send {
-    type Event: crate::Event;
+    type Event: replay::Event;
 
     fn stream_filter(&self) -> crate::StreamFilter {
         crate::StreamFilter::all()

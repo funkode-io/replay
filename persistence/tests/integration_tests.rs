@@ -2,12 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
-use thiserror::Error;
 use tokio_test::assert_err;
 use urn::{Urn, UrnBuilder};
 
-use replay::StreamFilter;
 use replay_macros::{Event, Urn};
+use replay_persistence::StreamFilter;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -56,18 +55,6 @@ impl BankAccountEvent {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Urn)]
 struct BankAccountUrn(Urn);
 
-// bank account errors
-#[derive(Debug, Error)]
-enum BankAccountError {
-    #[error("Insufficient funds")]
-    InsufficientFunds,
-    #[error("Persistence error: {source}")]
-    PersistenceError {
-        #[from]
-        source: replay::persistence::EventStoreError,
-    },
-}
-
 // bank account stream
 impl replay::Stream for BankAccountAggregate {
     type Event = BankAccountEvent;
@@ -97,7 +84,7 @@ impl replay::Stream for BankAccountAggregate {
 
 impl replay::Aggregate for BankAccountAggregate {
     type Command = BankAccountCommand;
-    type Error = BankAccountError;
+    type Error = replay::Error;
 
     type Services = ();
 
@@ -122,7 +109,9 @@ impl replay::Aggregate for BankAccountAggregate {
                 amount,
             } => {
                 if self.balance < amount {
-                    return Err(BankAccountError::InsufficientFunds);
+                    return Err(replay::Error::business_rule_violation("Insufficient funds")
+                        .with_operation("Withdraw")
+                        .with_context("amount_tried", &amount));
                 }
 
                 let event = BankAccountEvent::Withdrawn {
@@ -159,12 +148,12 @@ impl std::fmt::Display for BankAccountStatement {
     }
 }
 
-impl replay::Query for BankAccountStatement {
+impl replay_persistence::Query for BankAccountStatement {
     type Event = BankAccountEvent;
 
     fn stream_filter(&self) -> StreamFilter {
         // filter by from / to dates
-        StreamFilter::with_stream_id::<BankAccountAggregate>(&self.bank_account)
+        replay_persistence::StreamFilter::with_stream_id::<BankAccountAggregate>(&self.bank_account)
     }
 
     fn update(&mut self, event: Self::Event) {
@@ -222,8 +211,8 @@ async fn bank_account_postgres_test() {
 
     println!("Connected to postgres and ran migrations");
 
-    let store = replay::persistence::PostgresEventStore::new(pg_pool);
-    let cqrs = replay::persistence::Cqrs::new(store);
+    let store = replay_persistence::PostgresEventStore::new(pg_pool);
+    let cqrs = replay_persistence::Cqrs::new(store);
 
     let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
 
