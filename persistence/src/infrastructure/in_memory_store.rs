@@ -19,7 +19,7 @@ pub struct InMemoryEventStore {
 }
 
 impl EventStore for InMemoryEventStore {
-    async fn store_events<S: replay::Stream>(
+    async fn store_events<S: replay::EventStream>(
         &self,
         stream_id: &S::StreamId,
         _stream_type: String,
@@ -108,7 +108,7 @@ impl EventStore for InMemoryEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use replay::Stream;
+    use replay::EventStream;
 
     use futures::TryStreamExt;
 
@@ -140,7 +140,7 @@ mod tests {
     }
 
     // bank account stream
-    impl replay::Stream for BankAccountStream {
+    impl replay::EventStream for BankAccountStream {
         type Event = BankAccountEvent;
         type StreamId = BankAccountUrn;
 

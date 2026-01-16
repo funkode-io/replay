@@ -46,3 +46,6 @@ dotenvy = "0.15.7"
 proc-macro2 = "1.0.105"
 syn = "2.0.114"
 quote = "1.0.43"
+
+# test dependencies
+wasm-bindgen-test = "0.3.40"

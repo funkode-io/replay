@@ -56,7 +56,7 @@ impl BankAccountEvent {
 struct BankAccountUrn(Urn);
 
 // bank account stream
-impl replay::Stream for BankAccountAggregate {
+impl replay::EventStream for BankAccountAggregate {
     type Event = BankAccountEvent;
     type StreamId = BankAccountUrn;
 
@@ -111,7 +111,7 @@ impl replay::Aggregate for BankAccountAggregate {
                 if self.balance < amount {
                     return Err(replay::Error::business_rule_violation("Insufficient funds")
                         .with_operation("Withdraw")
-                        .with_context("amount_tried", &amount));
+                        .with_context("amount_tried", amount));
                 }
 
                 let event = BankAccountEvent::Withdrawn {

@@ -3,14 +3,14 @@ use std::future::Future;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::{Error, Stream};
+use crate::{Error, EventStream};
 
 /// An aggregate is a domain-driven design pattern that allows you to model a domain entity as a sequence of events.
 ///
-/// It extends the `Stream` trait and adds a `Command` type that represents the commands that can be applied to the aggregate.
+/// It extends the `EventStream` trait and adds a `Command` type that represents the commands that can be applied to the aggregate.
 ///
 /// In the example of a bank account the aggregate can validate a withdraw command and return an error if the account has insufficient balance.
-pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send + Stream {
+pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send + EventStream {
     type Command: Send + Sync;
 
     type Error: std::error::Error + From<Error> + Send + Sync;
@@ -71,7 +71,7 @@ mod tests {
         }
     }
 
-    impl Stream for BankAccountAggregate {
+    impl EventStream for BankAccountAggregate {
         type Event = BankAccountEvent;
         type StreamId = BankAccountUrn;
 
@@ -133,6 +133,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     #[traced_test]
     async fn test_bank_account_aggregate() {
@@ -155,6 +156,7 @@ mod tests {
     }
 
     // test that the aggregate returns an error when the account has insufficient balance
+    #[cfg(not(target_arch = "wasm32"))]
     #[traced_test]
     #[tokio::test]
     async fn test_aggregate_with_insufficient_balance() {

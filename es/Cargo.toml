@@ -13,5 +13,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 replay-macros = { path = "../macros" }
-tokio = { workspace = true }
 tracing-test = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }

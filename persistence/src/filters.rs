@@ -21,7 +21,7 @@ pub enum StreamFilter {
 }
 
 impl StreamFilter {
-    pub fn passes<S: replay::Stream>(&self, event: &PersistedEvent<S::Event>) -> bool {
+    pub fn passes<S: replay::EventStream>(&self, event: &PersistedEvent<S::Event>) -> bool {
         match self {
             StreamFilter::All => true,
             StreamFilter::WithStreamId(stream_id) => event.stream_id == *stream_id,
@@ -39,11 +39,11 @@ impl StreamFilter {
         StreamFilter::All
     }
 
-    pub fn with_stream_id<S: replay::Stream>(stream_id: &S::StreamId) -> StreamFilter {
+    pub fn with_stream_id<S: replay::EventStream>(stream_id: &S::StreamId) -> StreamFilter {
         StreamFilter::WithStreamId(stream_id.clone().into())
     }
 
-    pub fn for_stream_type<S: replay::Stream>() -> StreamFilter {
+    pub fn for_stream_type<S: replay::EventStream>() -> StreamFilter {
         StreamFilter::ForStreamTypes(vec![S::stream_type()])
     }
 
@@ -124,7 +124,7 @@ mod tests {
         pub balance: f64,
     }
 
-    impl replay::Stream for BankAccountStream {
+    impl replay::EventStream for BankAccountStream {
         type Event = BankAccountEvent;
         type StreamId = BankAccountUrn;
 

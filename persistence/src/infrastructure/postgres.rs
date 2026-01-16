@@ -86,7 +86,7 @@ impl PostgresEventStore {
 }
 
 impl EventStore for PostgresEventStore {
-    async fn store_events<S: replay::Stream>(
+    async fn store_events<S: replay::EventStream>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
