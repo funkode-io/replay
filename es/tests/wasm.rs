@@ -4,8 +4,6 @@ use wasm_bindgen_test::*;
 // Configure tests to run in a browser or Node.js
 wasm_bindgen_test_configure!(run_in_browser); // or run_in_nodejs
 
-use std::vec;
-
 use replay::{Aggregate, EventStream};
 use replay_macros::define_aggregate;
 
@@ -83,7 +81,7 @@ impl Aggregate for BankAccount {
 }
 
 #[wasm_bindgen_test]
-async fn test_my_library_function_in_wasm() {
+async fn test_bank_account_aggregate_in_wasm() {
     let mut aggregate = BankAccount::default();
     let services = BankAccountServices;
 
