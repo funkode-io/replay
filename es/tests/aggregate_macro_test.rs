@@ -212,4 +212,88 @@ mod tests {
         // Verify namespace method
         assert_eq!(CustomerUrn::namespace(), "my-customer");
     }
+
+    // Test proper camelCase to kebab-case conversion including acronym handling
+    #[test]
+    fn test_aggregate_namespace_conversion() {
+        // Test simple camelCase
+        define_aggregate! {
+            BankAccount {
+                state: { value: i32 },
+                commands: { DoSomething },
+                events: { SomethingDone }
+            }
+        }
+        assert_eq!(BankAccountUrn::namespace(), "bank-account");
+
+        // Test leading acronym
+        define_aggregate! {
+            HTTPConnection {
+                state: { value: i32 },
+                commands: { DoSomething },
+                events: { SomethingDone }
+            }
+        }
+        assert_eq!(HTTPConnectionUrn::namespace(), "http-connection");
+
+        // Test trailing acronym
+        define_aggregate! {
+            ConnectionHTTP {
+                state: { value: i32 },
+                commands: { DoSomething },
+                events: { SomethingDone }
+            }
+        }
+        assert_eq!(ConnectionHTTPUrn::namespace(), "connection-http");
+
+        // Test middle acronym
+        define_aggregate! {
+            MyHTTPServer {
+                state: { value: i32 },
+                commands: { DoSomething },
+                events: { SomethingDone }
+            }
+        }
+        assert_eq!(MyHTTPServerUrn::namespace(), "my-http-server");
+
+        // Test single word
+        define_aggregate! {
+            Account {
+                state: { value: i32 },
+                commands: { DoSomething },
+                events: { SomethingDone }
+            }
+        }
+        assert_eq!(AccountUrn::namespace(), "account");
+
+        // Test all caps word
+        define_aggregate! {
+            API {
+                state: { value: i32 },
+                commands: { DoSomething },
+                events: { SomethingDone }
+            }
+        }
+        assert_eq!(APIUrn::namespace(), "api");
+
+        // Test multiple acronyms
+        define_aggregate! {
+            HTTPSAPIGateway {
+                state: { value: i32 },
+                commands: { DoSomething },
+                events: { SomethingDone }
+            }
+        }
+        assert_eq!(HTTPSAPIGatewayUrn::namespace(), "httpsapi-gateway");
+
+        // Test consecutive caps followed by lowercase
+        define_aggregate! {
+            XMLHttpRequest {
+                state: { value: i32 },
+                commands: { DoSomething },
+                events: { SomethingDone }
+            }
+        }
+        assert_eq!(XMLHttpRequestUrn::namespace(), "xml-http-request");
+    }
 }

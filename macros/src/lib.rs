@@ -310,13 +310,31 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         .as_ref()
         .map(|lit| lit.value())
         .unwrap_or_else(|| {
-            // Convert CamelCase to kebab-case
+            // Convert CamelCase to kebab-case with proper acronym handling
+            // e.g., "HTTPConnection" -> "http-connection", "BankAccount" -> "bank-account"
             let name_str = name.to_string();
             let mut result = String::new();
-            for (i, ch) in name_str.chars().enumerate() {
-                if ch.is_uppercase() && i > 0 {
-                    result.push('-');
+            let chars: Vec<char> = name_str.chars().collect();
+
+            for i in 0..chars.len() {
+                let ch = chars[i];
+
+                if ch.is_uppercase() {
+                    // Add hyphen before uppercase if:
+                    // 1. Not at the start (i > 0)
+                    // 2. AND one of:
+                    //    a. Previous char is lowercase (e.g., "myHTTP" -> "my-HTTP")
+                    //    b. Next char exists and is lowercase (end of acronym: "HTTPConnection" -> "HTTP-Connection")
+                    if i > 0 {
+                        let prev_is_lower = chars[i - 1].is_lowercase();
+                        let next_is_lower = i + 1 < chars.len() && chars[i + 1].is_lowercase();
+
+                        if prev_is_lower || next_is_lower {
+                            result.push('-');
+                        }
+                    }
                 }
+
                 result.push(ch.to_ascii_lowercase());
             }
             result
@@ -435,7 +453,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
 
         // URN type
         #[derive(Clone, PartialEq, Debug)]
-        pub struct #urn_name(pub urn::Urn);
+        pub struct #urn_name(urn::Urn);
 
         #urn_serde_impl
 
@@ -451,7 +469,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
             }
         }
 
-        // URN helper methods (if namespace is configured)
+        // URN helper methods
         #urn_impl_methods
 
         // Services placeholder
