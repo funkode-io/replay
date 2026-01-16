@@ -304,6 +304,26 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     let urn_name = quote::format_ident!("{}Urn", name);
     let services_name = quote::format_ident!("{}Services", name);
 
+    // Derive namespace from aggregate name if not provided
+    let namespace_str = aggregate_def
+        .namespace
+        .as_ref()
+        .map(|lit| lit.value())
+        .unwrap_or_else(|| {
+            // Convert CamelCase to kebab-case
+            let name_str = name.to_string();
+            let mut result = String::new();
+            for (i, ch) in name_str.chars().enumerate() {
+                if ch.is_uppercase() && i > 0 {
+                    result.push('-');
+                }
+                result.push(ch.to_ascii_lowercase());
+            }
+            result
+        });
+
+    let namespace = syn::LitStr::new(&namespace_str, name.span());
+
     // Generate state fields
     let state_fields = &aggregate_def.state_fields;
 
@@ -329,24 +349,69 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
     });
 
-    // Generate URN helper methods if namespace is provided
-    let urn_impl_methods = if let Some(namespace) = &aggregate_def.namespace {
-        quote! {
-            impl #urn_name {
-                /// Create a new URN with the configured namespace
-                pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
-                    let id_str = id.to_string();
-                    Ok(Self(urn::UrnBuilder::new(#namespace, &id_str).build()?))
-                }
-
-                /// Get the namespace identifier (NID)
-                pub fn namespace() -> &'static str {
-                    #namespace
-                }
+    // Generate URN serialization implementations with namespace validation
+    let urn_serde_impl = quote! {
+        impl serde::Serialize for #urn_name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&self.0.to_string())
             }
         }
-    } else {
-        quote! {}
+
+        impl<'de> serde::Deserialize<'de> for #urn_name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                use std::str::FromStr;
+                let s = String::deserialize(deserializer)?;
+                let urn = urn::Urn::from_str(&s)
+                    .map_err(|e| serde::de::Error::custom(format!("Invalid URN: {}", e)))?;
+
+                if urn.nid() != #namespace {
+                    return Err(serde::de::Error::custom(
+                        format!("Invalid URN namespace: expected '{}', got '{}'", #namespace, urn.nid())
+                    ));
+                }
+
+                Ok(Self(urn))
+            }
+        }
+    };
+
+    // Generate URN helper methods with namespace validation
+    let urn_impl_methods = quote! {
+        impl #urn_name {
+            /// Create a new URN with the configured namespace
+            pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
+                let id_str = id.to_string();
+                Ok(Self(urn::UrnBuilder::new(#namespace, &id_str).build()?))
+            }
+
+            /// Parse a URN string and validate the namespace
+            pub fn parse(input: impl AsRef<str>) -> Result<Self, String> {
+                use std::str::FromStr;
+                let urn = urn::Urn::from_str(input.as_ref())
+                    .map_err(|e| format!("Failed to parse URN: {}", e))?;
+
+                if urn.nid() != #namespace {
+                    return Err(format!(
+                        "Invalid URN namespace: expected '{}', got '{}'",
+                        #namespace,
+                        urn.nid()
+                    ));
+                }
+
+                Ok(Self(urn))
+            }
+
+            /// Get the namespace identifier (NID)
+            pub fn namespace() -> &'static str {
+                #namespace
+            }
+        }
     };
 
     let expanded = quote! {
@@ -371,6 +436,8 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         // URN type
         #[derive(Clone, PartialEq, Debug)]
         pub struct #urn_name(pub urn::Urn);
+
+        #urn_serde_impl
 
         impl From<#urn_name> for urn::Urn {
             fn from(urn: #urn_name) -> Self {

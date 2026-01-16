@@ -97,6 +97,21 @@ mod tests {
         // Test that event enum was created
         let evt = BankAccountEvent::Deposited { amount: 100.0 };
         assert!(matches!(evt, BankAccountEvent::Deposited { .. }));
+
+        // Test that namespace is auto-generated (BankAccount -> bank-account)
+        assert_eq!(BankAccountUrn::namespace(), "bank-account");
+
+        // Test URN creation and validation
+        let urn = BankAccountUrn::new("acc-123").unwrap();
+        assert_eq!(urn.to_string(), "urn:bank-account:acc-123");
+
+        // Test parse with correct namespace
+        let parsed = BankAccountUrn::parse("urn:bank-account:acc-456").unwrap();
+        assert_eq!(parsed.to_string(), "urn:bank-account:acc-456");
+
+        // Test parse with wrong namespace fails
+        let wrong = BankAccountUrn::parse("urn:customer:acc-789");
+        assert!(wrong.is_err());
     }
 
     #[test]
@@ -120,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lifecylce_of_aggregate() {
+    fn test_lifecycle_of_aggregate() {
         let mut account = BankAccount::default();
 
         // Apply AccountOpened event
@@ -161,5 +176,40 @@ mod tests {
 
         let customer_urn = CustomerUrn::new("peter@gmail.com").unwrap();
         assert_eq!(customer_urn.to_string(), "urn:my-customer:peter@gmail.com");
+
+        // Test serialization
+        let json = serde_json::to_string(&customer_urn).unwrap();
+        assert_eq!(json, "\"urn:my-customer:peter@gmail.com\"");
+
+        // Test deserialization with correct namespace
+        let deserialized: CustomerUrn = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, customer_urn);
+
+        // Test deserialization with wrong namespace should fail
+        let wrong_namespace = "\"urn:wrong-namespace:peter@gmail.com\"";
+        let result: Result<CustomerUrn, _> = serde_json::from_str(wrong_namespace);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid URN namespace"));
+
+        // Test creating URN from string directly
+        use std::str::FromStr;
+        let urn_from_str = urn::Urn::from_str("urn:my-customer:john@example.com").unwrap();
+        let customer_urn2 = CustomerUrn(urn_from_str);
+        assert_eq!(
+            customer_urn2.to_string(),
+            "urn:my-customer:john@example.com"
+        );
+
+        // Test parse method with valid namespace
+        let parsed_urn = CustomerUrn::parse("urn:my-customer:alice@example.com").unwrap();
+        assert_eq!(parsed_urn.to_string(), "urn:my-customer:alice@example.com");
+
+        // Test parse method with wrong namespace should fail
+        let wrong_parse = CustomerUrn::parse("urn:wrong-namespace:bob@example.com");
+        assert!(wrong_parse.is_err());
+
+        // Verify namespace method
+        assert_eq!(CustomerUrn::namespace(), "my-customer");
     }
 }
