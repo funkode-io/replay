@@ -140,4 +140,26 @@ mod tests {
         account.apply(withdraw_event);
         assert_eq!(account.balance, 100.0);
     }
+
+    // test an aggregate with custom urn namespace using macros
+    #[test]
+    fn test_aggregate_with_urn_namespace() {
+        define_aggregate! {
+            Customer {
+                namespace: "my-customer",
+                state: {
+                    name: String,
+                },
+                commands: {
+                    CreateCustomer { name: String },
+                },
+                events: {
+                    CustomerCreated { name: String },
+                }
+            }
+        };
+
+        let customer_urn = CustomerUrn::new("peter@gmail.com").unwrap();
+        assert_eq!(customer_urn.to_string(), "urn:my-customer:peter@gmail.com");
+    }
 }
