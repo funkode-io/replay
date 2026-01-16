@@ -262,14 +262,20 @@ The macro automatically generates:
 - The aggregate state struct (`BankAccountAggregate`)
 - The command enum (`BankAccountAggregateCommand`)
 - The event enum with `Event` trait (`BankAccountAggregateEvent`)
-- The URN type (`BankAccountAggregateUrn`)
+- The URN type (`BankAccountAggregateUrn`) with helper methods:
+  - `YourTypeUrn::new(id)` - Creates a URN with the configured namespace
+  - `YourTypeUrn::parse(input)` - Parses a URN string and validates the namespace
+  - `YourTypeUrn::namespace()` - Returns the namespace identifier as a static string
+  - `Display` implementation for easy string conversion
 - A services placeholder struct (`BankAccountAggregateServices`)
 
 This reduces boilerplate while keeping the same functionality. You still need to implement the `EventStream` and `Aggregate` traits to define the behavior.
 
-### Optional Namespace Configuration
+### URN Namespace Configuration
 
-You can optionally specify a `namespace` to configure the URN namespace identifier (NID) for your aggregate. This adds convenient helper methods to the URN type:
+The URN namespace identifier (NID) is automatically derived from the aggregate name by converting CamelCase to kebab-case (e.g., `BankAccount` becomes `bank-account`, `HTTPConnection` becomes `http-connection`).
+
+You can optionally specify a custom `namespace` to override this default behavior:
 
 ```rust
 define_aggregate! {
@@ -288,7 +294,7 @@ define_aggregate! {
     }
 }
 
-// With namespace configured, you get helper methods:
+// The URN helper methods are always available:
 let customer_urn = CustomerUrn::new("peter@example.com").unwrap();
 assert_eq!(customer_urn.to_string(), "urn:customer:peter@example.com");
 
@@ -296,8 +302,4 @@ assert_eq!(customer_urn.to_string(), "urn:customer:peter@example.com");
 assert_eq!(CustomerUrn::namespace(), "customer");
 ```
 
-When `namespace` is specified, the macro generates:
-
-- `YourTypeUrn::new(id)` - Creates a URN with the configured namespace
-- `YourTypeUrn::namespace()` - Returns the namespace identifier as a static string
-- `Display` implementation for easy string conversion
+If no custom namespace is specified, the namespace will be automatically derived from the aggregate name (e.g., `BankAccount` → `bank-account`).
