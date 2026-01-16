@@ -120,6 +120,7 @@ pub fn derive_urn(input: TokenStream) -> TokenStream {
 // Struct to parse the define_aggregate! macro input
 struct AggregateDefinition {
     name: Ident,
+    namespace: Option<syn::LitStr>,
     state_fields: Vec<Field>,
     commands: Vec<CommandVariant>,
     events: Vec<EventVariant>,
@@ -142,6 +143,7 @@ impl Parse for AggregateDefinition {
         let content;
         syn::braced!(content in input);
 
+        let mut namespace = None;
         let mut state_fields = Vec::new();
         let mut commands = Vec::new();
         let mut events = Vec::new();
@@ -150,119 +152,130 @@ impl Parse for AggregateDefinition {
             let section_name: Ident = content.parse()?;
             content.parse::<Token![:]>()?;
 
-            let section_content;
-            syn::braced!(section_content in content);
-
             match section_name.to_string().as_str() {
-                "state" => {
-                    while !section_content.is_empty() {
-                        let field_name: Ident = section_content.parse()?;
-                        section_content.parse::<Token![:]>()?;
-                        let field_type: Type = section_content.parse()?;
-
-                        state_fields.push(Field {
-                            attrs: Vec::new(),
-                            vis: syn::Visibility::Public(syn::token::Pub::default()),
-                            mutability: syn::FieldMutability::None,
-                            ident: Some(field_name),
-                            colon_token: Some(Token![:](proc_macro2::Span::call_site())),
-                            ty: field_type,
-                        });
-
-                        if section_content.peek(Token![,]) {
-                            section_content.parse::<Token![,]>()?;
-                        }
-                    }
-                }
-                "commands" => {
-                    while !section_content.is_empty() {
-                        let variant_name: Ident = section_content.parse()?;
-
-                        let variant_fields = if section_content.peek(Brace) {
-                            let fields_content;
-                            syn::braced!(fields_content in section_content);
-
-                            let mut fields = Vec::new();
-                            while !fields_content.is_empty() {
-                                let field_name: Ident = fields_content.parse()?;
-                                fields_content.parse::<Token![:]>()?;
-                                let field_type: Type = fields_content.parse()?;
-
-                                fields.push(Field {
-                                    attrs: Vec::new(),
-                                    vis: syn::Visibility::Inherited,
-                                    mutability: syn::FieldMutability::None,
-                                    ident: Some(field_name),
-                                    colon_token: Some(Token![:](proc_macro2::Span::call_site())),
-                                    ty: field_type,
-                                });
-
-                                if fields_content.peek(Token![,]) {
-                                    fields_content.parse::<Token![,]>()?;
-                                }
-                            }
-                            fields
-                        } else {
-                            Vec::new()
-                        };
-
-                        commands.push(CommandVariant {
-                            name: variant_name,
-                            fields: variant_fields,
-                        });
-
-                        if section_content.peek(Token![,]) {
-                            section_content.parse::<Token![,]>()?;
-                        }
-                    }
-                }
-                "events" => {
-                    while !section_content.is_empty() {
-                        let variant_name: Ident = section_content.parse()?;
-
-                        let variant_fields = if section_content.peek(Brace) {
-                            let fields_content;
-                            syn::braced!(fields_content in section_content);
-
-                            let mut fields = Vec::new();
-                            while !fields_content.is_empty() {
-                                let field_name: Ident = fields_content.parse()?;
-                                fields_content.parse::<Token![:]>()?;
-                                let field_type: Type = fields_content.parse()?;
-
-                                fields.push(Field {
-                                    attrs: Vec::new(),
-                                    vis: syn::Visibility::Inherited,
-                                    mutability: syn::FieldMutability::None,
-                                    ident: Some(field_name),
-                                    colon_token: Some(Token![:](proc_macro2::Span::call_site())),
-                                    ty: field_type,
-                                });
-
-                                if fields_content.peek(Token![,]) {
-                                    fields_content.parse::<Token![,]>()?;
-                                }
-                            }
-                            fields
-                        } else {
-                            Vec::new()
-                        };
-
-                        events.push(EventVariant {
-                            name: variant_name,
-                            fields: variant_fields,
-                        });
-
-                        if section_content.peek(Token![,]) {
-                            section_content.parse::<Token![,]>()?;
-                        }
-                    }
+                "namespace" => {
+                    namespace = Some(content.parse()?);
                 }
                 _ => {
-                    return Err(syn::Error::new_spanned(
-                        section_name,
-                        "Expected 'state', 'commands', or 'events'",
-                    ));
+                    let section_content;
+                    syn::braced!(section_content in content);
+
+                    match section_name.to_string().as_str() {
+                        "state" => {
+                            while !section_content.is_empty() {
+                                let field_name: Ident = section_content.parse()?;
+                                section_content.parse::<Token![:]>()?;
+                                let field_type: Type = section_content.parse()?;
+
+                                state_fields.push(Field {
+                                    attrs: Vec::new(),
+                                    vis: syn::Visibility::Public(syn::token::Pub::default()),
+                                    mutability: syn::FieldMutability::None,
+                                    ident: Some(field_name),
+                                    colon_token: Some(Token![:](proc_macro2::Span::call_site())),
+                                    ty: field_type,
+                                });
+
+                                if section_content.peek(Token![,]) {
+                                    section_content.parse::<Token![,]>()?;
+                                }
+                            }
+                        }
+                        "commands" => {
+                            while !section_content.is_empty() {
+                                let variant_name: Ident = section_content.parse()?;
+
+                                let variant_fields = if section_content.peek(Brace) {
+                                    let fields_content;
+                                    syn::braced!(fields_content in section_content);
+
+                                    let mut fields = Vec::new();
+                                    while !fields_content.is_empty() {
+                                        let field_name: Ident = fields_content.parse()?;
+                                        fields_content.parse::<Token![:]>()?;
+                                        let field_type: Type = fields_content.parse()?;
+
+                                        fields.push(Field {
+                                            attrs: Vec::new(),
+                                            vis: syn::Visibility::Inherited,
+                                            mutability: syn::FieldMutability::None,
+                                            ident: Some(field_name),
+                                            colon_token: Some(Token![:](
+                                                proc_macro2::Span::call_site(),
+                                            )),
+                                            ty: field_type,
+                                        });
+
+                                        if fields_content.peek(Token![,]) {
+                                            fields_content.parse::<Token![,]>()?;
+                                        }
+                                    }
+                                    fields
+                                } else {
+                                    Vec::new()
+                                };
+
+                                commands.push(CommandVariant {
+                                    name: variant_name,
+                                    fields: variant_fields,
+                                });
+
+                                if section_content.peek(Token![,]) {
+                                    section_content.parse::<Token![,]>()?;
+                                }
+                            }
+                        }
+                        "events" => {
+                            while !section_content.is_empty() {
+                                let variant_name: Ident = section_content.parse()?;
+
+                                let variant_fields = if section_content.peek(Brace) {
+                                    let fields_content;
+                                    syn::braced!(fields_content in section_content);
+
+                                    let mut fields = Vec::new();
+                                    while !fields_content.is_empty() {
+                                        let field_name: Ident = fields_content.parse()?;
+                                        fields_content.parse::<Token![:]>()?;
+                                        let field_type: Type = fields_content.parse()?;
+
+                                        fields.push(Field {
+                                            attrs: Vec::new(),
+                                            vis: syn::Visibility::Inherited,
+                                            mutability: syn::FieldMutability::None,
+                                            ident: Some(field_name),
+                                            colon_token: Some(Token![:](
+                                                proc_macro2::Span::call_site(),
+                                            )),
+                                            ty: field_type,
+                                        });
+
+                                        if fields_content.peek(Token![,]) {
+                                            fields_content.parse::<Token![,]>()?;
+                                        }
+                                    }
+                                    fields
+                                } else {
+                                    Vec::new()
+                                };
+
+                                events.push(EventVariant {
+                                    name: variant_name,
+                                    fields: variant_fields,
+                                });
+
+                                if section_content.peek(Token![,]) {
+                                    section_content.parse::<Token![,]>()?;
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(syn::Error::new_spanned(
+                                section_name,
+                                "Expected 'state', 'commands', or 'events'",
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -273,6 +286,7 @@ impl Parse for AggregateDefinition {
 
         Ok(AggregateDefinition {
             name,
+            namespace,
             state_fields,
             commands,
             events,
@@ -315,6 +329,26 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
     });
 
+    // Generate URN helper methods if namespace is provided
+    let urn_impl_methods = if let Some(namespace) = &aggregate_def.namespace {
+        quote! {
+            impl #urn_name {
+                /// Create a new URN with the configured namespace
+                pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
+                    let id_str = id.to_string();
+                    Ok(Self(urn::UrnBuilder::new(#namespace, &id_str).build()?))
+                }
+
+                /// Get the namespace identifier (NID)
+                pub fn namespace() -> &'static str {
+                    #namespace
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         // Aggregate state struct
         #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
@@ -343,6 +377,15 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
                 urn.0
             }
         }
+
+        impl std::fmt::Display for #urn_name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        // URN helper methods (if namespace is configured)
+        #urn_impl_methods
 
         // Services placeholder
         #[derive(Clone, Debug)]

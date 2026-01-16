@@ -266,3 +266,38 @@ The macro automatically generates:
 - A services placeholder struct (`BankAccountAggregateServices`)
 
 This reduces boilerplate while keeping the same functionality. You still need to implement the `EventStream` and `Aggregate` traits to define the behavior.
+
+### Optional Namespace Configuration
+
+You can optionally specify a `namespace` to configure the URN namespace identifier (NID) for your aggregate. This adds convenient helper methods to the URN type:
+
+```rust
+define_aggregate! {
+    Customer {
+        namespace: "customer",
+        state: {
+            email: String,
+            name: String
+        },
+        commands: {
+            RegisterCustomer { email: String, name: String }
+        },
+        events: {
+            CustomerRegistered { email: String, name: String }
+        }
+    }
+}
+
+// With namespace configured, you get helper methods:
+let customer_urn = CustomerUrn::new("peter@example.com").unwrap();
+assert_eq!(customer_urn.to_string(), "urn:customer:peter@example.com");
+
+// Get the namespace identifier
+assert_eq!(CustomerUrn::namespace(), "customer");
+```
+
+When `namespace` is specified, the macro generates:
+
+- `YourTypeUrn::new(id)` - Creates a URN with the configured namespace
+- `YourTypeUrn::namespace()` - Returns the namespace identifier as a static string
+- `Display` implementation for easy string conversion
