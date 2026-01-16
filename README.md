@@ -172,3 +172,97 @@ let result = store
 
 assert_err!(result, "Insufficient funds");
 ```
+
+## Using Macros
+
+You can simplify the aggregate definition using the `define_aggregate!` macro. Here's the same bank account example using the macro:
+
+```rust
+use replay_macros::define_aggregate;
+use replay::{Aggregate, EventStream};
+use thiserror::Error;
+
+// Define the aggregate structure with the macro
+define_aggregate! {
+    BankAccountAggregate {
+        state: {
+            balance: f64
+        },
+        commands: {
+            Deposit { amount: f64 },
+            Withdraw { amount: f64 }
+        },
+        events: {
+            Deposited { amount: f64 },
+            Withdrawn { amount: f64 }
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum BankAccountError {
+    #[error("Insufficient funds")]
+    InsufficientFunds,
+    #[error("Persistence error: {source}")]
+    PersistenceError {
+        #[from]
+        source: replay::persistence::EventStoreError,
+    },
+}
+
+// Implement the EventStream trait
+impl replay::EventStream for BankAccountAggregate {
+    type Event = BankAccountAggregateEvent;
+    type StreamId = BankAccountAggregateUrn;
+
+    fn stream_type() -> String {
+        "BankAccount".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            BankAccountAggregateEvent::Deposited { amount } => {
+                self.balance += amount;
+            }
+            BankAccountAggregateEvent::Withdrawn { amount } => {
+                self.balance -= amount;
+            }
+        }
+    }
+}
+
+// Implement the Aggregate trait
+impl replay::Aggregate for BankAccountAggregate {
+    type Command = BankAccountAggregateCommand;
+    type Error = BankAccountError;
+    type Services = BankAccountAggregateServices;
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            BankAccountAggregateCommand::Deposit { amount } => {
+                Ok(vec![BankAccountAggregateEvent::Deposited { amount }])
+            }
+            BankAccountAggregateCommand::Withdraw { amount } => {
+                if self.balance < amount {
+                    return Err(BankAccountError::InsufficientFunds);
+                }
+                Ok(vec![BankAccountAggregateEvent::Withdrawn { amount }])
+            }
+        }
+    }
+}
+```
+
+The macro automatically generates:
+
+- The aggregate state struct (`BankAccountAggregate`)
+- The command enum (`BankAccountAggregateCommand`)
+- The event enum with `Event` trait (`BankAccountAggregateEvent`)
+- The URN type (`BankAccountAggregateUrn`)
+- A services placeholder struct (`BankAccountAggregateServices`)
+
+This reduces boilerplate while keeping the same functionality. You still need to implement the `EventStream` and `Aggregate` traits to define the behavior.

@@ -7,7 +7,7 @@ use replay::Event;
 use super::PersistedEvent;
 
 pub trait EventStore: Send + Sync {
-    fn store_events<S: replay::Stream>(
+    fn store_events<S: replay::EventStream>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
@@ -21,7 +21,7 @@ pub trait EventStore: Send + Sync {
         filter: crate::StreamFilter,
     ) -> impl TryStream<Ok = PersistedEvent<E>, Error = replay::Error> + Send;
 
-    fn stream_events_by_stream_id<S: replay::Stream>(
+    fn stream_events_by_stream_id<S: replay::EventStream>(
         &self,
         stream_id: &S::StreamId,
         at_stream_version: Option<i64>,

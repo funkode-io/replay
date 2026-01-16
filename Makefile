@@ -40,3 +40,7 @@ pgadmin:
 .PHONY: fix
 fix:
 	cargo clippy --fix
+
+.PHONY: wasm-test
+wasm-test:
+	wasm-pack test --headless --chrome es

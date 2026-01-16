@@ -1,7 +1,5 @@
 use urn::Urn;
 
-/// Helper functions to convert common errors to replay::Error
-
 /// Convert a deserialization error to replay::Error
 pub fn deser_error(error: serde_json::Error) -> replay::Error {
     replay::Error::internal(format!("Deserialization failed: {}", error))

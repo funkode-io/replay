@@ -1,5 +1,3 @@
-use std::fmt::{self, Display};
-
 use urn::Urn;
 
 use super::Event;
@@ -14,7 +12,7 @@ use super::Event;
 /// # Example
 ///
 /// ```
-/// use replay::{Event, Stream};
+/// use replay::{Event, EventStream};
 /// use replay_macros::Event;
 /// use serde::{Deserialize, Serialize};
 /// use urn::Urn;
@@ -39,7 +37,7 @@ use super::Event;
 ///     }
 /// }
 ///
-/// impl Stream for BankAccountStream {
+/// impl EventStream for BankAccountStream {
 ///    type Event = BankAccountEvent;
 ///    type StreamId = BankAccountUrn;
 ///
@@ -59,7 +57,7 @@ use super::Event;
 ///    }
 ///}
 /// ```
-pub trait Stream: Default + Sized {
+pub trait EventStream: Default + Sized {
     type Event: Event;
     type StreamId: Into<Urn> + Clone + Sync + Send + PartialEq;
 
@@ -74,18 +72,19 @@ pub trait Stream: Default + Sized {
     }
 }
 
+/*
 /// Stream state is a representation of the current state of a stream, every time an event is applied the state is updated and the version will increment.
 ///
 /// The stream id is a URN that identifies the stream and it's not included in the model to avoid polluting the domain (not all domains have an id).
 ///
 /// The stream type is the type of the stream, it's used to identify the stream.
+
 #[derive(Debug)]
 pub struct StreamState {
     pub stream_id: Urn,
     pub stream_type: String,
     pub version: i64,
 }
-
 impl Display for StreamState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -95,6 +94,7 @@ impl Display for StreamState {
         )
     }
 }
+*/
 
 #[cfg(test)]
 mod tests {
@@ -130,7 +130,7 @@ mod tests {
     }
 
     // bank account stream
-    impl Stream for BankAccountStream {
+    impl EventStream for BankAccountStream {
         type Event = BankAccountEvent;
         type StreamId = BankAccountUrn;
 

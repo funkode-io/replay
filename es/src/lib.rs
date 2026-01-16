@@ -8,4 +8,4 @@ pub use aggregate::Aggregate;
 pub use error::{Error, ErrorKind, ErrorStatus};
 pub use event::Event;
 pub use metadata::Metadata;
-pub use stream::Stream;
+pub use stream::EventStream;
