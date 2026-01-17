@@ -2,6 +2,7 @@ use std::future::Future;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use urn::Urn;
 
 use crate::{Error, EventStream};
 
@@ -11,10 +12,16 @@ use crate::{Error, EventStream};
 ///
 /// In the example of a bank account the aggregate can validate a withdraw command and return an error if the account has insufficient balance.
 ///
+/// # Constructor Pattern
+/// Aggregates should be created using `with_id(id)` to ensure they always have an identifier.
+///  `with_id` is the required constructor pattern; using `Default` is not supported for constructing aggregates.
+///
 /// # Methods
 /// - `handle`: Validates and processes a command, returning the resulting events or an error.
 /// - `handle_and_apply`: Processes a command and, if successful, applies the resulting events to the aggregate instance. This is a convenience method for typical aggregate workflows where you want to both validate and mutate state in one step.
-pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send + EventStream {
+/// - `with_id`: Creates a new aggregate instance with the given id (recommended constructor).
+/// - `id`: Returns the aggregate's identifier (URN).
+pub trait Aggregate: Serialize + DeserializeOwned + Sync + Send + EventStream {
     type Command: Send + Sync;
 
     type Error: std::error::Error + From<Error> + Send + Sync;
@@ -24,13 +31,43 @@ pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send + Even
         &self,
         command: Self::Command,
         services: &Self::Services,
-    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + Send;
+    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + Send;
+
+    /// Creates a new aggregate instance with the given id.
+    /// This is the required constructor pattern to ensure aggregates always have an id.
+    fn with_id(id: Self::StreamId) -> Self;
+
+    fn with_string_id(id: impl Into<String>) -> crate::Result<Self> {
+        use std::str::FromStr;
+        let id_string = id.into();
+
+        // Parse string as URN
+        let urn = Urn::from_str(&id_string).map_err(|e| {
+            Error::invalid_input("Invalid URN format")
+                .with_operation("with_string_id")
+                .with_context("id", id_string.clone())
+                .with_context("error", format!("{:?}", e))
+        })?;
+
+        // Convert URN to aggregate StreamId type
+        let aggregate_id: Self::StreamId = urn.try_into().map_err(|e| {
+            Error::invalid_input("Failed to convert URN to aggregate StreamId type")
+                .with_operation("with_string_id")
+                .with_context("id", id_string.clone())
+                .with_context("error", format!("{:?}", e))
+        })?;
+
+        Ok(Self::with_id(aggregate_id))
+    }
+
+    /// Returns the aggregate's identifier (URN).
+    fn id(&self) -> &Self::StreamId;
 
     fn handle_and_apply<'a>(
         &'a mut self,
         command: Self::Command,
         services: &'a Self::Services,
-    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + Send + 'a
+    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + Send + 'a
     where
         Self: Sized,
     {
@@ -75,18 +112,34 @@ mod tests {
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     struct BankAccountServices;
 
-    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     struct BankAccountAggregate {
+        pub id: BankAccountUrn,
         pub account_number: String,
         pub balance: f64,
     }
 
-    #[derive(Clone, PartialEq, Debug)]
+    #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
     struct BankAccountUrn(Urn);
 
     impl From<BankAccountUrn> for Urn {
         fn from(urn: BankAccountUrn) -> Self {
             urn.0
+        }
+    }
+
+    impl TryFrom<Urn> for BankAccountUrn {
+        type Error = String;
+
+        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+            if urn.nid() == "bank-account" {
+                Ok(BankAccountUrn(urn))
+            } else {
+                Err(format!(
+                    "Invalid namespace: expected 'bank-account', got '{}'",
+                    urn.nid()
+                ))
+            }
         }
     }
 
@@ -150,13 +203,27 @@ mod tests {
                 }
             }
         }
+
+        fn with_id(id: Self::StreamId) -> Self {
+            Self {
+                id,
+                account_number: String::new(),
+                balance: 0.0,
+            }
+        }
+
+        fn id(&self) -> &Self::StreamId {
+            &self.id
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     #[traced_test]
     async fn test_bank_account_aggregate() {
-        let mut aggregate = BankAccountAggregate::default();
+        use urn::UrnBuilder;
+        let bank_id = BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
+        let mut aggregate = BankAccountAggregate::with_id(bank_id);
         let services = BankAccountServices;
 
         let open_account = BankAccountCommand::OpenAccount {
@@ -179,7 +246,9 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn test_aggregate_with_insufficient_balance() {
-        let mut aggregate = BankAccountAggregate::default();
+        use urn::UrnBuilder;
+        let bank_id = BankAccountUrn(UrnBuilder::new("bank-account", "456").build().unwrap());
+        let mut aggregate = BankAccountAggregate::with_id(bank_id);
         let services = BankAccountServices;
 
         let open_account = BankAccountCommand::OpenAccount {
@@ -208,5 +277,37 @@ mod tests {
         tracing::error!("Expected error: {}", error);
         assert!(error.to_string().contains("Insufficient balance"));
         assert!(error.is_permanent());
+    }
+
+    // test aggregate id management
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_aggregate_id() {
+        use urn::UrnBuilder;
+
+        // Test with_id
+        let urn = BankAccountUrn(UrnBuilder::new("bank-account", "123456").build().unwrap());
+        let aggregate = BankAccountAggregate::with_id(urn.clone());
+
+        // Verify id is set
+        assert_eq!(aggregate.id(), &urn);
+    }
+
+    // test aggregate with_string_id constructor
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_aggregate_with_string_id() {
+        // Test with valid URN string
+        let aggregate = BankAccountAggregate::with_string_id("urn:bank-account:789").unwrap();
+        assert_eq!(aggregate.id().0.nss(), "789");
+        assert_eq!(aggregate.id().0.nid(), "bank-account");
+
+        // Test with invalid URN format should fail
+        let result = BankAccountAggregate::with_string_id("not-a-urn");
+        assert!(result.is_err());
+
+        // Test with wrong namespace should fail
+        let result = BankAccountAggregate::with_string_id("urn:wrong-namespace:123");
+        assert!(result.is_err());
     }
 }

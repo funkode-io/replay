@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub type Result<T> = std::result::Result<T, Error>;
+
 /// Categorizes errors by what the caller can do about them, not by their origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {

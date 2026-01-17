@@ -29,7 +29,7 @@ impl<ES: EventStore> Cqrs<ES> {
             .stream_events_by_stream_id::<A>(id, at_stream_version, at_timestamp)
             .map_err(A::Error::from);
 
-        let mut stream = A::default();
+        let mut stream = A::with_id(id.clone());
 
         futures::pin_mut!(events);
 
