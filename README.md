@@ -24,9 +24,10 @@ use replay_macros::Event;
 use serde::{Deserialize, Serialize};
 use urn::Urn;
 
-//  bank account is an aggregate (id of aggregate is not part of the model)
-#[derive(Default, Serialize, Deserialize, Clone, PartialEq, Debug)]
+//  bank account is an aggregate (id of aggregate is now part of the model)
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct BankAccountAggregate {
+    pub id: BankAccountUrn,
     pub balance: f64,
 }
 
@@ -49,6 +50,18 @@ struct BankAccountUrn(Urn);
 impl From<BankAccountUrn> for Urn {
     fn from(urn: BankAccountUrn) -> Self {
         urn.0
+    }
+}
+
+impl TryFrom<Urn> for BankAccountUrn {
+    type Error = String;
+
+    fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+        if urn.nid() == "bank-account" {
+            Ok(BankAccountUrn(urn))
+        } else {
+            Err(format!("Invalid namespace: expected 'bank-account', got '{}'", urn.nid()))
+        }
     }
 }
 
@@ -89,14 +102,13 @@ impl replay::Stream for BankAccountAggregate {
 impl replay::Aggregate for BankAccountAggregate {
     type Command = BankAccountCommand;
     type Error = BankAccountError;
-
     type Services = ();
 
     async fn handle(
         &self,
         command: Self::Command,
         _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    ) -> replay::Result<Vec<Self::Event>> {
         match command {
             BankAccountCommand::Deposit { amount } => {
                 let event = BankAccountEvent::Deposited { amount };
@@ -112,7 +124,41 @@ impl replay::Aggregate for BankAccountAggregate {
             }
         }
     }
+
+    fn with_id(id: Self::StreamId) -> Self {
+        Self { 
+            id,
+            balance: 0.0 
+        }
+    }
+
+    fn id(&self) -> &Self::StreamId {
+        &self.id
+    }
 }
+```
+
+### Aggregate Identity Pattern
+
+Aggregates in DDD must always have an identity. The `Aggregate` trait enforces this through:
+
+- **`StreamId`**: Inherited from `EventStream`, a strongly-typed identifier that must implement `Into<Urn>`, `TryFrom<Urn>`, `Clone`, and `PartialEq`
+- **`with_id(id)`**: Required constructor that creates an aggregate with an identity
+- **`with_string_id(urn_string)`**: Convenience constructor that parses a URN string
+- **`id()`**: Returns a reference to the aggregate's identity
+
+This design ensures aggregates are always created with a valid URN-based identity, following DDD principles.
+
+```rust
+// Create aggregate with typed id
+let bank_id = BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
+let aggregate = BankAccountAggregate::with_id(bank_id);
+
+// Create aggregate from URN string
+let aggregate = BankAccountAggregate::with_string_id("urn:bank-account:456").unwrap();
+
+// Access the aggregate's id
+println!("Aggregate ID: {}", aggregate.id());
 ```
 
 Now we can create a Postgres store and start storing aggregates:
@@ -139,38 +185,26 @@ let commands = vec![
     BankAccountCommand::Withdraw { amount: 40.0 },
 ];
 
-let mut bank_account: BankAccountAggregate = BankAccountAggregate::default();
+// Create aggregate with id
+let mut bank_account = BankAccountAggregate::with_id(bank_id.clone());
 
 let services = &();
 let expected_version = None;
 
 for command in commands {
-    bank_account = store
-        .apply_command_and_store_events(
-            &bank_id,
-            replay::Metadata::default(),
-            command,
-            services,
-            expected_version,
-        )
-        .await
-        .unwrap();
+    let events = bank_account.handle(command, services).await.unwrap();
+    bank_account.apply_all(events);
 }
 
 assert_eq!(bank_account.balance, 60.0);
 
 // if we try to withdraw again we will get a business error (InsufficientFunds)
-let result = store
-    .apply_command_and_store_events::<BankAccountAggregate>(
-        &bank_id,
-        replay::Metadata::default(),
-        BankAccountCommand::Withdraw { amount: 100f64 },
-        services,
-        expected_version,
-    )
-    .await;
+let result = bank_account.handle(
+    BankAccountCommand::Withdraw { amount: 100.0 },
+    services
+).await;
 
-assert_err!(result, "Insufficient funds");
+assert!(result.is_err());
 ```
 
 ## Using Macros
@@ -241,7 +275,7 @@ impl replay::Aggregate for BankAccountAggregate {
         &self,
         command: Self::Command,
         _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    ) -> replay::Result<Vec<Self::Event>> {
         match command {
             BankAccountAggregateCommand::Deposit { amount } => {
                 Ok(vec![BankAccountAggregateEvent::Deposited { amount }])
@@ -254,12 +288,23 @@ impl replay::Aggregate for BankAccountAggregate {
             }
         }
     }
+
+    fn with_id(id: Self::StreamId) -> Self {
+        Self {
+            id,
+            balance: 0.0,
+        }
+    }
+
+    fn id(&self) -> &Self::StreamId {
+        &self.id
+    }
 }
 ```
 
 The macro automatically generates:
 
-- The aggregate state struct (`BankAccountAggregate`)
+- The aggregate state struct (`BankAccountAggregate`) with an `id` field of type `YourTypeUrn`
 - The command enum (`BankAccountAggregateCommand`)
 - The event enum with `Event` trait (`BankAccountAggregateEvent`)
 - The URN type (`BankAccountAggregateUrn`) with helper methods:
@@ -267,9 +312,10 @@ The macro automatically generates:
   - `YourTypeUrn::parse(input)` - Parses a URN string and validates the namespace
   - `YourTypeUrn::namespace()` - Returns the namespace identifier as a static string
   - `Display` implementation for easy string conversion
+  - `TryFrom<Urn>` implementation for converting URNs to the typed wrapper
 - A services placeholder struct (`BankAccountAggregateServices`)
 
-This reduces boilerplate while keeping the same functionality. You still need to implement the `EventStream` and `Aggregate` traits to define the behavior.
+This reduces boilerplate while keeping the same functionality. You still need to implement the `EventStream` and `Aggregate` traits (including `with_id` and `id` methods) to define the behavior.
 
 ### URN Namespace Configuration
 

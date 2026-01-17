@@ -82,7 +82,8 @@ impl Aggregate for BankAccount {
 
 #[wasm_bindgen_test]
 async fn test_bank_account_aggregate_in_wasm() {
-    let mut aggregate = BankAccount::default();
+    let id = BankAccountUrn::new("test-account".to_string()).unwrap();
+    let mut aggregate = BankAccount::with_id(id);
     let services = BankAccountServices;
 
     let open_account = BankAccountCommand::OpenAccount {

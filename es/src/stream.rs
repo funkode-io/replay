@@ -37,6 +37,14 @@ use super::Event;
 ///     }
 /// }
 ///
+/// impl TryFrom<Urn> for BankAccountUrn {
+///     type Error = String;
+///
+///     fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+///         Ok(BankAccountUrn(urn))
+///     }
+/// }
+///
 /// impl EventStream for BankAccountStream {
 ///    type Event = BankAccountEvent;
 ///    type StreamId = BankAccountUrn;
@@ -57,9 +65,9 @@ use super::Event;
 ///    }
 ///}
 /// ```
-pub trait EventStream: Default + Sized {
+pub trait EventStream: Sized {
     type Event: Event;
-    type StreamId: Into<Urn> + Clone + Sync + Send + PartialEq;
+    type StreamId: Send + Sync + Into<Urn> + TryFrom<Urn> + Clone + PartialEq;
 
     fn stream_type() -> String;
 
@@ -129,6 +137,14 @@ mod tests {
         }
     }
 
+    impl TryFrom<Urn> for BankAccountUrn {
+        type Error = String;
+
+        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+            Ok(BankAccountUrn(urn))
+        }
+    }
+
     // bank account stream
     impl EventStream for BankAccountStream {
         type Event = BankAccountEvent;
@@ -152,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_bank_account_stream() {
-        let mut bank_account = BankAccountStream::default();
+        let mut bank_account = BankAccountStream { balance: 0.0 };
         let deposited_event = BankAccountEvent::Deposited { amount: 100.0 };
         let withdrawn_event = BankAccountEvent::Withdrawn { amount: 50.0 };
 
