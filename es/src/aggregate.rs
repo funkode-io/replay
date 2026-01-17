@@ -10,6 +10,10 @@ use crate::{Error, EventStream};
 /// It extends the `EventStream` trait and adds a `Command` type that represents the commands that can be applied to the aggregate.
 ///
 /// In the example of a bank account the aggregate can validate a withdraw command and return an error if the account has insufficient balance.
+///
+/// # Methods
+/// - `handle`: Validates and processes a command, returning the resulting events or an error.
+/// - `handle_and_apply`: Processes a command and, if successful, applies the resulting events to the aggregate instance. This is a convenience method for typical aggregate workflows where you want to both validate and mutate state in one step.
 pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send + EventStream {
     type Command: Send + Sync;
 
@@ -21,6 +25,21 @@ pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send + Even
         command: Self::Command,
         services: &Self::Services,
     ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + Send;
+
+    fn handle_and_apply<'a>(
+        &'a mut self,
+        command: Self::Command,
+        services: &'a Self::Services,
+    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + Send + 'a
+    where
+        Self: Sized,
+    {
+        async move {
+            let events = self.handle(command, services).await?;
+            self.apply_all(events.clone());
+            Ok(events)
+        }
+    }
 }
 
 // tests
@@ -170,12 +189,16 @@ mod tests {
         let withdraw = BankAccountCommand::Withdraw { amount: 200.0 };
 
         // open account
-        let events = aggregate.handle(open_account, &services).await.unwrap();
-        aggregate.apply_all(events);
+        aggregate
+            .handle_and_apply(open_account, &services)
+            .await
+            .unwrap();
 
         // deposit 100
-        let events = aggregate.handle(deposit, &services).await.unwrap();
-        aggregate.apply_all(events);
+        aggregate
+            .handle_and_apply(deposit, &services)
+            .await
+            .unwrap();
 
         // withdraw 200
         let result = aggregate.handle(withdraw, &services).await;
