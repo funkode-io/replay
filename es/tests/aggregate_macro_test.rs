@@ -54,7 +54,7 @@ impl Aggregate for BankAccount {
         &self,
         command: Self::Command,
         _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    ) -> replay::Result<Vec<Self::Event>> {
         match command {
             BankAccountCommand::OpenAccount { account_number } => {
                 Ok(vec![BankAccountEvent::AccountOpened { account_number }])
@@ -75,6 +75,18 @@ impl Aggregate for BankAccount {
             }
         }
     }
+
+    fn with_id(id: Self::StreamId) -> Self {
+        Self {
+            id,
+            account_number: String::new(),
+            balance: 0.0,
+        }
+    }
+
+    fn id(&self) -> &Self::StreamId {
+        &self.id
+    }
 }
 
 #[cfg(test)]
@@ -84,7 +96,8 @@ mod tests {
     #[test]
     fn test_aggregate_generation() {
         // Test that the aggregate struct was created
-        let account = BankAccount::default();
+        let id = BankAccountUrn::new("test-account").expect("Failed to create URN");
+        let account = BankAccount::with_id(id);
         assert_eq!(account.balance, 0.0);
         assert_eq!(account.account_number, "");
 
@@ -136,7 +149,8 @@ mod tests {
 
     #[test]
     fn test_lifecycle_of_aggregate() {
-        let mut account = BankAccount::default();
+        let mut account = BankAccount::with_string_id("urn:bank-account:acc-001")
+            .expect("Failed to create aggregate from string id");
 
         // Apply AccountOpened event
         let open_event = BankAccountEvent::AccountOpened {

@@ -5,14 +5,16 @@ use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 use tokio_test::assert_err;
 use urn::{Urn, UrnBuilder};
 
+use replay::Aggregate;
 use replay_macros::{Event, Urn};
 use replay_persistence::StreamFilter;
 
 const POSTGRES_PORT: u16 = 5432;
 
 //  bank account stream (id of stream is not part of the model)
-#[derive(Default, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct BankAccountAggregate {
+    pub id: BankAccountUrn,
     pub balance: f64,
 }
 
@@ -55,6 +57,15 @@ impl BankAccountEvent {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Urn)]
 struct BankAccountUrn(Urn);
 
+impl TryFrom<Urn> for BankAccountUrn {
+    type Error = String;
+
+    fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+        // Accept any namespace for this test
+        Ok(BankAccountUrn(urn))
+    }
+}
+
 // bank account stream
 impl replay::EventStream for BankAccountAggregate {
     type Event = BankAccountEvent;
@@ -92,7 +103,7 @@ impl replay::Aggregate for BankAccountAggregate {
         &self,
         command: Self::Command,
         _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    ) -> replay::Result<Vec<Self::Event>> {
         match command {
             BankAccountCommand::Deposit {
                 effective_on,
@@ -121,6 +132,14 @@ impl replay::Aggregate for BankAccountAggregate {
                 Ok(vec![event])
             }
         }
+    }
+
+    fn with_id(id: Self::StreamId) -> Self {
+        Self { id, balance: 0.0 }
+    }
+
+    fn id(&self) -> &Self::StreamId {
+        &self.id
     }
 }
 
@@ -229,7 +248,8 @@ async fn bank_account_postgres_test() {
         },
     ];
 
-    let mut bank_account: BankAccountAggregate = BankAccountAggregate::default();
+    let id = BankAccountUrn(UrnBuilder::new("bank-account", "test-1").build().unwrap());
+    let mut bank_account: BankAccountAggregate = BankAccountAggregate::with_id(id);
 
     let services = &();
     let expected_version = None;

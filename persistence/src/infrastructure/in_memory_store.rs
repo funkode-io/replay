@@ -139,6 +139,14 @@ mod tests {
         }
     }
 
+    impl TryFrom<Urn> for BankAccountUrn {
+        type Error = String;
+
+        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+            Ok(BankAccountUrn(urn))
+        }
+    }
+
     // bank account stream
     impl replay::EventStream for BankAccountStream {
         type Event = BankAccountEvent;
@@ -195,7 +203,7 @@ mod tests {
 
         assert_eq!(stream_events.len(), 2);
 
-        let mut stream = BankAccountStream::default();
+        let mut stream = BankAccountStream { balance: 0.0 };
         stream.apply_all(stream_events);
 
         assert_eq!(stream.balance, 60.0);
