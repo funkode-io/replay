@@ -4,7 +4,7 @@ use wasm_bindgen_test::*;
 // Configure tests to run in a browser or Node.js
 wasm_bindgen_test_configure!(run_in_browser); // or run_in_nodejs
 
-use replay::{Aggregate, EventStream};
+use replay::{Aggregate, EventStream, WithId};
 use replay_macros::define_aggregate;
 
 define_aggregate! {
@@ -28,7 +28,6 @@ define_aggregate! {
 
 impl EventStream for BankAccount {
     type Event = BankAccountEvent;
-    type StreamId = BankAccountUrn;
 
     fn stream_type() -> String {
         "BankAccount".to_string()

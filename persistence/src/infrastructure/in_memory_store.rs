@@ -107,8 +107,9 @@ impl EventStore for InMemoryEventStore {
 // tests
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use replay::EventStream;
+    use replay::{EventStream, WithId};
 
     use futures::TryStreamExt;
 
@@ -117,8 +118,8 @@ mod tests {
     use urn::{Urn, UrnBuilder};
 
     //  bank account stream (id of stream is not part of the model)
-    #[derive(Default)]
     struct BankAccountStream {
+        pub id: BankAccountUrn,
         pub balance: f64,
     }
 
@@ -147,10 +148,24 @@ mod tests {
         }
     }
 
+    impl WithId for BankAccountStream {
+        type StreamId = BankAccountUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            BankAccountStream {
+                id: id.clone(),
+                balance: 0.0,
+            }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
     // bank account stream
     impl replay::EventStream for BankAccountStream {
         type Event = BankAccountEvent;
-        type StreamId = BankAccountUrn;
 
         fn stream_type() -> String {
             "BankAccount".to_string()
@@ -203,7 +218,10 @@ mod tests {
 
         assert_eq!(stream_events.len(), 2);
 
-        let mut stream = BankAccountStream { balance: 0.0 };
+        let mut stream = BankAccountStream {
+            id: stream_id.clone(),
+            balance: 0.0,
+        };
         stream.apply_all(stream_events);
 
         assert_eq!(stream.balance, 60.0);

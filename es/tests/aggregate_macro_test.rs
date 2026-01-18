@@ -24,7 +24,6 @@ define_aggregate! {
 
 impl EventStream for BankAccount {
     type Event = BankAccountEvent;
-    type StreamId = BankAccountUrn;
 
     fn stream_type() -> String {
         "BankAccount".to_string()
@@ -75,23 +74,13 @@ impl Aggregate for BankAccount {
             }
         }
     }
-
-    fn with_id(id: Self::StreamId) -> Self {
-        Self {
-            id,
-            account_number: String::new(),
-            balance: 0.0,
-        }
-    }
-
-    fn id(&self) -> &Self::StreamId {
-        &self.id
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use replay::WithId;
 
     #[test]
     fn test_aggregate_generation() {

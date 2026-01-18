@@ -1,6 +1,50 @@
 use urn::Urn;
 
+use crate::Error;
+
 use super::Event;
+
+/// A trait for types that have a stream identifier.
+///
+/// This trait provides constructor and accessor methods for working with stream identifiers.
+pub trait WithId: Sized {
+    type StreamId: Send
+        + Sync
+        + Into<Urn>
+        + TryFrom<Urn, Error: std::fmt::Debug>
+        + Clone
+        + PartialEq
+        + std::fmt::Debug;
+
+    /// Creates a new instance with the given id.
+    fn with_id(id: Self::StreamId) -> Self;
+
+    /// Returns a reference to the identifier.
+    fn get_id(&self) -> &Self::StreamId;
+
+    fn with_string_id(id: impl Into<String>) -> crate::Result<Self> {
+        use std::str::FromStr;
+        let id_string = id.into();
+
+        // Parse string as URN
+        let urn = Urn::from_str(&id_string).map_err(|e| {
+            Error::invalid_input("Invalid URN format")
+                .with_operation("with_string_id")
+                .with_context("id", id_string.clone())
+                .with_context("error", format!("{:?}", e))
+        })?;
+
+        // Convert URN to aggregate StreamId type
+        let aggregate_id: Self::StreamId = urn.try_into().map_err(|e| {
+            Error::invalid_input("Failed to convert URN to StreamId type")
+                .with_operation("with_string_id")
+                .with_context("id", id_string.clone())
+                .with_context("error", format!("{:?}", e))
+        })?;
+
+        Ok(Self::with_id(aggregate_id))
+    }
+}
 
 /// In event sourcing a stream is a sequence of events that are related to a specific entity.
 ///
@@ -12,13 +56,13 @@ use super::Event;
 /// # Example
 ///
 /// ```
-/// use replay::{Event, EventStream};
+/// use replay::{Event, EventStream, WithId};
 /// use replay_macros::Event;
 /// use serde::{Deserialize, Serialize};
 /// use urn::Urn;
 ///
-/// #[derive(Default)]
 /// struct BankAccountStream {
+///     pub id: BankAccountUrn,
 ///     pub balance: f64,
 /// }
 ///
@@ -45,9 +89,20 @@ use super::Event;
 ///     }
 /// }
 ///
+/// impl WithId for BankAccountStream {
+///    type StreamId = BankAccountUrn;
+///
+///    fn with_id(id: Self::StreamId) -> Self {
+///        Self { id, balance: 0.0 }
+///    }
+///
+///    fn get_id(&self) -> &Self::StreamId {
+///        &self.id
+///    }
+/// }
+///
 /// impl EventStream for BankAccountStream {
 ///    type Event = BankAccountEvent;
-///    type StreamId = BankAccountUrn;
 ///
 ///    fn stream_type() -> String {
 ///        "BankAccount".to_string()
@@ -65,12 +120,8 @@ use super::Event;
 ///    }
 ///}
 /// ```
-pub trait EventStream: Sized
-where
-    <Self::StreamId as TryFrom<Urn>>::Error: std::fmt::Debug,
-{
+pub trait EventStream: Sized + WithId {
     type Event: Event;
-    type StreamId: Send + Sync + Into<Urn> + TryFrom<Urn> + Clone + PartialEq + std::fmt::Debug;
 
     fn stream_type() -> String;
 
@@ -109,6 +160,8 @@ impl Display for StreamState {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     // hack to use macros inside this crate
     use crate as replay;
     use replay_macros::Event;
@@ -118,8 +171,8 @@ mod tests {
     use super::*;
 
     //  bank account stream (id of stream is not part of the model)
-    #[derive(Default)]
     struct BankAccountStream {
+        pub id: BankAccountUrn,
         pub balance: f64,
     }
 
@@ -148,10 +201,21 @@ mod tests {
         }
     }
 
+    impl WithId for BankAccountStream {
+        type StreamId = BankAccountUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            BankAccountStream { id, balance: 0.0 }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
     // bank account stream
     impl EventStream for BankAccountStream {
         type Event = BankAccountEvent;
-        type StreamId = BankAccountUrn;
 
         fn stream_type() -> String {
             "BankAccount".to_string()
@@ -171,7 +235,10 @@ mod tests {
 
     #[test]
     fn test_bank_account_stream() {
-        let mut bank_account = BankAccountStream { balance: 0.0 };
+        let mut bank_account = BankAccountStream {
+            id: BankAccountUrn(Urn::from_str("urn:bank-account:1").unwrap()),
+            balance: 0.0,
+        };
         let deposited_event = BankAccountEvent::Deposited { amount: 100.0 };
         let withdrawn_event = BankAccountEvent::Withdrawn { amount: 50.0 };
 

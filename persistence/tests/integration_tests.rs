@@ -5,7 +5,7 @@ use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 use tokio_test::assert_err;
 use urn::{Urn, UrnBuilder};
 
-use replay::Aggregate;
+use replay::WithId;
 use replay_macros::{Event, Urn};
 use replay_persistence::StreamFilter;
 
@@ -75,10 +75,22 @@ impl TryFrom<Urn> for BankAccountUrn {
     }
 }
 
+// Implement WithId trait
+impl replay::WithId for BankAccountAggregate {
+    type StreamId = BankAccountUrn;
+
+    fn with_id(id: Self::StreamId) -> Self {
+        Self { id, balance: 0.0 }
+    }
+
+    fn get_id(&self) -> &Self::StreamId {
+        &self.id
+    }
+}
+
 // bank account stream
 impl replay::EventStream for BankAccountAggregate {
     type Event = BankAccountEvent;
-    type StreamId = BankAccountUrn;
 
     fn stream_type() -> String {
         "BankAccount".to_string()
@@ -141,14 +153,6 @@ impl replay::Aggregate for BankAccountAggregate {
                 Ok(vec![event])
             }
         }
-    }
-
-    fn with_id(id: Self::StreamId) -> Self {
-        Self { id, balance: 0.0 }
-    }
-
-    fn id(&self) -> &Self::StreamId {
-        &self.id
     }
 }
 
