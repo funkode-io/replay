@@ -432,12 +432,31 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Extract field names for initialization
+    let state_field_names = aggregate_def.state_fields.iter().map(|f| &f.ident);
+
     let expanded = quote! {
         // Aggregate state struct
         #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
         pub struct #name {
             pub id: #urn_name,
             #(#state_fields),*
+        }
+
+        // Implement WithId trait
+        impl replay::WithId for #name {
+            type StreamId = #urn_name;
+
+            fn with_id(id: Self::StreamId) -> Self {
+                Self {
+                    id,
+                    #(#state_field_names: Default::default()),*
+                }
+            }
+
+            fn get_id(&self) -> &Self::StreamId {
+                &self.id
+            }
         }
 
         // Command enum

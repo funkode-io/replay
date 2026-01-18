@@ -116,17 +116,32 @@ mod tests {
     use serde_with::{DeserializeFromStr, SerializeDisplay};
     use urn::{Urn, UrnBuilder};
 
-    use replay::Metadata;
+    use replay::{Metadata, WithId};
 
     // create bank account stream
-    #[derive(Debug, Clone, PartialEq, Default)]
+    #[derive(Debug, Clone, PartialEq)]
     pub struct BankAccountStream {
+        pub id: BankAccountUrn,
+        pub account_number: String,
         pub balance: f64,
+    }
+
+    impl WithId for BankAccountStream {
+        type StreamId = BankAccountUrn;
+        fn with_id(id: Self::StreamId) -> Self {
+            BankAccountStream {
+                id,
+                account_number: String::new(),
+                balance: 0.0,
+            }
+        }
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
     }
 
     impl replay::EventStream for BankAccountStream {
         type Event = BankAccountEvent;
-        type StreamId = BankAccountUrn;
 
         fn stream_type() -> String {
             "BankAccount".to_string()

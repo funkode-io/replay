@@ -2,7 +2,6 @@ use std::future::Future;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use urn::Urn;
 
 use crate::{Error, EventStream};
 
@@ -32,36 +31,6 @@ pub trait Aggregate: Serialize + DeserializeOwned + Sync + Send + EventStream {
         command: Self::Command,
         services: &Self::Services,
     ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + Send;
-
-    /// Creates a new aggregate instance with the given id.
-    /// This is the required constructor pattern to ensure aggregates always have an id.
-    fn with_id(id: Self::StreamId) -> Self;
-
-    fn with_string_id(id: impl Into<String>) -> crate::Result<Self> {
-        use std::str::FromStr;
-        let id_string = id.into();
-
-        // Parse string as URN
-        let urn = Urn::from_str(&id_string).map_err(|e| {
-            Error::invalid_input("Invalid URN format")
-                .with_operation("with_string_id")
-                .with_context("id", id_string.clone())
-                .with_context("error", format!("{:?}", e))
-        })?;
-
-        // Convert URN to aggregate StreamId type
-        let aggregate_id: Self::StreamId = urn.try_into().map_err(|e| {
-            Error::invalid_input("Failed to convert URN to aggregate StreamId type")
-                .with_operation("with_string_id")
-                .with_context("id", id_string.clone())
-                .with_context("error", format!("{:?}", e))
-        })?;
-
-        Ok(Self::with_id(aggregate_id))
-    }
-
-    /// Returns the aggregate's identifier (URN).
-    fn id(&self) -> &Self::StreamId;
 
     fn handle_and_apply<'a>(
         &'a mut self,
@@ -100,7 +69,7 @@ mod tests {
     }
 
     // hack to use macros inside this crate
-    use crate as replay;
+    use crate::{self as replay, WithId};
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
     enum BankAccountEvent {
@@ -143,9 +112,24 @@ mod tests {
         }
     }
 
+    impl WithId for BankAccountAggregate {
+        type StreamId = BankAccountUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            BankAccountAggregate {
+                id,
+                account_number: String::new(),
+                balance: 0.0,
+            }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
     impl EventStream for BankAccountAggregate {
         type Event = BankAccountEvent;
-        type StreamId = BankAccountUrn;
 
         fn stream_type() -> String {
             "BankAccount".to_string()
@@ -202,18 +186,6 @@ mod tests {
                     }
                 }
             }
-        }
-
-        fn with_id(id: Self::StreamId) -> Self {
-            Self {
-                id,
-                account_number: String::new(),
-                balance: 0.0,
-            }
-        }
-
-        fn id(&self) -> &Self::StreamId {
-            &self.id
         }
     }
 
@@ -290,7 +262,7 @@ mod tests {
         let aggregate = BankAccountAggregate::with_id(urn.clone());
 
         // Verify id is set
-        assert_eq!(aggregate.id(), &urn);
+        assert_eq!(aggregate.get_id(), &urn);
     }
 
     // test aggregate with_string_id constructor
@@ -299,8 +271,8 @@ mod tests {
     async fn test_aggregate_with_string_id() {
         // Test with valid URN string
         let aggregate = BankAccountAggregate::with_string_id("urn:bank-account:789").unwrap();
-        assert_eq!(aggregate.id().0.nss(), "789");
-        assert_eq!(aggregate.id().0.nid(), "bank-account");
+        assert_eq!(aggregate.get_id().0.nss(), "789");
+        assert_eq!(aggregate.get_id().0.nid(), "bank-account");
 
         // Test with invalid URN format should fail
         let result = BankAccountAggregate::with_string_id("not-a-urn");
