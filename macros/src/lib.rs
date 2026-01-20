@@ -487,7 +487,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
 
         // URN type
-        #[derive(Clone, PartialEq, Debug)]
+        #[derive(Clone, PartialEq, Eq, Debug, Hash)]
         pub struct #urn_name(urn::Urn);
 
         #urn_serde_impl

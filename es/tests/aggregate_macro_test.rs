@@ -299,4 +299,74 @@ mod tests {
         }
         assert_eq!(XMLHttpRequestUrn::namespace(), "xml-http-request");
     }
+
+    #[test]
+    fn test_urn_hash_in_hashmap() {
+        use std::collections::HashMap;
+
+        define_aggregate! {
+            Product {
+                state: { name: String, price: f64 },
+                commands: { CreateProduct { name: String, price: f64 } },
+                events: { ProductCreated { name: String, price: f64 } }
+            }
+        }
+
+        // Create URNs
+        let urn1 = ProductUrn::new("product-1").unwrap();
+        let urn2 = ProductUrn::new("product-2").unwrap();
+        let urn3 = ProductUrn::new("product-1").unwrap(); // Same as urn1
+
+        // Use URNs as HashMap keys
+        let mut products = HashMap::new();
+        products.insert(urn1.clone(), "Laptop".to_string());
+        products.insert(urn2.clone(), "Mouse".to_string());
+
+        // Verify retrieval
+        assert_eq!(products.get(&urn1), Some(&"Laptop".to_string()));
+        assert_eq!(products.get(&urn2), Some(&"Mouse".to_string()));
+
+        // Verify that urn3 (equal to urn1) retrieves the same value
+        assert_eq!(products.get(&urn3), Some(&"Laptop".to_string()));
+
+        // Update using equivalent URN
+        products.insert(urn3, "Gaming Laptop".to_string());
+        assert_eq!(products.get(&urn1), Some(&"Gaming Laptop".to_string()));
+        assert_eq!(products.len(), 2); // Still only 2 entries
+    }
+
+    #[test]
+    fn test_urn_hash_in_hashset() {
+        use std::collections::HashSet;
+
+        define_aggregate! {
+            User {
+                state: { email: String },
+                commands: { RegisterUser { email: String } },
+                events: { UserRegistered { email: String } }
+            }
+        }
+
+        // Create URNs
+        let urn1 = UserUrn::new("user-1").unwrap();
+        let urn2 = UserUrn::new("user-2").unwrap();
+        let urn3 = UserUrn::new("user-1").unwrap(); // Same as urn1
+
+        // Use URNs in HashSet
+        let mut users = HashSet::new();
+        users.insert(urn1.clone());
+        users.insert(urn2.clone());
+        users.insert(urn3.clone()); // Should not increase size
+
+        // Verify set operations
+        assert_eq!(users.len(), 2); // Only 2 unique URNs
+        assert!(users.contains(&urn1));
+        assert!(users.contains(&urn2));
+        assert!(users.contains(&urn3)); // urn3 == urn1
+
+        // Test removal
+        users.remove(&urn3); // Remove using equivalent URN
+        assert_eq!(users.len(), 1);
+        assert!(!users.contains(&urn1)); // urn1 should also be gone
+    }
 }
