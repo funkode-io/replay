@@ -429,11 +429,35 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
             pub fn namespace() -> &'static str {
                 #namespace
             }
+
+            /// Get a reference to the inner URN
+            pub fn to_urn(&self) -> &urn::Urn {
+                &self.0
+            }
+
+            /// Get the namespace identifier (NID) of this URN instance
+            pub fn nid(&self) -> &str {
+                self.0.nid()
+            }
+
+            /// Get the namespace specific string (NSS) - the ID part of the URN
+            pub fn nss(&self) -> &str {
+                self.0.nss()
+            }
         }
     };
 
     // Extract field names for initialization
     let state_field_names = aggregate_def.state_fields.iter().map(|f| &f.ident);
+
+    // Extract field names for Display implementation
+    let display_field_names = aggregate_def.state_fields.iter().map(|f| {
+        let field_name = &f.ident;
+        let field_name_str = field_name.as_ref().unwrap().to_string();
+        quote! {
+            write!(f, ", {}: {}", #field_name_str, self.#field_name)?;
+        }
+    });
 
     let expanded = quote! {
         // Aggregate state struct
@@ -456,6 +480,15 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
 
             fn get_id(&self) -> &Self::StreamId {
                 &self.id
+            }
+        }
+
+        // Implement Display trait
+        impl std::fmt::Display for #name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}(id: {}", stringify!(#name), self.id)?;
+                #(#display_field_names)*
+                write!(f, ")")
             }
         }
 
