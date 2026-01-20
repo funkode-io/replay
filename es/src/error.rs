@@ -125,6 +125,11 @@ impl Error {
         Self::permanent(ErrorKind::BusinessRuleViolation, message)
     }
 
+    #[track_caller]
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::permanent(ErrorKind::Unauthorized, message)
+    }
+
     /// Set the operation being performed when the error occurred.
     pub fn with_operation(mut self, operation: &'static str) -> Self {
         self.operation = operation;
