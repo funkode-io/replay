@@ -311,9 +311,9 @@ The macro automatically generates:
   - `YourTypeUrn::new(id)` - Creates a URN with the configured namespace
   - `YourTypeUrn::parse(input)` - Parses a URN string and validates the namespace
   - `YourTypeUrn::namespace()` - Returns the namespace identifier as a static string
-  - `yourUrn.to_urn()` - Returns a reference to the inner URN
-  - `yourUrn.nid()` - Returns the namespace identifier (NID)
-  - `yourUrn.nss()` - Returns the namespace specific string (NSS) - the ID part
+  - `your_urn.to_urn()` - Returns a reference to the inner URN
+  - `your_urn.nid()` - Returns the namespace identifier (NID)
+  - `your_urn.nss()` - Returns the namespace specific string (NSS) - the ID part
   - `Display` implementation for easy string conversion
   - `TryFrom<Urn>` implementation for converting URNs to the typed wrapper
 - A services placeholder struct (`BankAccountServices`)
@@ -397,4 +397,40 @@ assert_eq!(parsed.nss(), "67890");
 // Use in aggregates
 let order = Order::with_id(order_id);
 println!("Created: {}", order);  // Order(id: urn:order:12345, total: 0, status: )
+```
+
+### URNs in Collections
+
+The generated URN types implement `Hash` and `Eq`, making them suitable for use as keys in `HashMap` and elements in `HashSet`:
+
+```rust
+use std::collections::{HashMap, HashSet};
+use replay_macros::define_aggregate;
+
+define_aggregate! {
+    Product {
+        state: { name: String, price: f64 },
+        commands: { UpdatePrice { price: f64 } },
+        events: { PriceUpdated { price: f64 } }
+    }
+}
+
+// Use URNs as HashMap keys
+let mut inventory = HashMap::new();
+let product1 = ProductUrn::new("laptop-001").unwrap();
+let product2 = ProductUrn::new("mouse-002").unwrap();
+
+inventory.insert(product1.clone(), 50);
+inventory.insert(product2.clone(), 200);
+
+if let Some(stock) = inventory.get(&product1) {
+    println!("Stock for {}: {}", product1.nss(), stock);  // Stock for laptop-001: 50
+}
+
+// Use URNs in HashSet for unique collections
+let mut active_products = HashSet::new();
+active_products.insert(product1);
+active_products.insert(product2);
+
+assert_eq!(active_products.len(), 2);
 ```
