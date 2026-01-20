@@ -311,6 +311,9 @@ The macro automatically generates:
   - `YourTypeUrn::new(id)` - Creates a URN with the configured namespace
   - `YourTypeUrn::parse(input)` - Parses a URN string and validates the namespace
   - `YourTypeUrn::namespace()` - Returns the namespace identifier as a static string
+  - `yourUrn.to_urn()` - Returns a reference to the inner URN
+  - `yourUrn.nid()` - Returns the namespace identifier (NID)
+  - `yourUrn.nss()` - Returns the namespace specific string (NSS) - the ID part
   - `Display` implementation for easy string conversion
   - `TryFrom<Urn>` implementation for converting URNs to the typed wrapper
 - A services placeholder struct (`BankAccountServices`)
@@ -346,6 +349,52 @@ assert_eq!(customer_urn.to_string(), "urn:customer:peter@example.com");
 
 // Get the namespace identifier
 assert_eq!(CustomerUrn::namespace(), "customer");
+
+// Access URN components
+assert_eq!(customer_urn.nid(), "customer");
+assert_eq!(customer_urn.nss(), "peter@example.com");
+
+// Get reference to inner URN
+let inner_urn: &Urn = customer_urn.to_urn();
 ```
 
 If no custom namespace is specified, the namespace will be automatically derived from the aggregate name (e.g., `BankAccount` → `bank-account`).
+
+### Using URN Helper Methods
+
+The generated URN types provide convenient methods for working with identifiers:
+
+```rust
+use replay_macros::define_aggregate;
+
+define_aggregate! {
+    Order {
+        state: {
+            total: f64,
+            status: String
+        },
+        commands: {
+            PlaceOrder { total: f64 }
+        },
+        events: {
+            OrderPlaced { total: f64 }
+        }
+    }
+}
+
+// Create a new URN
+let order_id = OrderUrn::new("12345").unwrap();
+println!("Full URN: {}", order_id);  // urn:order:12345
+
+// Extract components
+println!("Namespace: {}", order_id.nid());  // order
+println!("ID: {}", order_id.nss());         // 12345
+
+// Parse from string
+let parsed = OrderUrn::parse("urn:order:67890").unwrap();
+assert_eq!(parsed.nss(), "67890");
+
+// Use in aggregates
+let order = Order::with_id(order_id);
+println!("Created: {}", order);  // Order(id: urn:order:12345, total: 0, status: )
+```
