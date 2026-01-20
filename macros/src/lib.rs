@@ -450,15 +450,6 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     // Extract field names for initialization
     let state_field_names = aggregate_def.state_fields.iter().map(|f| &f.ident);
 
-    // Extract field names for Display implementation
-    let display_field_names = aggregate_def.state_fields.iter().map(|f| {
-        let field_name = &f.ident;
-        let field_name_str = field_name.as_ref().unwrap().to_string();
-        quote! {
-            write!(f, ", {}: {}", #field_name_str, self.#field_name)?;
-        }
-    });
-
     let expanded = quote! {
         // Aggregate state struct
         #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
@@ -480,15 +471,6 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
 
             fn get_id(&self) -> &Self::StreamId {
                 &self.id
-            }
-        }
-
-        // Implement Display trait
-        impl std::fmt::Display for #name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}(id: {}", stringify!(#name), self.id)?;
-                #(#display_field_names)*
-                write!(f, ")")
             }
         }
 
