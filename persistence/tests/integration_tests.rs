@@ -7,7 +7,7 @@ use urn::{Urn, UrnBuilder};
 
 use replay::WithId;
 use replay_macros::{Event, Urn};
-use replay_persistence::StreamFilter;
+use replay_persistence::{PersistedEvent, StreamFilter};
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -188,7 +188,9 @@ impl replay_persistence::Query for BankAccountStatement {
         replay_persistence::StreamFilter::with_stream_id::<BankAccountAggregate>(&self.bank_account)
     }
 
-    fn update(&mut self, event: Self::Event) {
+    fn update(&mut self, event: PersistedEvent<Self::Event>) {
+        let event = event.data;
+
         // right now we don't have filters for "after timestamp" so we need to apply here
         if event.operation_date() > self.to || event.operation_date() < self.from {
             return;

@@ -21,4 +21,4 @@ tokio = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = { workspace = true }
-uuid = { workspace = true, features = ["js"] }
+uuid = { workspace = true, features = ["js", "v4"] }
