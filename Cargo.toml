@@ -9,7 +9,10 @@ serde_with = "3.16.1"
 serde_json = "1.0.149"
 
 urn = { version = "0.7.0", features = ["serde"] }
-uuid = { version = "1.19.0", features = ["v4", "serde"] }
+uuid = { version = "1.19.0", features = [
+  "v4",
+  "serde",
+], default-features = false }
 
 chrono = { version = "0.4.43", features = ["serde"] }
 
