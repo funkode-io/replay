@@ -1,3 +1,5 @@
+use crate::PersistedEvent;
+
 pub trait Query: Sync + Send {
     type Event: replay::Event;
 
@@ -5,5 +7,5 @@ pub trait Query: Sync + Send {
         crate::StreamFilter::all()
     }
 
-    fn update(&mut self, event: Self::Event);
+    fn update(&mut self, event: PersistedEvent<Self::Event>);
 }
