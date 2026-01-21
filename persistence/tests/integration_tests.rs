@@ -261,7 +261,11 @@ async fn bank_account_postgres_test() {
         },
     ];
 
-    let id = BankAccountUrn(UrnBuilder::new("bank-account", "test-1").build().unwrap());
+    let id = BankAccountUrn(
+        UrnBuilder::new("bank-account", &uuid::Uuid::new_v4().to_string())
+            .build()
+            .unwrap(),
+    );
     let mut bank_account: BankAccountAggregate = BankAccountAggregate::with_id(id);
 
     let services = &();

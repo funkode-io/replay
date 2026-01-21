@@ -444,6 +444,12 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
             pub fn nss(&self) -> &str {
                 self.0.nss()
             }
+
+            /// Create a new URN with a random UUID v4 identifier
+            pub fn new_random() -> Self {
+                let id = uuid::Uuid::new_v4().to_string();
+                Self(urn::UrnBuilder::new(#namespace, &id).build().expect("UUID-based URN should always be valid"))
+            }
         }
     };
 

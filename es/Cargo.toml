@@ -14,9 +14,11 @@ tracing = { workspace = true }
 [dev-dependencies]
 replay-macros = { path = "../macros" }
 tracing-test = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = { workspace = true }
+uuid = { workspace = true, features = ["js"] }
