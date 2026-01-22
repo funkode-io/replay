@@ -458,7 +458,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         // Aggregate state struct
-        #[derive(Clone, PartialEq, Debug)]
+        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
         pub struct #name {
             pub id: #urn_name,
             #(#state_fields),*
@@ -481,7 +481,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
 
         // Command enum
-        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+        #[derive(Clone, PartialEq, Debug)]
         pub enum #command_name {
             #(#command_variants),*
         }
