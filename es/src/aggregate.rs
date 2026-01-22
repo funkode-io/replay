@@ -1,8 +1,5 @@
 use std::future::Future;
 
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-
 use crate::{Error, EventStream};
 
 /// An aggregate is a domain-driven design pattern that allows you to model a domain entity as a sequence of events.
@@ -20,7 +17,7 @@ use crate::{Error, EventStream};
 /// - `handle_and_apply`: Processes a command and, if successful, applies the resulting events to the aggregate instance. This is a convenience method for typical aggregate workflows where you want to both validate and mutate state in one step.
 /// - `with_id`: Creates a new aggregate instance with the given id (recommended constructor).
 /// - `id`: Returns the aggregate's identifier (URN).
-pub trait Aggregate: Serialize + DeserializeOwned + Sync + Send + EventStream {
+pub trait Aggregate: Sync + Send + EventStream {
     type Command: Send + Sync;
 
     type Error: std::error::Error + From<Error> + Send + Sync;
