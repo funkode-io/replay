@@ -481,7 +481,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
 
         // Command enum
-        #[derive(Clone, PartialEq, Debug)]
+        #[derive(Debug)]
         pub enum #command_name {
             #(#command_variants),*
         }
