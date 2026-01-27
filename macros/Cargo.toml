@@ -11,6 +11,7 @@ replay = { path = "../es" }
 proc-macro2 = { workspace = true }
 syn = { workspace = true }
 quote = { workspace = true }
+async-trait = { workspace = true }
 
 urn = { workspace = true }
 uuid = { workspace = true }

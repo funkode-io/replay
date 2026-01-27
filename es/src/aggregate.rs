@@ -8,6 +8,15 @@ use crate::{Error, EventStream};
 ///
 /// In the example of a bank account the aggregate can validate a withdraw command and return an error if the account has insufficient balance.
 ///
+/// # Thread Safety
+/// This version of the trait (for non-WASM targets) includes `Send` bounds on the aggregate, commands, services, and futures.
+/// This enables multi-threaded async runtimes (like Tokio) to safely move aggregates across threads, which is essential for:
+/// - Web server request handling across thread pools
+/// - Concurrent command processing with `tokio::spawn`
+/// - Message passing through async channels
+///
+/// For WASM targets (single-threaded), a separate trait definition without `Send` bounds is provided.
+///
 /// # Constructor Pattern
 /// Aggregates should be created using `with_id(id)` to ensure they always have an identifier.
 ///  `with_id` is the required constructor pattern; using `Default` is not supported for constructing aggregates.
@@ -17,11 +26,12 @@ use crate::{Error, EventStream};
 /// - `handle_and_apply`: Processes a command and, if successful, applies the resulting events to the aggregate instance. This is a convenience method for typical aggregate workflows where you want to both validate and mutate state in one step.
 /// - `with_id`: Creates a new aggregate instance with the given id (recommended constructor).
 /// - `id`: Returns the aggregate's identifier (URN).
+#[cfg(not(target_arch = "wasm32"))]
 pub trait Aggregate: Sync + Send + EventStream {
-    type Command: Send + Sync;
+    type Command: Sync + Send;
 
-    type Error: std::error::Error + From<Error> + Send + Sync;
-    type Services: Send + Sync;
+    type Error: std::error::Error + From<Error> + Sync + Send;
+    type Services: Sync + Send;
 
     fn handle(
         &self,
@@ -34,6 +44,56 @@ pub trait Aggregate: Sync + Send + EventStream {
         command: Self::Command,
         services: &'a Self::Services,
     ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + Send + 'a
+    where
+        Self: Sized,
+    {
+        async move {
+            let events = self.handle(command, services).await?;
+            self.apply_all(events.clone());
+            Ok(events)
+        }
+    }
+}
+
+/// An aggregate is a domain-driven design pattern that allows you to model a domain entity as a sequence of events.
+///
+/// It extends the `EventStream` trait and adds a `Command` type that represents the commands that can be applied to the aggregate.
+///
+/// In the example of a bank account the aggregate can validate a withdraw command and return an error if the account has insufficient balance.
+///
+/// # WASM Compatibility
+/// This version of the trait (for WASM targets) omits `Send` bounds because WASM runs in a single-threaded environment.
+/// This allows services to use `async_trait(?Send)` for async methods, which is necessary for WASM compatibility.
+///
+/// For non-WASM targets (servers), a separate trait definition with `Send` bounds is provided to enable multi-threaded execution.
+///
+/// # Constructor Pattern
+/// Aggregates should be created using `with_id(id)` to ensure they always have an identifier.
+///  `with_id` is the required constructor pattern; using `Default` is not supported for constructing aggregates.
+///
+/// # Methods
+/// - `handle`: Validates and processes a command, returning the resulting events or an error.
+/// - `handle_and_apply`: Processes a command and, if successful, applies the resulting events to the aggregate instance. This is a convenience method for typical aggregate workflows where you want to both validate and mutate state in one step.
+/// - `with_id`: Creates a new aggregate instance with the given id (recommended constructor).
+/// - `id`: Returns the aggregate's identifier (URN).
+#[cfg(target_arch = "wasm32")]
+pub trait Aggregate: Sync + EventStream {
+    type Command: Sync;
+
+    type Error: std::error::Error + From<Error> + Sync;
+    type Services: Sync;
+
+    fn handle(
+        &self,
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>>;
+
+    fn handle_and_apply<'a>(
+        &'a mut self,
+        command: Self::Command,
+        services: &'a Self::Services,
+    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + 'a
     where
         Self: Sized,
     {

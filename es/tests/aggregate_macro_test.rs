@@ -1,3 +1,6 @@
+#![cfg(not(target_arch = "wasm32"))] // Skip for wasm target
+
+use async_trait::async_trait;
 use replay_macros::define_aggregate;
 
 // This is needed to make the macro work inside tests
@@ -7,7 +10,7 @@ define_aggregate! {
     BankAccount {
         state: {
             account_number: String,
-            balance: f64
+            balance: f64,
         },
         commands: {
             OpenAccount { account_number: String },
@@ -18,7 +21,24 @@ define_aggregate! {
             AccountOpened { account_number: String },
             Deposited { amount: f64 },
             Withdrawn { amount: f64 }
+        },
+        service: {
+            async fn validate_account_number(account_number: &str) -> bool;
         }
+    }
+}
+
+// Implement the service trait
+#[derive(Clone)]
+pub struct MockBankAccountServices;
+
+#[async_trait]
+impl BankAccountServices for MockBankAccountServices {
+    async fn validate_account_number(&self, account_number: &str) -> bool {
+        let account_number = account_number.to_string();
+
+        // Simple validation: account number must be at least 5 characters
+        account_number.len() >= 5
     }
 }
 
@@ -47,15 +67,22 @@ impl EventStream for BankAccount {
 impl Aggregate for BankAccount {
     type Command = BankAccountCommand;
     type Error = replay::Error;
-    type Services = BankAccountServices;
+    type Services = std::sync::Arc<dyn BankAccountServices>;
 
     async fn handle(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        services: &Self::Services,
     ) -> replay::Result<Vec<Self::Event>> {
         match command {
             BankAccountCommand::OpenAccount { account_number } => {
+                if !services.validate_account_number(&account_number).await {
+                    return Err(replay::Error::business_rule_violation(
+                        "Invalid account number: must be at least 5 characters",
+                    )
+                    .with_operation("OpenAccount")
+                    .with_context("account_number", account_number.clone()));
+                }
                 Ok(vec![BankAccountEvent::AccountOpened { account_number }])
             }
             BankAccountCommand::Deposit { amount } => {
@@ -129,6 +156,50 @@ mod tests {
         assert_eq!(evt.event_type(), "Deposited");
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_service_validation_success() {
+        use replay::WithId;
+
+        let id = BankAccountUrn::new("test-account").expect("Failed to create URN");
+        let account = BankAccount::with_id(id);
+        let services: std::sync::Arc<dyn BankAccountServices> =
+            std::sync::Arc::new(MockBankAccountServices);
+
+        // Valid account number (>= 5 characters)
+        let command = BankAccountCommand::OpenAccount {
+            account_number: "ACC12345".to_string(),
+        };
+
+        let result = account.handle(command, &services).await;
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], BankAccountEvent::AccountOpened { .. }));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_service_validation_failure() {
+        use replay::WithId;
+
+        let id = BankAccountUrn::new("test-account").expect("Failed to create URN");
+        let account = BankAccount::with_id(id);
+        let services: std::sync::Arc<dyn BankAccountServices> =
+            std::sync::Arc::new(MockBankAccountServices);
+
+        // Invalid account number (< 5 characters)
+        let command = BankAccountCommand::OpenAccount {
+            account_number: "A123".to_string(),
+        };
+
+        let result = account.handle(command, &services).await;
+        assert!(result.is_err());
+
+        let error = result.unwrap_err();
+        assert_eq!(error.operation(), "OpenAccount");
+        assert!(error.to_string().contains("Invalid account number"));
+    }
     #[test]
     fn test_stream_type() {
         use replay::EventStream;

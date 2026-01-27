@@ -18,7 +18,7 @@ impl<ES: EventStore> Cqrs<ES> {
         }
     }
 
-    pub async fn fetch_aggregate<A: Aggregate + Send + Sync>(
+    pub async fn fetch_aggregate<A: Aggregate + Sync>(
         &self,
         id: &A::StreamId,
         at_stream_version: Option<i64>,

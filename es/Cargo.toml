@@ -15,6 +15,7 @@ tracing = { workspace = true }
 replay-macros = { path = "../macros" }
 tracing-test = { workspace = true }
 uuid = { workspace = true }
+async-trait = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }

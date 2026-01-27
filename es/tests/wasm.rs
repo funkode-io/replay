@@ -1,4 +1,7 @@
-#![cfg(target_arch = "wasm32")] // Only compile for wasm target
+#![cfg(target_arch = "wasm32")]
+
+use async_trait::async_trait;
+// Only compile for wasm target
 use wasm_bindgen_test::*;
 
 // Configure tests to run in a browser or Node.js
@@ -22,7 +25,22 @@ define_aggregate! {
             AccountOpened { account_number: String },
             Deposited { amount: f64 },
             Withdrawn { amount: f64 }
+        },
+        service: {
+            async fn validate_account_number(account_number: &str) -> bool;
         }
+    }
+}
+
+// Implement the service trait
+#[derive(Clone)]
+pub struct MockBankAccountServices;
+
+#[async_trait(?Send)]
+impl BankAccountServices for MockBankAccountServices {
+    async fn validate_account_number(&self, account_number: &str) -> bool {
+        // Simple validation: account number must be at least 5 characters
+        account_number.len() >= 5
     }
 }
 
@@ -51,15 +69,22 @@ impl EventStream for BankAccount {
 impl Aggregate for BankAccount {
     type Command = BankAccountCommand;
     type Error = replay::Error;
-    type Services = BankAccountServices;
+    type Services = std::sync::Arc<dyn BankAccountServices>;
 
     async fn handle(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             BankAccountCommand::OpenAccount { account_number } => {
+                if !services.validate_account_number(&account_number).await {
+                    return Err(replay::Error::business_rule_violation(
+                        "Invalid account number: must be at least 5 characters",
+                    )
+                    .with_operation("OpenAccount")
+                    .with_context("account_number", account_number.clone()));
+                }
                 Ok(vec![BankAccountEvent::AccountOpened { account_number }])
             }
             BankAccountCommand::Deposit { amount } => {
@@ -83,7 +108,8 @@ impl Aggregate for BankAccount {
 async fn test_bank_account_aggregate_in_wasm() {
     let id = BankAccountUrn::new_random();
     let mut aggregate = BankAccount::with_id(id);
-    let services = BankAccountServices;
+    let services: std::sync::Arc<dyn BankAccountServices> =
+        std::sync::Arc::new(MockBankAccountServices);
 
     let open_account = BankAccountCommand::OpenAccount {
         account_number: "123456".to_string(),
@@ -98,4 +124,29 @@ async fn test_bank_account_aggregate_in_wasm() {
     }
 
     assert_eq!(aggregate.balance, 40.0);
+}
+
+#[wasm_bindgen_test]
+async fn test_service_validation_in_wasm() {
+    let id = BankAccountUrn::new_random();
+    let aggregate = BankAccount::with_id(id);
+    let services: std::sync::Arc<dyn BankAccountServices> =
+        std::sync::Arc::new(MockBankAccountServices);
+
+    // Test valid account number
+    let valid_command = BankAccountCommand::OpenAccount {
+        account_number: "ACC12345".to_string(),
+    };
+    let result = aggregate.handle(valid_command, &services).await;
+    assert!(result.is_ok());
+
+    // Test invalid account number (too short)
+    let invalid_command = BankAccountCommand::OpenAccount {
+        account_number: "A12".to_string(),
+    };
+    let result = aggregate.handle(invalid_command, &services).await;
+    assert!(result.is_err());
+
+    let error = result.unwrap_err();
+    assert_eq!(error.operation(), "OpenAccount");
 }

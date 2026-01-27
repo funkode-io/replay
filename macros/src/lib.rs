@@ -4,7 +4,7 @@ use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input,
     token::Brace,
-    Data, DeriveInput, Field, Fields, Ident, Token, Type,
+    Data, DeriveInput, Field, Fields, FnArg, Ident, ReturnType, Token, Type,
 };
 
 #[proc_macro_derive(Event)]
@@ -124,6 +124,7 @@ struct AggregateDefinition {
     state_fields: Vec<Field>,
     commands: Vec<CommandVariant>,
     events: Vec<EventVariant>,
+    service_functions: Vec<ServiceFunction>,
 }
 
 struct CommandVariant {
@@ -134,6 +135,13 @@ struct CommandVariant {
 struct EventVariant {
     name: Ident,
     fields: Vec<Field>,
+}
+
+struct ServiceFunction {
+    name: Ident,
+    inputs: Vec<FnArg>,
+    output: ReturnType,
+    is_async: bool,
 }
 
 impl Parse for AggregateDefinition {
@@ -147,6 +155,7 @@ impl Parse for AggregateDefinition {
         let mut state_fields = Vec::new();
         let mut commands = Vec::new();
         let mut events = Vec::new();
+        let mut service_functions = Vec::new();
 
         while !content.is_empty() {
             let section_name: Ident = content.parse()?;
@@ -269,10 +278,48 @@ impl Parse for AggregateDefinition {
                                 }
                             }
                         }
+                        "service" => {
+                            while !section_content.is_empty() {
+                                // Parse optional "async"
+                                let is_async = section_content.peek(Token![async]);
+                                if is_async {
+                                    section_content.parse::<Token![async]>()?;
+                                }
+
+                                // Parse "fn"
+                                section_content.parse::<Token![fn]>()?;
+
+                                // Parse function name
+                                let fn_name: Ident = section_content.parse()?;
+
+                                // Parse function parameters
+                                let inputs_content;
+                                syn::parenthesized!(inputs_content in section_content);
+                                let inputs: syn::punctuated::Punctuated<FnArg, Token![,]> =
+                                    inputs_content.parse_terminated(FnArg::parse, Token![,])?;
+
+                                // Parse return type
+                                let output: ReturnType = section_content.parse()?;
+
+                                service_functions.push(ServiceFunction {
+                                    name: fn_name,
+                                    inputs: inputs.into_iter().collect(),
+                                    output,
+                                    is_async,
+                                });
+
+                                // Optional comma or semicolon
+                                if section_content.peek(Token![,]) {
+                                    section_content.parse::<Token![,]>()?;
+                                } else if section_content.peek(Token![;]) {
+                                    section_content.parse::<Token![;]>()?;
+                                }
+                            }
+                        }
                         _ => {
                             return Err(syn::Error::new_spanned(
                                 section_name,
-                                "Expected 'state', 'commands', or 'events'",
+                                "Expected 'state', 'commands', 'events', or 'service'",
                             ));
                         }
                     }
@@ -290,6 +337,7 @@ impl Parse for AggregateDefinition {
             state_fields,
             commands,
             events,
+            service_functions,
         })
     }
 }
@@ -456,6 +504,48 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     // Extract field names for initialization
     let state_field_names = aggregate_def.state_fields.iter().map(|f| &f.ident);
 
+    // Generate Services trait if service functions are defined
+    let services_trait = if !aggregate_def.service_functions.is_empty() {
+        // Check if any function is async
+        let has_async = aggregate_def.service_functions.iter().any(|f| f.is_async);
+
+        let trait_methods = aggregate_def.service_functions.iter().map(|func| {
+            let func_name = &func.name;
+            let inputs = &func.inputs;
+            let output = &func.output;
+            let async_token = if func.is_async {
+                quote! { async }
+            } else {
+                quote! {}
+            };
+            quote! {
+                #async_token fn #func_name(&self, #(#inputs),*) #output;
+            }
+        });
+
+        // Add async_trait attributes conditionally based on target
+        let async_trait_attr = if has_async {
+            quote! {
+                #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+                #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+            }
+        } else {
+            quote! {}
+        };
+
+        quote! {
+            #async_trait_attr
+            pub trait #services_name: Send + Sync {
+                #(#trait_methods)*
+            }
+        }
+    } else {
+        quote! {
+            #[derive(Clone, Debug)]
+            pub struct #services_name;
+        }
+    };
+
     let expanded = quote! {
         // Aggregate state struct
         #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
@@ -529,9 +619,8 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         // URN helper methods
         #urn_impl_methods
 
-        // Services placeholder
-        #[derive(Clone, Debug)]
-        pub struct #services_name;
+        // Generate Services trait
+        #services_trait
     };
 
     TokenStream::from(expanded)
