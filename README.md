@@ -316,9 +316,201 @@ The macro automatically generates:
   - `your_urn.nss()` - Returns the namespace specific string (NSS) - the ID part
   - `Display` implementation for easy string conversion
   - `TryFrom<Urn>` implementation for converting URNs to the typed wrapper
-- A services placeholder struct (`BankAccountServices`)
+- A services trait (`BankAccountServices`) if service functions are defined, or a placeholder struct if not
 
 This reduces boilerplate while keeping the same functionality. You still need to implement the `EventStream` and `Aggregate` traits (including `with_id` and `id` methods) to define the behavior.
+
+### Using Services for External Dependencies
+
+When your aggregate needs to interact with external services (e.g., authentication, validation, external APIs), you can define a service trait using the `service` section in the macro. The macro generates a **trait** (not a struct) that you implement with your own service logic.
+
+```rust
+use replay_macros::define_aggregate;
+use replay::{Aggregate, EventStream, WithId};
+use std::sync::Arc;
+
+// The macro generates the BankAccountServices trait
+define_aggregate! {
+    BankAccount {
+        state: {
+            account_number: String,
+            balance: f64
+        },
+        commands: {
+            OpenAccount { account_number: String },
+            Deposit { amount: f64 }
+        },
+        events: {
+            AccountOpened { account_number: String },
+            Deposited { amount: f64 }
+        },
+        service: {
+            fn validate_account_number(account_number: &str) -> bool;
+        }
+    }
+}
+
+// This generates:
+// pub trait BankAccountServices: Send + Sync {
+//     fn validate_account_number(&self, account_number: &str) -> bool;
+// }
+
+// Now you implement the generated trait with your own struct
+#[derive(Clone)]
+pub struct MyBankServices;
+
+impl BankAccountServices for MyBankServices {
+    fn validate_account_number(&self, account_number: &str) -> bool {
+        // Your validation logic
+        account_number.len() >= 5
+    }
+}
+
+impl EventStream for BankAccount {
+    type Event = BankAccountEvent;
+
+    fn stream_type() -> String {
+        "BankAccount".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            BankAccountEvent::AccountOpened { account_number } => {
+                self.account_number = account_number;
+            }
+            BankAccountEvent::Deposited { amount } => {
+                self.balance += amount;
+            }
+        }
+    }
+}
+
+impl Aggregate for BankAccount {
+    type Command = BankAccountCommand;
+    type Error = replay::Error;
+    // Use Arc<dyn Trait> to accept any implementation
+    type Services = Arc<dyn BankAccountServices>;
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> replay::Result<Vec<Self::Event>> {
+        match command {
+            BankAccountCommand::OpenAccount { account_number } => {
+                // Use the service to validate
+                if !services.validate_account_number(&account_number) {
+                    return Err(replay::Error::business_rule_violation(
+                        "Invalid account number: must be at least 5 characters"
+                    )
+                    .with_operation("OpenAccount")
+                    .with_context("account_number", account_number));
+                }
+                Ok(vec![BankAccountEvent::AccountOpened { account_number }])
+            }
+            BankAccountCommand::Deposit { amount } => {
+                Ok(vec![BankAccountEvent::Deposited { amount }])
+            }
+        }
+    }
+}
+
+// Usage example
+#[tokio::main]
+async fn main() {
+    // Create service implementation wrapped in Arc
+    let services: Arc<dyn BankAccountServices> = Arc::new(MyBankServices);
+    
+    let id = BankAccountUrn::new("acc-123").unwrap();
+    let account = BankAccount::with_id(id);
+    
+    // Valid account number
+    let cmd = BankAccountCommand::OpenAccount {
+        account_number: "12345".to_string(),
+    };
+    let events = account.handle(cmd, &services).await.unwrap();
+    println!("Account opened successfully");
+    
+    // Invalid account number (too short)
+    let cmd = BankAccountCommand::OpenAccount {
+        account_number: "123".to_string(),
+    };
+    let result = account.handle(cmd, &services).await;
+    assert!(result.is_err());
+    println!("Validation failed as expected");
+}
+```
+
+**Key points about services:**
+
+- The macro generates a **trait** (e.g., `BankAccountServices`), not a struct
+- Service functions are defined without `&self` in the macro - it's added automatically
+- The generated trait is `Send + Sync` compatible for async contexts
+- You implement the trait with your own struct containing dependencies
+- Use `Arc<dyn YourServices>` as the `Services` type in your aggregate
+- Services allow dependency injection, making aggregates easier to test
+- The aggregate struct has no type parameters - it stays simple
+
+#### Async Services
+
+Services can define async functions using the `async fn` syntax:
+
+```rust
+define_aggregate! {
+    BankAccount {
+        state: {
+            account_number: String,
+            balance: f64
+        },
+        commands: {
+            OpenAccount { account_number: String }
+        },
+        events: {
+            AccountOpened { account_number: String }
+        },
+        service: {
+            // Async service function
+            async fn validate_account_number(account_number: &str) -> bool;
+        }
+    }
+}
+
+// Implement with async_trait
+#[async_trait::async_trait]
+impl BankAccountServices for MyBankServices {
+    async fn validate_account_number(&self, account_number: &str) -> bool {
+        // Can call async APIs, databases, etc.
+        external_api::validate(account_number).await
+    }
+}
+
+// Use in handle method with .await
+impl Aggregate for BankAccount {
+    type Command = BankAccountCommand;
+    type Error = replay::Error;
+    type Services = Arc<dyn BankAccountServices>;
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> replay::Result<Vec<Self::Event>> {
+        match command {
+            BankAccountCommand::OpenAccount { account_number } => {
+                // Await the async service call
+                if !services.validate_account_number(&account_number).await {
+                    return Err(replay::Error::business_rule_violation(
+                        "Invalid account number"
+                    ));
+                }
+                Ok(vec![BankAccountEvent::AccountOpened { account_number }])
+            }
+        }
+    }
+}
+```
+
+**WASM Compatibility**: The generated service trait uses `#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]` to automatically support WASM targets, where futures cannot be `Send`. For non-WASM targets, regular `async_trait` is used to enable multi-threaded execution.
 
 ### URN Namespace Configuration
 
@@ -433,4 +625,65 @@ active_products.insert(product1);
 active_products.insert(product2);
 
 assert_eq!(active_products.len(), 2);
+```
+
+## WASM Support
+
+The library supports WebAssembly (WASM) targets with automatic adjustments for single-threaded environments:
+
+### Aggregate Trait
+
+The `Aggregate` trait has two variants:
+
+- **Non-WASM targets**: Includes `Send` bounds on aggregates, commands, services, and futures to enable multi-threaded async runtimes (Tokio, async-std)
+- **WASM targets**: Omits `Send` bounds since WASM runs in a single-threaded environment
+
+This is handled automatically - you don't need to change your code.
+
+### Async Services in WASM
+
+When defining async service functions, the generated trait automatically uses the appropriate async_trait configuration:
+
+```rust
+service: {
+    async fn validate_data(data: &str) -> bool;
+}
+```
+
+Generated trait (automatically adjusted per target):
+
+```rust
+// For WASM (wasm32):
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+// For servers (non-WASM):
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait YourServices: Send + Sync {
+    async fn validate_data(&self, data: &str) -> bool;
+}
+```
+
+### Testing WASM
+
+Run WASM tests using `wasm-pack`:
+
+```bash
+# Test in headless browser
+wasm-pack test --headless --firefox es
+
+# Or using the Makefile
+make wasm-test
+```
+
+Tests should be placed in files with `#![cfg(target_arch = "wasm32")]` to only compile for WASM:
+
+```rust
+#![cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::*;
+
+wasm_bindgen_test_configure!(run_in_browser);
+
+#[wasm_bindgen_test]
+async fn test_aggregate_in_wasm() {
+    // Your test code
+}
 ```
