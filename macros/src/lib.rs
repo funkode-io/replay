@@ -1,11 +1,12 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{
-    parse::{Parse, ParseStream},
-    parse_macro_input,
-    token::Brace,
-    Data, DeriveInput, Field, Fields, FnArg, Ident, ReturnType, Token, Type,
-};
+use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
+
+mod define_aggregate_macro;
+mod merge_events_macro;
+
+use define_aggregate_macro::AggregateDefinition;
+use merge_events_macro::QueryEventsDefinition;
 
 #[proc_macro_derive(Event)]
 pub fn derive_event(input: TokenStream) -> TokenStream {
@@ -115,231 +116,6 @@ pub fn derive_urn(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(urn_impl)
-}
-
-// Struct to parse the define_aggregate! macro input
-struct AggregateDefinition {
-    name: Ident,
-    namespace: Option<syn::LitStr>,
-    state_fields: Vec<Field>,
-    commands: Vec<CommandVariant>,
-    events: Vec<EventVariant>,
-    service_functions: Vec<ServiceFunction>,
-}
-
-struct CommandVariant {
-    name: Ident,
-    fields: Vec<Field>,
-}
-
-struct EventVariant {
-    name: Ident,
-    fields: Vec<Field>,
-}
-
-struct ServiceFunction {
-    name: Ident,
-    inputs: Vec<FnArg>,
-    output: ReturnType,
-    is_async: bool,
-}
-
-impl Parse for AggregateDefinition {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let name: Ident = input.parse()?;
-
-        let content;
-        syn::braced!(content in input);
-
-        let mut namespace = None;
-        let mut state_fields = Vec::new();
-        let mut commands = Vec::new();
-        let mut events = Vec::new();
-        let mut service_functions = Vec::new();
-
-        while !content.is_empty() {
-            let section_name: Ident = content.parse()?;
-            content.parse::<Token![:]>()?;
-
-            match section_name.to_string().as_str() {
-                "namespace" => {
-                    namespace = Some(content.parse()?);
-                }
-                _ => {
-                    let section_content;
-                    syn::braced!(section_content in content);
-
-                    match section_name.to_string().as_str() {
-                        "state" => {
-                            while !section_content.is_empty() {
-                                let field_name: Ident = section_content.parse()?;
-                                section_content.parse::<Token![:]>()?;
-                                let field_type: Type = section_content.parse()?;
-
-                                state_fields.push(Field {
-                                    attrs: Vec::new(),
-                                    vis: syn::Visibility::Public(syn::token::Pub::default()),
-                                    mutability: syn::FieldMutability::None,
-                                    ident: Some(field_name),
-                                    colon_token: Some(Token![:](proc_macro2::Span::call_site())),
-                                    ty: field_type,
-                                });
-
-                                if section_content.peek(Token![,]) {
-                                    section_content.parse::<Token![,]>()?;
-                                }
-                            }
-                        }
-                        "commands" => {
-                            while !section_content.is_empty() {
-                                let variant_name: Ident = section_content.parse()?;
-
-                                let variant_fields = if section_content.peek(Brace) {
-                                    let fields_content;
-                                    syn::braced!(fields_content in section_content);
-
-                                    let mut fields = Vec::new();
-                                    while !fields_content.is_empty() {
-                                        let field_name: Ident = fields_content.parse()?;
-                                        fields_content.parse::<Token![:]>()?;
-                                        let field_type: Type = fields_content.parse()?;
-
-                                        fields.push(Field {
-                                            attrs: Vec::new(),
-                                            vis: syn::Visibility::Inherited,
-                                            mutability: syn::FieldMutability::None,
-                                            ident: Some(field_name),
-                                            colon_token: Some(Token![:](
-                                                proc_macro2::Span::call_site(),
-                                            )),
-                                            ty: field_type,
-                                        });
-
-                                        if fields_content.peek(Token![,]) {
-                                            fields_content.parse::<Token![,]>()?;
-                                        }
-                                    }
-                                    fields
-                                } else {
-                                    Vec::new()
-                                };
-
-                                commands.push(CommandVariant {
-                                    name: variant_name,
-                                    fields: variant_fields,
-                                });
-
-                                if section_content.peek(Token![,]) {
-                                    section_content.parse::<Token![,]>()?;
-                                }
-                            }
-                        }
-                        "events" => {
-                            while !section_content.is_empty() {
-                                let variant_name: Ident = section_content.parse()?;
-
-                                let variant_fields = if section_content.peek(Brace) {
-                                    let fields_content;
-                                    syn::braced!(fields_content in section_content);
-
-                                    let mut fields = Vec::new();
-                                    while !fields_content.is_empty() {
-                                        let field_name: Ident = fields_content.parse()?;
-                                        fields_content.parse::<Token![:]>()?;
-                                        let field_type: Type = fields_content.parse()?;
-
-                                        fields.push(Field {
-                                            attrs: Vec::new(),
-                                            vis: syn::Visibility::Inherited,
-                                            mutability: syn::FieldMutability::None,
-                                            ident: Some(field_name),
-                                            colon_token: Some(Token![:](
-                                                proc_macro2::Span::call_site(),
-                                            )),
-                                            ty: field_type,
-                                        });
-
-                                        if fields_content.peek(Token![,]) {
-                                            fields_content.parse::<Token![,]>()?;
-                                        }
-                                    }
-                                    fields
-                                } else {
-                                    Vec::new()
-                                };
-
-                                events.push(EventVariant {
-                                    name: variant_name,
-                                    fields: variant_fields,
-                                });
-
-                                if section_content.peek(Token![,]) {
-                                    section_content.parse::<Token![,]>()?;
-                                }
-                            }
-                        }
-                        "service" => {
-                            while !section_content.is_empty() {
-                                // Parse optional "async"
-                                let is_async = section_content.peek(Token![async]);
-                                if is_async {
-                                    section_content.parse::<Token![async]>()?;
-                                }
-
-                                // Parse "fn"
-                                section_content.parse::<Token![fn]>()?;
-
-                                // Parse function name
-                                let fn_name: Ident = section_content.parse()?;
-
-                                // Parse function parameters
-                                let inputs_content;
-                                syn::parenthesized!(inputs_content in section_content);
-                                let inputs: syn::punctuated::Punctuated<FnArg, Token![,]> =
-                                    inputs_content.parse_terminated(FnArg::parse, Token![,])?;
-
-                                // Parse return type
-                                let output: ReturnType = section_content.parse()?;
-
-                                service_functions.push(ServiceFunction {
-                                    name: fn_name,
-                                    inputs: inputs.into_iter().collect(),
-                                    output,
-                                    is_async,
-                                });
-
-                                // Optional comma or semicolon
-                                if section_content.peek(Token![,]) {
-                                    section_content.parse::<Token![,]>()?;
-                                } else if section_content.peek(Token![;]) {
-                                    section_content.parse::<Token![;]>()?;
-                                }
-                            }
-                        }
-                        _ => {
-                            return Err(syn::Error::new_spanned(
-                                section_name,
-                                "Expected 'state', 'commands', 'events', or 'service'",
-                            ));
-                        }
-                    }
-                }
-            }
-
-            if content.peek(Token![,]) {
-                content.parse::<Token![,]>()?;
-            }
-        }
-
-        Ok(AggregateDefinition {
-            name,
-            namespace,
-            state_fields,
-            commands,
-            events,
-            service_functions,
-        })
-    }
 }
 
 #[proc_macro]
@@ -621,6 +397,202 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
 
         // Generate Services trait
         #services_trait
+    };
+
+    TokenStream::from(expanded)
+}
+
+/// Macro to generate a wrapper enum for multiple event types in queries.
+///
+/// Example usage:
+/// ```ignore
+/// query_events!(UserHistoryEvent => [UserEvent, CatalogEvent]);
+/// ```
+///
+/// This will generate:
+/// - An enum with variants for each event type
+/// - From trait implementations for each event type
+/// - Serialize/Deserialize implementations that delegate to inner types
+/// - replay::Event trait implementation
+/// - PartialEq, Display, and Debug implementations
+#[proc_macro]
+pub fn query_events(input: TokenStream) -> TokenStream {
+    let query_def = parse_macro_input!(input as QueryEventsDefinition);
+
+    let enum_name = &query_def.name;
+    let event_types = &query_def.event_types;
+
+    // Generate enum variants (e.g., UserEvent(UserEvent), CatalogEvent(CatalogEvent))
+    let enum_variants = event_types.iter().map(|ty| {
+        // Extract the last segment of the type path for the variant name
+        let variant_name = if let Type::Path(type_path) = ty {
+            type_path.path.segments.last().unwrap().ident.clone()
+        } else {
+            panic!("Expected a type path");
+        };
+
+        quote! {
+            #variant_name(#ty)
+        }
+    });
+
+    // Generate From trait implementations
+    let from_impls = event_types.iter().map(|ty| {
+        let variant_name = if let Type::Path(type_path) = ty {
+            type_path.path.segments.last().unwrap().ident.clone()
+        } else {
+            panic!("Expected a type path");
+        };
+
+        quote! {
+            impl From<#ty> for #enum_name {
+                fn from(event: #ty) -> Self {
+                    #enum_name::#variant_name(event)
+                }
+            }
+        }
+    });
+
+    // Generate Deserialize match arms (try each type in order)
+    let deserialize_attempts = event_types.iter().enumerate().map(|(i, ty)| {
+        let variant_name = if let Type::Path(type_path) = ty {
+            type_path.path.segments.last().unwrap().ident.clone()
+        } else {
+            panic!("Expected a type path");
+        };
+
+        if i < event_types.len() - 1 {
+            // For all but the last, clone the value for retry
+            quote! {
+                if let Ok(event) = serde_json::from_value::<#ty>(value.clone()) {
+                    return Ok(#enum_name::#variant_name(event));
+                }
+            }
+        } else {
+            // For the last one, no clone needed
+            quote! {
+                match serde_json::from_value::<#ty>(value) {
+                    Ok(event) => Ok(#enum_name::#variant_name(event)),
+                    Err(_) => Err(serde::de::Error::custom(
+                        format!("Could not deserialize as any of the expected event types")
+                    )),
+                }
+            }
+        }
+    });
+
+    // Generate Serialize match arms
+    let serialize_arms = event_types.iter().map(|ty| {
+        let variant_name = if let Type::Path(type_path) = ty {
+            type_path.path.segments.last().unwrap().ident.clone()
+        } else {
+            panic!("Expected a type path");
+        };
+
+        quote! {
+            #enum_name::#variant_name(event) => event.serialize(serializer)
+        }
+    });
+
+    // Generate replay::Event match arms
+    let event_type_arms = event_types.iter().map(|ty| {
+        let variant_name = if let Type::Path(type_path) = ty {
+            type_path.path.segments.last().unwrap().ident.clone()
+        } else {
+            panic!("Expected a type path");
+        };
+
+        quote! {
+            #enum_name::#variant_name(event) => event.event_type()
+        }
+    });
+
+    // Generate PartialEq match arms
+    let partial_eq_arms = event_types.iter().map(|ty| {
+        let variant_name = if let Type::Path(type_path) = ty {
+            type_path.path.segments.last().unwrap().ident.clone()
+        } else {
+            panic!("Expected a type path");
+        };
+
+        quote! {
+            (#enum_name::#variant_name(e1), #enum_name::#variant_name(e2)) => e1 == e2
+        }
+    });
+
+    // Generate Display match arms
+    let display_arms = event_types.iter().map(|ty| {
+        let variant_name = if let Type::Path(type_path) = ty {
+            type_path.path.segments.last().unwrap().ident.clone()
+        } else {
+            panic!("Expected a type path");
+        };
+
+        quote! {
+            #enum_name::#variant_name(event) => write!(f, "{:?}", event)
+        }
+    });
+
+    let expanded = quote! {
+        #[derive(Clone, Debug)]
+        pub enum #enum_name {
+            #(#enum_variants),*
+        }
+
+        // Generate From trait implementations
+        #(#from_impls)*
+
+        // Deserialize implementation
+        impl<'de> serde::Deserialize<'de> for #enum_name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = serde_json::Value::deserialize(deserializer)?;
+
+                #(#deserialize_attempts)*
+            }
+        }
+
+        // Serialize implementation
+        impl serde::Serialize for #enum_name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                match self {
+                    #(#serialize_arms),*
+                }
+            }
+        }
+
+        // replay::Event implementation
+        impl replay::Event for #enum_name {
+            fn event_type(&self) -> String {
+                match self {
+                    #(#event_type_arms),*
+                }
+            }
+        }
+
+        // PartialEq implementation
+        impl PartialEq for #enum_name {
+            fn eq(&self, other: &Self) -> bool {
+                match (self, other) {
+                    #(#partial_eq_arms,)*
+                    _ => false,
+                }
+            }
+        }
+
+        // Display implementation
+        impl std::fmt::Display for #enum_name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    #(#display_arms),*
+                }
+            }
+        }
     };
 
     TokenStream::from(expanded)
