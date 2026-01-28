@@ -687,3 +687,163 @@ async fn test_aggregate_in_wasm() {
     // Your test code
 }
 ```
+
+## Querying Events from Multiple Aggregates
+
+When building CQRS queries, you often need to process events from multiple aggregate types together. The `query_events!` macro simplifies creating a wrapper enum that can hold events from different aggregates:
+
+```rust
+use replay_macros::query_events;
+use replay::Event;
+use serde::{Deserialize, Serialize};
+
+// Define your individual event types
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum UserEvent {
+    UserCreated { user_id: String, name: String },
+    UserUpdated { user_id: String, name: String },
+}
+
+impl Event for UserEvent {
+    fn event_type(&self) -> String {
+        match self {
+            UserEvent::UserCreated { .. } => "UserCreated".to_string(),
+            UserEvent::UserUpdated { .. } => "UserUpdated".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum CatalogEvent {
+    ProductAdded { product_id: String, name: String },
+    ProductUpdated { product_id: String, name: String },
+}
+
+impl Event for CatalogEvent {
+    fn event_type(&self) -> String {
+        match self {
+            CatalogEvent::ProductAdded { .. } => "ProductAdded".to_string(),
+            CatalogEvent::ProductUpdated { .. } => "ProductUpdated".to_string(),
+        }
+    }
+}
+
+// Create a merged event type for queries
+query_events!(UserHistoryEvent => [UserEvent, CatalogEvent]);
+
+// Now you can use UserHistoryEvent in your queries
+fn process_user_history(events: Vec<UserHistoryEvent>) {
+    for event in events {
+        match event {
+            UserHistoryEvent::UserEvent(user_evt) => {
+                println!("User event: {}", user_evt.event_type());
+            }
+            UserHistoryEvent::CatalogEvent(catalog_evt) => {
+                println!("Catalog event: {}", catalog_evt.event_type());
+            }
+        }
+    }
+}
+
+// Use From trait for easy conversion
+let user_evt = UserEvent::UserCreated {
+    user_id: "user-1".to_string(),
+    name: "Alice".to_string(),
+};
+let merged: UserHistoryEvent = user_evt.into();
+
+// Works with collections
+let mut events: Vec<UserHistoryEvent> = vec![];
+events.push(UserEvent::UserCreated {
+    user_id: "user-1".to_string(),
+    name: "Alice".to_string(),
+}.into());
+events.push(CatalogEvent::ProductAdded {
+    product_id: "prod-1".to_string(),
+    name: "Laptop".to_string(),
+}.into());
+```
+
+### What the Macro Generates
+
+The `query_events!` macro automatically generates:
+
+1. **Enum with variants** for each event type:
+
+   ```rust
+   pub enum UserHistoryEvent {
+       UserEvent(UserEvent),
+       CatalogEvent(CatalogEvent),
+   }
+   ```
+
+2. **From trait implementations** for easy conversion:
+
+   ```rust
+   impl From<UserEvent> for UserHistoryEvent { ... }
+   impl From<CatalogEvent> for UserHistoryEvent { ... }
+   ```
+
+3. **Serialize/Deserialize** implementations that delegate to the inner event types
+
+4. **Event trait implementation** that delegates `event_type()` to the wrapped event
+
+5. **PartialEq** implementation for comparing wrapped events
+
+6. **Display** implementation for formatting
+
+7. **Clone and Debug** derived traits
+
+### Use Cases
+
+The merged event type is useful for:
+
+- **Cross-aggregate queries**: Building read models that need data from multiple aggregates
+- **User activity logs**: Tracking all actions across different parts of the system
+- **Audit trails**: Recording events from various domains in a unified format
+- **Event processing**: Handling events from multiple sources in a single stream processor
+- **Projections**: Creating views that span multiple aggregate types
+
+### Example: Building a User Activity Log
+
+```rust
+use replay_macros::query_events;
+
+query_events!(ActivityEvent => [UserEvent, OrderEvent, PaymentEvent]);
+
+// Query function that fetches events from multiple streams
+async fn get_user_activity(user_id: &str) -> Vec<ActivityEvent> {
+    let mut activity = Vec::new();
+    
+    // Fetch user events
+    let user_events = fetch_user_events(user_id).await;
+    activity.extend(user_events.into_iter().map(ActivityEvent::from));
+    
+    // Fetch order events
+    let order_events = fetch_user_orders(user_id).await;
+    activity.extend(order_events.into_iter().map(ActivityEvent::from));
+    
+    // Fetch payment events
+    let payment_events = fetch_user_payments(user_id).await;
+    activity.extend(payment_events.into_iter().map(ActivityEvent::from));
+    
+    // Sort by timestamp, filter, etc.
+    activity.sort_by_key(|e| e.timestamp());
+    activity
+}
+
+// Build a projection from the merged events
+fn build_activity_summary(events: Vec<ActivityEvent>) -> ActivitySummary {
+    let mut summary = ActivitySummary::default();
+    
+    for event in events {
+        match event {
+            ActivityEvent::UserEvent(evt) => summary.process_user_event(evt),
+            ActivityEvent::OrderEvent(evt) => summary.process_order_event(evt),
+            ActivityEvent::PaymentEvent(evt) => summary.process_payment_event(evt),
+        }
+    }
+    
+    summary
+}
+```
