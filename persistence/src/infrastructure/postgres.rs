@@ -151,7 +151,7 @@ impl EventStore for PostgresEventStore {
                 yield Ok(row);
             }
 
-            tracing::info!("Streamed {} events from Postgres", count);
+            tracing::debug!("Streamed {} events from Postgres", count);
         }
     }
 }
