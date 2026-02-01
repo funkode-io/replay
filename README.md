@@ -16,14 +16,6 @@ You can chose you implement just `Stream` (state will be built from events) or `
 
 Let's assume we have a bank account with a balance that is updated when there is a deposit or withdrawal.
 
-### Serialization Requirements
-
-In this library:
-
-- **Events must be serializable** - They are persisted to the event store
-- **Aggregates don't need serde** - They are ephemeral, rebuilt from events on demand
-- This allows aggregates to contain non-serializable runtime state (streams, channels, connections, etc.)
-
 Our domain would look something like this:
 
 ```rust
@@ -33,8 +25,7 @@ use serde::{Deserialize, Serialize};
 use urn::Urn;
 
 //  bank account is an aggregate (id of aggregate is now part of the model)
-// Note: Aggregates don't need serde - they're ephemeral and rebuilt from events
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct BankAccountAggregate {
     pub id: BankAccountUrn,
     pub balance: f64,
