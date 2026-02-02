@@ -1,3 +1,4 @@
+use serde::{de::DeserializeOwned, Serialize};
 use urn::Urn;
 
 use crate::Error;
@@ -14,7 +15,9 @@ pub trait WithId: Sized {
         + TryFrom<Urn, Error: std::fmt::Debug>
         + Clone
         + PartialEq
-        + std::fmt::Debug;
+        + std::fmt::Debug
+        + Serialize
+        + DeserializeOwned;
 
     /// Creates a new instance with the given id.
     fn with_id(id: Self::StreamId) -> Self;

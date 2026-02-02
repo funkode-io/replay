@@ -288,6 +288,70 @@ mod tests {
         assert_eq!(CustomerUrn::namespace(), "my-customer");
     }
 
+    #[test]
+    fn test_streamid_serde_as_urn_string() {
+        // Test that StreamId (URN) serializes and deserializes as URN string
+        define_aggregate! {
+            Order {
+                namespace: "order",
+                state: { total: f64 },
+                commands: { CreateOrder { total: f64 } },
+                events: { OrderCreated { total: f64 } }
+            }
+        }
+
+        // Create a URN
+        let order_id = OrderUrn::new("order-123").unwrap();
+
+        // Verify it displays as URN string
+        assert_eq!(order_id.to_string(), "urn:order:order-123");
+
+        // Test JSON serialization - should be a simple string
+        let json = serde_json::to_string(&order_id).unwrap();
+        assert_eq!(json, "\"urn:order:order-123\"");
+
+        // Test JSON deserialization from URN string
+        let deserialized: OrderUrn = serde_json::from_str("\"urn:order:order-456\"").unwrap();
+        assert_eq!(deserialized.to_string(), "urn:order:order-456");
+
+        // Test round-trip
+        let round_trip: OrderUrn = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, order_id);
+
+        // Test that invalid URN format fails
+        let invalid: Result<OrderUrn, _> = serde_json::from_str("\"not-a-urn\"");
+        assert!(invalid.is_err());
+
+        // Test that wrong namespace fails
+        let wrong_ns: Result<OrderUrn, _> = serde_json::from_str("\"urn:wrong:id-123\"");
+        assert!(wrong_ns.is_err());
+        assert!(wrong_ns
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid URN namespace"));
+
+        // Test in a struct to ensure it works in composite types
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct OrderResponse {
+            order_id: OrderUrn,
+            status: String,
+        }
+
+        let response = OrderResponse {
+            order_id: OrderUrn::new("order-789").unwrap(),
+            status: "confirmed".to_string(),
+        };
+
+        // Serialize struct containing URN
+        let response_json = serde_json::to_string(&response).unwrap();
+        assert!(response_json.contains("\"urn:order:order-789\""));
+
+        // Deserialize struct containing URN
+        let parsed: OrderResponse = serde_json::from_str(&response_json).unwrap();
+        assert_eq!(parsed, response);
+        assert_eq!(parsed.order_id.to_string(), "urn:order:order-789");
+    }
+
     // Test proper camelCase to kebab-case conversion including acronym handling
     #[test]
     fn test_aggregate_namespace_conversion() {
