@@ -188,6 +188,19 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
     }
 
+    // Check if a type is used in command fields
+    let mut used_in_commands = std::collections::HashSet::new();
+    for command in &aggregate_def.commands {
+        for field in &command.fields {
+            let mut visitor = TypeParamVisitor {
+                type_params: &type_param_idents,
+                found: std::collections::HashSet::new(),
+            };
+            syn::visit::visit_field(&mut visitor, field);
+            used_in_commands.extend(visitor.found);
+        }
+    }
+
     // Check if a type is used in event fields
     let mut used_in_events = std::collections::HashSet::new();
     for event in &aggregate_def.events {
@@ -200,6 +213,25 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
             used_in_events.extend(visitor.found);
         }
     }
+
+    // Create generics for commands that only include used type parameters
+    let mut command_generics = generics_with_bounds.clone();
+    command_generics.params = command_generics
+        .params
+        .iter()
+        .filter(|param| {
+            if let syn::GenericParam::Type(type_param) = param {
+                used_in_commands.contains(&type_param.ident)
+            } else {
+                true // Keep lifetime and const parameters
+            }
+        })
+        .cloned()
+        .collect();
+
+    let (_command_impl_generics, _command_ty_generics, command_where_clause) =
+        command_generics.split_for_impl();
+    let command_type_params = &command_generics.params;
 
     // Create generics for events that only include used type parameters
     let mut event_generics = generics_with_bounds.clone();
@@ -477,9 +509,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
 
         // Command enum
-        #[derive(serde::Serialize, serde::Deserialize, Debug)]
-        #serde_bound_attr
-        pub enum #command_name <#type_params> #where_clause {
+        pub enum #command_name <#command_type_params> #command_where_clause {
             #(#command_variants),*
         }
 
