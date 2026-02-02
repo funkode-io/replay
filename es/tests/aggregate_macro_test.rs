@@ -782,8 +782,8 @@ mod tests {
             value: String,
         }
 
-        // T is used in state but NOT in events
-        // Events use "Thing" which contains 'T' but is not the type parameter T
+        // T is used in state but NOT in commands or events
+        // Commands/events use "Thing" which contains 'T' but is not the type parameter T
         define_aggregate! {
             Manager<T> {
                 state: {
@@ -791,7 +791,7 @@ mod tests {
                     count: usize,
                 },
                 commands: {
-                    Update { data: T }
+                    Update { thing: Thing }  // "Thing" contains 'T' but is NOT the type parameter T
                 },
                 events: {
                     Updated { thing: Thing }  // "Thing" contains 'T' but is NOT the type parameter T
@@ -800,8 +800,10 @@ mod tests {
         }
 
         // If the macro incorrectly used string matching with .contains(),
-        // it would think T is used in events because "Thing" contains 'T'
-        // But with proper AST traversal, ManagerEvent should have NO type parameter
+        // it would think T is used in commands/events because "Thing" contains 'T'
+        // But with proper AST traversal:
+        // - ManagerCommand should have NO type parameter
+        // - ManagerEvent should have NO type parameter
 
         impl EventStream for Manager<String> {
             type Event = ManagerEvent; // No <String> - T not actually used in events!
@@ -819,13 +821,147 @@ mod tests {
             }
         }
 
+        impl Aggregate for Manager<String> {
+            type Command = ManagerCommand; // No <String> - T not actually used in commands!
+            type Error = replay::Error;
+            type Services = ();
+
+            async fn handle(
+                &self,
+                command: Self::Command,
+                _services: &Self::Services,
+            ) -> replay::Result<Vec<Self::Event>> {
+                match command {
+                    ManagerCommand::Update { thing } => Ok(vec![ManagerEvent::Updated { thing }]),
+                }
+            }
+        }
+
+        // Test the full workflow
         let id = ManagerUrn::new("mgr-1").unwrap();
-        let _manager: Manager<String> = Manager::with_id(id);
-        let _event = ManagerEvent::Updated {
+        let mut manager: Manager<String> = Manager::with_id(id);
+
+        // Create a command - no type parameter needed!
+        let command = ManagerCommand::Update {
             thing: Thing {
                 value: "test".to_string(),
             },
         };
-        // This compiles, proving that ManagerEvent has no type parameter
+
+        // Handle the command
+        let services = ();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let events = runtime
+            .block_on(manager.handle(command, &services))
+            .unwrap();
+
+        // Apply the events
+        manager.apply_all(events);
+        assert_eq!(manager.count, 1);
+
+        // This all compiles, proving that neither ManagerCommand nor ManagerEvent
+        // have type parameters, even though the aggregate Manager<T> does!
+    }
+
+    #[test]
+    fn test_command_with_byte_stream() {
+        // Test that commands can handle non-serializable types like byte streams
+        // since commands are effectful and don't need serde
+        use std::io::Read;
+
+        // A reader that wraps bytes - not serializable but has Debug
+        #[derive(Debug)]
+        struct ByteReader {
+            data: std::io::Cursor<Vec<u8>>,
+        }
+
+        impl ByteReader {
+            fn new(data: Vec<u8>) -> Self {
+                Self {
+                    data: std::io::Cursor::new(data),
+                }
+            }
+
+            fn read_to_string(&mut self) -> String {
+                let mut result = String::new();
+                self.data.read_to_string(&mut result).unwrap();
+                result
+            }
+        }
+
+        define_aggregate! {
+            FileProcessor {
+                state: {
+                    processed_content: String,
+                    file_count: usize,
+                },
+                commands: {
+                    ProcessBytes { reader: ByteReader }  // Non-serializable command!
+                },
+                events: {
+                    BytesProcessed { content: String }  // Event is serializable
+                }
+            }
+        }
+
+        impl EventStream for FileProcessor {
+            type Event = FileProcessorEvent;
+
+            fn stream_type() -> String {
+                "FileProcessor".to_string()
+            }
+
+            fn apply(&mut self, event: Self::Event) {
+                match event {
+                    FileProcessorEvent::BytesProcessed { content } => {
+                        self.processed_content = content;
+                        self.file_count += 1;
+                    }
+                }
+            }
+        }
+
+        impl Aggregate for FileProcessor {
+            type Command = FileProcessorCommand;
+            type Error = replay::Error;
+            type Services = ();
+
+            async fn handle(
+                &self,
+                command: Self::Command,
+                _services: &Self::Services,
+            ) -> replay::Result<Vec<Self::Event>> {
+                match command {
+                    FileProcessorCommand::ProcessBytes { mut reader } => {
+                        // Process the byte stream
+                        let content = reader.read_to_string();
+                        Ok(vec![FileProcessorEvent::BytesProcessed { content }])
+                    }
+                }
+            }
+        }
+
+        // Usage
+        let id = FileProcessorUrn::new("processor-1").unwrap();
+        let mut processor = FileProcessor::with_id(id);
+
+        // Create a command with a byte stream
+        let bytes = b"Hello from bytes!".to_vec();
+        let reader = ByteReader::new(bytes);
+        let command = FileProcessorCommand::ProcessBytes { reader };
+
+        // Handle the command using tokio runtime
+        let services = ();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let events = runtime
+            .block_on(processor.handle(command, &services))
+            .unwrap();
+
+        // Apply the events
+        processor.apply_all(events);
+
+        // Verify the result
+        assert_eq!(processor.processed_content, "Hello from bytes!");
+        assert_eq!(processor.file_count, 1);
     }
 }
