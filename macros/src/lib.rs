@@ -280,8 +280,10 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     // Extract field names for initialization
     let state_field_names = aggregate_def.state_fields.iter().map(|f| &f.ident);
 
-    // Generate Services trait if service functions are defined
-    let services_trait = if !aggregate_def.service_functions.is_empty() {
+    // Generate Services trait if service functions are defined or base trait is specified
+    let services_trait = if !aggregate_def.service_functions.is_empty()
+        || aggregate_def.base_service_trait.is_some()
+    {
         // Check if any function is async
         let has_async = aggregate_def.service_functions.iter().any(|f| f.is_async);
 
@@ -317,9 +319,16 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
             quote! {}
         };
 
+        // Build the trait bounds (supertraits)
+        let trait_bounds = if let Some(ref base_trait) = aggregate_def.base_service_trait {
+            quote! { : #base_trait + Send + Sync }
+        } else {
+            quote! { : Send + Sync }
+        };
+
         quote! {
             #async_trait_attr
-            pub trait #services_name: Send + Sync {
+            pub trait #services_name #trait_bounds {
                 #(#trait_methods)*
             }
         }

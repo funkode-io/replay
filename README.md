@@ -366,6 +366,32 @@ impl BankAccountServices for MyBankServices {
     }
 }
 
+// You can also extend an existing service trait:
+define_aggregate! {
+    Order {
+        state: {
+            order_id: String,
+            items: Vec<String>,
+        },
+        commands: {
+            CreateOrder { items: Vec<String> }
+        },
+        events: {
+            OrderCreated { order_id: String, items: Vec<String> }
+        },
+        service: FileService {
+            async fn validate_items(items: &[String]) -> bool;
+        }
+    }
+}
+
+// This generates:
+// pub trait OrderServices: FileService + Send + Sync {
+//     async fn validate_items(&self, items: &[String]) -> bool;
+// }
+//
+// Your implementation must now implement both FileService and OrderServices
+
 impl EventStream for BankAccount {
     type Event = BankAccountEvent;
 
