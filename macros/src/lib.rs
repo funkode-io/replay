@@ -229,8 +229,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         .cloned()
         .collect();
 
-    let (_command_impl_generics, _command_ty_generics, command_where_clause) =
-        command_generics.split_for_impl();
+    let (_, _, command_where_clause) = command_generics.split_for_impl();
     let command_type_params = &command_generics.params;
 
     // Create generics for events that only include used type parameters
@@ -248,8 +247,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         .cloned()
         .collect();
 
-    let (_event_impl_generics, _event_ty_generics, event_where_clause) =
-        event_generics.split_for_impl();
+    let (_, _, event_where_clause) = event_generics.split_for_impl();
     let event_type_params = &event_generics.params;
 
     let command_name = quote::format_ident!("{}Command", name);
