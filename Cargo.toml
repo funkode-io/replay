@@ -48,7 +48,7 @@ dotenvy = "0.15.7"
 
 # Proc-macro dependencies
 proc-macro2 = "1.0.105"
-syn = "2.0.114"
+syn = { version = "2.0.114", features = ["visit"] }
 quote = "1.0.43"
 
 # test dependencies

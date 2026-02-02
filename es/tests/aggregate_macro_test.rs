@@ -770,4 +770,62 @@ mod tests {
         container.apply(event);
         assert_eq!(container.count, 5);
     }
+
+    #[test]
+    fn test_type_parameter_detection_avoids_false_positives() {
+        // Test that type parameter detection uses proper AST traversal
+        // and doesn't falsely match on types that contain the parameter name as a substring
+
+        // Type that contains 'T' in its name but is not the type parameter T
+        #[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
+        struct Thing {
+            value: String,
+        }
+
+        // T is used in state but NOT in events
+        // Events use "Thing" which contains 'T' but is not the type parameter T
+        define_aggregate! {
+            Manager<T> {
+                state: {
+                    data: T,
+                    count: usize,
+                },
+                commands: {
+                    Update { data: T }
+                },
+                events: {
+                    Updated { thing: Thing }  // "Thing" contains 'T' but is NOT the type parameter T
+                }
+            }
+        }
+
+        // If the macro incorrectly used string matching with .contains(),
+        // it would think T is used in events because "Thing" contains 'T'
+        // But with proper AST traversal, ManagerEvent should have NO type parameter
+
+        impl EventStream for Manager<String> {
+            type Event = ManagerEvent; // No <String> - T not actually used in events!
+
+            fn stream_type() -> String {
+                "Manager".to_string()
+            }
+
+            fn apply(&mut self, event: Self::Event) {
+                match event {
+                    ManagerEvent::Updated { thing: _ } => {
+                        self.count += 1;
+                    }
+                }
+            }
+        }
+
+        let id = ManagerUrn::new("mgr-1").unwrap();
+        let _manager: Manager<String> = Manager::with_id(id);
+        let _event = ManagerEvent::Updated {
+            thing: Thing {
+                value: "test".to_string(),
+            },
+        };
+        // This compiles, proving that ManagerEvent has no type parameter
+    }
 }

@@ -150,7 +150,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     // For type declarations, we need the params with bounds
     let type_params = &generics_with_bounds.params;
 
-    // Analyze which type parameters are used in events
+    // Analyze which type parameters are used in events using proper AST traversal
     let type_param_idents: Vec<_> = generics
         .params
         .iter()
@@ -163,17 +163,41 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // Visitor to detect type parameter usage in types
+    struct TypeParamVisitor<'a> {
+        type_params: &'a [syn::Ident],
+        found: std::collections::HashSet<syn::Ident>,
+    }
+
+    impl<'ast, 'a> syn::visit::Visit<'ast> for TypeParamVisitor<'a> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            // Check if this path is a single identifier matching one of our type parameters
+            if path.segments.len() == 1 {
+                let segment = &path.segments[0];
+                if segment.arguments.is_empty() {
+                    for type_param in self.type_params {
+                        if segment.ident == *type_param {
+                            self.found.insert(type_param.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            // Continue visiting nested types (e.g., Vec<T>, Option<T>)
+            syn::visit::visit_path(self, path);
+        }
+    }
+
     // Check if a type is used in event fields
     let mut used_in_events = std::collections::HashSet::new();
     for event in &aggregate_def.events {
         for field in &event.fields {
-            // Check if field type contains any of our generic type parameters
-            let field_type_str = quote::quote!(#field).to_string();
-            for type_ident in &type_param_idents {
-                if field_type_str.contains(&type_ident.to_string()) {
-                    used_in_events.insert(type_ident.clone());
-                }
-            }
+            let mut visitor = TypeParamVisitor {
+                type_params: &type_param_idents,
+                found: std::collections::HashSet::new(),
+            };
+            syn::visit::visit_field(&mut visitor, field);
+            used_in_events.extend(visitor.found);
         }
     }
 
