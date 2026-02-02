@@ -11,6 +11,7 @@ pub struct AggregateDefinition {
     pub state_fields: Vec<Field>,
     pub commands: Vec<CommandVariant>,
     pub events: Vec<EventVariant>,
+    pub base_service_trait: Option<syn::Path>,
     pub service_functions: Vec<ServiceFunction>,
 }
 
@@ -43,6 +44,7 @@ impl Parse for AggregateDefinition {
         let mut state_fields = Vec::new();
         let mut commands = Vec::new();
         let mut events = Vec::new();
+        let mut base_service_trait = None;
         let mut service_functions = Vec::new();
 
         while !content.is_empty() {
@@ -52,6 +54,72 @@ impl Parse for AggregateDefinition {
             match section_name.to_string().as_str() {
                 "namespace" => {
                     namespace = Some(content.parse()?);
+                }
+                "service" => {
+                    // Check if there's a base trait before the opening brace
+                    // service: BaseService { ... } or service: { ... }
+                    if !content.peek(Brace) {
+                        // Try to parse base trait path
+                        if let Ok(path) = content.parse::<syn::Path>() {
+                            base_service_trait = Some(path);
+                        }
+                    }
+
+                    let section_content;
+                    syn::braced!(section_content in content);
+
+                    while !section_content.is_empty() {
+                        // Parse optional "async"
+                        let is_async = section_content.peek(Token![async]);
+                        if is_async {
+                            section_content.parse::<Token![async]>()?;
+                        }
+
+                        // Parse "fn"
+                        section_content.parse::<Token![fn]>()?;
+
+                        // Parse function name
+                        let fn_name: Ident = section_content.parse()?;
+
+                        // Parse optional lifetime parameters
+                        let lifetimes = if section_content.peek(Token![<]) {
+                            section_content.parse::<Token![<]>()?;
+                            let lifetimes_content: syn::punctuated::Punctuated<
+                                syn::LifetimeParam,
+                                Token![,],
+                            > = syn::punctuated::Punctuated::parse_separated_nonempty(
+                                &section_content,
+                            )?;
+                            section_content.parse::<Token![>]>()?;
+                            lifetimes_content.into_iter().collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        // Parse function parameters
+                        let inputs_content;
+                        syn::parenthesized!(inputs_content in section_content);
+                        let inputs: syn::punctuated::Punctuated<FnArg, Token![,]> =
+                            inputs_content.parse_terminated(FnArg::parse, Token![,])?;
+
+                        // Parse return type
+                        let output: ReturnType = section_content.parse()?;
+
+                        service_functions.push(ServiceFunction {
+                            name: fn_name,
+                            lifetimes,
+                            inputs: inputs.into_iter().collect(),
+                            output,
+                            is_async,
+                        });
+
+                        // Optional comma or semicolon
+                        if section_content.peek(Token![,]) {
+                            section_content.parse::<Token![,]>()?;
+                        } else if section_content.peek(Token![;]) {
+                            section_content.parse::<Token![;]>()?;
+                        }
+                    }
                 }
                 _ => {
                     let section_content;
@@ -166,60 +234,6 @@ impl Parse for AggregateDefinition {
                                 }
                             }
                         }
-                        "service" => {
-                            while !section_content.is_empty() {
-                                // Parse optional "async"
-                                let is_async = section_content.peek(Token![async]);
-                                if is_async {
-                                    section_content.parse::<Token![async]>()?;
-                                }
-
-                                // Parse "fn"
-                                section_content.parse::<Token![fn]>()?;
-
-                                // Parse function name
-                                let fn_name: Ident = section_content.parse()?;
-
-                                // Parse optional lifetime parameters
-                                let lifetimes = if section_content.peek(Token![<]) {
-                                    section_content.parse::<Token![<]>()?;
-                                    let lifetimes_content: syn::punctuated::Punctuated<
-                                        syn::LifetimeParam,
-                                        Token![,],
-                                    > = syn::punctuated::Punctuated::parse_separated_nonempty(
-                                        &section_content,
-                                    )?;
-                                    section_content.parse::<Token![>]>()?;
-                                    lifetimes_content.into_iter().collect()
-                                } else {
-                                    Vec::new()
-                                };
-
-                                // Parse function parameters
-                                let inputs_content;
-                                syn::parenthesized!(inputs_content in section_content);
-                                let inputs: syn::punctuated::Punctuated<FnArg, Token![,]> =
-                                    inputs_content.parse_terminated(FnArg::parse, Token![,])?;
-
-                                // Parse return type
-                                let output: ReturnType = section_content.parse()?;
-
-                                service_functions.push(ServiceFunction {
-                                    name: fn_name,
-                                    lifetimes,
-                                    inputs: inputs.into_iter().collect(),
-                                    output,
-                                    is_async,
-                                });
-
-                                // Optional comma or semicolon
-                                if section_content.peek(Token![,]) {
-                                    section_content.parse::<Token![,]>()?;
-                                } else if section_content.peek(Token![;]) {
-                                    section_content.parse::<Token![;]>()?;
-                                }
-                            }
-                        }
                         _ => {
                             return Err(syn::Error::new_spanned(
                                 section_name,
@@ -241,6 +255,7 @@ impl Parse for AggregateDefinition {
             state_fields,
             commands,
             events,
+            base_service_trait,
             service_functions,
         })
     }

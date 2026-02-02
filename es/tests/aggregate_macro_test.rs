@@ -510,4 +510,70 @@ mod tests {
         let result = services.check_title(empty_title);
         assert_eq!(result, None);
     }
+
+    #[tokio::test]
+    async fn test_service_with_base_trait() {
+        // Define a base service trait
+        #[async_trait]
+        pub trait FileService: Send + Sync {
+            async fn read_file(&self, path: &str) -> Result<String, String>;
+        }
+
+        // Test that we can extend an existing service trait
+        define_aggregate! {
+            Report {
+                state: {
+                    title: String,
+                    content: String,
+                },
+                commands: {
+                    GenerateReport { title: String }
+                },
+                events: {
+                    ReportGenerated { title: String, content: String }
+                },
+                service: FileService {
+                    async fn validate_title(title: &str) -> bool;
+                }
+            }
+        }
+
+        // Implement the generated service trait
+        #[derive(Clone)]
+        struct MockReportServices;
+
+        #[async_trait]
+        impl FileService for MockReportServices {
+            async fn read_file(&self, path: &str) -> Result<String, String> {
+                if path.is_empty() {
+                    Err("Path cannot be empty".to_string())
+                } else {
+                    Ok(format!("Contents of {}", path))
+                }
+            }
+        }
+
+        #[async_trait]
+        impl ReportServices for MockReportServices {
+            async fn validate_title(&self, title: &str) -> bool {
+                !title.is_empty() && title.len() <= 100
+            }
+        }
+
+        // Test the services
+        let services = MockReportServices;
+
+        // Test the base trait method
+        let result = services.read_file("test.txt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Contents of test.txt");
+
+        let result = services.read_file("").await;
+        assert!(result.is_err());
+
+        // Test the aggregate-specific method
+        assert!(services.validate_title("Valid Title").await);
+        assert!(!services.validate_title("").await);
+        assert!(!services.validate_title(&"x".repeat(101)).await);
+    }
 }
