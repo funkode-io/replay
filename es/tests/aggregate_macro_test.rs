@@ -645,4 +645,80 @@ mod tests {
         assert!(services.validate_entry("Valid entry"));
         assert!(!services.validate_entry(""));
     }
+
+    #[test]
+    fn test_aggregate_with_generic_type_parameter() {
+        // Test aggregate with generic type parameter - bounds are automatically added by macro
+        define_aggregate! {
+            FileManager<T> {
+                state: {
+                    processed: T,
+                    count: usize,
+                },
+                commands: {
+                    ProcessFile { data: T }
+                },
+                events: {
+                    FileProcessed { data: T }
+                }
+            }
+        }
+
+        // Test with String type
+        impl EventStream for FileManager<String> {
+            type Event = FileManagerEvent<String>;
+
+            fn stream_type() -> String {
+                "FileManager".to_string()
+            }
+
+            fn apply(&mut self, event: Self::Event) {
+                match event {
+                    FileManagerEvent::FileProcessed { data } => {
+                        self.processed = data;
+                        self.count += 1;
+                    }
+                }
+            }
+        }
+
+        // Create an instance
+        let id = FileManagerUrn::new("manager-1").unwrap();
+        let mut manager: FileManager<String> = FileManager::with_id(id);
+        assert_eq!(manager.count, 0);
+        assert_eq!(manager.processed, String::default());
+
+        // Apply an event
+        let event = FileManagerEvent::FileProcessed {
+            data: "file1.txt".to_string(),
+        };
+        manager.apply(event);
+        assert_eq!(manager.processed, "file1.txt");
+        assert_eq!(manager.count, 1);
+
+        // Test with i32 type
+        impl EventStream for FileManager<i32> {
+            type Event = FileManagerEvent<i32>;
+
+            fn stream_type() -> String {
+                "FileManager".to_string()
+            }
+
+            fn apply(&mut self, event: Self::Event) {
+                match event {
+                    FileManagerEvent::FileProcessed { data } => {
+                        self.processed = data;
+                        self.count += 1;
+                    }
+                }
+            }
+        }
+
+        let id2 = FileManagerUrn::new("manager-2").unwrap();
+        let mut manager2: FileManager<i32> = FileManager::with_id(id2);
+        let event2 = FileManagerEvent::FileProcessed { data: 42 };
+        manager2.apply(event2);
+        assert_eq!(manager2.processed, 42);
+        assert_eq!(manager2.count, 1);
+    }
 }

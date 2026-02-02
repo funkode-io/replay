@@ -12,6 +12,8 @@ use merge_events_macro::QueryEventsDefinition;
 pub fn derive_event(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
+    let generics = &input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let event_type_impl = match input.data {
         Data::Enum(data_enum) => {
@@ -28,7 +30,7 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
             });
 
             quote! {
-                impl replay::Event for #name {
+                impl #impl_generics replay::Event for #name #ty_generics #where_clause {
                     fn event_type(&self) -> String {
                         match self {
                             #(#match_arms)*
@@ -40,7 +42,7 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
         // if it's an struct use the struct name
         Data::Struct(_data_struct) => {
             quote! {
-                impl replay::Event for #name {
+                impl #impl_generics replay::Event for #name #ty_generics #where_clause {
                     fn event_type(&self) -> String {
                         stringify!(#name).to_string()
                     }
@@ -123,6 +125,30 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     let aggregate_def = parse_macro_input!(input as AggregateDefinition);
 
     let name = &aggregate_def.name;
+    let generics = &aggregate_def.generics;
+
+    // Add required bounds to all generic type parameters for Event trait compatibility
+    let mut generics_with_bounds = generics.clone();
+    for param in &mut generics_with_bounds.params {
+        if let syn::GenericParam::Type(type_param) = param {
+            // Add the required bounds: Clone + Default + Debug + PartialEq + Serialize + DeserializeOwned + Send + Sync
+            type_param.bounds.push(syn::parse_quote!(Clone));
+            type_param.bounds.push(syn::parse_quote!(Default));
+            type_param.bounds.push(syn::parse_quote!(std::fmt::Debug));
+            type_param.bounds.push(syn::parse_quote!(PartialEq));
+            type_param.bounds.push(syn::parse_quote!(serde::Serialize));
+            type_param
+                .bounds
+                .push(syn::parse_quote!(serde::de::DeserializeOwned));
+            type_param.bounds.push(syn::parse_quote!(Send));
+            type_param.bounds.push(syn::parse_quote!(Sync));
+        }
+    }
+
+    let (impl_generics, ty_generics, where_clause) = generics_with_bounds.split_for_impl();
+    // For type declarations, we need the params with bounds
+    let type_params = &generics_with_bounds.params;
+
     let command_name = quote::format_ident!("{}Command", name);
     let event_name = quote::format_ident!("{}Event", name);
     let urn_name = quote::format_ident!("{}Urn", name);
@@ -340,16 +366,24 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Generate serde(bound = "") to prevent serde from adding its own bounds
+    let serde_bound_attr = if !generics.params.is_empty() {
+        quote! { #[serde(bound = "")] }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         // Aggregate state struct
         #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
-        pub struct #name {
+        #serde_bound_attr
+        pub struct #name <#type_params> #where_clause {
             pub id: #urn_name,
             #(#state_fields),*
         }
 
         // Implement WithId trait
-        impl replay::WithId for #name {
+        impl #impl_generics replay::WithId for #name #ty_generics #where_clause {
             type StreamId = #urn_name;
 
             fn with_id(id: Self::StreamId) -> Self {
@@ -365,14 +399,16 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
 
         // Command enum
-        #[derive(Debug)]
-        pub enum #command_name {
+        #[derive(serde::Serialize, serde::Deserialize, Debug)]
+        #serde_bound_attr
+        pub enum #command_name <#type_params> #where_clause {
             #(#command_variants),*
         }
 
         // Event enum with Event derive
         #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, replay_macros::Event)]
-        pub enum #event_name {
+        #serde_bound_attr
+        pub enum #event_name <#type_params> #where_clause {
             #(#event_variants),*
         }
 
