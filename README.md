@@ -392,6 +392,29 @@ define_aggregate! {
 //
 // Your implementation must now implement both FileService and OrderServices
 
+// You can also extend multiple service traits:
+define_aggregate! {
+    AuditLog {
+        state: {
+            entries: Vec<String>,
+        },
+        commands: {
+            AddEntry { message: String }
+        },
+        events: {
+            EntryAdded { message: String }
+        },
+        service: FileService + LogService {
+            fn validate_entry(entry: &str) -> bool;
+        }
+    }
+}
+
+// This generates:
+// pub trait AuditLogServices: FileService + LogService + Send + Sync {
+//     fn validate_entry(&self, entry: &str) -> bool;
+// }
+
 impl EventStream for BankAccount {
     type Event = BankAccountEvent;
 
