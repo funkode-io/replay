@@ -28,7 +28,7 @@ use crate::{Error, EventStream};
 /// - `id`: Returns the aggregate's identifier (URN).
 #[cfg(not(target_arch = "wasm32"))]
 pub trait Aggregate: Sync + Send + EventStream {
-    type Command: Sync + Send;
+    type Command: Send;
 
     type Error: std::error::Error + From<Error> + Sync + Send;
     type Services: Sync + Send;
@@ -78,7 +78,7 @@ pub trait Aggregate: Sync + Send + EventStream {
 /// - `id`: Returns the aggregate's identifier (URN).
 #[cfg(target_arch = "wasm32")]
 pub trait Aggregate: Sync + EventStream {
-    type Command: Sync;
+    type Command;
 
     type Error: std::error::Error + From<Error> + Sync;
     type Services: Sync;
