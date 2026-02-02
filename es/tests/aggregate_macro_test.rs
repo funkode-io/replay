@@ -440,4 +440,74 @@ mod tests {
         assert_eq!(users.len(), 1);
         assert!(!users.contains(&urn1)); // urn1 should also be gone
     }
+
+    #[tokio::test]
+    async fn test_service_with_lifetime() {
+        // Test that service functions can use lifetime parameters
+        define_aggregate! {
+            Document {
+                state: {
+                    title: String,
+                    content: String,
+                },
+                commands: {
+                    CreateDocument { title: String, content: String },
+                    UpdateContent { content: String }
+                },
+                events: {
+                    DocumentCreated { title: String, content: String },
+                    ContentUpdated { content: String }
+                },
+                service: {
+                    async fn validate_content<'a>(content: &'a str) -> Result<&'a str, String>;
+                    fn check_title<'a>(title: &'a str) -> Option<&'a str>;
+                }
+            }
+        }
+
+        // Implement the service trait with lifetime parameters
+        #[derive(Clone)]
+        struct MockDocumentServices;
+
+        #[async_trait]
+        impl DocumentServices for MockDocumentServices {
+            async fn validate_content<'a>(&self, content: &'a str) -> Result<&'a str, String> {
+                if content.len() < 10 {
+                    Err("Content too short".to_string())
+                } else {
+                    Ok(content)
+                }
+            }
+
+            fn check_title<'a>(&self, title: &'a str) -> Option<&'a str> {
+                if title.is_empty() {
+                    None
+                } else {
+                    Some(title)
+                }
+            }
+        }
+
+        // Test the services
+        let services = MockDocumentServices;
+
+        // Test validate_content
+        let valid_content = "This is a long enough content string";
+        let result = services.validate_content(valid_content).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), valid_content);
+
+        let short_content = "Short";
+        let result = services.validate_content(short_content).await;
+        assert!(result.is_err());
+
+        // Test check_title
+        let title = "My Document";
+        let result = services.check_title(title);
+        assert_eq!(result, Some(title));
+
+        let empty_title = "";
+        let result = services.check_title(empty_title);
+        assert_eq!(result, None);
+    }
 }

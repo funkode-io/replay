@@ -287,6 +287,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
 
         let trait_methods = aggregate_def.service_functions.iter().map(|func| {
             let func_name = &func.name;
+            let lifetimes = &func.lifetimes;
             let inputs = &func.inputs;
             let output = &func.output;
             let async_token = if func.is_async {
@@ -294,8 +295,15 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
             } else {
                 quote! {}
             };
+
+            let lifetime_params = if !lifetimes.is_empty() {
+                quote! { <#(#lifetimes),*> }
+            } else {
+                quote! {}
+            };
+
             quote! {
-                #async_token fn #func_name(&self, #(#inputs),*) #output;
+                #async_token fn #func_name #lifetime_params(&self, #(#inputs),*) #output;
             }
         });
 

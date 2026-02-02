@@ -26,6 +26,7 @@ pub struct EventVariant {
 
 pub struct ServiceFunction {
     pub name: Ident,
+    pub lifetimes: Vec<syn::LifetimeParam>,
     pub inputs: Vec<FnArg>,
     pub output: ReturnType,
     pub is_async: bool,
@@ -179,6 +180,21 @@ impl Parse for AggregateDefinition {
                                 // Parse function name
                                 let fn_name: Ident = section_content.parse()?;
 
+                                // Parse optional lifetime parameters
+                                let lifetimes = if section_content.peek(Token![<]) {
+                                    section_content.parse::<Token![<]>()?;
+                                    let lifetimes_content: syn::punctuated::Punctuated<
+                                        syn::LifetimeParam,
+                                        Token![,],
+                                    > = syn::punctuated::Punctuated::parse_separated_nonempty(
+                                        &section_content,
+                                    )?;
+                                    section_content.parse::<Token![>]>()?;
+                                    lifetimes_content.into_iter().collect()
+                                } else {
+                                    Vec::new()
+                                };
+
                                 // Parse function parameters
                                 let inputs_content;
                                 syn::parenthesized!(inputs_content in section_content);
@@ -190,6 +206,7 @@ impl Parse for AggregateDefinition {
 
                                 service_functions.push(ServiceFunction {
                                     name: fn_name,
+                                    lifetimes,
                                     inputs: inputs.into_iter().collect(),
                                     output,
                                     is_async,
