@@ -1123,4 +1123,92 @@ mod tests {
         assert_eq!(processor.processed_content, "Hello from bytes!");
         assert_eq!(processor.file_count, 1);
     }
+
+    #[test]
+    fn test_command_with_non_sync_type() {
+        // Test that commands can handle Send but not Sync types (like channels)
+        // This verifies that commands only require Send, not Sync
+        use std::sync::mpsc;
+
+        // mpsc::Receiver is Send but NOT Sync
+        define_aggregate! {
+            StreamProcessor {
+                state: {
+                    messages_received: usize,
+                },
+                commands: {
+                    // Receiver<String> is Send but NOT Sync - this should compile
+                    ProcessStream { receiver: mpsc::Receiver<String> }
+                },
+                events: {
+                    StreamProcessed { count: usize }
+                }
+            }
+        }
+
+        impl EventStream for StreamProcessor {
+            type Event = StreamProcessorEvent;
+
+            fn stream_type() -> String {
+                "StreamProcessor".to_string()
+            }
+
+            fn apply(&mut self, event: Self::Event) {
+                match event {
+                    StreamProcessorEvent::StreamProcessed { count } => {
+                        self.messages_received = count;
+                    }
+                }
+            }
+        }
+
+        impl Aggregate for StreamProcessor {
+            type Command = StreamProcessorCommand;
+            type Error = replay::Error;
+            type Services = ();
+
+            async fn handle(
+                &self,
+                command: Self::Command,
+                _services: &Self::Services,
+            ) -> replay::Result<Vec<Self::Event>> {
+                match command {
+                    StreamProcessorCommand::ProcessStream { receiver } => {
+                        let mut count = 0;
+                        // Consume all messages from the receiver
+                        while let Ok(_msg) = receiver.try_recv() {
+                            count += 1;
+                        }
+                        Ok(vec![StreamProcessorEvent::StreamProcessed {
+                            count: self.messages_received + count,
+                        }])
+                    }
+                }
+            }
+        }
+
+        // Usage - verify it compiles and works
+        let id = StreamProcessorUrn::new("processor-1").unwrap();
+        let mut processor = StreamProcessor::with_id(id);
+
+        // Create a channel (Receiver is Send but not Sync)
+        let (sender, receiver) = mpsc::channel();
+        sender.send("Message 1".to_string()).unwrap();
+        sender.send("Message 2".to_string()).unwrap();
+        sender.send("Message 3".to_string()).unwrap();
+        drop(sender); // Close the channel
+
+        // Create command with the receiver (which is NOT Sync)
+        let command = StreamProcessorCommand::ProcessStream { receiver };
+
+        // This should compile because commands only need Send, not Sync
+        let services = ();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let events = runtime
+            .block_on(processor.handle(command, &services))
+            .unwrap();
+
+        processor.apply_all(events);
+        assert_eq!(processor.messages_received, 3);
+    }
 }

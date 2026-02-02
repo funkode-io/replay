@@ -127,7 +127,8 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     let name = &aggregate_def.name;
     let generics = &aggregate_def.generics;
 
-    // Add required bounds to all generic type parameters
+    // Add required bounds to all generic type parameters for the aggregate state
+    // State needs full bounds since it's persisted and shared
     let mut generics_with_bounds = generics.clone();
     for param in &mut generics_with_bounds.params {
         if let syn::GenericParam::Type(type_param) = param {
@@ -149,6 +150,16 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics_with_bounds.split_for_impl();
     // For type declarations, we need the params with bounds
     let type_params = &generics_with_bounds.params;
+
+    // Create separate bounds for commands - only Send (not Sync) since commands are moved, not shared
+    let mut command_bounds = generics.clone();
+    for param in &mut command_bounds.params {
+        if let syn::GenericParam::Type(type_param) = param {
+            // Commands only need Send - they're effectful operations that are moved, not shared
+            // This allows commands to contain things like streams which are Send but not Sync
+            type_param.bounds.push(syn::parse_quote!(Send));
+        }
+    }
 
     // Analyze which type parameters are used in events using proper AST traversal
     let type_param_idents: Vec<_> = generics
@@ -213,7 +224,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     }
 
     // Create generics for commands that only include used type parameters
-    let mut command_generics = generics_with_bounds.clone();
+    let mut command_generics = command_bounds.clone();
     command_generics.params = command_generics
         .params
         .iter()
