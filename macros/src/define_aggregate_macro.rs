@@ -7,6 +7,7 @@ use syn::{
 // Struct to parse the define_aggregate! macro input
 pub struct AggregateDefinition {
     pub name: Ident,
+    pub generics: syn::Generics,
     pub namespace: Option<syn::LitStr>,
     pub state_fields: Vec<Field>,
     pub commands: Vec<CommandVariant>,
@@ -36,6 +37,9 @@ pub struct ServiceFunction {
 impl Parse for AggregateDefinition {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let name: Ident = input.parse()?;
+
+        // Parse optional generic parameters
+        let generics: syn::Generics = input.parse()?;
 
         let content;
         syn::braced!(content in input);
@@ -262,6 +266,7 @@ impl Parse for AggregateDefinition {
 
         Ok(AggregateDefinition {
             name,
+            generics,
             namespace,
             state_fields,
             commands,
