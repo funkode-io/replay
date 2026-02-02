@@ -127,15 +127,16 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     let name = &aggregate_def.name;
     let generics = &aggregate_def.generics;
 
-    // Add required bounds to all generic type parameters for Event trait compatibility
+    // Add required bounds to all generic type parameters
     let mut generics_with_bounds = generics.clone();
     for param in &mut generics_with_bounds.params {
         if let syn::GenericParam::Type(type_param) = param {
-            // Add the required bounds: Clone + Default + Debug + PartialEq + Serialize + DeserializeOwned + Send + Sync
+            // Add the required bounds: Clone + Default + Debug + Serialize + DeserializeOwned + Send + Sync
+            // Note: PartialEq is NOT automatically added - it's only required if T is used in events,
+            // which the Event derive macro will enforce naturally through its own where clauses
             type_param.bounds.push(syn::parse_quote!(Clone));
             type_param.bounds.push(syn::parse_quote!(Default));
             type_param.bounds.push(syn::parse_quote!(std::fmt::Debug));
-            type_param.bounds.push(syn::parse_quote!(PartialEq));
             type_param.bounds.push(syn::parse_quote!(serde::Serialize));
             type_param
                 .bounds
@@ -148,6 +149,52 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics_with_bounds.split_for_impl();
     // For type declarations, we need the params with bounds
     let type_params = &generics_with_bounds.params;
+
+    // Analyze which type parameters are used in events
+    let type_param_idents: Vec<_> = generics
+        .params
+        .iter()
+        .filter_map(|param| {
+            if let syn::GenericParam::Type(type_param) = param {
+                Some(type_param.ident.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Check if a type is used in event fields
+    let mut used_in_events = std::collections::HashSet::new();
+    for event in &aggregate_def.events {
+        for field in &event.fields {
+            // Check if field type contains any of our generic type parameters
+            let field_type_str = quote::quote!(#field).to_string();
+            for type_ident in &type_param_idents {
+                if field_type_str.contains(&type_ident.to_string()) {
+                    used_in_events.insert(type_ident.clone());
+                }
+            }
+        }
+    }
+
+    // Create generics for events that only include used type parameters
+    let mut event_generics = generics_with_bounds.clone();
+    event_generics.params = event_generics
+        .params
+        .iter()
+        .filter(|param| {
+            if let syn::GenericParam::Type(type_param) = param {
+                used_in_events.contains(&type_param.ident)
+            } else {
+                true // Keep lifetime and const parameters
+            }
+        })
+        .cloned()
+        .collect();
+
+    let (_event_impl_generics, _event_ty_generics, event_where_clause) =
+        event_generics.split_for_impl();
+    let event_type_params = &event_generics.params;
 
     let command_name = quote::format_ident!("{}Command", name);
     let event_name = quote::format_ident!("{}Event", name);
@@ -375,7 +422,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         // Aggregate state struct
-        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+        #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
         #serde_bound_attr
         pub struct #name <#type_params> #where_clause {
             pub id: #urn_name,
@@ -398,6 +445,13 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
             }
         }
 
+        // Implement PartialEq to compare aggregates by ID only
+        impl #impl_generics PartialEq for #name #ty_generics #where_clause {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+
         // Command enum
         #[derive(serde::Serialize, serde::Deserialize, Debug)]
         #serde_bound_attr
@@ -408,7 +462,7 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         // Event enum with Event derive
         #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, replay_macros::Event)]
         #serde_bound_attr
-        pub enum #event_name <#type_params> #where_clause {
+        pub enum #event_name <#event_type_params> #event_where_clause {
             #(#event_variants),*
         }
 

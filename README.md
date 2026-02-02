@@ -498,7 +498,54 @@ async fn main() {
 - You implement the trait with your own struct containing dependencies
 - Use `Arc<dyn YourServices>` as the `Services` type in your aggregate
 - Services allow dependency injection, making aggregates easier to test
-- The aggregate struct has no type parameters - it stays simple
+
+#### Service Function Lifetimes
+
+Service functions can use lifetime parameters when working with borrowed data:
+
+```rust
+define_aggregate! {
+    Document {
+        state: {
+            content: String,
+            validated: bool,
+        },
+        commands: {
+            UpdateContent { content: String }
+        },
+        events: {
+            ContentUpdated { content: String }
+        },
+        service: {
+            // Lifetime parameters for borrowed data
+            fn validate_content<'a>(content: &'a str) -> Result<&'a str, String>;
+            
+            // Multiple lifetime parameters work too
+            fn compare_contents<'a, 'b>(old: &'a str, new: &'b str) -> bool;
+        }
+    }
+}
+
+// The generated trait includes the lifetime parameters
+// pub trait DocumentServices: Send + Sync {
+//     fn validate_content<'a>(&self, content: &'a str) -> Result<&'a str, String>;
+//     fn compare_contents<'a, 'b>(&self, old: &'a str, new: &'b str) -> bool;
+// }
+
+impl DocumentServices for MyDocumentServices {
+    fn validate_content<'a>(&self, content: &'a str) -> Result<&'a str, String> {
+        if content.is_empty() {
+            Err("Content cannot be empty".to_string())
+        } else {
+            Ok(content)
+        }
+    }
+
+    fn compare_contents<'a, 'b>(&self, old: &'a str, new: &'b str) -> bool {
+        old != new
+    }
+}
+```
 
 #### Async Services
 
@@ -598,6 +645,129 @@ assert_eq!(customer_urn.nss(), "peter@example.com");
 // Get reference to inner URN
 let inner_urn: &Urn = customer_urn.to_urn();
 ```
+
+### Generic Type Parameters
+
+Aggregates can use generic type parameters to make them reusable with different data types. The macro automatically adds required trait bounds (`Clone`, `Default`, `Debug`, `Serialize`, `DeserializeOwned`, `Send`, `Sync`) to all type parameters.
+
+```rust
+use replay_macros::define_aggregate;
+use serde::{Deserialize, Serialize};
+
+// Define an aggregate with a generic type parameter
+define_aggregate! {
+    FileManager<T: PartialEq> {
+        state: {
+            processed: T,
+            count: usize,
+        },
+        commands: {
+            ProcessFile { data: T }
+        },
+        events: {
+            FileProcessed { data: T }
+        }
+    }
+}
+
+// The macro generates:
+// - FileManager<T> struct with automatic bounds
+// - FileManagerCommand<T> enum
+// - FileManagerEvent<T> enum (only includes T since T is used in events)
+// - FileManagerUrn type
+
+impl EventStream for FileManager<String> {
+    type Event = FileManagerEvent<String>;
+
+    fn stream_type() -> String {
+        "FileManager".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            FileManagerEvent::FileProcessed { data } => {
+                self.processed = data;
+                self.count += 1;
+            }
+        }
+    }
+}
+
+// Usage with concrete type
+let id = FileManagerUrn::new("manager-1").unwrap();
+let mut manager: FileManager<String> = FileManager::with_id(id);
+let event = FileManagerEvent::FileProcessed { 
+    data: "file.txt".to_string() 
+};
+manager.apply(event);
+```
+
+#### Smart Event Enum Generics
+
+The macro intelligently analyzes which type parameters are actually used in event variants. **If a type parameter is not used in any event**, it won't be included in the Event enum's generic parameters.
+
+This means you don't need to add `PartialEq` bounds unless the type is actually used in events:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+// Type without PartialEq
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+struct NoCompare {
+    data: String,
+}
+
+// T is used in state and commands, but NOT in events
+define_aggregate! {
+    Container<T> {
+        state: {
+            item: T,
+            count: usize,
+        },
+        commands: {
+            Store { value: T }
+        },
+        events: {
+            Stored { count: usize }  // T is NOT used here!
+        }
+    }
+}
+
+// The macro generates:
+// - Container<T> with all required bounds (Clone, Default, etc.)
+// - ContainerCommand<T> (includes T since used in commands)
+// - ContainerEvent (NO type parameter! T not used in events)
+
+impl EventStream for Container<NoCompare> {
+    type Event = ContainerEvent;  // Note: No <NoCompare> needed!
+
+    fn stream_type() -> String {
+        "Container".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            ContainerEvent::Stored { count } => {
+                self.count = count;
+            }
+        }
+    }
+}
+
+// This works even though NoCompare doesn't implement PartialEq,
+// because ContainerEvent doesn't need it
+let id = ContainerUrn::new("container-1").unwrap();
+let container: Container<NoCompare> = Container::with_id(id);
+let event = ContainerEvent::Stored { count: 5 };
+```
+
+**Key points about generic type parameters:**
+
+- **Automatic bounds**: The macro adds `Clone + Default + Debug + Serialize + DeserializeOwned + Send + Sync` to all type parameters
+- **PartialEq is conditional**: Only add `PartialEq` bound (e.g., `T: PartialEq`) if T is used in events (required by the `Event` trait)
+- **Smart Event enum**: Event enum only includes type parameters that are actually used in event variants
+- **Aggregate comparison**: Aggregates always compare by ID only (using `WithId`), regardless of their generic type parameters
+- **Flexibility**: Allows using types that don't implement `PartialEq` as long as they're not in events
 
 If no custom namespace is specified, the namespace will be automatically derived from the aggregate name (e.g., `BankAccount` → `bank-account`).
 

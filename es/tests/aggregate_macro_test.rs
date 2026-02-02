@@ -108,6 +108,7 @@ mod tests {
     use super::*;
 
     use replay::WithId;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn test_aggregate_generation() {
@@ -649,8 +650,9 @@ mod tests {
     #[test]
     fn test_aggregate_with_generic_type_parameter() {
         // Test aggregate with generic type parameter - bounds are automatically added by macro
+        // Note: PartialEq is required here because T is used in events
         define_aggregate! {
-            FileManager<T> {
+            FileManager<T: PartialEq> {
                 state: {
                     processed: T,
                     count: usize,
@@ -720,5 +722,52 @@ mod tests {
         manager2.apply(event2);
         assert_eq!(manager2.processed, 42);
         assert_eq!(manager2.count, 1);
+    }
+
+    #[test]
+    fn test_aggregate_generic_without_partialeq_in_events() {
+        // Test that T doesn't need PartialEq when it's not used in events
+        // This type deliberately doesn't implement PartialEq
+        #[derive(Clone, Default, Debug, Serialize, Deserialize)]
+        struct NoCompare {
+            data: String,
+        }
+
+        define_aggregate! {
+            Container<T> {
+                state: {
+                    item: T,
+                    count: usize,
+                },
+                commands: {
+                    Store { value: T }
+                },
+                events: {
+                    Stored { count: usize }  // T is not in events, so no PartialEq needed!
+                }
+            }
+        }
+
+        impl EventStream for Container<NoCompare> {
+            type Event = ContainerEvent; // No <NoCompare> since T not used in events
+
+            fn stream_type() -> String {
+                "Container".to_string()
+            }
+
+            fn apply(&mut self, event: Self::Event) {
+                match event {
+                    ContainerEvent::Stored { count } => {
+                        self.count = count;
+                    }
+                }
+            }
+        }
+
+        let id = ContainerUrn::new("container-1").unwrap();
+        let mut container: Container<NoCompare> = Container::with_id(id);
+        let event = ContainerEvent::Stored { count: 5 };
+        container.apply(event);
+        assert_eq!(container.count, 5);
     }
 }
