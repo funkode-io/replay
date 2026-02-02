@@ -928,6 +928,101 @@ mod tests {
     }
 
     #[test]
+    fn test_associated_type_parameter_detection() {
+        // Test that associated types like T::Item are correctly detected as using type parameter T
+        use serde::de::DeserializeOwned;
+        use std::fmt;
+
+        // A trait with an associated type
+        trait Container:
+            Clone + Default + fmt::Debug + Serialize + DeserializeOwned + Sync + Send
+        {
+            type Item: Clone + Default + fmt::Debug + Serialize + DeserializeOwned + Sync + Send;
+        }
+
+        #[derive(Clone, Default, Debug, Serialize, Deserialize)]
+        struct StringContainer;
+        impl Container for StringContainer {
+            type Item = String;
+        }
+
+        // Aggregate where commands use T::Item but events don't
+        define_aggregate! {
+            Processor<T: Container> {
+                state: {
+                    item: T::Item,
+                    count: usize,
+                },
+                commands: {
+                    Process { item: T::Item }  // Uses T::Item - should include T in command generics
+                },
+                events: {
+                    Processed { count: usize }  // Doesn't use T - should NOT include T in event generics
+                }
+            }
+        }
+
+        impl EventStream for Processor<StringContainer> {
+            type Event = ProcessorEvent; // No <StringContainer> since T not used in events
+
+            fn stream_type() -> String {
+                "Processor".to_string()
+            }
+
+            fn apply(&mut self, event: Self::Event) {
+                match event {
+                    ProcessorEvent::Processed { count } => {
+                        self.count = count;
+                    }
+                }
+            }
+        }
+
+        impl Aggregate for Processor<StringContainer> {
+            type Command = ProcessorCommand<StringContainer>; // Should have <StringContainer> since T::Item used!
+            type Error = replay::Error;
+            type Services = ();
+
+            async fn handle(
+                &self,
+                command: Self::Command,
+                _services: &Self::Services,
+            ) -> replay::Result<Vec<Self::Event>> {
+                match command {
+                    ProcessorCommand::Process { item } => {
+                        // item is T::Item which is String
+                        let _: String = item;
+                        Ok(vec![ProcessorEvent::Processed {
+                            count: self.count + 1,
+                        }])
+                    }
+                }
+            }
+        }
+
+        // Test it works
+        let id = ProcessorUrn::new("proc-1").unwrap();
+        let mut processor: Processor<StringContainer> = Processor::with_id(id);
+
+        let command = ProcessorCommand::Process {
+            item: "test".to_string(),
+        };
+
+        let services = ();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let events = runtime
+            .block_on(processor.handle(command, &services))
+            .unwrap();
+
+        processor.apply_all(events);
+        assert_eq!(processor.count, 1);
+
+        // This proves that:
+        // - ProcessorCommand<T> has type parameter T (because T::Item is used)
+        // - ProcessorEvent has NO type parameter (because T is not used in events)
+    }
+
+    #[test]
     fn test_command_with_byte_stream() {
         // Test that commands can handle non-serializable types like byte streams
         // since commands are effectful and don't need serde

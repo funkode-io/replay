@@ -171,15 +171,13 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
 
     impl<'ast, 'a> syn::visit::Visit<'ast> for TypeParamVisitor<'a> {
         fn visit_path(&mut self, path: &'ast syn::Path) {
-            // Check if this path is a single identifier matching one of our type parameters
-            if path.segments.len() == 1 {
-                let segment = &path.segments[0];
-                if segment.arguments.is_empty() {
-                    for type_param in self.type_params {
-                        if segment.ident == *type_param {
-                            self.found.insert(type_param.clone());
-                            break;
-                        }
+            // Check if the first segment of the path matches a type parameter
+            // This handles both simple cases (T) and associated types (A::StreamId)
+            if let Some(first_segment) = path.segments.first() {
+                for type_param in self.type_params {
+                    if first_segment.ident == *type_param {
+                        self.found.insert(type_param.clone());
+                        break;
                     }
                 }
             }
