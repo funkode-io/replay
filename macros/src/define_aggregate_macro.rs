@@ -11,7 +11,7 @@ pub struct AggregateDefinition {
     pub state_fields: Vec<Field>,
     pub commands: Vec<CommandVariant>,
     pub events: Vec<EventVariant>,
-    pub base_service_trait: Option<syn::Path>,
+    pub base_service_traits: Vec<syn::Path>,
     pub service_functions: Vec<ServiceFunction>,
 }
 
@@ -44,7 +44,7 @@ impl Parse for AggregateDefinition {
         let mut state_fields = Vec::new();
         let mut commands = Vec::new();
         let mut events = Vec::new();
-        let mut base_service_trait = None;
+        let mut base_service_traits = Vec::new();
         let mut service_functions = Vec::new();
 
         while !content.is_empty() {
@@ -56,12 +56,23 @@ impl Parse for AggregateDefinition {
                     namespace = Some(content.parse()?);
                 }
                 "service" => {
-                    // Check if there's a base trait before the opening brace
-                    // service: BaseService { ... } or service: { ... }
+                    // Check if there are base traits before the opening brace
+                    // service: BaseService { ... } or service: BaseService + OtherService { ... }
                     if !content.peek(Brace) {
-                        // Try to parse base trait path
-                        if let Ok(path) = content.parse::<syn::Path>() {
-                            base_service_trait = Some(path);
+                        // Parse traits separated by +
+                        loop {
+                            if let Ok(path) = content.parse::<syn::Path>() {
+                                base_service_traits.push(path);
+                            } else {
+                                break;
+                            }
+
+                            // Check if there's a + for another trait
+                            if content.peek(Token![+]) {
+                                content.parse::<Token![+]>()?;
+                            } else {
+                                break;
+                            }
                         }
                     }
 
@@ -255,7 +266,7 @@ impl Parse for AggregateDefinition {
             state_fields,
             commands,
             events,
-            base_service_trait,
+            base_service_traits,
             service_functions,
         })
     }

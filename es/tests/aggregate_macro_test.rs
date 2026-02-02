@@ -576,4 +576,73 @@ mod tests {
         assert!(!services.validate_title("").await);
         assert!(!services.validate_title(&"x".repeat(101)).await);
     }
+
+    #[tokio::test]
+    async fn test_service_with_multiple_base_traits() {
+        // Define multiple base service traits
+        #[async_trait]
+        pub trait FileService: Send + Sync {
+            async fn read_file(&self, path: &str) -> Result<String, String>;
+        }
+
+        pub trait LogService: Send + Sync {
+            fn log(&self, message: &str);
+        }
+
+        // Test that we can extend multiple existing service traits
+        define_aggregate! {
+            AuditLog {
+                state: {
+                    entries: Vec<String>,
+                },
+                commands: {
+                    AddEntry { message: String }
+                },
+                events: {
+                    EntryAdded { message: String }
+                },
+                service: FileService + LogService {
+                    fn validate_entry(entry: &str) -> bool;
+                }
+            }
+        }
+
+        // Implement the generated service trait
+        #[derive(Clone)]
+        struct MockAuditLogServices;
+
+        #[async_trait]
+        impl FileService for MockAuditLogServices {
+            async fn read_file(&self, path: &str) -> Result<String, String> {
+                Ok(format!("Log from {}", path))
+            }
+        }
+
+        impl LogService for MockAuditLogServices {
+            fn log(&self, message: &str) {
+                println!("LOG: {}", message);
+            }
+        }
+
+        impl AuditLogServices for MockAuditLogServices {
+            fn validate_entry(&self, entry: &str) -> bool {
+                !entry.is_empty()
+            }
+        }
+
+        // Test the services
+        let services = MockAuditLogServices;
+
+        // Test the first base trait method
+        let result = services.read_file("audit.log").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Log from audit.log");
+
+        // Test the second base trait method
+        services.log("Test message");
+
+        // Test the aggregate-specific method
+        assert!(services.validate_entry("Valid entry"));
+        assert!(!services.validate_entry(""));
+    }
 }
