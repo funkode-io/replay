@@ -167,7 +167,7 @@ mod tests {
     }
 
     // bank account urn
-    #[derive(Debug, Clone, PartialEq, Urn, SerializeDisplay, DeserializeFromStr)]
+    #[derive(Debug, Clone, Urn, SerializeDisplay, DeserializeFromStr)]
     pub struct BankAccountUrn(Urn);
 
     impl TryFrom<Urn> for BankAccountUrn {
