@@ -54,7 +54,7 @@ impl BankAccountEvent {
 }
 
 // bank account urn
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Urn)]
+#[derive(Clone, Serialize, Deserialize, Debug, Urn)]
 struct BankAccountUrn(Urn);
 
 impl TryFrom<Urn> for BankAccountUrn {

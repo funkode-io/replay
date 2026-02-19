@@ -115,6 +115,16 @@ pub fn derive_urn(input: TokenStream) -> TokenStream {
                 Ok(Self(Urn::from_str(s)?))
             }
         }
+
+        impl PartialEq for #name {
+            fn eq(&self, other: &Self) -> bool {
+                let lhs: &urn::Urn = &self.0;
+                let rhs: &urn::Urn = &other.0;
+                lhs == rhs
+            }
+        }
+
+        impl Eq for #name {}
     };
 
     TokenStream::from(urn_impl)
