@@ -362,10 +362,48 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
     // Generate URN helper methods with namespace validation
     let urn_impl_methods = quote! {
         impl #urn_name {
-            /// Create a new URN with the configured namespace
-            pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
+            /// Create a new URN with the configured namespace.
+            ///
+            /// If `id` is already a full URN string (starts with `"urn:"`), it is
+            /// parsed and validated instead of being used as the raw NSS. Nested URNs
+            /// sharing the same namespace (e.g. `urn:catalog:urn:catalog:urn:catalog:123`)
+            /// are automatically unwrapped down to the innermost non-nested identifier.
+            pub fn new(id: impl std::fmt::Display) -> Result<Self, String> {
+                use std::str::FromStr;
                 let id_str = id.to_string();
-                Ok(Self(urn::UrnBuilder::new(#namespace, &id_str).build()?))
+                if id_str.starts_with("urn:") {
+                    // Parse the full URN string.
+                    let mut urn = urn::Urn::from_str(&id_str)
+                        .map_err(|e| format!("Failed to parse URN: {}", e))?;
+
+                    // Validate that the namespace matches.
+                    if urn.nid() != #namespace {
+                        return Err(format!(
+                            "Invalid URN namespace: expected '{}', got '{}'",
+                            #namespace,
+                            urn.nid()
+                        ));
+                    }
+
+                    // Unwrap nested same-namespace URNs, e.g.
+                    // urn:catalog:urn:catalog:urn:catalog:123 → urn:catalog:123
+                    while urn.nss().starts_with("urn:") {
+                        let inner = urn::Urn::from_str(urn.nss())
+                            .map_err(|e| format!("Failed to parse nested URN: {}", e))?;
+                        if inner.nid() != #namespace {
+                            // Different namespace in the NSS — stop unwrapping.
+                            break;
+                        }
+                        urn = inner;
+                    }
+
+                    Ok(Self(urn))
+                } else {
+                    urn::UrnBuilder::new(#namespace, &id_str)
+                        .build()
+                        .map(Self)
+                        .map_err(|e| format!("Failed to build URN: {}", e))
+                }
             }
 
             /// Parse a URN string and validate the namespace

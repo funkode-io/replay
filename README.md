@@ -308,8 +308,8 @@ The macro automatically generates:
 - The command enum (`BankAccountCommand`)
 - The event enum with `Event` trait (`BankAccountEvent`)
 - The URN type (`BankAccountUrn`) with helper methods:
-  - `YourTypeUrn::new(id)` - Creates a URN with the configured namespace
-  - `YourTypeUrn::parse(input)` - Parses a URN string and validates the namespace
+  - `YourTypeUrn::new(id)` - Creates a URN with the configured namespace. If `id` already starts with `"urn:"` it is parsed and namespace-validated instead of being used as a raw identifier; nested same-namespace URNs (e.g. `urn:customer:urn:customer:123`) are automatically unwrapped to the innermost id
+  - `YourTypeUrn::parse(input)` - Parses a full URN string and validates the namespace
   - `YourTypeUrn::namespace()` - Returns the namespace identifier as a static string
   - `your_urn.to_urn()` - Returns a reference to the inner URN
   - `your_urn.nid()` - Returns the namespace identifier (NID)
@@ -634,6 +634,17 @@ define_aggregate! {
 // The URN helper methods are always available:
 let customer_urn = CustomerUrn::new("peter@example.com").unwrap();
 assert_eq!(customer_urn.to_string(), "urn:customer:peter@example.com");
+
+// new() is smart about full URN strings — passing a URN is the same as parse()
+let same = CustomerUrn::new("urn:customer:peter@example.com").unwrap();
+assert_eq!(same.to_string(), "urn:customer:peter@example.com");
+
+// Accidentally nested URNs are automatically unwrapped
+let nested = CustomerUrn::new("urn:customer:urn:customer:urn:customer:peter@example.com").unwrap();
+assert_eq!(nested.to_string(), "urn:customer:peter@example.com");
+
+// Wrong namespace is rejected
+assert!(CustomerUrn::new("urn:other-namespace:peter@example.com").is_err());
 
 // Get the namespace identifier
 assert_eq!(CustomerUrn::namespace(), "customer");
