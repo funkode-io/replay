@@ -378,28 +378,22 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
             /// parsed and validated instead of being used as the raw NSS. Nested URNs
             /// sharing the same namespace (e.g. `urn:catalog:urn:catalog:urn:catalog:123`)
             /// are automatically unwrapped down to the innermost non-nested identifier.
-            pub fn new(id: impl std::fmt::Display) -> Result<Self, String> {
+            pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
                 use std::str::FromStr;
                 let id_str = id.to_string();
                 if id_str.starts_with("urn:") {
                     // Parse the full URN string.
-                    let mut urn = urn::Urn::from_str(&id_str)
-                        .map_err(|e| format!("Failed to parse URN: {}", e))?;
+                    let mut urn = urn::Urn::from_str(&id_str)?;
 
                     // Validate that the namespace matches.
                     if urn.nid() != #namespace {
-                        return Err(format!(
-                            "Invalid URN namespace: expected '{}', got '{}'",
-                            #namespace,
-                            urn.nid()
-                        ));
+                        return Err(urn::Error::InvalidNid);
                     }
 
                     // Unwrap nested same-namespace URNs, e.g.
                     // urn:catalog:urn:catalog:urn:catalog:123 → urn:catalog:123
                     while urn.nss().starts_with("urn:") {
-                        let inner = urn::Urn::from_str(urn.nss())
-                            .map_err(|e| format!("Failed to parse nested URN: {}", e))?;
+                        let inner = urn::Urn::from_str(urn.nss())?;
                         if inner.nid() != #namespace {
                             // Different namespace in the NSS — stop unwrapping.
                             break;
@@ -412,15 +406,13 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
                     urn::UrnBuilder::new(#namespace, &id_str)
                         .build()
                         .map(Self)
-                        .map_err(|e| format!("Failed to build URN: {}", e))
                 }
             }
 
             /// Parse a URN string and validate the namespace
             pub fn parse(input: impl AsRef<str>) -> Result<Self, String> {
                 use std::str::FromStr;
-                let urn = urn::Urn::from_str(input.as_ref())
-                    .map_err(|e| format!("Failed to parse URN: {}", e))?;
+                let urn = urn::Urn::from_str(input.as_ref()).map_err(|e| e.to_string())?;
 
                 if urn.nid() != #namespace {
                     return Err(format!(
@@ -588,17 +580,13 @@ pub fn define_aggregate(input: TokenStream) -> TokenStream {
         }
 
         impl std::convert::TryFrom<urn::Urn> for #urn_name {
-            type Error = String;
+            type Error = urn::Error;
 
             fn try_from(urn: urn::Urn) -> Result<Self, Self::Error> {
                 if urn.nid() == #namespace {
                     Ok(#urn_name(urn))
                 } else {
-                    Err(format!(
-                        "Invalid URN namespace: expected '{}', got '{}'",
-                        #namespace,
-                        urn.nid()
-                    ))
+                    Err(urn::Error::InvalidNid)
                 }
             }
         }
