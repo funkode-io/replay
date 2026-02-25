@@ -286,6 +286,26 @@ mod tests {
 
         // Verify namespace method
         assert_eq!(CustomerUrn::namespace(), "my-customer");
+
+        // new() with a full URN string should be the same as parse()
+        let from_full_urn = CustomerUrn::new("urn:my-customer:peter@gmail.com").unwrap();
+        assert_eq!(from_full_urn.to_string(), "urn:my-customer:peter@gmail.com");
+
+        // new() with a nested same-namespace URN should unwrap to innermost id
+        let nested =
+            CustomerUrn::new("urn:my-customer:urn:my-customer:urn:my-customer:peter@gmail.com")
+                .unwrap();
+        assert_eq!(nested.to_string(), "urn:my-customer:peter@gmail.com");
+
+        // new() with a wrong namespace in the URN prefix should fail
+        let wrong_ns = CustomerUrn::new("urn:wrong-namespace:peter@gmail.com");
+        assert!(wrong_ns.is_err());
+        assert!(wrong_ns.unwrap_err().contains("Invalid URN namespace"));
+
+        // new() with an outer-correct but inner-different namespace stops at the boundary
+        // e.g. urn:my-customer:urn:other:123 → urn:my-customer:urn:other:123 (no further unwrap)
+        let mixed = CustomerUrn::new("urn:my-customer:urn:other:123").unwrap();
+        assert_eq!(mixed.to_string(), "urn:my-customer:urn:other:123");
     }
 
     #[test]
