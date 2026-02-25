@@ -300,7 +300,7 @@ mod tests {
         // new() with a wrong namespace in the URN prefix should fail
         let wrong_ns = CustomerUrn::new("urn:wrong-namespace:peter@gmail.com");
         assert!(wrong_ns.is_err());
-        assert!(wrong_ns.unwrap_err().contains("Invalid URN namespace"));
+        assert_eq!(wrong_ns.unwrap_err(), urn::Error::InvalidNid);
 
         // new() with an outer-correct but inner-different namespace stops at the boundary
         // e.g. urn:my-customer:urn:other:123 → urn:my-customer:urn:other:123 (no further unwrap)
