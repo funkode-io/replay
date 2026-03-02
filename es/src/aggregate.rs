@@ -1,5 +1,7 @@
 use std::future::Future;
 
+use futures::TryStream;
+
 use crate::{Error, EventStream};
 
 /// An aggregate is a domain-driven design pattern that allows you to model a domain entity as a sequence of events.
@@ -103,6 +105,162 @@ pub trait Aggregate: Sync + EventStream {
             Ok(events)
         }
     }
+}
+
+/// A trait for aggregates that can produce the minimum set of events needed to reconstruct
+/// their current state, discarding redundant or superseded events from the full history.
+///
+/// In event sourcing, an aggregate's full event history may contain events that cancel each other
+/// out (e.g. `Add("a")` followed by `Delete("a")`). Storing and replaying all of them is
+/// correct but inefficient. `Compactable` lets an aggregate express the *minimal* event sequence
+/// that, when replayed from a clean state, would produce the same current state.
+///
+/// The original history is **not** discarded by this trait — it is the caller's responsibility
+/// to archive or retain old events before replacing them with the compacted set.
+/// [`EventStore::compact`] handles this automatically: it archives the full event log under a
+/// numbered version before writing the compacted set as the new live stream.
+///
+/// # Implementation contract
+///
+/// `compacted_events` must derive its output solely from the aggregate's **current in-memory
+/// state fields** — never from a stored log. This guarantees that redundant or cancelling events
+/// are naturally omitted: only what the state actually contains ends up in the result.
+///
+/// The returned sequence must be self-sufficient: replaying it against a freshly constructed
+/// aggregate (via `with_id`) must reproduce the identical state observable before compaction.
+///
+/// # Monthly bank-account compaction example
+///
+/// ## The problem
+///
+/// A busy bank account accumulates thousands of `Deposited` and `Withdrawn` events over many
+/// months. Replaying the full stream on every command grows increasingly slow. However, individual
+/// transactions within the *current* period must remain queryable (e.g. for a monthly statement),
+/// so they cannot simply be dropped.
+///
+/// ## The strategy
+///
+/// Introduce a single summary event:
+///
+/// - **`MonthlyClosed`** — recorded when a month ends; carries the month and its closing balance.
+///   Applying it sets the running balance directly, replacing the entire transaction history of
+///   all prior months.
+///
+/// When `compact` is called:
+///
+/// 1. All history is archived under a new version number (handled by the store).
+/// 2. The store passes the current live event stream to `compacted_events`.
+/// 3. The live stream is replaced with the minimal sequence returned by `compacted_events`:
+///    - The last `MonthlyClosed` event (encodes the entire prior history).
+///    - Any individual `Deposited` / `Withdrawn` events recorded **after** it.
+///
+/// Replaying these few events is enough to reconstruct the exact same aggregate state.
+/// The full history is still accessible via `AggregateVersion::Version(n)`.
+///
+/// ## Code
+///
+/// ```rust,ignore
+/// use chrono::NaiveDate;
+/// use serde::{Deserialize, Serialize};
+/// use replay::{Compactable, EventStream, WithId};
+/// use replay_macros::Event;
+///
+/// // ── Events ──────────────────────────────────────────────────────────────
+///
+/// #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+/// enum BankAccountEvent {
+///     /// A positive amount was credited to the account.
+///     Deposited { operation_date: NaiveDate, amount: f64 },
+///     /// A positive amount was debited from the account.
+///     Withdrawn { operation_date: NaiveDate, amount: f64 },
+///     /// Marks the end of a calendar month and records the closing balance.
+///     /// Applying this event restores the balance without replaying prior transactions.
+///     MonthlyClosed { month: NaiveDate, closing_balance: f64 },
+/// }
+///
+/// // ── Aggregate ────────────────────────────────────────────────────────────
+/// // No extra state fields needed — the aggregate only tracks what it needs for
+/// // business logic.  Compaction is driven by the event stream itself.
+///
+/// struct BankAccountAggregate {
+///     pub id: BankAccountUrn,
+///     pub balance: f64,
+/// }
+///
+/// // ── EventStream ──────────────────────────────────────────────────────────
+///
+/// impl EventStream for BankAccountAggregate {
+///     type Event = BankAccountEvent;
+///
+///     fn stream_type() -> String { "BankAccount".to_string() }
+///
+///     fn apply(&mut self, event: Self::Event) {
+///         match event {
+///             BankAccountEvent::Deposited { amount, .. }  => self.balance += amount,
+///             BankAccountEvent::Withdrawn { amount, .. }  => self.balance -= amount,
+///             BankAccountEvent::MonthlyClosed { closing_balance, .. } => {
+///                 self.balance = closing_balance;
+///             }
+///         }
+///     }
+/// }
+///
+/// // ── Compactable ──────────────────────────────────────────────────────────
+///
+/// impl Compactable for BankAccountAggregate {
+///     async fn compacted_events(
+///         &self,
+///         events: impl TryStream<Ok = Self::Event, Error = replay::Error> + Send,
+///     ) -> replay::Result<Vec<Self::Event>> {
+///         use futures::TryStreamExt;
+///         // Sliding-window via try_fold: only keep events from the last
+///         // MonthlyClosed onward.  Prior months are never buffered in memory.
+///         events
+///             .try_fold(Vec::new(), |mut tail, event| async move {
+///                 if matches!(event, BankAccountEvent::MonthlyClosed { .. }) {
+///                     tail.clear(); // discard all history before this checkpoint
+///                 }
+///                 tail.push(event);
+///                 Ok(tail)
+///             })
+///             .await
+///     }
+/// }
+/// ```
+///
+/// ## Before and after compaction
+///
+/// **Full history (stored as `Version(1)` after the first compact call):**
+/// ```text
+/// Deposited    { operation_date: 2026-01-01, amount: 1000.00 }
+/// Withdrawn    { operation_date: 2026-01-15, amount:  200.00 }
+/// Deposited    { operation_date: 2026-01-31, amount:  500.00 }
+/// MonthlyClosed { month: 2026-01, closing_balance: 1300.00 }
+/// Deposited    { operation_date: 2026-02-15, amount:  400.00 }  ← current period
+/// Withdrawn    { operation_date: 2026-02-28, amount:  100.00 }  ← current period
+/// ```
+///
+/// **Compacted live stream (3 events instead of 6):**
+/// ```text
+/// MonthlyClosed { month: 2026-01, closing_balance: 1300.00 }  ← all of January
+/// Deposited    { operation_date: 2026-02-15, amount: 400.00 } ← preserved
+/// Withdrawn    { operation_date: 2026-02-28, amount: 100.00 } ← preserved
+/// ```
+///
+/// Replaying the compacted stream yields `balance == 1600.00`, identical to replaying
+/// the full history. The full history remains accessible via `AggregateVersion::Version(1)`.
+pub trait Compactable: EventStream {
+    /// Consumes the current live event stream for this aggregate and returns the minimal
+    /// subsequence that, when replayed from a fresh instance, reproduces the current state.
+    ///
+    /// The store passes the live stream to this method so implementations can process events
+    /// one at a time without loading the entire history into memory.  Only events that must
+    /// be preserved (e.g. the most recent summary + the current-period transactions) need to
+    /// be buffered.
+    fn compacted_events(
+        &self,
+        events: impl TryStream<Ok = Self::Event, Error = Error> + Send,
+    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + Send;
 }
 
 // tests

@@ -10,9 +10,13 @@ pub struct PersistedEvent<E> {
     pub data: E,
     pub stream_id: Urn,
     pub r#type: String,
+    /// Monotonic position of this event within the aggregate's current stream.
     pub version: i64,
     pub created: DateTime<Utc>,
     pub metadata: Metadata,
+    /// `None` identifies events belonging to the current (latest) stream.
+    /// `Some(n)` identifies events that were archived during the nth compaction.
+    pub aggregate_version: Option<u32>,
 }
 
 impl<E> PersistedEvent<E> {
@@ -25,6 +29,7 @@ impl<E> PersistedEvent<E> {
             version: self.version,
             created: self.created,
             metadata: self.metadata,
+            aggregate_version: self.aggregate_version,
         }
     }
 
@@ -37,6 +42,7 @@ impl<E> PersistedEvent<E> {
             version: self.version,
             created: self.created,
             metadata: self.metadata,
+            aggregate_version: self.aggregate_version,
         }
     }
 }

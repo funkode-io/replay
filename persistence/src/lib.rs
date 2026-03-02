@@ -1,3 +1,4 @@
+mod aggregate_version;
 mod cqrs;
 mod error;
 mod filters;
@@ -6,6 +7,7 @@ mod persisted_event;
 mod query;
 mod store;
 
+pub use aggregate_version::AggregateVersion;
 pub use cqrs::Cqrs;
 pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;

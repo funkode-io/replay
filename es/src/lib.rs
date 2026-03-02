@@ -4,7 +4,7 @@ mod event;
 mod metadata;
 mod stream;
 
-pub use aggregate::Aggregate;
+pub use aggregate::{Aggregate, Compactable};
 pub use error::{Error, ErrorKind, ErrorStatus, Result};
 pub use event::Event;
 pub use metadata::Metadata;
