@@ -122,12 +122,12 @@ pub trait Aggregate: Sync + EventStream {
 ///
 /// # Implementation contract
 ///
-/// `compacted_events` must derive its output solely from the aggregate's **current in-memory
-/// state fields** — never from a stored log. This guarantees that redundant or cancelling events
-/// are naturally omitted: only what the state actually contains ends up in the result.
+/// `compacted_events` receives the **current live event stream** supplied by the store and must
+/// return the shortest subsequence that, when replayed from a freshly constructed aggregate
+/// (via `with_id`), reproduces the identical state observable before compaction.
 ///
-/// The returned sequence must be self-sufficient: replaying it against a freshly constructed
-/// aggregate (via `with_id`) must reproduce the identical state observable before compaction.
+/// Implementations should process the stream lazily — buffering only the events that are truly
+/// needed in the output — rather than collecting the full history into memory first.
 ///
 /// # Monthly bank-account compaction example
 ///

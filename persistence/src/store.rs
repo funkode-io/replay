@@ -61,7 +61,7 @@ pub trait EventStore: Send + Sync {
         &self,
         aggregate: &A,
         metadata: replay::Metadata,
-    ) -> impl Future<Output = Result<u32, replay::Error>> + Send
+    ) -> impl Future<Output = Result<i32, replay::Error>> + Send
     where
         A: replay::Aggregate + Compactable + Sync;
 }
