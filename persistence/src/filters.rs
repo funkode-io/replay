@@ -17,7 +17,7 @@ pub enum StreamFilter {
     CreatedAfter(chrono::DateTime<Utc>),
     /// Matches events whose `aggregate_version` equals the given value.
     /// `None` selects current (non-archived) events; `Some(n)` selects version n.
-    WithAggregateVersion(Option<u32>),
+    WithAggregateVersion(Option<i32>),
     And(Box<StreamFilter>, Box<StreamFilter>),
     Or(Box<StreamFilter>, Box<StreamFilter>),
     Not(Box<StreamFilter>),
@@ -101,11 +101,11 @@ impl StreamFilter {
         }
     }
 
-    pub fn with_aggregate_version(aggregate_version: Option<u32>) -> StreamFilter {
+    pub fn with_aggregate_version(aggregate_version: Option<i32>) -> StreamFilter {
         StreamFilter::WithAggregateVersion(aggregate_version)
     }
 
-    pub fn and_aggregate_version(self, aggregate_version: Option<u32>) -> StreamFilter {
+    pub fn and_aggregate_version(self, aggregate_version: Option<i32>) -> StreamFilter {
         self.and(StreamFilter::WithAggregateVersion(aggregate_version))
     }
 }

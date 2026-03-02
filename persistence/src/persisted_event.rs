@@ -16,7 +16,8 @@ pub struct PersistedEvent<E> {
     pub metadata: Metadata,
     /// `None` identifies events belonging to the current (latest) stream.
     /// `Some(n)` identifies events that were archived during the nth compaction.
-    pub aggregate_version: Option<u32>,
+    /// Matches the `INTEGER` column type in the database.
+    pub aggregate_version: Option<i32>,
 }
 
 impl<E> PersistedEvent<E> {

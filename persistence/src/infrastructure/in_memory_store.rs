@@ -93,8 +93,7 @@ impl EventStore for InMemoryEventStore {
             .map(|events| {
                 events
                     .iter()
-                    .filter(|e| e.aggregate_version.is_none())
-                    .last()
+                    .rfind(|e| e.aggregate_version.is_none())
                     .map(|e| e.version)
                     .unwrap_or(0)
             })
@@ -179,7 +178,7 @@ impl EventStore for InMemoryEventStore {
         &self,
         aggregate: &A,
         metadata: replay::Metadata,
-    ) -> Result<u32, replay::Error>
+    ) -> Result<i32, replay::Error>
     where
         A: replay::Aggregate + Compactable + Sync,
     {
@@ -212,7 +211,7 @@ impl EventStore for InMemoryEventStore {
             let mut store = self.events.write().unwrap();
             let stream = store.entry(stream_id.clone()).or_default();
 
-            let next_version: u32 = stream
+            let next_version: i32 = stream
                 .iter()
                 .filter_map(|e| e.aggregate_version)
                 .max()
@@ -228,9 +227,8 @@ impl EventStore for InMemoryEventStore {
 
             // Insert compacted events as the new current stream (aggregate_version = None).
             // Sequence versions restart from 1.
-            let mut seq: i64 = 0;
-            for event in &compacted {
-                seq += 1;
+            for (seq, event) in (0_i64..).zip(compacted.iter()) {
+                let seq = seq + 1;
                 let data = serde_json::to_value(event).map_err(crate::ser_error)?;
                 stream.push(PersistedEvent {
                     id: Uuid::new_v4(),
@@ -244,7 +242,7 @@ impl EventStore for InMemoryEventStore {
                 });
             }
 
-            return Ok(next_version);
+            Ok(next_version)
         }
     }
 }

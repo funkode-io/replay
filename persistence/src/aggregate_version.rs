@@ -7,20 +7,21 @@
 ///
 /// # Variants
 /// - `Latest` — load the current event stream (default, no version filter).
-/// - `Version(u32)` — load the archived event stream created by a specific compaction run.
+/// - `Version(i32)` — load the archived event stream created by a specific compaction run.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AggregateVersion {
     /// Load the current event stream (post-compaction or uncompacted).
     #[default]
     Latest,
     /// Load the archived event stream produced by the nth compaction.
-    Version(u32),
+    /// Matches the `INTEGER` column in the database; values start at 1 and increment.
+    Version(i32),
 }
 
 impl AggregateVersion {
     /// Returns `None` for `Latest` (stored as SQL NULL / no version tag)
     /// and `Some(n)` for `Version(n)`.
-    pub fn as_option(&self) -> Option<u32> {
+    pub fn as_option(&self) -> Option<i32> {
         match self {
             AggregateVersion::Latest => None,
             AggregateVersion::Version(v) => Some(*v),

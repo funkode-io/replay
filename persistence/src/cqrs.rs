@@ -87,7 +87,7 @@ impl<ES: EventStore> Cqrs<ES> {
         &self,
         aggregate: &A,
         metadata: replay::Metadata,
-    ) -> Result<u32, replay::Error>
+    ) -> Result<i32, replay::Error>
     where
         A: replay::Aggregate + replay::Compactable + Sync,
     {

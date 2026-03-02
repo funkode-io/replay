@@ -61,7 +61,7 @@ impl PostgresEventStore {
                 Some(version) => {
                     query_builder
                         .push(" aggregate_version = ")
-                        .push_bind(version as i32);
+                        .push_bind(version);
                 }
             },
             StreamFilter::And(left, right) => {
@@ -167,7 +167,7 @@ impl EventStore for PostgresEventStore {
         &self,
         aggregate: &A,
         metadata: replay::Metadata,
-    ) -> Result<u32, replay::Error>
+    ) -> Result<i32, replay::Error>
     where
         A: replay::Aggregate + Compactable + Sync,
     {
@@ -253,7 +253,7 @@ impl EventStore for PostgresEventStore {
 
         tx.commit().await.map_err(crate::db_error)?;
 
-        Ok(next_version as u32)
+        Ok(next_version)
     }
 }
 
@@ -296,7 +296,7 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
             version,
             created,
             metadata,
-            aggregate_version: aggregate_version.map(|v| v as u32),
+            aggregate_version,
         })
     }
 }
