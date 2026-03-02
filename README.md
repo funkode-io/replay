@@ -1092,6 +1092,8 @@ shortest subsequence that, when replayed from scratch, reproduces the same state
 does **not** need to store events in its own fields:
 
 ```rust
+use futures::TryStream;       // trait bound used in the signature
+use futures::TryStreamExt;    // .try_fold() extension method
 use replay::Compactable;
 
 impl Compactable for BankAccountAggregate {
@@ -1099,7 +1101,6 @@ impl Compactable for BankAccountAggregate {
         &self,
         events: impl TryStream<Ok = Self::Event, Error = replay::Error> + Send,
     ) -> replay::Result<Vec<Self::Event>> {
-        use futures::TryStreamExt;
         // Sliding-window via try_fold: only events from the last MonthlyClosed
         // onward are kept in the accumulator. Prior months are never buffered.
         events
