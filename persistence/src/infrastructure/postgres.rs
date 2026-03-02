@@ -174,25 +174,42 @@ impl EventStore for PostgresEventStore {
         let stream_id: Urn = aggregate.get_id().clone().into();
         let stream_id_str = stream_id.to_string();
 
-        // 1. Stream current live events lazily from the pool (outside any transaction)
-        //    and compute the compacted set without loading the full history into memory.
-        let event_stream = sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+
+        // 1. Lock the stream row for the duration of this transaction.
+        //    Any concurrent `append_event` call that updates (or inserts into) this stream
+        //    will block on this lock and only proceed after we commit, so no events can
+        //    be appended between the read and the archive steps.
+        sqlx::query("SELECT id FROM streams WHERE id = $1 FOR UPDATE")
+            .bind(&stream_id_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
+
+        // 2. Read the current live events inside the transaction (now protected by the lock).
+        //    Using fetch_all here is intentional: compaction is a maintenance operation and
+        //    the lock must be held for the entire read + archive window, which precludes
+        //    interleaving other queries on the same connection.
+        let rows = sqlx::query(
             "SELECT data FROM events WHERE stream_id = $1 AND aggregate_version IS NULL ORDER BY version",
         )
         .bind(&stream_id_str)
-        .fetch(&self.pool)
-        .map(|r| {
-            let row = r.map_err(crate::db_error)?;
-            let data: serde_json::Value = row.get("data");
-            serde_json::from_value::<A::Event>(data).map_err(crate::deser_error)
-        });
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
 
+        let events: Vec<Result<A::Event, replay::Error>> = rows
+            .into_iter()
+            .map(|row: sqlx::postgres::PgRow| {
+                let data: serde_json::Value = row.get("data");
+                serde_json::from_value::<A::Event>(data).map_err(crate::deser_error)
+            })
+            .collect();
+
+        let event_stream = futures::stream::iter(events);
         let compacted = aggregate.compacted_events(event_stream).await?;
-        // event_stream fully consumed; pool borrow released.
 
-        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
-
-        // 2. Determine the next archive version number.
+        // 3. Determine the next archive version number.
         let next_version: i32 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(aggregate_version), 0) + 1 FROM events WHERE stream_id = $1",
         )
@@ -201,7 +218,7 @@ impl EventStore for PostgresEventStore {
         .await
         .map_err(crate::db_error)?;
 
-        // 3. Archive all current (un-versioned) events for this stream.
+        // 4. Archive all current (un-versioned) events for this stream.
         sqlx::query(
             "UPDATE events SET aggregate_version = $1 WHERE stream_id = $2 AND aggregate_version IS NULL",
         )
@@ -211,14 +228,14 @@ impl EventStore for PostgresEventStore {
         .await
         .map_err(crate::db_error)?;
 
-        // 4. Reset the stream's version counter so compacted events start from 1.
+        // 5. Reset the stream's version counter so compacted events start from 1.
         sqlx::query("UPDATE streams SET version = 0 WHERE id = $1")
             .bind(&stream_id_str)
             .execute(&mut *tx)
             .await
             .map_err(crate::db_error)?;
 
-        // 5. Insert compacted events as the new current stream (aggregate_version = NULL).
+        // 6. Insert compacted events as the new current stream (aggregate_version = NULL).
         let stream_type = A::stream_type();
         let meta_json = metadata.to_json();
         for (seq, event) in compacted.iter().enumerate() {
@@ -241,7 +258,7 @@ impl EventStore for PostgresEventStore {
             .map_err(crate::db_error)?;
         }
 
-        // 6. Update the stream version to the count of compacted events.
+        // 7. Update the stream version to the count of compacted events.
         let new_stream_version = compacted.len() as i64;
         sqlx::query("UPDATE streams SET version = $1, type = $2 WHERE id = $3")
             .bind(new_stream_version)
