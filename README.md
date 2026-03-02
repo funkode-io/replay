@@ -1077,3 +1077,131 @@ fn build_activity_summary(events: Vec<ActivityEvent>) -> ActivitySummary {
     summary
 }
 ```
+
+## Stream Compaction
+
+As an aggregate accumulates events over a long lifetime the full history grows large, making every
+replay slower. **Compaction** lets a `Compactable` aggregate replace its live event stream with the
+minimum set of events needed to reconstruct its current state, while archiving the original history
+under a versioned snapshot.
+
+### The `Compactable` trait
+
+`compacted_events` receives the **current live event stream** from the store and returns the
+shortest subsequence that, when replayed from scratch, reproduces the same state. The aggregate
+does **not** need to store events in its own fields:
+
+```rust
+use replay::Compactable;
+
+impl Compactable for BankAccountAggregate {
+    async fn compacted_events(
+        &self,
+        events: impl TryStream<Ok = Self::Event, Error = replay::Error> + Send,
+    ) -> replay::Result<Vec<Self::Event>> {
+        use futures::TryStreamExt;
+        // Sliding-window via try_fold: only events from the last MonthlyClosed
+        // onward are kept in the accumulator. Prior months are never buffered.
+        events
+            .try_fold(Vec::new(), |mut tail, event| async move {
+                if matches!(event, BankAccountEvent::MonthlyClosed { .. }) {
+                    tail.clear();
+                }
+                tail.push(event);
+                Ok(tail)
+            })
+            .await
+    }
+}
+```
+
+### Bank-account example with `MonthlyClosed`
+
+`MonthlyClosed { month, closing_balance }` encodes an entire month's activity. Applying it sets
+the running balance directly, so the aggregate needs no extra state fields for compaction:
+
+```rust
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+enum BankAccountEvent {
+    Deposited { operation_date: NaiveDate, amount: f64 },
+    Withdrawn { operation_date: NaiveDate, amount: f64 },
+    MonthlyClosed { month: NaiveDate, closing_balance: f64 },
+}
+
+struct BankAccountAggregate {
+    pub id: BankAccountUrn,
+    pub balance: f64,   // only what business logic needs — no compaction bookkeeping
+}
+
+impl EventStream for BankAccountAggregate {
+    type Event = BankAccountEvent;
+
+    fn stream_type() -> String { "BankAccount".to_string() }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            BankAccountEvent::Deposited { amount, .. }             => self.balance += amount,
+            BankAccountEvent::Withdrawn { amount, .. }             => self.balance -= amount,
+            BankAccountEvent::MonthlyClosed { closing_balance, .. } => self.balance = closing_balance,
+        }
+    }
+}
+```
+
+**Before compaction** — 6 events in the live stream:
+
+```text
+Deposited     { operation_date: 2026-01-01, amount: 1000.00 }
+Withdrawn     { operation_date: 2026-01-15, amount:  200.00 }
+Deposited     { operation_date: 2026-01-31, amount:  500.00 }
+MonthlyClosed { month: 2026-01,  closing_balance: 1300.00  }
+Deposited     { operation_date: 2026-02-15, amount:  400.00 }
+Withdrawn     { operation_date: 2026-02-28, amount:  100.00 }
+```
+
+**After compaction** — 3 events in the live stream, 6 archived as `Version(1)`:
+
+```text
+MonthlyClosed { month: 2026-01, closing_balance: 1300.00 }   <- all of January
+Deposited     { operation_date: 2026-02-15, amount: 400.00 } <- preserved
+Withdrawn     { operation_date: 2026-02-28, amount: 100.00 } <- preserved
+```
+
+Both streams yield `balance == 1600.00`. The full history is still accessible via
+`AggregateVersion::Version(1)`.
+
+### Running compaction via `Cqrs`
+
+```rust
+// Execute commands as usual.
+cqrs.execute::<BankAccountAggregate>(
+    &stream_id, meta.clone(),
+    BankAccountCommand::CloseMonth { month: jan_1 },
+    &services, None,
+).await?;
+
+// Fetch the aggregate to pass to compact.
+let aggregate = cqrs
+    .fetch_aggregate::<BankAccountAggregate>(
+        &stream_id, AggregateVersion::Latest, None, None,
+    )
+    .await?;
+
+// Compact: archives the full history and writes the minimal live stream.
+let archive_version = cqrs.compact(&aggregate, meta).await?;
+// archive_version == 1 on the first compaction, 2 on the second, etc.
+
+// Future fetches replay only the 3 compacted events.
+let compacted = cqrs
+    .fetch_aggregate::<BankAccountAggregate>(
+        &stream_id, AggregateVersion::Latest, None, None,
+    )
+    .await?;
+
+// Original history is still accessible.
+let archived = cqrs
+    .fetch_aggregate::<BankAccountAggregate>(
+        &stream_id, AggregateVersion::Version(1), None, None,
+    )
+    .await?;
+```

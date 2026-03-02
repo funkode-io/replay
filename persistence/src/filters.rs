@@ -15,6 +15,9 @@ pub enum StreamFilter {
     WithMetadata(replay::Metadata),
     AfterVersion(i64),
     CreatedAfter(chrono::DateTime<Utc>),
+    /// Matches events whose `aggregate_version` equals the given value.
+    /// `None` selects current (non-archived) events; `Some(n)` selects version n.
+    WithAggregateVersion(Option<u32>),
     And(Box<StreamFilter>, Box<StreamFilter>),
     Or(Box<StreamFilter>, Box<StreamFilter>),
     Not(Box<StreamFilter>),
@@ -29,6 +32,7 @@ impl StreamFilter {
             StreamFilter::WithMetadata(metadata) => event.metadata == *metadata,
             StreamFilter::AfterVersion(version) => event.version > *version,
             StreamFilter::CreatedAfter(timestamp) => event.created > *timestamp,
+            StreamFilter::WithAggregateVersion(v) => event.aggregate_version == *v,
             StreamFilter::And(left, right) => left.passes::<S>(event) && right.passes::<S>(event),
             StreamFilter::Or(left, right) => left.passes::<S>(event) || right.passes::<S>(event),
             StreamFilter::Not(filter) => !filter.passes::<S>(event),
@@ -95,6 +99,14 @@ impl StreamFilter {
             Some(timestamp) => self.and(StreamFilter::CreatedAfter(timestamp)),
             None => self,
         }
+    }
+
+    pub fn with_aggregate_version(aggregate_version: Option<u32>) -> StreamFilter {
+        StreamFilter::WithAggregateVersion(aggregate_version)
+    }
+
+    pub fn and_aggregate_version(self, aggregate_version: Option<u32>) -> StreamFilter {
+        self.and(StreamFilter::WithAggregateVersion(aggregate_version))
     }
 }
 
@@ -209,6 +221,7 @@ mod tests {
                 bank_account: bank_account_urn,
             }
             .into(),
+            aggregate_version: None,
         };
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
@@ -232,6 +245,7 @@ mod tests {
                 bank_account: bank_account_urn,
             }
             .into(),
+            aggregate_version: None,
         };
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
@@ -255,6 +269,7 @@ mod tests {
                 bank_account: bank_account_urn,
             }
             .into(),
+            aggregate_version: None,
         };
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
@@ -276,6 +291,7 @@ mod tests {
             version: 1,
             created: chrono::Utc::now(),
             metadata: metadata.into(),
+            aggregate_version: None,
         };
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
@@ -299,6 +315,7 @@ mod tests {
                 bank_account: bank_account_urn,
             }
             .into(),
+            aggregate_version: None,
         };
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
@@ -323,6 +340,7 @@ mod tests {
                 bank_account: bank_account_urn,
             }
             .into(),
+            aggregate_version: None,
         };
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
@@ -347,6 +365,7 @@ mod tests {
                 bank_account: bank_account_urn,
             }
             .into(),
+            aggregate_version: None,
         };
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
@@ -371,6 +390,7 @@ mod tests {
                 bank_account: bank_account_urn,
             }
             .into(),
+            aggregate_version: None,
         };
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
@@ -395,6 +415,7 @@ mod tests {
                 bank_account: bank_account_urn,
             }
             .into(),
+            aggregate_version: None,
         };
 
         assert!(filter.passes::<BankAccountStream>(&persisted_event));

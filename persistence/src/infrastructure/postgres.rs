@@ -11,7 +11,7 @@ use urn::Urn;
 use uuid::Uuid;
 
 use crate::{EventStore, PersistedEvent, StreamFilter};
-use replay::{Event, Metadata};
+use replay::{Compactable, Event, Metadata};
 
 pub struct PostgresEventStore {
     pool: Pool<Postgres>,
@@ -54,6 +54,16 @@ impl PostgresEventStore {
             StreamFilter::CreatedAfter(timestamp) => {
                 query_builder.push(" created > ").push_bind(timestamp);
             }
+            StreamFilter::WithAggregateVersion(v) => match v {
+                None => {
+                    query_builder.push(" aggregate_version IS NULL");
+                }
+                Some(version) => {
+                    query_builder
+                        .push(" aggregate_version = ")
+                        .push_bind(version as i32);
+                }
+            },
             StreamFilter::And(left, right) => {
                 query_builder.push(" (");
                 Self::add_filters(query_builder, *left);
@@ -125,7 +135,7 @@ impl EventStore for PostgresEventStore {
         filter: StreamFilter,
     ) -> impl TryStream<Ok = PersistedEvent<E>, Error = replay::Error> + Send {
         async_stream::stream! {
-            let sql = "SELECT id, data, metadata, stream_id, type, version, created
+            let sql = "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version
                 FROM events 
                 WHERE " ;
 
@@ -133,8 +143,6 @@ impl EventStore for PostgresEventStore {
             Self::add_filters(&mut query_builder, filter.clone());
 
             let query_builder = query_builder.push(" ORDER BY created, version ASC");
-
-            //println!("Executing query: {}", query_builder.sql());
 
             let mut rows = query_builder
                 .build()
@@ -153,6 +161,99 @@ impl EventStore for PostgresEventStore {
 
             tracing::debug!("Streamed {} events from Postgres", count);
         }
+    }
+
+    async fn compact<A>(
+        &self,
+        aggregate: &A,
+        metadata: replay::Metadata,
+    ) -> Result<u32, replay::Error>
+    where
+        A: replay::Aggregate + Compactable + Sync,
+    {
+        let stream_id: Urn = aggregate.get_id().clone().into();
+        let stream_id_str = stream_id.to_string();
+
+        // 1. Stream current live events lazily from the pool (outside any transaction)
+        //    and compute the compacted set without loading the full history into memory.
+        let event_stream = sqlx::query(
+            "SELECT data FROM events WHERE stream_id = $1 AND aggregate_version IS NULL ORDER BY version",
+        )
+        .bind(&stream_id_str)
+        .fetch(&self.pool)
+        .map(|r| {
+            let row = r.map_err(crate::db_error)?;
+            let data: serde_json::Value = row.get("data");
+            serde_json::from_value::<A::Event>(data).map_err(crate::deser_error)
+        });
+
+        let compacted = aggregate.compacted_events(event_stream).await?;
+        // event_stream fully consumed; pool borrow released.
+
+        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+
+        // 2. Determine the next archive version number.
+        let next_version: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(aggregate_version), 0) + 1 FROM events WHERE stream_id = $1",
+        )
+        .bind(&stream_id_str)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
+
+        // 3. Archive all current (un-versioned) events for this stream.
+        sqlx::query(
+            "UPDATE events SET aggregate_version = $1 WHERE stream_id = $2 AND aggregate_version IS NULL",
+        )
+        .bind(next_version)
+        .bind(&stream_id_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
+
+        // 4. Reset the stream's version counter so compacted events start from 1.
+        sqlx::query("UPDATE streams SET version = 0 WHERE id = $1")
+            .bind(&stream_id_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
+
+        // 5. Insert compacted events as the new current stream (aggregate_version = NULL).
+        let stream_type = A::stream_type();
+        let meta_json = metadata.to_json();
+        for (seq, event) in compacted.iter().enumerate() {
+            let event_type = event.event_type();
+            let data = serde_json::to_value(event).map_err(crate::ser_error)?;
+            let version = (seq as i64) + 1;
+
+            sqlx::query(
+                "INSERT INTO events (id, data, metadata, stream_id, type, version, aggregate_version)
+                 VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(&data)
+            .bind(&meta_json)
+            .bind(&stream_id_str)
+            .bind(&event_type)
+            .bind(version)
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
+        }
+
+        // 6. Update the stream version to the count of compacted events.
+        let new_stream_version = compacted.len() as i64;
+        sqlx::query("UPDATE streams SET version = $1, type = $2 WHERE id = $3")
+            .bind(new_stream_version)
+            .bind(&stream_type)
+            .bind(&stream_id_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
+
+        tx.commit().await.map_err(crate::db_error)?;
+
+        Ok(next_version as u32)
     }
 }
 
@@ -185,6 +286,7 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
         let created: chrono::DateTime<Utc> = value.get("created");
         let metadata: Value = value.get("metadata");
         let metadata: Metadata = Metadata::new(metadata);
+        let aggregate_version: Option<i32> = value.get("aggregate_version");
 
         Ok(PersistedEvent {
             id,
@@ -194,6 +296,7 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
             version,
             created,
             metadata,
+            aggregate_version: aggregate_version.map(|v| v as u32),
         })
     }
 }
