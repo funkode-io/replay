@@ -180,11 +180,19 @@ impl EventStore for PostgresEventStore {
         //    Any concurrent `append_event` call that updates (or inserts into) this stream
         //    will block on this lock and only proceed after we commit, so no events can
         //    be appended between the read and the archive steps.
-        sqlx::query("SELECT id FROM streams WHERE id = $1 FOR UPDATE")
+        //    If the stream does not exist (0 rows matched) we return NotFound immediately
+        //    rather than silently producing an empty compaction for a phantom aggregate.
+        let lock_result = sqlx::query("SELECT id FROM streams WHERE id = $1 FOR UPDATE")
             .bind(&stream_id_str)
             .execute(&mut *tx)
             .await
             .map_err(crate::db_error)?;
+
+        if lock_result.rows_affected() == 0 {
+            return Err(replay::Error::not_found("Stream not found")
+                .with_operation("compact")
+                .with_context("stream_id", stream_id_str));
+        }
 
         // 2. Read the current live events inside the transaction (now protected by the lock).
         //    Using fetch_all here is intentional: compaction is a maintenance operation and
