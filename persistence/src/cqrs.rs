@@ -23,8 +23,10 @@ impl<ES: EventStore> Cqrs<ES> {
     /// - `aggregate_version`: choose which snapshot of the stream to load.  Use
     ///   [`AggregateVersion::Latest`] (the default) to replay the current event stream; use
     ///   [`AggregateVersion::Version(n)`] to inspect a specific archived compaction version.
-    /// - `at_stream_version`: optional upper bound on the event sequence number.
-    /// - `at_timestamp`: optional upper bound on the event creation timestamp.
+    /// - `at_stream_version`: optional inclusive upper bound on the event sequence number
+    ///   (events with version ≤ n are included).  Use this for time-travel reads.
+    /// - `at_timestamp`: optional inclusive upper bound on the event creation timestamp
+    ///   (events created at or before the given instant are included).
     pub async fn fetch_aggregate<A: Aggregate + Sync>(
         &self,
         id: &A::StreamId,

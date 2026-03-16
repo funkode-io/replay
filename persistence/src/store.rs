@@ -26,8 +26,10 @@ pub trait EventStore: Send + Sync {
     ///
     /// - `aggregate_version`: `Latest` loads the current (non-archived) events; `Version(n)`
     ///   loads the events that were archived during the nth compaction run.
-    /// - `at_stream_version`: upper bound on the event sequence number (for time-travel queries).
-    /// - `at_timestamp`: upper bound on the event creation timestamp.
+    /// - `at_stream_version`: inclusive upper bound on the event sequence number
+    ///   (events with version ≤ n are included; use for time-travel reads).
+    /// - `at_timestamp`: inclusive upper bound on the event creation timestamp
+    ///   (events created at or before the given instant are included).
     fn stream_events_by_stream_id<S: replay::EventStream>(
         &self,
         stream_id: &S::StreamId,

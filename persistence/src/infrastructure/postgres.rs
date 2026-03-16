@@ -51,8 +51,14 @@ impl PostgresEventStore {
             StreamFilter::AfterVersion(version) => {
                 query_builder.push(" version > ").push_bind(version);
             }
+            StreamFilter::UpToVersion(version) => {
+                query_builder.push(" version <= ").push_bind(version);
+            }
             StreamFilter::CreatedAfter(timestamp) => {
                 query_builder.push(" created > ").push_bind(timestamp);
+            }
+            StreamFilter::CreatedBefore(timestamp) => {
+                query_builder.push(" created <= ").push_bind(timestamp);
             }
             StreamFilter::WithAggregateVersion(v) => match v {
                 None => {
