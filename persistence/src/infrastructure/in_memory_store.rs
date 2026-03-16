@@ -56,7 +56,9 @@ impl InMemoryEventStore {
             .with_operation("stream_events")),
             StreamFilter::WithMetadata(metadata) => Ok(event.metadata == *metadata),
             StreamFilter::AfterVersion(version) => Ok(event.version > *version),
+            StreamFilter::UpToVersion(version) => Ok(event.version <= *version),
             StreamFilter::CreatedAfter(timestamp) => Ok(event.created > *timestamp),
+            StreamFilter::CreatedBefore(timestamp) => Ok(event.created <= *timestamp),
             StreamFilter::WithAggregateVersion(v) => Ok(event.aggregate_version == *v),
             StreamFilter::And(left, right) => {
                 Ok(Self::evaluate(left, event)? && Self::evaluate(right, event)?)

@@ -13,8 +13,14 @@ pub enum StreamFilter {
     WithStreamId(Urn),
     ForStreamTypes(Vec<String>),
     WithMetadata(replay::Metadata),
+    /// Matches events whose sequence version is strictly greater than the given value.
     AfterVersion(i64),
+    /// Matches events whose sequence version is less than or equal to the given value.
+    UpToVersion(i64),
+    /// Matches events created strictly after the given timestamp.
     CreatedAfter(chrono::DateTime<Utc>),
+    /// Matches events created at or before the given timestamp.
+    CreatedBefore(chrono::DateTime<Utc>),
     /// Matches events whose `aggregate_version` equals the given value.
     /// `None` selects current (non-archived) events; `Some(n)` selects version n.
     WithAggregateVersion(Option<i32>),
@@ -31,7 +37,9 @@ impl StreamFilter {
             StreamFilter::ForStreamTypes(stream_types) => stream_types.contains(&S::stream_type()),
             StreamFilter::WithMetadata(metadata) => event.metadata == *metadata,
             StreamFilter::AfterVersion(version) => event.version > *version,
+            StreamFilter::UpToVersion(version) => event.version <= *version,
             StreamFilter::CreatedAfter(timestamp) => event.created > *timestamp,
+            StreamFilter::CreatedBefore(timestamp) => event.created <= *timestamp,
             StreamFilter::WithAggregateVersion(v) => event.aggregate_version == *v,
             StreamFilter::And(left, right) => left.passes::<S>(event) && right.passes::<S>(event),
             StreamFilter::Or(left, right) => left.passes::<S>(event) || right.passes::<S>(event),
@@ -59,8 +67,16 @@ impl StreamFilter {
         StreamFilter::AfterVersion(version)
     }
 
+    pub fn up_to_version(version: i64) -> StreamFilter {
+        StreamFilter::UpToVersion(version)
+    }
+
     pub fn created_after(timestamp: chrono::DateTime<Utc>) -> StreamFilter {
         StreamFilter::CreatedAfter(timestamp)
+    }
+
+    pub fn created_before(timestamp: chrono::DateTime<Utc>) -> StreamFilter {
+        StreamFilter::CreatedBefore(timestamp)
     }
 
     // implement methods from an existing filter
@@ -76,19 +92,22 @@ impl StreamFilter {
         self.and(StreamFilter::with_metadata(metadata))
     }
 
+    /// Filter to events with sequence version ≤ `version` (inclusive upper bound, for time-travel reads).
     pub fn and_at_stream_version(self, version: i64) -> StreamFilter {
-        self.and(StreamFilter::AfterVersion(version))
+        self.and(StreamFilter::UpToVersion(version))
     }
 
+    /// Filter to events with sequence version ≤ `version` when `Some`, otherwise no-op.
     pub fn and_at_stream_version_optional(self, version: Option<i64>) -> StreamFilter {
         match version {
-            Some(version) => self.and(StreamFilter::AfterVersion(version)),
+            Some(version) => self.and(StreamFilter::UpToVersion(version)),
             None => self,
         }
     }
 
+    /// Filter to events created at or before `timestamp` (inclusive upper bound, for time-travel reads).
     pub fn and_at_timestamp(self, timestamp: chrono::DateTime<Utc>) -> StreamFilter {
-        self.and(StreamFilter::CreatedAfter(timestamp))
+        self.and(StreamFilter::CreatedBefore(timestamp))
     }
 
     pub fn and_at_timestamp_optional(
@@ -96,7 +115,7 @@ impl StreamFilter {
         timestamp: Option<chrono::DateTime<Utc>>,
     ) -> StreamFilter {
         match timestamp {
-            Some(timestamp) => self.and(StreamFilter::CreatedAfter(timestamp)),
+            Some(timestamp) => self.and(StreamFilter::CreatedBefore(timestamp)),
             None => self,
         }
     }
