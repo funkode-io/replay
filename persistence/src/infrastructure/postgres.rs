@@ -200,27 +200,19 @@ impl EventStore for PostgresEventStore {
                 .with_context("stream_id", stream_id_str));
         }
 
-        // 2. Read the current live events inside the transaction (now protected by the lock).
-        //    Using fetch_all here is intentional: compaction is a maintenance operation and
-        //    the lock must be held for the entire read + archive window, which precludes
-        //    interleaving other queries on the same connection.
-        let rows = sqlx::query(
+        // 2. Stream the current live events inside the transaction (now protected by the lock),
+        //    processing rows one at a time so the full history is never held in memory.
+        let event_stream = sqlx::query(
             "SELECT data FROM events WHERE stream_id = $1 AND aggregate_version IS NULL ORDER BY version",
         )
         .bind(&stream_id_str)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(crate::db_error)?;
+        .fetch(&mut *tx)
+        .map_err(crate::db_error)
+        .and_then(|row: PgRow| async move {
+            let data: serde_json::Value = row.get("data");
+            serde_json::from_value::<A::Event>(data).map_err(crate::deser_error)
+        });
 
-        let events: Vec<Result<A::Event, replay::Error>> = rows
-            .into_iter()
-            .map(|row: sqlx::postgres::PgRow| {
-                let data: serde_json::Value = row.get("data");
-                serde_json::from_value::<A::Event>(data).map_err(crate::deser_error)
-            })
-            .collect();
-
-        let event_stream = futures::stream::iter(events);
         let compacted = aggregate.compacted_events(event_stream).await?;
 
         // 3. Determine the next archive version number.
