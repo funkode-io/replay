@@ -211,6 +211,13 @@ impl EventStore for InMemoryEventStore {
         // 2. Determine the next archive version number and archive all current events.
         {
             let mut store = self.events.write().unwrap();
+
+            if !store.contains_key(&stream_id) {
+                return Err(replay::Error::not_found("Stream not found")
+                    .with_operation("compact")
+                    .with_context("stream_id", stream_id.to_string()));
+            }
+
             let stream = store.entry(stream_id.clone()).or_default();
 
             let next_version: i32 = stream
@@ -526,17 +533,13 @@ mod tests {
 
         let account = BankAccountStream::with_id(id.clone());
 
-        // Compacting a stream with no prior events should succeed.
-        let archive_version = store
-            .compact(&account, replay::Metadata::default())
-            .await
-            .unwrap();
+        // Compacting a stream that has never had events should return NotFound,
+        // matching the behaviour of PostgresEventStore::compact.
+        let result = store.compact(&account, replay::Metadata::default()).await;
 
-        assert_eq!(archive_version, 1);
-
-        // The compacted set for balance=0 is [Deposited(0)]; live stream has that one event.
-        let live = live_events(&store, &id).await;
-        assert_eq!(live, vec![BankAccountEvent::Deposited { amount: 0.0 }]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), replay::ErrorKind::NotFound);
     }
 
     #[tokio::test]
