@@ -117,7 +117,7 @@ pub trait Aggregate: Sync + EventStream {
 ///
 /// The original history is **not** discarded by this trait — it is the caller's responsibility
 /// to archive or retain old events before replacing them with the compacted set.
-/// [`EventStore::compact`] handles this automatically: it archives the full event log under a
+/// The store's `compact` operation handles this automatically: it archives the full event log under a
 /// numbered version before writing the compacted set as the new live stream.
 ///
 /// # Implementation contract

@@ -326,6 +326,217 @@ mod tests {
         }
     }
 
+    // ── Compactable support ──────────────────────────────────────────────────
+
+    /// A compaction strategy that collapses the whole history into a single
+    /// `Deposited` event whose amount equals the current balance.
+    impl Compactable for BankAccountStream {
+        async fn compacted_events(
+            &self,
+            events: impl futures::TryStream<Ok = Self::Event, Error = replay::Error> + Send,
+        ) -> replay::Result<Vec<Self::Event>> {
+            use futures::TryStreamExt;
+            let all: Vec<BankAccountEvent> = events.try_collect().await?;
+            let balance = all.iter().fold(0.0_f64, |acc, ev| match ev {
+                BankAccountEvent::Deposited { amount } => acc + amount,
+                BankAccountEvent::Withdrawn { amount } => acc - amount,
+            });
+            Ok(vec![BankAccountEvent::Deposited { amount: balance }])
+        }
+    }
+
+    impl replay::Aggregate for BankAccountStream {
+        type Command = ();
+        type Error = replay::Error;
+        type Services = ();
+
+        async fn handle(
+            &self,
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> replay::Result<Vec<Self::Event>> {
+            Ok(vec![])
+        }
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn make_stream_id(n: &str) -> BankAccountUrn {
+        BankAccountUrn(UrnBuilder::new("bank-account", n).build().unwrap())
+    }
+
+    async fn add_events(
+        store: &InMemoryEventStore,
+        id: &BankAccountUrn,
+        events: &[BankAccountEvent],
+    ) {
+        store
+            .store_events::<BankAccountStream>(
+                id,
+                "BankAccount".to_string(),
+                replay::Metadata::default(),
+                events,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn live_events(store: &InMemoryEventStore, id: &BankAccountUrn) -> Vec<BankAccountEvent> {
+        use futures::TryStreamExt;
+        store
+            .stream_events::<BankAccountEvent>(StreamFilter::And(
+                Box::new(StreamFilter::with_stream_id::<BankAccountStream>(id)),
+                Box::new(StreamFilter::WithAggregateVersion(None)),
+            ))
+            .map_ok(|e| e.data)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+    }
+
+    async fn archived_events(
+        store: &InMemoryEventStore,
+        id: &BankAccountUrn,
+        version: i32,
+    ) -> Vec<PersistedEvent<BankAccountEvent>> {
+        use futures::TryStreamExt;
+        store
+            .stream_events::<BankAccountEvent>(StreamFilter::And(
+                Box::new(StreamFilter::with_stream_id::<BankAccountStream>(id)),
+                Box::new(StreamFilter::WithAggregateVersion(Some(version))),
+            ))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+    }
+
+    // ── compact tests ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_compact_reduces_live_events() {
+        let store = InMemoryEventStore::new();
+        let id = make_stream_id("compact-1");
+
+        add_events(
+            &store,
+            &id,
+            &[
+                BankAccountEvent::Deposited { amount: 100.0 },
+                BankAccountEvent::Withdrawn { amount: 40.0 },
+                BankAccountEvent::Deposited { amount: 50.0 },
+            ],
+        )
+        .await;
+
+        // Build the aggregate state so `compacted_events` has the right `self`.
+        let mut account = BankAccountStream::with_id(id.clone());
+        for ev in live_events(&store, &id).await {
+            account.apply(ev);
+        }
+        assert_eq!(account.balance, 110.0);
+
+        let archive_version = store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+
+        assert_eq!(archive_version, 1);
+
+        // Live stream is now a single synthetic Deposited event.
+        let live = live_events(&store, &id).await;
+        assert_eq!(live, vec![BankAccountEvent::Deposited { amount: 110.0 }]);
+
+        // Original 3 events are archived under version 1.
+        let archived = archived_events(&store, &id, 1).await;
+        assert_eq!(archived.len(), 3);
+        assert!(archived.iter().all(|e| e.aggregate_version == Some(1)));
+    }
+
+    #[tokio::test]
+    async fn test_compact_increments_archive_version() {
+        let store = InMemoryEventStore::new();
+        let id = make_stream_id("compact-2");
+
+        add_events(
+            &store,
+            &id,
+            &[
+                BankAccountEvent::Deposited { amount: 200.0 },
+                BankAccountEvent::Withdrawn { amount: 50.0 },
+            ],
+        )
+        .await;
+
+        let mut account = BankAccountStream::with_id(id.clone());
+        for ev in live_events(&store, &id).await {
+            account.apply(ev);
+        }
+
+        // First compaction → archive version 1, live = [Deposited(150)].
+        store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+
+        // Add more events after the first compaction.
+        store
+            .store_events::<BankAccountStream>(
+                &id,
+                "BankAccount".to_string(),
+                replay::Metadata::default(),
+                &[BankAccountEvent::Withdrawn { amount: 30.0 }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Rebuild aggregate for second compaction.
+        let mut account2 = BankAccountStream::with_id(id.clone());
+        for ev in live_events(&store, &id).await {
+            account2.apply(ev);
+        }
+        assert_eq!(account2.balance, 120.0);
+
+        let archive_version2 = store
+            .compact(&account2, replay::Metadata::default())
+            .await
+            .unwrap();
+
+        assert_eq!(archive_version2, 2);
+
+        let live = live_events(&store, &id).await;
+        assert_eq!(live, vec![BankAccountEvent::Deposited { amount: 120.0 }]);
+
+        // Version 1 archive still intact (2 original events).
+        let arch1 = archived_events(&store, &id, 1).await;
+        assert_eq!(arch1.len(), 2);
+
+        // Version 2 archive contains the compacted event + the post-compaction withdrawal.
+        let arch2 = archived_events(&store, &id, 2).await;
+        assert_eq!(arch2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_compact_empty_stream_is_noop() {
+        let store = InMemoryEventStore::new();
+        let id = make_stream_id("compact-empty");
+
+        let account = BankAccountStream::with_id(id.clone());
+
+        // Compacting a stream with no prior events should succeed.
+        let archive_version = store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+
+        assert_eq!(archive_version, 1);
+
+        // The compacted set for balance=0 is [Deposited(0)]; live stream has that one event.
+        let live = live_events(&store, &id).await;
+        assert_eq!(live, vec![BankAccountEvent::Deposited { amount: 0.0 }]);
+    }
+
     #[tokio::test]
     async fn test_store_events() {
         let store = InMemoryEventStore {
