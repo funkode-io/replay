@@ -27,7 +27,7 @@ impl<ES: EventStore> Cqrs<ES> {
     ///   (events with version ≤ n are included).  Use this for time-travel reads.
     /// - `at_timestamp`: optional inclusive upper bound on the event creation timestamp
     ///   (events created at or before the given instant are included).
-    pub async fn fetch_aggregate<A: Aggregate + Sync>(
+    pub async fn fetch_aggregate_at<A: Aggregate + Sync>(
         &self,
         id: &A::StreamId,
         aggregate_version: AggregateVersion,
@@ -50,6 +50,26 @@ impl<ES: EventStore> Cqrs<ES> {
         Ok(stream)
     }
 
+    /// Reconstruct an aggregate at its latest state.
+    ///
+    /// This is a convenience wrapper around [`Self::fetch_aggregate_at`] that
+    /// always replays the current (latest) event stream without any stream-version
+    /// or timestamp upper bound.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let account = cqrs.fetch_aggregate::<BankAccountAggregate>(&account_id).await?;
+    /// println!("balance: {}", account.balance);
+    /// ```
+    pub async fn fetch_aggregate<A: Aggregate + Sync>(
+        &self,
+        id: &A::StreamId,
+    ) -> Result<A, A::Error> {
+        self.fetch_aggregate_at(id, AggregateVersion::Latest, None, None)
+            .await
+    }
+
     pub async fn execute<A: Aggregate>(
         &self,
         id: &A::StreamId,
@@ -60,7 +80,7 @@ impl<ES: EventStore> Cqrs<ES> {
     ) -> Result<A, A::Error> {
         // Always load the latest (current) event stream for command handling.
         let mut aggregate = self
-            .fetch_aggregate::<A>(id, AggregateVersion::Latest, expected_version, None)
+            .fetch_aggregate_at::<A>(id, AggregateVersion::Latest, expected_version, None)
             .await?;
 
         let stream_type = A::stream_type();

@@ -494,8 +494,9 @@ async fn bank_account_compaction_postgres_test() {
     }
 
     // Full history at this point: 6 events (3 Jan + MonthlyClosed + 2 Feb).
+    // fetch_aggregate is the ergonomic shorthand for fetching the latest state.
     let aggregate = cqrs
-        .fetch_aggregate::<BankAccountAggregate>(&stream_id, AggregateVersion::Latest, None, None)
+        .fetch_aggregate::<BankAccountAggregate>(&stream_id)
         .await
         .unwrap();
 
@@ -510,7 +511,12 @@ async fn bank_account_compaction_postgres_test() {
 
     // ── Verify: balance unchanged after replaying compacted stream ────────────
     let compacted_aggregate = cqrs
-        .fetch_aggregate::<BankAccountAggregate>(&stream_id, AggregateVersion::Latest, None, None)
+        .fetch_aggregate_at::<BankAccountAggregate>(
+            &stream_id,
+            AggregateVersion::Latest,
+            None,
+            None,
+        )
         .await
         .unwrap();
 

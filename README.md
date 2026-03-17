@@ -1182,10 +1182,9 @@ cqrs.execute::<BankAccountAggregate>(
 ).await?;
 
 // Fetch the aggregate to pass to compact.
+// fetch_aggregate is a shorthand for fetch_aggregate_at with the latest version.
 let aggregate = cqrs
-    .fetch_aggregate::<BankAccountAggregate>(
-        &stream_id, AggregateVersion::Latest, None, None,
-    )
+    .fetch_aggregate::<BankAccountAggregate>(&stream_id)
     .await?;
 
 // Compact: archives the full history and writes the minimal live stream.
@@ -1194,14 +1193,12 @@ let archive_version = cqrs.compact(&aggregate, meta).await?;
 
 // Future fetches replay only the 3 compacted events.
 let compacted = cqrs
-    .fetch_aggregate::<BankAccountAggregate>(
-        &stream_id, AggregateVersion::Latest, None, None,
-    )
+    .fetch_aggregate::<BankAccountAggregate>(&stream_id)
     .await?;
 
 // Original history is still accessible.
 let archived = cqrs
-    .fetch_aggregate::<BankAccountAggregate>(
+    .fetch_aggregate_at::<BankAccountAggregate>(
         &stream_id, AggregateVersion::Version(1), None, None,
     )
     .await?;
