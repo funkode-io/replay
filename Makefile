@@ -43,4 +43,4 @@ fix:
 
 .PHONY: wasm-test
 wasm-test:
-	wasm-pack test --headless --chrome es
+	wasm-pack test --headless --chrome macros-tests

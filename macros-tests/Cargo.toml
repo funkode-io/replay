@@ -1,0 +1,28 @@
+[package]
+name = "es-replay-macros-tests"
+version.workspace = true
+edition.workspace = true
+description = "Integration tests for es-replay-macros"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[lib]
+name = "replay_macros_tests"
+
+[dependencies]
+replay = { package = "es-replay", path = "../es", version = "0.1.0" }
+replay-macros = { package = "es-replay-macros", path = "../macros", version = "0.1.0" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+urn = { workspace = true }
+uuid = { workspace = true }
+
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-test = { workspace = true }

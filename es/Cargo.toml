@@ -26,7 +26,6 @@ tracing = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
-replay-macros = { package = "es-replay-macros", path = "../macros", version = "0.1.0" }
 tracing-test = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
