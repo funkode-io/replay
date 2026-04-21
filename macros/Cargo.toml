@@ -1,5 +1,5 @@
 [package]
-name = "replay-macros"
+name = "es-replay-macros"
 version.workspace = true
 edition.workspace = true
 description = "Procedural macros for the Replay event sourcing library"
@@ -15,9 +15,10 @@ targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [lib]
 proc-macro = true
+name = "replay_macros"
 
 [dependencies]
-replay = { path = "../es", version = "0.1.0" }
+replay = { package = "es-replay", path = "../es", version = "0.1.0" }
 proc-macro2 = { workspace = true }
 syn = { workspace = true }
 quote = { workspace = true }
