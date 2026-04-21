@@ -3,13 +3,22 @@ resolver = "2"
 
 members = ["es", "macros", "persistence"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Carlos Verdes <cverdes@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/funkode-io/replay"
+homepage = "https://github.com/funkode-io/replay"
+readme = "README.md"
+
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
-serde_with = "3.16.1"
+serde_with = "3.18.0"
 serde_json = "1.0.149"
 
 urn = { version = "0.7.0", features = ["serde"] }
-uuid = { version = "1.19.0", features = [
+uuid = { version = "1.23.1", features = [
   "v4",
   "serde",
 ], default-features = false }
@@ -17,7 +26,7 @@ uuid = { version = "1.19.0", features = [
 chrono = { version = "0.4", features = ["serde"] }
 
 thiserror = "2.0.18"
-anyhow = "1.0.101"
+anyhow = "1.0.102"
 
 sqlx = { version = "0.8.6", features = [
   "runtime-tokio",
@@ -27,20 +36,20 @@ sqlx = { version = "0.8.6", features = [
   "postgres",
 ] }
 
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
 futures = "0.3.31"
 async-stream = "0.3.6"
 async-trait = "0.1"
 
-moka = { version = "0.12.12", features = ["future"] }
+moka = { version = "0.12.15", features = ["future"] }
 tracing = "0.1.44"
 
 # Dev dependencies
 log = "0.4.29"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-test = "0.2"
 tokio-test = "0.4.5"
-testcontainers-modules = { version = "0.14.0", features = [
+testcontainers-modules = { version = "0.15.0", features = [
   "postgres",
   "blocking",
 ] }
@@ -48,8 +57,8 @@ dotenvy = "0.15.7"
 
 # Proc-macro dependencies
 proc-macro2 = "1.0.105"
-syn = { version = "2.0.114", features = ["visit"] }
-quote = "1.0.43"
+syn = { version = "2.0.117", features = ["visit"] }
+quote = "1.0.45"
 
 # test dependencies
-wasm-bindgen-test = "0.3.40"
+wasm-bindgen-test = "0.3.68"
