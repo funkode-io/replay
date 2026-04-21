@@ -11,10 +11,10 @@ keywords = ["event-sourcing", "cqrs", "postgres", "sqlx", "persistence"]
 categories = ["database", "asynchronous"]
 
 [package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [lib]
-crate-type = ["lib", "cdylib"]
+crate-type = ["lib"]
 
 [dependencies]
 replay = { path = "../es", version = "0.1.0" }
