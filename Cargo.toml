@@ -6,6 +6,7 @@ members = ["es", "macros", "persistence"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["Carlos Verdes"]
 license = "MIT"
 repository = "https://github.com/funkode-io/replay"
 homepage = "https://github.com/funkode-io/replay"
