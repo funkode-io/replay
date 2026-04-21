@@ -60,7 +60,6 @@ pub trait WithId: Sized {
 ///
 /// ```
 /// use replay::{Event, EventStream, WithId};
-/// use replay_macros::Event;
 /// use serde::{Deserialize, Serialize};
 /// use urn::Urn;
 ///
@@ -69,10 +68,19 @@ pub trait WithId: Sized {
 ///     pub balance: f64,
 /// }
 ///
-/// #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+/// #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 /// enum BankAccountEvent {
 ///     Deposited { amount: f64 },
 ///     Withdrawn { amount: f64 },
+/// }
+///
+/// impl Event for BankAccountEvent {
+///     fn event_type(&self) -> String {
+///         match self {
+///             BankAccountEvent::Deposited { .. } => "Deposited".to_string(),
+///             BankAccountEvent::Withdrawn { .. } => "Withdrawn".to_string(),
+///         }
+///     }
 /// }
 ///
 /// #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
@@ -165,9 +173,6 @@ impl Display for StreamState {
 mod tests {
     use std::str::FromStr;
 
-    // hack to use macros inside this crate
-    use crate as replay;
-    use replay_macros::Event;
     use serde::{Deserialize, Serialize};
     use urn::Urn;
 
@@ -180,10 +185,19 @@ mod tests {
     }
 
     // create bank account events enum: Deposited and Withdrawn
-    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     enum BankAccountEvent {
         Deposited { amount: f64 },
         Withdrawn { amount: f64 },
+    }
+
+    impl crate::Event for BankAccountEvent {
+        fn event_type(&self) -> String {
+            match self {
+                BankAccountEvent::Deposited { .. } => "Deposited".to_string(),
+                BankAccountEvent::Withdrawn { .. } => "Withdrawn".to_string(),
+            }
+        }
     }
 
     // bank account urn

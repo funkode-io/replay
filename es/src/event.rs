@@ -15,12 +15,20 @@ use serde::{de::DeserializeOwned, Serialize};
 /// use serde::{Deserialize, Serialize};
 ///
 /// use replay::Event;
-/// use replay_macros::Event;
 ///
-/// #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+/// #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 /// enum BankAccountEvent {
 ///     Deposited { amount: f64 },
 ///     Withdrawn { amount: f64 },
+/// }
+///
+/// impl Event for BankAccountEvent {
+///     fn event_type(&self) -> String {
+///         match self {
+///             BankAccountEvent::Deposited { .. } => "Deposited".to_string(),
+///             BankAccountEvent::Withdrawn { .. } => "Withdrawn".to_string(),
+///         }
+///     }
 /// }
 ///
 /// assert_eq!(BankAccountEvent::Deposited { amount: 100.0 }.event_type(), "Deposited");
@@ -35,17 +43,20 @@ pub trait Event:
 // tests
 #[cfg(test)]
 mod tests {
-    // hack to use macros inside this crate
-    use crate as replay;
-    use replay_macros::Event;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     use super::*;
 
-    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     struct TestEvent {
         pub id: i64,
         pub name: String,
+    }
+
+    impl Event for TestEvent {
+        fn event_type(&self) -> String {
+            "TestEvent".to_string()
+        }
     }
 
     #[test]
@@ -73,10 +84,19 @@ mod tests {
     }
 
     // create bank account events enum: Deposited and Withdrawn
-    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     enum BankAccountEvent {
         Deposited { amount: f64 },
         Withdrawn { amount: f64 },
+    }
+
+    impl Event for BankAccountEvent {
+        fn event_type(&self) -> String {
+            match self {
+                BankAccountEvent::Deposited { .. } => "Deposited".to_string(),
+                BankAccountEvent::Withdrawn { .. } => "Withdrawn".to_string(),
+            }
+        }
     }
 
     #[test]

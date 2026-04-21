@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = ["es", "macros", "persistence"]
+members = ["es", "macros", "persistence", "macros-tests"]
 
 [workspace.package]
 version = "0.1.0"

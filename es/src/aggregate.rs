@@ -269,7 +269,6 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use replay_macros::Event;
     use serde::{Deserialize, Serialize};
     use tracing_test::traced_test;
     use urn::Urn;
@@ -283,14 +282,23 @@ mod tests {
         Withdraw { amount: f64 },
     }
 
-    // hack to use macros inside this crate
-    use crate::{self as replay, WithId};
+    use crate::WithId;
 
-    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     enum BankAccountEvent {
         AccountOpened { account_number: String },
         Deposited { amount: f64 },
         Withdrawn { amount: f64 },
+    }
+
+    impl crate::Event for BankAccountEvent {
+        fn event_type(&self) -> String {
+            match self {
+                BankAccountEvent::AccountOpened { .. } => "AccountOpened".to_string(),
+                BankAccountEvent::Deposited { .. } => "Deposited".to_string(),
+                BankAccountEvent::Withdrawn { .. } => "Withdrawn".to_string(),
+            }
+        }
     }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
