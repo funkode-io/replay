@@ -1,7 +1,17 @@
 [package]
 name = "replay"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+description = "Event Sourcing and CQRS library with WASM support"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["event-sourcing", "cqrs", "ddd", "aggregate", "wasm"]
+categories = ["asynchronous"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [dependencies]
 serde = { workspace = true }
@@ -13,7 +23,7 @@ tracing = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
-replay-macros = { path = "../macros" }
+replay-macros = { path = "../macros", version = "0.1.0" }
 tracing-test = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }

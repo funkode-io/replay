@@ -3,6 +3,14 @@ resolver = "2"
 
 members = ["es", "macros", "persistence"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/funkode-io/replay"
+homepage = "https://github.com/funkode-io/replay"
+readme = "README.md"
+
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_with = "3.16.1"

@@ -1,13 +1,23 @@
 [package]
 name = "replay-macros"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+description = "Procedural macros for the Replay event sourcing library"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["event-sourcing", "cqrs", "macros", "proc-macro", "wasm"]
+categories = ["development-tools::procedural-macro-helpers"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [lib]
 proc-macro = true
 
 [dependencies]
-replay = { path = "../es" }
+replay = { path = "../es", version = "0.1.0" }
 proc-macro2 = { workspace = true }
 syn = { workspace = true }
 quote = { workspace = true }

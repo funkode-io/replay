@@ -1,14 +1,24 @@
 [package]
 name = "replay-persistence"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+description = "Persistence layer for the Replay event sourcing library (PostgreSQL and in-memory backends)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["event-sourcing", "cqrs", "postgres", "sqlx", "persistence"]
+categories = ["database", "asynchronous"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-replay = { path = "../es" }
-replay-macros = { path = "../macros" }
+replay = { path = "../es", version = "0.1.0" }
+replay-macros = { path = "../macros", version = "0.1.0" }
 
 serde = { workspace = true }
 serde_with = { workspace = true }
