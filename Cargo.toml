@@ -4,7 +4,7 @@ resolver = "2"
 members = ["es", "macros", "persistence", "macros-tests"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Carlos Verdes <cverdes@gmail.com>"]
 license = "MIT"
