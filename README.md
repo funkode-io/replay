@@ -857,6 +857,71 @@ active_products.insert(product2);
 assert_eq!(active_products.len(), 2);
 ```
 
+### Composing Scoped URNs
+
+When two streams are related (e.g., a product belonging to a catalog), you can embed that
+relationship directly in the URN using `WithId::at` and recover it with `WithId::extract_scope`.
+
+The resulting URN uses the format `urn:<nid>:<nss>@<scope_nid>:<scope_nss>`.
+
+```rust
+use replay::WithId;
+
+// urn:product:sku123  +  urn:catalog:that  →  urn:product:sku123@catalog:that
+let scoped = product.at(catalog_id)?;
+println!("{}", scoped.get_id()); // urn:product:sku123@catalog:that
+
+// Extract the scope back — specify the expected output type as a type parameter.
+// The output type's TryFrom<Urn> implementation validates the NID.
+let catalog: CatalogUrn = scoped.extract_scope::<CatalogUrn>()?;
+```
+
+`at` accepts any type that is `Into<Urn>`, which includes every `StreamId` in the library.
+This means you pass a typed URN directly by value; no raw `Urn` wrapping is required:
+
+```rust
+let catalog_urn: CatalogUrn = CatalogUrn::new("winter-2026").unwrap();
+let product_urn: ProductUrn = ProductUrn::new("sku-999").unwrap();
+
+// scope the product under the catalog
+let scoped_product = product.at(catalog_urn)?;
+// → urn:product:sku-999@catalog:winter-2026
+```
+
+`extract_scope` is **generic over the output type**. You declare what URN type you expect and
+the conversion is handled by that type's `TryFrom<Urn>` implementation, which is responsible
+for validating the NID. Requesting the wrong type is a compile-time-safe, runtime-checked error:
+
+```rust
+// ✅ correct — scope NID is "catalog", CatalogUrn accepts it
+let catalog: CatalogUrn = scoped_product.extract_scope::<CatalogUrn>()?;
+
+// ❌ wrong type — scope NID is "catalog", but ProductUrn expects "product"
+let wrong: ProductUrn = scoped_product.extract_scope::<ProductUrn>()?; // Err: NID mismatch
+```
+
+**Validation rules enforced by `at`:**
+
+| Condition | Error |
+|---|---|
+| NSS already contains `@` | "URN is already scoped" |
+
+**Validation rules enforced by `extract_scope`:**
+
+| Input NSS | Error |
+|---|---|
+| `sku123` — no `@` | "not scoped (no '@' in NSS)" |
+| `@catalog:that` — empty own NSS | "empty NSS before '@'" |
+| `sku123@catalog` — no `:` after `@` | "missing ':' (expected '<nid>:<nss>')" |
+| `sku@:nss` — empty scope NID | "Scope NID is empty" |
+| `sku@nid:` — empty scope NSS | "Scope NSS is empty" |
+| `a@b:c@d:e` — multiple `@` | "multiple '@' in NSS (ambiguous scope)" |
+| wrong output type | "NID mismatch" (from `TryFrom<Urn>` on the output type) |
+
+The output type can be any type that implements `TryFrom<Urn>` — it does not have to be the
+same as `Self::StreamId`. This allows a `ProductStream` to extract a `CatalogUrn`, a `TenantUrn`,
+or any other domain type, as long as the NID embedded in the scope part matches.
+
 ## WASM Support
 
 The library supports WebAssembly (WASM) targets with automatic adjustments for single-threaded environments:

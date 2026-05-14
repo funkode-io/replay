@@ -47,6 +47,143 @@ pub trait WithId: Sized {
 
         Ok(Self::with_id(aggregate_id))
     }
+
+    /// Returns a new instance whose stream ID has the suffix `@<other.nid>:<other.nss>` appended
+    /// to the current URN's NSS, scoping this stream under `other`.
+    ///
+    /// `other` can be any type that converts into a [`Urn`] — typically another aggregate's
+    /// `StreamId`.
+    ///
+    /// Fails if the current URN's NSS already contains `@`, which would indicate the stream is
+    /// already scoped.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // urn:product:sku123  +  urn:catalog:that  →  urn:product:sku123@catalog:that
+    /// let scoped: ProductUrn = product_urn.at(catalog_urn)?;
+    /// ```
+    fn at(&self, other: impl Into<Urn>) -> crate::Result<Self> {
+        let current_urn: Urn = self.get_id().clone().into();
+        let other_urn: Urn = other.into();
+
+        if current_urn.nss().contains('@') {
+            return Err(Error::invalid_input("URN is already scoped (contains '@')")
+                .with_operation("at")
+                .with_context("urn", current_urn.to_string()));
+        }
+
+        let new_nss = format!(
+            "{}@{}:{}",
+            current_urn.nss(),
+            other_urn.nid(),
+            other_urn.nss()
+        );
+
+        let new_urn = urn::UrnBuilder::new(current_urn.nid(), &new_nss)
+            .build()
+            .map_err(|e| {
+                Error::invalid_input("Failed to build scoped URN")
+                    .with_operation("at")
+                    .with_context("nss", new_nss.clone())
+                    .with_context("error", format!("{:?}", e))
+            })?;
+
+        let id: Self::StreamId = new_urn.try_into().map_err(|e| {
+            Error::invalid_input("Failed to convert scoped URN to StreamId")
+                .with_operation("at")
+                .with_context("error", format!("{:?}", e))
+        })?;
+
+        Ok(Self::with_id(id))
+    }
+
+    /// Extracts the scope URN that was embedded by [`Self::at`].
+    ///
+    /// The expected NSS format is `<nss>@<scope_nid>:<scope_nss>` where:
+    /// - `<nss>` is non-empty
+    /// - `<scope_nid>` and `<scope_nss>` are both non-empty
+    /// - there is exactly one `@`
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when:
+    /// - the NSS contains no `@` (not a scoped URN)
+    /// - the NSS contains more than one `@` (ambiguous)
+    /// - the part before `@` is empty (`urn:product:@catalog:that`)
+    /// - the part after `@` has no `:` (`urn:product:sku@catalog`)
+    /// - the scope NID or scope NSS is empty (`urn:product:sku@:nss` / `urn:product:sku@nid:`)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // urn:product:sku123@catalog:that  →  CatalogUrn(urn:catalog:that)
+    /// let scope: CatalogUrn = scoped_product.extract_scope::<CatalogUrn>()?;
+    /// ```
+    fn extract_scope<O>(&self) -> crate::Result<O>
+    where
+        O: TryFrom<Urn, Error: std::fmt::Debug>,
+    {
+        let current_urn: Urn = self.get_id().clone().into();
+        let nss = current_urn.nss();
+
+        let at_count = nss.chars().filter(|&c| c == '@').count();
+        if at_count == 0 {
+            return Err(Error::invalid_input("URN is not scoped (no '@' in NSS)")
+                .with_operation("extract_scope")
+                .with_context("urn", current_urn.to_string()));
+        }
+        if at_count > 1 {
+            return Err(
+                Error::invalid_input("URN has multiple '@' in NSS (ambiguous scope)")
+                    .with_operation("extract_scope")
+                    .with_context("urn", current_urn.to_string()),
+            );
+        }
+
+        // exactly one '@'
+        let (own_nss, scope_part) = nss.split_once('@').unwrap();
+
+        if own_nss.is_empty() {
+            return Err(Error::invalid_input("URN has empty NSS before '@'")
+                .with_operation("extract_scope")
+                .with_context("urn", current_urn.to_string()));
+        }
+
+        let (scope_nid, scope_nss) = scope_part.split_once(':').ok_or_else(|| {
+            Error::invalid_input("Scope part after '@' is missing ':' (expected '<nid>:<nss>')")
+                .with_operation("extract_scope")
+                .with_context("urn", current_urn.to_string())
+                .with_context("scope_part", scope_part.to_string())
+        })?;
+
+        if scope_nid.is_empty() {
+            return Err(Error::invalid_input("Scope NID is empty")
+                .with_operation("extract_scope")
+                .with_context("urn", current_urn.to_string()));
+        }
+        if scope_nss.is_empty() {
+            return Err(Error::invalid_input("Scope NSS is empty")
+                .with_operation("extract_scope")
+                .with_context("urn", current_urn.to_string()));
+        }
+
+        let scope_urn = urn::UrnBuilder::new(scope_nid, scope_nss)
+            .build()
+            .map_err(|e| {
+                Error::invalid_input("Failed to build scope URN")
+                    .with_operation("extract_scope")
+                    .with_context("scope_nid", scope_nid.to_string())
+                    .with_context("scope_nss", scope_nss.to_string())
+                    .with_context("error", format!("{:?}", e))
+            })?;
+
+        O::try_from(scope_urn).map_err(|e| {
+            Error::invalid_input("Failed to convert scope URN to expected type (NID mismatch?)")
+                .with_operation("extract_scope")
+                .with_context("error", format!("{:?}", e))
+        })
+    }
 }
 
 /// In event sourcing a stream is a sequence of events that are related to a specific entity.
@@ -266,5 +403,190 @@ mod tests {
         bank_account.apply(withdrawn_event);
 
         assert_eq!(bank_account.balance, 50.0);
+    }
+
+    // product urn — validates nid == "product"
+    #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+    struct ProductUrn(Urn);
+
+    impl From<ProductUrn> for Urn {
+        fn from(urn: ProductUrn) -> Self {
+            urn.0
+        }
+    }
+
+    impl TryFrom<Urn> for ProductUrn {
+        type Error = String;
+
+        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+            if urn.nid() == "product" {
+                Ok(ProductUrn(urn))
+            } else {
+                Err(format!(
+                    "Invalid NID for ProductUrn: expected 'product', got '{}'",
+                    urn.nid()
+                ))
+            }
+        }
+    }
+
+    // catalog urn — validates nid == "catalog"
+    #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+    struct CatalogUrn(Urn);
+
+    impl From<CatalogUrn> for Urn {
+        fn from(urn: CatalogUrn) -> Self {
+            urn.0
+        }
+    }
+
+    impl TryFrom<Urn> for CatalogUrn {
+        type Error = String;
+
+        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+            if urn.nid() == "catalog" {
+                Ok(CatalogUrn(urn))
+            } else {
+                Err(format!(
+                    "Invalid NID for CatalogUrn: expected 'catalog', got '{}'",
+                    urn.nid()
+                ))
+            }
+        }
+    }
+
+    // minimal stream wrappers so we can call WithId methods
+    struct ProductStream {
+        pub id: ProductUrn,
+    }
+
+    impl WithId for ProductStream {
+        type StreamId = ProductUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            ProductStream { id }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
+    #[test]
+    fn test_at_creates_scoped_urn() {
+        let product = ProductStream::with_string_id("urn:product:sku123").unwrap();
+        let catalog = CatalogUrn(Urn::from_str("urn:catalog:that").unwrap());
+        let scoped = product.at(catalog).unwrap();
+        let scoped_urn: Urn = scoped.get_id().clone().into();
+        assert_eq!(scoped_urn.to_string(), "urn:product:sku123@catalog:that");
+    }
+
+    #[test]
+    fn test_at_fails_if_already_scoped() {
+        let product = ProductStream::with_string_id("urn:product:sku123@catalog:that").unwrap();
+        let catalog = CatalogUrn(Urn::from_str("urn:catalog:other").unwrap());
+        assert!(product.at(catalog).is_err());
+    }
+
+    #[test]
+    fn test_extract_scope_happy_path() {
+        let product = ProductStream::with_string_id("urn:product:sku123@catalog:that").unwrap();
+        let scope: CatalogUrn = product.extract_scope::<CatalogUrn>().unwrap();
+        let scope_urn: Urn = scope.into();
+        assert_eq!(scope_urn.nid(), "catalog");
+        assert_eq!(scope_urn.nss(), "that");
+    }
+
+    #[test]
+    fn test_extract_scope_wrong_nid_fails() {
+        // The scope is urn:catalog:that, but we ask for it as ProductUrn (nid="product").
+        let product = ProductStream::with_string_id("urn:product:sku123@catalog:that").unwrap();
+        let err = product.extract_scope::<ProductUrn>().unwrap_err();
+        assert!(err.to_string().contains("NID mismatch"));
+    }
+
+    #[test]
+    fn test_extract_scope_roundtrip() {
+        let product = ProductStream::with_string_id("urn:product:sku123").unwrap();
+        let catalog = CatalogUrn(Urn::from_str("urn:catalog:that").unwrap());
+        let scoped = product.at(catalog.clone()).unwrap();
+        let extracted: CatalogUrn = scoped.extract_scope::<CatalogUrn>().unwrap();
+        assert_eq!(extracted, catalog);
+    }
+
+    #[test]
+    fn test_extract_scope_not_scoped() {
+        let product = ProductStream::with_string_id("urn:product:sku123").unwrap();
+        let err = product.extract_scope::<CatalogUrn>().unwrap_err();
+        assert!(err.to_string().contains("not scoped"));
+    }
+
+    #[test]
+    fn test_extract_scope_empty_own_nss() {
+        // urn:product:@catalog:that — empty NSS before @
+        let product = ProductStream::with_string_id("urn:product:@catalog:that").unwrap();
+        let err = product.extract_scope::<CatalogUrn>().unwrap_err();
+        assert!(err.to_string().contains("empty NSS before"));
+    }
+
+    #[test]
+    fn test_extract_scope_missing_colon_in_scope() {
+        // urn:product:sku123@catalog — no colon after @
+        let product = ProductStream::with_string_id("urn:product:sku123@catalog").unwrap();
+        let err = product.extract_scope::<CatalogUrn>().unwrap_err();
+        assert!(err.to_string().contains("missing ':'"));
+    }
+
+    #[test]
+    fn test_extract_scope_multiple_at() {
+        // urn:product:sku123@catalog:that@tenant:acme — multiple @
+        let product =
+            ProductStream::with_string_id("urn:product:sku123@catalog:that@tenant:acme").unwrap();
+        let err = product.extract_scope::<CatalogUrn>().unwrap_err();
+        assert!(err.to_string().contains("multiple '@'"));
+    }
+
+    #[test]
+    fn test_at_preserves_own_nid_and_nss() {
+        // The base product's nid and the NSS before @ must be unchanged.
+        let product = ProductStream::with_string_id("urn:product:sku-999").unwrap();
+        let catalog = CatalogUrn(Urn::from_str("urn:catalog:books").unwrap());
+        let scoped = product.at(catalog).unwrap();
+        let scoped_urn: Urn = scoped.get_id().clone().into();
+        assert_eq!(scoped_urn.nid(), "product");
+        assert_eq!(scoped_urn.nss(), "sku-999@catalog:books");
+    }
+
+    #[test]
+    fn test_extract_scope_empty_scope_nid() {
+        // urn:product:sku@:nss — empty NID in scope
+        let product = ProductStream::with_string_id("urn:product:sku@:nss").unwrap();
+        let err = product.extract_scope::<CatalogUrn>().unwrap_err();
+        assert!(err.to_string().contains("Scope NID is empty"));
+    }
+
+    #[test]
+    fn test_extract_scope_empty_scope_nss() {
+        // urn:product:sku@nid: — empty NSS in scope
+        let product = ProductStream::with_string_id("urn:product:sku@nid:").unwrap();
+        let err = product.extract_scope::<CatalogUrn>().unwrap_err();
+        assert!(err.to_string().contains("Scope NSS is empty"));
+    }
+
+    #[test]
+    fn test_scoped_urn_parses_back_from_string() {
+        // A scoped URN should survive a round-trip through with_string_id.
+        let product = ProductStream::with_string_id("urn:product:sku123").unwrap();
+        let catalog = CatalogUrn(Urn::from_str("urn:catalog:that").unwrap());
+        let scoped_urn_str: String = {
+            let u: Urn = product.at(catalog).unwrap().get_id().clone().into();
+            u.to_string()
+        };
+        // Parse back from the URN string.
+        let reparsed = ProductStream::with_string_id(&scoped_urn_str).unwrap();
+        let scope: CatalogUrn = reparsed.extract_scope::<CatalogUrn>().unwrap();
+        let scope_urn: Urn = scope.into();
+        assert_eq!(scope_urn.nid(), "catalog");
+        assert_eq!(scope_urn.nss(), "that");
     }
 }
