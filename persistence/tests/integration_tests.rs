@@ -574,3 +574,129 @@ async fn bank_account_compaction_postgres_test() {
         "Archived Version(1) must retain all 6 original events"
     );
 }
+
+// ── Scoped-URN types used by the tests below ─────────────────────────────────
+
+/// A branch that owns one or more bank accounts.
+#[derive(Clone, Serialize, Deserialize, Debug, Urn)]
+struct BranchUrn(Urn);
+
+impl TryFrom<Urn> for BranchUrn {
+    type Error = String;
+
+    fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+        let expected_nid = "branch";
+        if urn.nid() == expected_nid {
+            Ok(BranchUrn(urn))
+        } else {
+            Err(format!(
+                "Invalid namespace for BranchUrn: expected '{}', found '{}'",
+                expected_nid,
+                urn.nid()
+            ))
+        }
+    }
+}
+
+/// Minimal stream wrapper that uses `BankAccountUrn` as its `StreamId`.
+/// Used for `at` / `extract_scope` tests without Postgres.
+#[derive(Debug)]
+struct BankAccountStream {
+    pub id: BankAccountUrn,
+}
+
+impl WithId for BankAccountStream {
+    type StreamId = BankAccountUrn;
+
+    fn with_id(id: Self::StreamId) -> Self {
+        BankAccountStream { id }
+    }
+
+    fn get_id(&self) -> &Self::StreamId {
+        &self.id
+    }
+}
+
+// ── Scoped-URN tests (no Postgres required) ───────────────────────────────────
+
+/// A bank-account URN can be scoped to a branch:
+///   urn:bank-account:acct-1  +  urn:branch:london  →  urn:bank-account:acct-1@branch:london
+#[test]
+fn test_bank_account_scoped_to_branch() {
+    let account = BankAccountStream::with_string_id("urn:bank-account:acct-1").unwrap();
+    let branch = BranchUrn(UrnBuilder::new("branch", "london").build().unwrap());
+
+    let scoped = account.at(branch).unwrap();
+    let scoped_urn: Urn = scoped.get_id().clone().into();
+
+    assert_eq!(
+        scoped_urn.to_string(),
+        "urn:bank-account:acct-1@branch:london"
+    );
+    assert_eq!(scoped_urn.nid(), "bank-account");
+    assert_eq!(scoped_urn.nss(), "acct-1@branch:london");
+}
+
+/// Extracting the scope as `BranchUrn` validates the NID is "branch".
+#[test]
+fn test_extract_branch_from_scoped_account() {
+    let scoped =
+        BankAccountStream::with_string_id("urn:bank-account:acct-1@branch:london").unwrap();
+
+    let branch: BranchUrn = scoped.extract_scope::<BranchUrn>().unwrap();
+
+    assert_eq!(branch.0.nid(), "branch");
+    assert_eq!(branch.0.nss(), "london");
+}
+
+/// Extracting with the wrong type fails because the NID doesn't match.
+#[test]
+fn test_extract_scope_wrong_nid_fails() {
+    // scope is urn:branch:london, but we ask for BankAccountUrn (nid="bank-account")
+    let scoped =
+        BankAccountStream::with_string_id("urn:bank-account:acct-1@branch:london").unwrap();
+    let err = scoped.extract_scope::<BankAccountUrn>().unwrap_err();
+    assert!(err.to_string().contains("NID mismatch"));
+}
+
+/// `at` followed by `extract_scope` must round-trip to the original scope URN.
+#[test]
+fn test_scope_round_trip() {
+    let account = BankAccountStream::with_string_id("urn:bank-account:acct-42").unwrap();
+    let branch = BranchUrn(UrnBuilder::new("branch", "paris").build().unwrap());
+
+    let scoped = account.at(branch.clone()).unwrap();
+    let extracted: BranchUrn = scoped.extract_scope::<BranchUrn>().unwrap();
+
+    assert_eq!(extracted, branch);
+}
+
+/// Attempting to scope an already-scoped stream must fail.
+#[test]
+fn test_cannot_double_scope_account() {
+    let scoped =
+        BankAccountStream::with_string_id("urn:bank-account:acct-1@branch:london").unwrap();
+    let another_branch = BranchUrn(UrnBuilder::new("branch", "berlin").build().unwrap());
+
+    let err = scoped.at(another_branch).unwrap_err();
+    assert!(err.to_string().contains("already scoped"));
+}
+
+/// A scoped URN survives serialisation to a string and back.
+#[test]
+fn test_scoped_urn_string_round_trip() {
+    let account = BankAccountStream::with_string_id("urn:bank-account:acct-7").unwrap();
+    let branch = BranchUrn(UrnBuilder::new("branch", "tokyo").build().unwrap());
+    let scoped_str: String = {
+        let u: Urn = account.at(branch).unwrap().get_id().clone().into();
+        u.to_string()
+    };
+
+    assert_eq!(scoped_str, "urn:bank-account:acct-7@branch:tokyo");
+
+    // Reconstruct from the string and extract scope as the typed BranchUrn.
+    let reparsed = BankAccountStream::with_string_id(&scoped_str).unwrap();
+    let branch: BranchUrn = reparsed.extract_scope::<BranchUrn>().unwrap();
+    assert_eq!(branch.0.nid(), "branch");
+    assert_eq!(branch.0.nss(), "tokyo");
+}
