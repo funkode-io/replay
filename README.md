@@ -1001,6 +1001,165 @@ async fn test_aggregate_in_wasm() {
 }
 ```
 
+## Filtering Events with `StreamFilter`
+
+`StreamFilter` controls which persisted events are returned by `stream_events` and which events a
+`Query` processes. Filters compose freely using `.and()`, `.or()` and the `!` operator.
+
+### Available filters
+
+| Constructor | Matches events where… |
+|---|---|
+| `StreamFilter::all()` | everything (no restriction) |
+| `StreamFilter::with_stream_id::<S>(&id)` | `stream_id` equals the given URN |
+| `StreamFilter::for_stream_type::<S>()` | stream type equals `S::stream_type()` |
+| `StreamFilter::with_metadata(value)` | metadata equals the serialised value |
+| `StreamFilter::after_version(n)` | sequence version **>** `n` (exclusive) |
+| `StreamFilter::up_to_version(n)` | sequence version **≤** `n` (inclusive) |
+| `StreamFilter::created_after(ts)` | creation timestamp **>** `ts` (exclusive) |
+| `StreamFilter::created_before(ts)` | creation timestamp **≤** `ts` (inclusive) |
+| `StreamFilter::with_aggregate_version(v)` | `aggregate_version` equals `v` (`None` = current events, `Some(n)` = archived snapshot `n`) |
+
+### Combining filters
+
+All filters implement a fluent builder API:
+
+```rust
+use replay_persistence::StreamFilter;
+
+// AND: both conditions must hold
+let filter = StreamFilter::with_stream_id::<OrderStream>(&order_id)
+    .and(StreamFilter::after_version(10));
+
+// OR: either condition is sufficient
+let filter = StreamFilter::for_stream_type::<OrderStream>()
+    .or(StreamFilter::for_stream_type::<PaymentStream>());
+
+// NOT: negate any filter (also available via the `!` operator)
+let filter = StreamFilter::after_version(5).not();
+// equivalently:
+let filter = !StreamFilter::after_version(5);
+
+// Chaining helpers — each returns a new StreamFilter with the extra condition ANDed in
+let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
+    .and_with_metadata(metadata_value)
+    .and_at_stream_version(50)          // ≤ version 50
+    .and_at_timestamp(cutoff);          // created ≤ cutoff
+```
+
+### Per-filter examples
+
+**Select a single stream**
+
+```rust
+let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id);
+```
+
+**Select all streams of a given type**
+
+```rust
+let filter = StreamFilter::for_stream_type::<BankAccountStream>();
+```
+
+**Events after a known checkpoint** (e.g. catch-up subscriptions)
+
+```rust
+let filter = StreamFilter::for_stream_type::<OrderStream>()
+    .and(StreamFilter::after_version(last_processed_version));
+```
+
+**Time-travel read** — replay a stream as it looked at a past instant
+
+```rust
+let cutoff = "2026-01-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
+    .and_at_timestamp(cutoff);
+```
+
+**Version-range slice** — events between two sequence numbers
+
+```rust
+let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
+    .and(StreamFilter::after_version(10))   // > 10
+    .and(StreamFilter::up_to_version(20));  // ≤ 20
+```
+
+**Read a specific compaction snapshot** (`aggregate_version = Some(n)`) or the live stream (`None`)
+
+```rust
+// Live (current) events
+let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
+    .and_aggregate_version(None);
+
+// Archived snapshot created during the 2nd compaction
+let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
+    .and_aggregate_version(Some(2));
+```
+
+**Filter by metadata** (e.g. events tagged with a specific correlation ID)
+
+```rust
+#[derive(Serialize)]
+struct OrderMeta { correlation_id: String }
+
+let filter = StreamFilter::with_metadata(OrderMeta {
+    correlation_id: "req-abc".into(),
+});
+```
+
+**Optional bounds** — `_optional` variants are no-ops when the value is `None`, useful when
+the bound comes from an API query parameter:
+
+```rust
+// at_version and at_timestamp both come from optional query params
+let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
+    .and_at_stream_version_optional(at_version)   // Some(n) → UpToVersion(n), None → no-op
+    .and_at_timestamp_optional(at_timestamp);      // Some(ts) → CreatedBefore(ts), None → no-op
+```
+
+### Using `StreamFilter` in a `Query`
+
+Override `stream_filter` to restrict which events your query receives:
+
+```rust
+use replay_persistence::{Query, StreamFilter};
+
+struct AccountSummaryQuery {
+    account_id: BankAccountUrn,
+    total_deposited: f64,
+}
+
+impl Query for AccountSummaryQuery {
+    type Event = BankAccountEvent;
+
+    fn stream_filter(&self) -> StreamFilter {
+        StreamFilter::with_stream_id::<BankAccountStream>(&self.account_id)
+    }
+
+    fn update(&mut self, event: PersistedEvent<Self::Event>) {
+        if let BankAccountEvent::Deposited { amount } = event.data {
+            self.total_deposited += amount;
+        }
+    }
+}
+
+// Run it
+let mut query = AccountSummaryQuery { account_id: id, total_deposited: 0.0 };
+cqrs.run_query(&mut query).await?;
+println!("total deposited: {}", query.total_deposited);
+```
+
+### Using `StreamFilter` directly with the store
+
+```rust
+use replay_persistence::StreamFilter;
+
+let filter = StreamFilter::for_stream_type::<BankAccountStream>()
+    .and(StreamFilter::after_version(last_seen));
+
+let events = store.stream_events::<BankAccountEvent>(filter);
+```
+
 ## Querying Events from Multiple Aggregates
 
 When building CQRS queries, you often need to process events from multiple aggregate types together. The `query_events!` macro simplifies creating a wrapper enum that can hold events from different aggregates:
