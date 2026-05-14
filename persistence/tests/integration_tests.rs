@@ -1,97 +1,56 @@
+use std::str::FromStr;
+
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 use tokio_test::assert_err;
-use urn::{Urn, UrnBuilder};
+use urn::Urn;
 
-use replay::{Compactable, WithId};
-use replay_macros::{Event, Urn};
+use replay::{prelude::*, Compactable};
+use replay_macros::{define_aggregate, Urn};
 use replay_persistence::{AggregateVersion, EventStore, PersistedEvent, StreamFilter};
 
 const POSTGRES_PORT: u16 = 5432;
 
-//  bank account stream aggregate model (includes stream id)
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-struct BankAccountAggregate {
-    pub id: BankAccountUrn,
-    pub balance: f64,
-}
+// ── Aggregate definition via macro ───────────────────────────────────────────
 
-// bank account commands
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-enum BankAccountCommand {
-    Deposit {
-        effective_on: chrono::NaiveDate,
-        amount: f64,
-    },
-    Withdraw {
-        effective_on: chrono::NaiveDate,
-        amount: f64,
-    },
-    /// Formally close the month identified by `month`.  The closing balance is
-    /// derived from the aggregate's current in-memory state.
-    CloseMonth { month: chrono::NaiveDate },
-}
-
-// bank account events
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
-enum BankAccountEvent {
-    Deposited {
-        operation_date: chrono::NaiveDate,
-        amount: f64,
-    },
-    Withdrawn {
-        operation_date: chrono::NaiveDate,
-        amount: f64,
-    },
-    /// Summarises all activity up to and including a completed calendar month.
-    /// Carries the closing balance so the aggregate can be restored from this
-    /// single event without replaying every prior transaction.
-    MonthlyClosed {
-        month: chrono::NaiveDate,
-        closing_balance: f64,
-    },
-}
-
-// bank account urn
-#[derive(Clone, Serialize, Deserialize, Debug, Urn)]
-struct BankAccountUrn(Urn);
-
-impl TryFrom<Urn> for BankAccountUrn {
-    type Error = String;
-
-    fn try_from(urn: Urn) -> Result<Self, Self::Error> {
-        // Enforce namespace validation to be consistent with production behavior
-        let expected_nid = "bank-account";
-        if urn.nid() == expected_nid {
-            Ok(BankAccountUrn(urn))
-        } else {
-            Err(format!(
-                "Invalid namespace for BankAccountUrn: expected '{}', found '{}'",
-                expected_nid,
-                urn.nid()
-            ))
+define_aggregate! {
+    BankAccount {
+        namespace: "bank-account",
+        state: {
+            balance: f64,
+        },
+        commands: {
+            Deposit {
+                effective_on: chrono::NaiveDate,
+                amount: f64,
+            },
+            Withdraw {
+                effective_on: chrono::NaiveDate,
+                amount: f64,
+            },
+            CloseMonth { month: chrono::NaiveDate },
+        },
+        events: {
+            Deposited {
+                operation_date: chrono::NaiveDate,
+                amount: f64,
+            },
+            Withdrawn {
+                operation_date: chrono::NaiveDate,
+                amount: f64,
+            },
+            MonthlyClosed {
+                month: chrono::NaiveDate,
+                closing_balance: f64,
+            },
         }
     }
 }
 
-// Implement WithId trait
-impl replay::WithId for BankAccountAggregate {
-    type StreamId = BankAccountUrn;
-
-    fn with_id(id: Self::StreamId) -> Self {
-        Self { id, balance: 0.0 }
-    }
-
-    fn get_id(&self) -> &Self::StreamId {
-        &self.id
-    }
-}
-
-// bank account stream
-impl replay::EventStream for BankAccountAggregate {
+impl replay::EventStream for BankAccount {
     type Event = BankAccountEvent;
 
     fn stream_type() -> String {
@@ -111,10 +70,9 @@ impl replay::EventStream for BankAccountAggregate {
     }
 }
 
-impl replay::Aggregate for BankAccountAggregate {
+impl replay::Aggregate for BankAccount {
     type Command = BankAccountCommand;
     type Error = replay::Error;
-
     type Services = ();
 
     async fn handle(
@@ -126,13 +84,10 @@ impl replay::Aggregate for BankAccountAggregate {
             BankAccountCommand::Deposit {
                 effective_on,
                 amount,
-            } => {
-                let event = BankAccountEvent::Deposited {
-                    operation_date: effective_on,
-                    amount,
-                };
-                Ok(vec![event])
-            }
+            } => Ok(vec![BankAccountEvent::Deposited {
+                operation_date: effective_on,
+                amount,
+            }]),
             BankAccountCommand::Withdraw {
                 effective_on,
                 amount,
@@ -142,14 +97,11 @@ impl replay::Aggregate for BankAccountAggregate {
                         .with_operation("Withdraw")
                         .with_context("amount_tried", amount));
                 }
-
-                let event = BankAccountEvent::Withdrawn {
+                Ok(vec![BankAccountEvent::Withdrawn {
                     operation_date: effective_on,
                     amount,
-                };
-                Ok(vec![event])
+                }])
             }
-            // Close the current month; closing balance is taken from aggregate state.
             BankAccountCommand::CloseMonth { month } => Ok(vec![BankAccountEvent::MonthlyClosed {
                 month,
                 closing_balance: self.balance,
@@ -158,19 +110,16 @@ impl replay::Aggregate for BankAccountAggregate {
     }
 }
 
-impl Compactable for BankAccountAggregate {
+impl Compactable for BankAccount {
     async fn compacted_events(
         &self,
         events: impl futures::TryStream<Ok = BankAccountEvent, Error = replay::Error> + Send,
     ) -> replay::Result<Vec<BankAccountEvent>> {
         use futures::TryStreamExt;
-        // Sliding-window scan via try_fold: only the events from the last
-        // MonthlyClosed onward are kept in the accumulator at any time.
-        // Closed months are never accumulated in memory.
         events
             .try_fold(Vec::new(), |mut tail, event| async move {
                 if matches!(event, BankAccountEvent::MonthlyClosed { .. }) {
-                    tail.clear(); // drop everything before this summary checkpoint
+                    tail.clear();
                 }
                 tail.push(event);
                 Ok(tail)
@@ -193,7 +142,7 @@ impl std::fmt::Display for BankAccountStatement {
         write!(
             f,
             "Bank account: {}\nFrom: {}\nTo: {}\nTransactions: {:?}\nBalance change: {}\nTotal transactions: {}",
-            self.bank_account.0,
+            self.bank_account,
             self.from,
             self.to,
             self.transactions,
@@ -207,12 +156,10 @@ impl replay_persistence::Query for BankAccountStatement {
     type Event = BankAccountEvent;
 
     fn stream_filter(&self) -> StreamFilter {
-        // filter by from / to dates
-        replay_persistence::StreamFilter::with_stream_id::<BankAccountAggregate>(&self.bank_account)
+        replay_persistence::StreamFilter::with_stream_id::<BankAccount>(&self.bank_account)
     }
 
     fn update(&mut self, event: PersistedEvent<Self::Event>) {
-        // Summary events are not individual transactions and are excluded from statements.
         match event.data {
             BankAccountEvent::Deposited {
                 operation_date,
@@ -242,7 +189,6 @@ impl replay_persistence::Query for BankAccountStatement {
                 self.balance_change -= amount;
                 self.total_transactions += 1;
             }
-            // MonthlyClosed is a compaction marker — not an individual statement line.
             BankAccountEvent::MonthlyClosed { .. } => {}
         }
     }
@@ -279,7 +225,7 @@ async fn bank_account_postgres_test() {
     let store = replay_persistence::PostgresEventStore::new(pg_pool);
     let cqrs = replay_persistence::Cqrs::new(store);
 
-    let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
+    let stream_id = BankAccountUrn::new("1").unwrap();
 
     let commands = vec![
         // create deposit for 1st Jan 2025
@@ -294,12 +240,8 @@ async fn bank_account_postgres_test() {
         },
     ];
 
-    let id = BankAccountUrn(
-        UrnBuilder::new("bank-account", &uuid::Uuid::new_v4().to_string())
-            .build()
-            .unwrap(),
-    );
-    let mut bank_account: BankAccountAggregate = BankAccountAggregate::with_id(id);
+    let id = BankAccountUrn::new_random();
+    let mut bank_account: BankAccount = BankAccount::with_id(id);
 
     let services = &();
     let expected_version = None;
@@ -320,7 +262,7 @@ async fn bank_account_postgres_test() {
     assert_eq!(bank_account.balance, 60.0);
 
     let result = cqrs
-        .execute::<BankAccountAggregate>(
+        .execute::<BankAccount>(
             &stream_id,
             replay::Metadata::default(),
             // create withdraw for 3rd Jan 2025
@@ -428,11 +370,7 @@ async fn bank_account_compaction_postgres_test() {
     let store = replay_persistence::PostgresEventStore::new(pg_pool);
     let cqrs = replay_persistence::Cqrs::new(store.clone());
 
-    let stream_id = BankAccountUrn(
-        UrnBuilder::new("bank-account", "compact-1")
-            .build()
-            .unwrap(),
-    );
+    let stream_id = BankAccountUrn::new("compact-1").unwrap();
     let services = &();
     let meta = replay::Metadata::default();
 
@@ -459,14 +397,14 @@ async fn bank_account_compaction_postgres_test() {
             amount: 500.0,
         },
     ] {
-        cqrs.execute::<BankAccountAggregate>(&stream_id, meta.clone(), cmd, services, None)
+        cqrs.execute::<BankAccount>(&stream_id, meta.clone(), cmd, services, None)
             .await
             .unwrap();
     }
 
     // ── Close January ─────────────────────────────────────────────────────────
     // CloseMonth derives closing_balance from current aggregate state (1300).
-    cqrs.execute::<BankAccountAggregate>(
+    cqrs.execute::<BankAccount>(
         &stream_id,
         meta.clone(),
         BankAccountCommand::CloseMonth { month: jan_1 },
@@ -488,7 +426,7 @@ async fn bank_account_compaction_postgres_test() {
             amount: 100.0,
         },
     ] {
-        cqrs.execute::<BankAccountAggregate>(&stream_id, meta.clone(), cmd, services, None)
+        cqrs.execute::<BankAccount>(&stream_id, meta.clone(), cmd, services, None)
             .await
             .unwrap();
     }
@@ -496,7 +434,7 @@ async fn bank_account_compaction_postgres_test() {
     // Full history at this point: 6 events (3 Jan + MonthlyClosed + 2 Feb).
     // fetch_aggregate is the ergonomic shorthand for fetching the latest state.
     let aggregate = cqrs
-        .fetch_aggregate::<BankAccountAggregate>(&stream_id)
+        .fetch_aggregate::<BankAccount>(&stream_id)
         .await
         .unwrap();
 
@@ -511,12 +449,7 @@ async fn bank_account_compaction_postgres_test() {
 
     // ── Verify: balance unchanged after replaying compacted stream ────────────
     let compacted_aggregate = cqrs
-        .fetch_aggregate_at::<BankAccountAggregate>(
-            &stream_id,
-            AggregateVersion::Latest,
-            None,
-            None,
-        )
+        .fetch_aggregate_at::<BankAccount>(&stream_id, AggregateVersion::Latest, None, None)
         .await
         .unwrap();
 
@@ -528,12 +461,7 @@ async fn bank_account_compaction_postgres_test() {
     // ── Verify: live stream now has exactly 3 events ──────────────────────────
     // Expected: MonthlyClosed(Jan,1300) · Deposited(Feb) · Withdrawn(Feb)
     let live_events: Vec<_> = store
-        .stream_events_by_stream_id::<BankAccountAggregate>(
-            &stream_id,
-            AggregateVersion::Latest,
-            None,
-            None,
-        )
+        .stream_events_by_stream_id::<BankAccount>(&stream_id, AggregateVersion::Latest, None, None)
         .try_collect()
         .await
         .unwrap();
@@ -558,7 +486,7 @@ async fn bank_account_compaction_postgres_test() {
 
     // ── Verify: full history still accessible as Version(1) ───────────────────
     let archived_events: Vec<_> = store
-        .stream_events_by_stream_id::<BankAccountAggregate>(
+        .stream_events_by_stream_id::<BankAccount>(
             &stream_id,
             AggregateVersion::Version(1),
             None,
@@ -581,6 +509,13 @@ async fn bank_account_compaction_postgres_test() {
 #[derive(Clone, Serialize, Deserialize, Debug, Urn)]
 struct BranchUrn(Urn);
 
+impl BranchUrn {
+    pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
+        let urn = urn::UrnBuilder::new("branch", &id.to_string()).build()?;
+        Ok(BranchUrn(urn))
+    }
+}
+
 impl TryFrom<Urn> for BranchUrn {
     type Error = String;
 
@@ -598,36 +533,17 @@ impl TryFrom<Urn> for BranchUrn {
     }
 }
 
-/// Minimal stream wrapper that uses `BankAccountUrn` as its `StreamId`.
-/// Used for `at` / `extract_scope` tests without Postgres.
-#[derive(Debug)]
-struct BankAccountStream {
-    pub id: BankAccountUrn,
-}
-
-impl WithId for BankAccountStream {
-    type StreamId = BankAccountUrn;
-
-    fn with_id(id: Self::StreamId) -> Self {
-        BankAccountStream { id }
-    }
-
-    fn get_id(&self) -> &Self::StreamId {
-        &self.id
-    }
-}
-
 // ── Scoped-URN tests (no Postgres required) ───────────────────────────────────
 
 /// A bank-account URN can be scoped to a branch:
 ///   urn:bank-account:acct-1  +  urn:branch:london  →  urn:bank-account:acct-1@branch:london
 #[test]
 fn test_bank_account_scoped_to_branch() {
-    let account = BankAccountStream::with_string_id("urn:bank-account:acct-1").unwrap();
-    let branch = BranchUrn(UrnBuilder::new("branch", "london").build().unwrap());
+    let account = BankAccountUrn::new("acct-1").unwrap();
+    let branch = BranchUrn::new("london").unwrap();
 
-    let scoped = account.at(branch).unwrap();
-    let scoped_urn: Urn = scoped.get_id().clone().into();
+    let scoped: BankAccountUrn = account.at(branch).unwrap();
+    let scoped_urn: Urn = scoped.into();
 
     assert_eq!(
         scoped_urn.to_string(),
@@ -640,8 +556,7 @@ fn test_bank_account_scoped_to_branch() {
 /// Extracting the scope as `BranchUrn` validates the NID is "branch".
 #[test]
 fn test_extract_branch_from_scoped_account() {
-    let scoped =
-        BankAccountStream::with_string_id("urn:bank-account:acct-1@branch:london").unwrap();
+    let scoped = BankAccountUrn::new("acct-1@branch:london").unwrap();
 
     let branch: BranchUrn = scoped.extract_scope::<BranchUrn>().unwrap();
 
@@ -653,8 +568,7 @@ fn test_extract_branch_from_scoped_account() {
 #[test]
 fn test_extract_scope_wrong_nid_fails() {
     // scope is urn:branch:london, but we ask for BankAccountUrn (nid="bank-account")
-    let scoped =
-        BankAccountStream::with_string_id("urn:bank-account:acct-1@branch:london").unwrap();
+    let scoped = BankAccountUrn::new("acct-1@branch:london").unwrap();
     let err = scoped.extract_scope::<BankAccountUrn>().unwrap_err();
     assert!(err.to_string().contains("NID mismatch"));
 }
@@ -662,10 +576,10 @@ fn test_extract_scope_wrong_nid_fails() {
 /// `at` followed by `extract_scope` must round-trip to the original scope URN.
 #[test]
 fn test_scope_round_trip() {
-    let account = BankAccountStream::with_string_id("urn:bank-account:acct-42").unwrap();
-    let branch = BranchUrn(UrnBuilder::new("branch", "paris").build().unwrap());
+    let account = BankAccountUrn::new("acct-42").unwrap();
+    let branch = BranchUrn::new("paris").unwrap();
 
-    let scoped = account.at(branch.clone()).unwrap();
+    let scoped: BankAccountUrn = account.at(branch.clone()).unwrap();
     let extracted: BranchUrn = scoped.extract_scope::<BranchUrn>().unwrap();
 
     assert_eq!(extracted, branch);
@@ -674,9 +588,8 @@ fn test_scope_round_trip() {
 /// Attempting to scope an already-scoped stream must fail.
 #[test]
 fn test_cannot_double_scope_account() {
-    let scoped =
-        BankAccountStream::with_string_id("urn:bank-account:acct-1@branch:london").unwrap();
-    let another_branch = BranchUrn(UrnBuilder::new("branch", "berlin").build().unwrap());
+    let scoped = BankAccountUrn::new("acct-1@branch:london").unwrap();
+    let another_branch = BranchUrn::new("berlin").unwrap();
 
     let err = scoped.at(another_branch).unwrap_err();
     assert!(err.to_string().contains("already scoped"));
@@ -685,18 +598,28 @@ fn test_cannot_double_scope_account() {
 /// A scoped URN survives serialisation to a string and back.
 #[test]
 fn test_scoped_urn_string_round_trip() {
-    let account = BankAccountStream::with_string_id("urn:bank-account:acct-7").unwrap();
-    let branch = BranchUrn(UrnBuilder::new("branch", "tokyo").build().unwrap());
+    let account = BankAccountUrn::new("acct-7").unwrap();
+    let branch = BranchUrn::new("tokyo").unwrap();
     let scoped_str: String = {
-        let u: Urn = account.at(branch).unwrap().get_id().clone().into();
+        let u: Urn = account.at(branch).unwrap().into();
         u.to_string()
     };
 
     assert_eq!(scoped_str, "urn:bank-account:acct-7@branch:tokyo");
 
     // Reconstruct from the string and extract scope as the typed BranchUrn.
-    let reparsed = BankAccountStream::with_string_id(&scoped_str).unwrap();
+    let reparsed = BankAccountUrn::new("acct-7@branch:tokyo").unwrap();
     let branch: BranchUrn = reparsed.extract_scope::<BranchUrn>().unwrap();
     assert_eq!(branch.0.nid(), "branch");
     assert_eq!(branch.0.nss(), "tokyo");
+}
+
+/// Scoping with an already-scoped branch URN must fail.
+#[test]
+fn test_at_rejects_scoped_scope_urn() {
+    let account = BankAccountUrn::new("acct-1").unwrap();
+    // Construct a BranchUrn whose NSS itself contains '@' — simulating a scoped scope
+    let already_scoped_branch = BranchUrn(Urn::from_str("urn:branch:london@region:uk").unwrap());
+    let err = account.at(already_scoped_branch).unwrap_err();
+    assert!(err.to_string().contains("scope URN is already scoped"));
 }
