@@ -194,7 +194,11 @@ pub trait WithId: Sized {
         Ok(Self::with_id(aggregate_id))
     }
 
-    /// Returns a new aggregate instance whose stream ID is scoped under `other`.
+    /// Returns a new instance whose stream ID has the suffix `@<other.nid>:<other.nss>` appended
+    /// to the current URN's NSS, scoping this stream under `other`.
+    ///
+    /// `other` can be any type that converts into a [`Urn`] — typically another aggregate's
+    /// `StreamId`. Fails if either URN is already scoped (NSS contains `@`).
     ///
     /// Delegates to [`ScopedUrn::at`] on `StreamId`.
     ///
