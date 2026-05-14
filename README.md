@@ -902,7 +902,8 @@ let wrong: BankAccountUrn = scoped.extract_scope::<BankAccountUrn>()?; // Err: N
 
 | Condition | Error |
 |---|---|
-| NSS already contains `@` | "URN is already scoped" |
+| Current URN's NSS already contains `@` | "URN is already scoped" |
+| `other`'s NSS contains `@` | "scope URN is already scoped" |
 
 **Validation rules enforced by `extract_scope`:**
 

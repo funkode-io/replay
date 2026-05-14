@@ -32,7 +32,10 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
     /// Scopes `self` under `other`, returning a new URN whose NSS is
     /// `<current_nss>@<other_nid>:<other_nss>`.
     ///
-    /// Fails if the current URN is already scoped (NSS contains `@`).
+    /// Fails if the current URN is already scoped (NSS contains `@`), or if
+    /// `other`'s NSS contains `@` (i.e. `other` is itself a scoped URN).
+    /// Both preconditions are symmetric: the resulting URN will always contain
+    /// exactly one `@`, satisfying the invariant required by [`Self::extract_scope`].
     fn at(self, other: impl Into<Urn>) -> crate::Result<Self> {
         let current_urn: Urn = self.into();
         let other_urn: Urn = other.into();
@@ -41,6 +44,14 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
             return Err(Error::invalid_input("URN is already scoped (contains '@')")
                 .with_operation("at")
                 .with_context("urn", current_urn.to_string()));
+        }
+
+        if other_urn.nss().contains('@') {
+            return Err(
+                Error::invalid_input("scope URN is already scoped (contains '@')")
+                    .with_operation("at")
+                    .with_context("scope", other_urn.to_string()),
+            );
         }
 
         let new_nss = format!(
@@ -486,6 +497,7 @@ mod tests {
     }
 
     // minimal stream wrappers so we can call WithId methods
+    #[derive(Debug)]
     struct ProductStream {
         pub id: ProductUrn,
     }
@@ -516,6 +528,29 @@ mod tests {
         let product = ProductStream::with_string_id("urn:product:sku123@catalog:that").unwrap();
         let catalog = CatalogUrn(Urn::from_str("urn:catalog:other").unwrap());
         assert!(product.at(catalog).is_err());
+    }
+
+    #[test]
+    fn test_at_fails_if_scope_is_already_scoped() {
+        // other's NSS contains '@' — would produce a double-@ URN
+        let product = ProductStream::with_string_id("urn:product:sku123").unwrap();
+        let already_scoped_catalog =
+            CatalogUrn(Urn::from_str("urn:catalog:sub@tenant:acme").unwrap());
+        let err = product.at(already_scoped_catalog).unwrap_err();
+        assert!(err.to_string().contains("scope URN is already scoped"));
+    }
+
+    #[test]
+    fn test_scoped_urn_at_directly_on_urn_type() {
+        // ScopedUrn blanket impl lets you call at/extract_scope on a URN value directly.
+        let product = ProductUrn(Urn::from_str("urn:product:sku123").unwrap());
+        let catalog = CatalogUrn(Urn::from_str("urn:catalog:that").unwrap());
+        let scoped: ProductUrn = product.at(catalog).unwrap();
+        let scoped_urn: Urn = scoped.clone().into();
+        assert_eq!(scoped_urn.to_string(), "urn:product:sku123@catalog:that");
+        let extracted: CatalogUrn = scoped.extract_scope::<CatalogUrn>().unwrap();
+        let extracted_urn: Urn = extracted.into();
+        assert_eq!(extracted_urn.nss(), "that");
     }
 
     #[test]

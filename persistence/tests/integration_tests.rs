@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -610,4 +612,14 @@ fn test_scoped_urn_string_round_trip() {
     let branch: BranchUrn = reparsed.extract_scope::<BranchUrn>().unwrap();
     assert_eq!(branch.0.nid(), "branch");
     assert_eq!(branch.0.nss(), "tokyo");
+}
+
+/// Scoping with an already-scoped branch URN must fail.
+#[test]
+fn test_at_rejects_scoped_scope_urn() {
+    let account = BankAccountUrn::new("acct-1").unwrap();
+    // Construct a BranchUrn whose NSS itself contains '@' — simulating a scoped scope
+    let already_scoped_branch = BranchUrn(Urn::from_str("urn:branch:london@region:uk").unwrap());
+    let err = account.at(already_scoped_branch).unwrap_err();
+    assert!(err.to_string().contains("scope URN is already scoped"));
 }
