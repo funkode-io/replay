@@ -506,32 +506,9 @@ async fn bank_account_compaction_postgres_test() {
 // ── Scoped-URN types used by the tests below ─────────────────────────────────
 
 /// A branch that owns one or more bank accounts.
+/// Namespace auto-derives to "branch" (strips Urn suffix → Branch → kebab → "branch").
 #[derive(Clone, Serialize, Deserialize, Debug, Urn)]
 struct BranchUrn(Urn);
-
-impl BranchUrn {
-    pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
-        let urn = urn::UrnBuilder::new("branch", &id.to_string()).build()?;
-        Ok(BranchUrn(urn))
-    }
-}
-
-impl TryFrom<Urn> for BranchUrn {
-    type Error = String;
-
-    fn try_from(urn: Urn) -> Result<Self, Self::Error> {
-        let expected_nid = "branch";
-        if urn.nid() == expected_nid {
-            Ok(BranchUrn(urn))
-        } else {
-            Err(format!(
-                "Invalid namespace for BranchUrn: expected '{}', found '{}'",
-                expected_nid,
-                urn.nid()
-            ))
-        }
-    }
-}
 
 // ── Scoped-URN tests (no Postgres required) ───────────────────────────────────
 

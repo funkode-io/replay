@@ -2,6 +2,21 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
 
+/// Convert a CamelCase identifier to kebab-case at compile time.
+/// A trailing `Urn` suffix is stripped first.
+/// `BankAccountUrn` → `"bank-account"`, `BranchUrn` → `"branch"`.
+fn camel_to_kebab(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() && i > 0 && chars[i - 1].is_lowercase() {
+            result.push('-');
+        }
+        result.push(c.to_ascii_lowercase());
+    }
+    result
+}
+
 mod define_aggregate_macro;
 mod merge_events_macro;
 
@@ -95,6 +110,7 @@ pub fn derive_urn(input: TokenStream) -> TokenStream {
     let name = &input.ident;
 
     // Parse optional #[urn(namespace = "...")] attribute.
+    // When absent the namespace is derived from the type name (CamelCase → kebab-case).
     let namespace: Option<syn::LitStr> = input
         .attrs
         .iter()
@@ -118,6 +134,13 @@ pub fn derive_urn(input: TokenStream) -> TokenStream {
                     }
                 })
         });
+
+    let ns_str = namespace.map(|lit| lit.value()).unwrap_or_else(|| {
+        let type_name = name.to_string();
+        let base = type_name.strip_suffix("Urn").unwrap_or(&type_name);
+        camel_to_kebab(base)
+    });
+    let ns = syn::LitStr::new(&ns_str, proc_macro2::Span::call_site());
 
     let base_impl = quote! {
         impl From<#name> for urn::Urn {
@@ -157,100 +180,97 @@ pub fn derive_urn(input: TokenStream) -> TokenStream {
         }
     };
 
-    // When #[urn(namespace = "...")] is present, also generate TryFrom<Urn>
-    // (with NID validation) and all helper constructors/accessors.
-    let namespace_impl = if let Some(ns) = namespace {
-        quote! {
-            impl std::convert::TryFrom<urn::Urn> for #name {
-                type Error = String;
+    // Always generate TryFrom<Urn> (with NID validation) and all helper constructors/accessors.
+    // The namespace is either the explicit #[urn(namespace = "...")] value or the type name
+    // converted to kebab-case.
+    let namespace_impl = quote! {
+        impl std::convert::TryFrom<urn::Urn> for #name {
+            type Error = String;
 
-                fn try_from(urn: urn::Urn) -> Result<Self, Self::Error> {
-                    if urn.nid() != #ns {
-                        return Err(format!(
-                            "Invalid URN namespace: expected '{}', got '{}'",
-                            #ns,
-                            urn.nid()
-                        ));
-                    }
-                    Ok(Self(urn))
+            fn try_from(urn: urn::Urn) -> Result<Self, Self::Error> {
+                if urn.nid() != #ns {
+                    return Err(format!(
+                        "Invalid URN namespace: expected '{}', got '{}'",
+                        #ns,
+                        urn.nid()
+                    ));
                 }
-            }
-
-            impl #name {
-                /// Build a URN from any `Display` value used as the NSS.
-                ///
-                /// If `id` is already a full URN string (starts with `"urn:"`), it is
-                /// parsed and its namespace validated. Nested same-namespace URNs
-                /// (e.g. `urn:foo:urn:foo:123`) are automatically unwrapped.
-                pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
-                    use std::str::FromStr;
-                    let id_str = id.to_string();
-                    if id_str.starts_with("urn:") {
-                        let mut urn = urn::Urn::from_str(&id_str)?;
-                        if urn.nid() != #ns {
-                            return Err(urn::Error::InvalidNid);
-                        }
-                        while urn.nss().starts_with("urn:") {
-                            let inner = urn::Urn::from_str(urn.nss())?;
-                            if inner.nid() != #ns {
-                                break;
-                            }
-                            urn = inner;
-                        }
-                        Ok(Self(urn))
-                    } else {
-                        urn::UrnBuilder::new(#ns, &id_str).build().map(Self)
-                    }
-                }
-
-                /// Build a URN with a random UUID v4 identifier. Infallible.
-                pub fn new_random() -> Self {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    Self(
-                        urn::UrnBuilder::new(#ns, &id)
-                            .build()
-                            .expect("UUID-based URN should always be valid"),
-                    )
-                }
-
-                /// Parse a full URN string and validate the namespace.
-                /// Returns a descriptive `Err(String)` instead of `urn::Error`.
-                pub fn parse(input: impl AsRef<str>) -> Result<Self, String> {
-                    use std::str::FromStr;
-                    let urn = urn::Urn::from_str(input.as_ref()).map_err(|e| e.to_string())?;
-                    if urn.nid() != #ns {
-                        return Err(format!(
-                            "Invalid URN namespace: expected '{}', got '{}'",
-                            #ns,
-                            urn.nid()
-                        ));
-                    }
-                    Ok(Self(urn))
-                }
-
-                /// The configured namespace identifier (NID) as a `&'static str`.
-                pub fn namespace() -> &'static str {
-                    #ns
-                }
-
-                /// NID of this URN instance.
-                pub fn nid(&self) -> &str {
-                    self.0.nid()
-                }
-
-                /// NSS (the ID part) of this URN instance.
-                pub fn nss(&self) -> &str {
-                    self.0.nss()
-                }
-
-                /// Borrow the inner `urn::Urn`.
-                pub fn to_urn(&self) -> &urn::Urn {
-                    &self.0
-                }
+                Ok(Self(urn))
             }
         }
-    } else {
-        quote! {}
+
+        impl #name {
+            /// Build a URN from any `Display` value used as the NSS.
+            ///
+            /// If `id` is already a full URN string (starts with `"urn:"`), it is
+            /// parsed and its namespace validated. Nested same-namespace URNs
+            /// (e.g. `urn:foo:urn:foo:123`) are automatically unwrapped.
+            pub fn new(id: impl std::fmt::Display) -> Result<Self, urn::Error> {
+                use std::str::FromStr;
+                let id_str = id.to_string();
+                if id_str.starts_with("urn:") {
+                    let mut urn = urn::Urn::from_str(&id_str)?;
+                    if urn.nid() != #ns {
+                        return Err(urn::Error::InvalidNid);
+                    }
+                    while urn.nss().starts_with("urn:") {
+                        let inner = urn::Urn::from_str(urn.nss())?;
+                        if inner.nid() != #ns {
+                            break;
+                        }
+                        urn = inner;
+                    }
+                    Ok(Self(urn))
+                } else {
+                    urn::UrnBuilder::new(#ns, &id_str).build().map(Self)
+                }
+            }
+
+            /// Build a URN with a random UUID v4 identifier. Infallible.
+            pub fn new_random() -> Self {
+                let id = uuid::Uuid::new_v4().to_string();
+                Self(
+                    urn::UrnBuilder::new(#ns, &id)
+                        .build()
+                        .expect("UUID-based URN should always be valid"),
+                )
+            }
+
+            /// Parse a full URN string and validate the namespace.
+            /// Returns a descriptive `Err(String)` instead of `urn::Error`.
+            pub fn parse(input: impl AsRef<str>) -> Result<Self, String> {
+                use std::str::FromStr;
+                let urn = urn::Urn::from_str(input.as_ref()).map_err(|e| e.to_string())?;
+                if urn.nid() != #ns {
+                    return Err(format!(
+                        "Invalid URN namespace: expected '{}', got '{}'",
+                        #ns,
+                        urn.nid()
+                    ));
+                }
+                Ok(Self(urn))
+            }
+
+            /// The configured namespace identifier (NID) as a `&'static str`.
+            pub fn namespace() -> &'static str {
+                #ns
+            }
+
+            /// NID of this URN instance.
+            pub fn nid(&self) -> &str {
+                self.0.nid()
+            }
+
+            /// NSS (the ID part) of this URN instance.
+            pub fn nss(&self) -> &str {
+                self.0.nss()
+            }
+
+            /// Borrow the inner `urn::Urn`.
+            pub fn to_urn(&self) -> &urn::Urn {
+                &self.0
+            }
+        }
     };
 
     let urn_impl = quote! {

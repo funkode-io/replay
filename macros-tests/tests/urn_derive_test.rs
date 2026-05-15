@@ -10,20 +10,50 @@ use urn::Urn;
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
-/// Basic newtype — no namespace; gets From, Display, FromStr, PartialEq, Eq, Hash.
+/// Basic newtype — no namespace attribute; namespace is derived from the type name
+/// (strip `Urn` suffix, then CamelCase → kebab-case), giving `"account"`.
+/// Gets all helper methods just like an explicit `#[urn(namespace = "...")]`.
 #[derive(Clone, Debug, Serialize, Deserialize, Urn)]
 struct AccountUrn(Urn);
 
-/// With namespace — also gets TryFrom<Urn>, new(), new_random(), parse(),
-/// namespace(), nid(), nss(), to_urn().
+/// Auto-derived namespace: `BranchUrn` → strip `Urn` → `Branch` → `"branch"`.
 #[derive(Clone, Debug, Serialize, Deserialize, Urn)]
-#[urn(namespace = "branch")]
 struct BranchUrn(Urn);
 
-/// With namespace and kebab-case namespace string.
+/// No explicit namespace — auto-derives from type name:
+/// `BankAccountUrn` strips `Urn` → `BankAccount` → kebab → `"bank-account"`.
 #[derive(Clone, Debug, Serialize, Deserialize, Urn)]
-#[urn(namespace = "bank-account")]
 struct BankAccountUrn(Urn);
+
+/// Explicit namespace overrides the auto-derived value.
+/// Without the attribute this would produce `"file-manager"`, but the domain
+/// calls for the shorter `"file"` — so the attribute is used to pin it.
+#[derive(Clone, Debug, Serialize, Deserialize, Urn)]
+#[urn(namespace = "file")]
+struct FileManagerUrn(Urn);
+
+// ── Auto-derived namespace (no attribute) ────────────────────────────────────
+
+#[test]
+fn test_auto_derived_namespace() {
+    // AccountUrn strips the Urn suffix → Account → kebab → "account"
+    assert_eq!(AccountUrn::namespace(), "account");
+    let urn = AccountUrn::new("acct-1").unwrap();
+    assert_eq!(urn.nid(), "account");
+    assert_eq!(urn.nss(), "acct-1");
+    assert_eq!(urn.to_string(), "urn:account:acct-1");
+}
+
+#[test]
+fn test_explicit_namespace_overrides_auto_derived() {
+    // FileManagerUrn would auto-derive to "file-manager", but the explicit
+    // #[urn(namespace = "file")] keeps URNs short: urn:file:123
+    assert_eq!(FileManagerUrn::namespace(), "file");
+    let urn = FileManagerUrn::new("123").unwrap();
+    assert_eq!(urn.to_string(), "urn:file:123");
+    assert_eq!(urn.nid(), "file");
+    assert_eq!(urn.nss(), "123");
+}
 
 // ── Display / FromStr (base derive) ──────────────────────────────────────────
 
@@ -110,6 +140,36 @@ fn test_hashmap_key() {
     assert_eq!(map[&key], "Alice");
 }
 
+// ── BankAccountUrn — auto-derived namespace + helpers ────────────────────────
+
+#[test]
+fn test_bank_account_auto_derived_namespace() {
+    // No #[urn(namespace)] on BankAccountUrn — strip Urn suffix → BankAccount → "bank-account"
+    assert_eq!(BankAccountUrn::namespace(), "bank-account");
+}
+
+#[test]
+fn test_bank_account_new_numeric_id() {
+    let urn = BankAccountUrn::new("123").unwrap();
+    assert_eq!(urn.nid(), "bank-account");
+    assert_eq!(urn.nss(), "123");
+    assert_eq!(urn.to_string(), "urn:bank-account:123");
+}
+
+// ── ScopedUrn interop (.at / .extract_scope) ─────────────────────────────────
+
+#[test]
+fn test_scoped_at_and_extract() {
+    let account_urn = BankAccountUrn::new("acct-1").unwrap();
+    let branch_urn = BranchUrn::new("london").unwrap();
+
+    // scope an account URN under a branch
+    let scoped = account_urn.at(branch_urn.clone()).unwrap();
+
+    // round-trip: extract the scope back out
+    assert_eq!(scoped.extract_scope::<BranchUrn>().unwrap(), branch_urn);
+}
+
 // ── new(id) — namespace attribute ────────────────────────────────────────────
 
 #[test]
@@ -141,13 +201,6 @@ fn test_new_unwraps_nested_same_namespace_urn() {
     assert_eq!(urn.nss(), "london");
 }
 
-#[test]
-fn test_new_with_kebab_case_namespace() {
-    let urn = BankAccountUrn::new("acct-1").unwrap();
-    assert_eq!(urn.nid(), "bank-account");
-    assert_eq!(urn.nss(), "acct-1");
-}
-
 // ── new_random() — namespace attribute ───────────────────────────────────────
 
 #[test]
@@ -164,7 +217,10 @@ fn test_new_random_produces_unique_values() {
 
 #[test]
 fn test_parse_valid_urn() {
-    assert_eq!(BranchUrn::parse("urn:branch:london").unwrap().nss(), "london");
+    assert_eq!(
+        BranchUrn::parse("urn:branch:london").unwrap().nss(),
+        "london"
+    );
 }
 
 #[test]
@@ -213,15 +269,4 @@ fn test_try_from_urn_valid() {
 fn test_try_from_urn_wrong_namespace_fails() {
     let raw = Urn::from_str("urn:other:london").unwrap();
     assert!(BranchUrn::try_from(raw).is_err());
-}
-
-// ── ScopedUrn interop (namespace attribute enables TryFrom, which unlocks ScopedUrn) ──
-
-#[test]
-fn test_scoped_urns() {
-    let account_urn = BankAccountUrn::new("acct-1").unwrap();
-    let branch_urn = BranchUrn::new("london").unwrap();
-
-    let scoped = account_urn.at(branch_urn.clone()).unwrap();
-    assert_eq!(scoped.extract_scope::<BranchUrn>().unwrap(), branch_urn);
 }
