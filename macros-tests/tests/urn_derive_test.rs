@@ -164,7 +164,7 @@ fn test_scoped_at_and_extract() {
     let branch_urn = BranchUrn::new("london").unwrap();
 
     // scope an account URN under a branch
-    let scoped = account_urn.at(branch_urn.clone()).unwrap();
+    let scoped = account_urn.at(&branch_urn).unwrap();
 
     // round-trip: extract the scope back out
     assert_eq!(scoped.extract_scope::<BranchUrn>().unwrap(), branch_urn);

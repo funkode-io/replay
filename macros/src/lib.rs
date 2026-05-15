@@ -178,6 +178,12 @@ pub fn derive_urn(input: TokenStream) -> TokenStream {
                 self.0.hash(state);
             }
         }
+
+        impl AsRef<urn::Urn> for #name {
+            fn as_ref(&self) -> &urn::Urn {
+                &self.0
+            }
+        }
     };
 
     // Always generate TryFrom<Urn> (with NID validation) and all helper constructors/accessors.

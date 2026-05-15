@@ -23,7 +23,8 @@ use super::Event;
 /// let branch:  BranchUrn      = BranchUrn::new("london")?;
 ///
 /// // urn:bank-account:acct-1  +  urn:branch:london  →  urn:bank-account:acct-1@branch:london
-/// let scoped: BankAccountUrn = account.at(branch)?;
+/// // Both by value and by reference work:
+/// let scoped: BankAccountUrn = account.at(&branch)?;  // branch is still usable after this
 ///
 /// // round-trip
 /// let extracted: BranchUrn = scoped.extract_scope::<BranchUrn>()?;
@@ -37,9 +38,9 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
     /// Both preconditions are symmetric: the resulting URN will always contain
     /// exactly one `@`, satisfying the invariant required by [`Self::extract_scope`].
     #[track_caller]
-    fn at(self, other: impl Into<Urn>) -> crate::Result<Self> {
-        let current_urn: Urn = self.into();
-        let other_urn: Urn = other.into();
+    fn at(&self, other: impl AsRef<Urn>) -> crate::Result<Self> {
+        let current_urn: Urn = self.clone().into();
+        let other_urn: &Urn = other.as_ref();
 
         if current_urn.nss().contains('@') {
             return Err(Error::invalid_input("URN is already scoped (contains '@')")
@@ -221,8 +222,8 @@ pub trait WithId: Sized {
     /// // urn:product:sku123  +  urn:catalog:that  →  urn:product:sku123@catalog:that
     /// let scoped: ProductStream = product_stream.at(catalog_urn)?;
     /// ```
-    fn at(&self, other: impl Into<Urn>) -> crate::Result<Self> {
-        let scoped_id = self.get_id().clone().at(other)?;
+    fn at(&self, other: impl AsRef<Urn>) -> crate::Result<Self> {
+        let scoped_id = self.get_id().at(other)?;
         Ok(Self::with_id(scoped_id))
     }
 
@@ -499,6 +500,12 @@ mod tests {
         }
     }
 
+    impl AsRef<Urn> for CatalogUrn {
+        fn as_ref(&self) -> &Urn {
+            &self.0
+        }
+    }
+
     impl TryFrom<Urn> for CatalogUrn {
         type Error = String;
 
@@ -563,7 +570,7 @@ mod tests {
         // ScopedUrn blanket impl lets you call at/extract_scope on a URN value directly.
         let product = ProductUrn(Urn::from_str("urn:product:sku123").unwrap());
         let catalog = CatalogUrn(Urn::from_str("urn:catalog:that").unwrap());
-        let scoped: ProductUrn = product.at(catalog).unwrap();
+        let scoped: ProductUrn = product.at(&catalog).unwrap();
         let scoped_urn: Urn = scoped.clone().into();
         assert_eq!(scoped_urn.to_string(), "urn:product:sku123@catalog:that");
         let extracted: CatalogUrn = scoped.extract_scope::<CatalogUrn>().unwrap();

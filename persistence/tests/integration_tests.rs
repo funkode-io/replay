@@ -519,7 +519,7 @@ fn test_bank_account_scoped_to_branch() {
     let account = BankAccountUrn::new("acct-1").unwrap();
     let branch = BranchUrn::new("london").unwrap();
 
-    let scoped: BankAccountUrn = account.at(branch).unwrap();
+    let scoped: BankAccountUrn = account.at(&branch).unwrap();
     let scoped_urn: Urn = scoped.into();
 
     assert_eq!(
@@ -556,7 +556,7 @@ fn test_scope_round_trip() {
     let account = BankAccountUrn::new("acct-42").unwrap();
     let branch = BranchUrn::new("paris").unwrap();
 
-    let scoped: BankAccountUrn = account.at(branch.clone()).unwrap();
+    let scoped: BankAccountUrn = account.at(&branch).unwrap();
     let extracted: BranchUrn = scoped.extract_scope::<BranchUrn>().unwrap();
 
     assert_eq!(extracted, branch);
@@ -568,7 +568,7 @@ fn test_cannot_double_scope_account() {
     let scoped = BankAccountUrn::new("acct-1@branch:london").unwrap();
     let another_branch = BranchUrn::new("berlin").unwrap();
 
-    let err = scoped.at(another_branch).unwrap_err();
+    let err = scoped.at(&another_branch).unwrap_err();
     assert!(err.to_string().contains("already scoped"));
 }
 
@@ -578,7 +578,7 @@ fn test_scoped_urn_string_round_trip() {
     let account = BankAccountUrn::new("acct-7").unwrap();
     let branch = BranchUrn::new("tokyo").unwrap();
     let scoped_str: String = {
-        let u: Urn = account.at(branch).unwrap().into();
+        let u: Urn = account.at(&branch).unwrap().into();
         u.to_string()
     };
 
@@ -597,6 +597,6 @@ fn test_at_rejects_scoped_scope_urn() {
     let account = BankAccountUrn::new("acct-1").unwrap();
     // Construct a BranchUrn whose NSS itself contains '@' — simulating a scoped scope
     let already_scoped_branch = BranchUrn(Urn::from_str("urn:branch:london@region:uk").unwrap());
-    let err = account.at(already_scoped_branch).unwrap_err();
+    let err = account.at(&already_scoped_branch).unwrap_err();
     assert!(err.to_string().contains("scope URN is already scoped"));
 }
