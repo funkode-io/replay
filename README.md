@@ -998,15 +998,15 @@ a `TenantUrn`, or any other domain type, as long as the NID embedded in the scop
 
 ### Prelude
 
-The most commonly used traits can be imported in one line:
+There are two prelude options depending on your dependencies.
+
+**Core prelude** (`replay`) — traits only, no persistence or macros:
 
 ```rust
 use replay::prelude::*;
 ```
 
-This brings the following traits into scope:
-
-| Trait | Purpose |
+| Export | Purpose |
 | --- | --- |
 | `ScopedUrn` | `at` and `extract_scope` on URN types |
 | `WithId` | `with_id`, `get_id`, `with_string_id` on aggregate structs |
@@ -1014,6 +1014,29 @@ This brings the following traits into scope:
 | `Aggregate` | `handle` |
 | `Compactable` | `compacted_events` |
 | `Event` | `event_type` |
+
+**Full prelude** (`replay_persistence`) — everything in one import, including macros and persistence:
+
+```rust
+use replay_persistence::prelude::*;
+```
+
+| Export | Purpose |
+| --- | --- |
+| `ScopedUrn`, `WithId`, `EventStream`, `Aggregate`, `Compactable`, `Event` | Core traits (same as above) |
+| `Error`, `Result` | Core error / result types |
+| `Urn` | `#[derive(Urn)]` derive macro |
+| `EventDerive` | `#[derive(Event)]` derive macro (re-exported as `EventDerive`) |
+| `define_aggregate!` | Aggregate scaffolding macro |
+| `query_events!` | Multi-aggregate event wrapper macro |
+| `Cqrs` | Command/query execution engine |
+| `EventStore` | Trait for pluggable event store backends |
+| `InMemoryEventStore` | In-memory backend (testing) |
+| `PostgresEventStore` | PostgreSQL backend |
+| `PersistedEvent` | Wrapper holding an event with its metadata |
+| `Query` | Trait for read-model projections |
+| `StreamFilter` | Filter builder for event queries |
+| `AggregateVersion` | Current / archived snapshot version discriminant |
 
 ## WASM Support
 
