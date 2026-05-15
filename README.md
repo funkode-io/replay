@@ -209,6 +209,55 @@ assert!(result.is_err());
 
 ## Using Macros
 
+### `#[derive(Urn)]`
+
+The `Urn` derive macro generates the boilerplate needed to use a newtype wrapper around `urn::Urn`
+as a strongly-typed stream identifier. Given a struct with a single `Urn` field it generates:
+
+| What is generated | Description |
+|---|---|
+| `impl From<MyUrn> for Urn` | Unwrap to the raw `urn::Urn` |
+| `impl Display for MyUrn` | Delegates to the inner `Urn` |
+| `impl FromStr for MyUrn` | Parses a URN string, returns `urn::Error` on failure |
+| `impl PartialEq / Eq` | Equality based on the inner `Urn` value |
+| `impl Hash` | Hash based on the inner `Urn` value — safe to use as `HashMap`/`HashSet` key |
+
+```rust
+use replay_macros::Urn;
+use serde::{Serialize, Deserialize};
+use urn::Urn;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Urn)]
+pub struct BankAccountUrn(Urn);
+
+// That's it — the macro generates the rest.
+
+// Parse from a string
+let id: BankAccountUrn = "urn:bank-account:acct-1".parse().unwrap();
+
+// Display round-trips back to the URN string
+assert_eq!(id.to_string(), "urn:bank-account:acct-1");
+
+// Convert to raw Urn
+let raw: Urn = id.clone().into();
+assert_eq!(raw.nid(), "bank-account");
+
+// Equality
+let same: BankAccountUrn = "urn:bank-account:acct-1".parse().unwrap();
+assert_eq!(id, same);
+
+// Works as a HashMap / HashSet key because Hash is implemented
+use std::collections::HashMap;
+let mut map: HashMap<BankAccountUrn, f64> = HashMap::new();
+map.insert(id.clone(), 100.0);
+assert_eq!(map[&id], 100.0);
+```
+
+> **Note:** `#[derive(Urn)]` does not add `TryFrom<Urn>` — that is intentionally left to the
+> caller so you can add NID validation. See the *Aggregate Identity Pattern* section above for
+> the recommended pattern. If you use `define_aggregate!` both `#[derive(Urn)]` and the
+> `TryFrom<Urn>` impl (with NID validation) are generated automatically.
+
 You can simplify the aggregate definition using the `define_aggregate!` macro. Here's the same bank account example using the macro:
 
 ```rust
