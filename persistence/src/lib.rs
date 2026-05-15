@@ -15,3 +15,27 @@ pub use infrastructure::{InMemoryEventStore, PostgresEventStore};
 pub use persisted_event::PersistedEvent;
 pub use query::Query;
 pub use store::EventStore;
+
+/// Convenience re-exports of the most commonly used types and traits across
+/// `replay`, `replay_macros`, and `replay_persistence`.
+///
+/// A single glob import brings everything into scope:
+///
+/// ```rust,ignore
+/// use replay_persistence::prelude::*;
+/// ```
+pub mod prelude {
+    // Core traits from es-replay
+    pub use replay::{
+        Aggregate, Compactable, Error, Event, EventStream, Result, ScopedUrn, WithId,
+    };
+
+    // Macros from es-replay-macros
+    pub use replay_macros::{define_aggregate, query_events, Event as EventDerive, Urn};
+
+    // Persistence types from this crate
+    pub use super::{
+        AggregateVersion, Cqrs, EventStore, InMemoryEventStore, PersistedEvent, PostgresEventStore,
+        Query, StreamFilter,
+    };
+}

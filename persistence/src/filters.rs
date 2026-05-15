@@ -201,14 +201,6 @@ mod tests {
     #[derive(Debug, Clone, Urn, SerializeDisplay, DeserializeFromStr)]
     pub struct BankAccountUrn(Urn);
 
-    impl TryFrom<Urn> for BankAccountUrn {
-        type Error = String;
-
-        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
-            Ok(BankAccountUrn(urn))
-        }
-    }
-
     // create metadata with bank account urn
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct BankAccountMetadata {

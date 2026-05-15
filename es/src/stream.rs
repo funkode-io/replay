@@ -36,6 +36,7 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
     /// `other`'s NSS contains `@` (i.e. `other` is itself a scoped URN).
     /// Both preconditions are symmetric: the resulting URN will always contain
     /// exactly one `@`, satisfying the invariant required by [`Self::extract_scope`].
+    #[track_caller]
     fn at(self, other: impl Into<Urn>) -> crate::Result<Self> {
         let current_urn: Urn = self.into();
         let other_urn: Urn = other.into();
@@ -61,20 +62,24 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
             other_urn.nss()
         );
 
-        let new_urn = urn::UrnBuilder::new(current_urn.nid(), &new_nss)
-            .build()
-            .map_err(|e| {
-                Error::invalid_input("Failed to build scoped URN")
+        let new_urn = match urn::UrnBuilder::new(current_urn.nid(), &new_nss).build() {
+            Err(e) => {
+                return Err(Error::invalid_input("Failed to build scoped URN")
                     .with_operation("at")
                     .with_context("nss", new_nss.clone())
-                    .with_context("error", format!("{:?}", e))
-            })?;
+                    .with_context("error", format!("{:?}", e)))
+            }
+            Ok(u) => u,
+        };
 
-        Self::try_from(new_urn).map_err(|e| {
-            Error::invalid_input("Failed to convert scoped URN to expected type")
-                .with_operation("at")
-                .with_context("error", format!("{:?}", e))
-        })
+        match Self::try_from(new_urn) {
+            Err(e) => Err(
+                Error::invalid_input("Failed to convert scoped URN to expected type")
+                    .with_operation("at")
+                    .with_context("error", format!("{:?}", e)),
+            ),
+            Ok(s) => Ok(s),
+        }
     }
 
     /// Extracts the scope URN embedded by [`Self::at`], converting it into
@@ -82,6 +87,7 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
     ///
     /// `O::try_from` is responsible for NID validation, so passing the wrong
     /// output type returns an error rather than silently succeeding.
+    #[track_caller]
     fn extract_scope<O>(&self) -> crate::Result<O>
     where
         O: TryFrom<Urn, Error: std::fmt::Debug>,
@@ -89,61 +95,68 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
         let current_urn: Urn = self.clone().into();
         let nss = current_urn.nss();
 
-        let at_count = nss.chars().filter(|&c| c == '@').count();
-        if at_count == 0 {
-            return Err(Error::invalid_input("URN is not scoped (no '@' in NSS)")
-                .with_operation("extract_scope")
-                .with_context("urn", current_urn.to_string()));
-        }
-        if at_count > 1 {
-            return Err(
-                Error::invalid_input("URN has multiple '@' in NSS (ambiguous scope)")
+        let (_own_nss, scope_part) = match nss.split_once('@') {
+            None => {
+                return Err(Error::invalid_input("URN is not scoped (no '@' in NSS)")
                     .with_operation("extract_scope")
-                    .with_context("urn", current_urn.to_string()),
-            );
-        }
+                    .with_context("urn", current_urn.to_string()))
+            }
+            Some((_, scope)) if scope.contains('@') => {
+                return Err(
+                    Error::invalid_input("URN has multiple '@' in NSS (ambiguous scope)")
+                        .with_operation("extract_scope")
+                        .with_context("urn", current_urn.to_string()),
+                )
+            }
+            Some(("", _)) => {
+                return Err(Error::invalid_input("URN has empty NSS before '@'")
+                    .with_operation("extract_scope")
+                    .with_context("urn", current_urn.to_string()))
+            }
+            Some(parts) => parts,
+        };
 
-        let (own_nss, scope_part) = nss.split_once('@').unwrap();
-
-        if own_nss.is_empty() {
-            return Err(Error::invalid_input("URN has empty NSS before '@'")
-                .with_operation("extract_scope")
-                .with_context("urn", current_urn.to_string()));
-        }
-
-        let (scope_nid, scope_nss) = scope_part.split_once(':').ok_or_else(|| {
-            Error::invalid_input("Scope part after '@' is missing ':' (expected '<nid>:<nss>')")
+        let (scope_nid, scope_nss) = match scope_part.split_once(':') {
+            None => {
+                return Err(Error::invalid_input(
+                    "Scope part after '@' is missing ':' (expected '<nid>:<nss>')",
+                )
                 .with_operation("extract_scope")
                 .with_context("urn", current_urn.to_string())
-                .with_context("scope_part", scope_part.to_string())
-        })?;
+                .with_context("scope_part", scope_part.to_string()))
+            }
+            Some(("", _)) => {
+                return Err(Error::invalid_input("Scope NID is empty")
+                    .with_operation("extract_scope")
+                    .with_context("urn", current_urn.to_string()))
+            }
+            Some((_, "")) => {
+                return Err(Error::invalid_input("Scope NSS is empty")
+                    .with_operation("extract_scope")
+                    .with_context("urn", current_urn.to_string()))
+            }
+            Some(parts) => parts,
+        };
 
-        if scope_nid.is_empty() {
-            return Err(Error::invalid_input("Scope NID is empty")
-                .with_operation("extract_scope")
-                .with_context("urn", current_urn.to_string()));
-        }
-        if scope_nss.is_empty() {
-            return Err(Error::invalid_input("Scope NSS is empty")
-                .with_operation("extract_scope")
-                .with_context("urn", current_urn.to_string()));
-        }
-
-        let scope_urn = urn::UrnBuilder::new(scope_nid, scope_nss)
-            .build()
-            .map_err(|e| {
-                Error::invalid_input("Failed to build scope URN")
+        let scope_urn = match urn::UrnBuilder::new(scope_nid, scope_nss).build() {
+            Err(e) => {
+                return Err(Error::invalid_input("Failed to build scope URN")
                     .with_operation("extract_scope")
                     .with_context("scope_nid", scope_nid.to_string())
                     .with_context("scope_nss", scope_nss.to_string())
-                    .with_context("error", format!("{:?}", e))
-            })?;
+                    .with_context("error", format!("{:?}", e)))
+            }
+            Ok(u) => u,
+        };
 
-        O::try_from(scope_urn).map_err(|e| {
-            Error::invalid_input("Failed to convert scope URN to expected type (NID mismatch?)")
-                .with_operation("extract_scope")
-                .with_context("error", format!("{:?}", e))
-        })
+        match O::try_from(scope_urn) {
+            Err(e) => Err(Error::invalid_input(
+                "Failed to convert scope URN to expected type (NID mismatch?)",
+            )
+            .with_operation("extract_scope")
+            .with_context("error", format!("{:?}", e))),
+            Ok(o) => Ok(o),
+        }
     }
 }
 
@@ -223,6 +236,7 @@ pub trait WithId: Sized {
     /// // urn:product:sku123@catalog:that  →  CatalogUrn(urn:catalog:that)
     /// let scope: CatalogUrn = scoped_product.extract_scope::<CatalogUrn>()?;
     /// ```
+    #[track_caller]
     fn extract_scope<O>(&self) -> crate::Result<O>
     where
         O: TryFrom<Urn, Error: std::fmt::Debug>,
