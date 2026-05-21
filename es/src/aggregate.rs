@@ -39,13 +39,13 @@ pub trait Aggregate: Sync + Send + EventStream {
         &self,
         command: Self::Command,
         services: &Self::Services,
-    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + Send;
+    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + Send;
 
     fn handle_and_apply<'a>(
         &'a mut self,
         command: Self::Command,
         services: &'a Self::Services,
-    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + Send + 'a
+    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + Send + 'a
     where
         Self: Sized,
     {
@@ -89,13 +89,13 @@ pub trait Aggregate: Sync + EventStream {
         &self,
         command: Self::Command,
         services: &Self::Services,
-    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>>;
+    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>>;
 
     fn handle_and_apply<'a>(
         &'a mut self,
         command: Self::Command,
         services: &'a Self::Services,
-    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + 'a
+    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + 'a
     where
         Self: Sized,
     {

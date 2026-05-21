@@ -363,7 +363,7 @@ mod tests {
             &self,
             _command: Self::Command,
             _services: &Self::Services,
-        ) -> replay::Result<Vec<Self::Event>> {
+        ) -> Result<Vec<Self::Event>, Self::Error> {
             Ok(vec![])
         }
     }
