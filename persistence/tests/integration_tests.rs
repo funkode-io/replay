@@ -79,7 +79,7 @@ impl replay::Aggregate for BankAccount {
         &self,
         command: Self::Command,
         _services: &Self::Services,
-    ) -> replay::Result<Vec<Self::Event>> {
+    ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             BankAccountCommand::Deposit {
                 effective_on,

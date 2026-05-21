@@ -73,7 +73,7 @@ impl Aggregate for BankAccount {
         &self,
         command: Self::Command,
         services: &Self::Services,
-    ) -> replay::Result<Vec<Self::Event>> {
+    ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             BankAccountCommand::OpenAccount { account_number } => {
                 if !services.validate_account_number(&account_number).await {
@@ -914,7 +914,7 @@ mod tests {
                 &self,
                 command: Self::Command,
                 _services: &Self::Services,
-            ) -> replay::Result<Vec<Self::Event>> {
+            ) -> Result<Vec<Self::Event>, Self::Error> {
                 match command {
                     ManagerCommand::Update { thing } => Ok(vec![ManagerEvent::Updated { thing }]),
                 }
@@ -1007,7 +1007,7 @@ mod tests {
                 &self,
                 command: Self::Command,
                 _services: &Self::Services,
-            ) -> replay::Result<Vec<Self::Event>> {
+            ) -> Result<Vec<Self::Event>, Self::Error> {
                 match command {
                     ProcessorCommand::Process { item } => {
                         // item is T::Item which is String
@@ -1109,7 +1109,7 @@ mod tests {
                 &self,
                 command: Self::Command,
                 _services: &Self::Services,
-            ) -> replay::Result<Vec<Self::Event>> {
+            ) -> Result<Vec<Self::Event>, Self::Error> {
                 match command {
                     FileProcessorCommand::ProcessBytes { mut reader } => {
                         // Process the byte stream
@@ -1191,7 +1191,7 @@ mod tests {
                 &self,
                 command: Self::Command,
                 _services: &Self::Services,
-            ) -> replay::Result<Vec<Self::Event>> {
+            ) -> Result<Vec<Self::Event>, Self::Error> {
                 match command {
                     StreamProcessorCommand::ProcessStream { receiver } => {
                         let mut count = 0;
