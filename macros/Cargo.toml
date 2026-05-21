@@ -18,7 +18,7 @@ proc-macro = true
 name = "replay_macros"
 
 [dependencies]
-replay = { package = "es-replay", path = "../es", version = "0.1.4" }
+replay = { package = "es-replay", path = "../es", version = "0.2.0" }
 proc-macro2 = { workspace = true }
 syn = { workspace = true }
 quote = { workspace = true }
