@@ -3,7 +3,7 @@ use std::fmt;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Categorizes errors by what the caller can do about them, not by their origin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// The requested resource was not found. Don't retry.
     NotFound,
@@ -25,8 +25,42 @@ pub enum ErrorKind {
     RateLimited,
 }
 
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ErrorKind::NotFound => "Not Found",
+            ErrorKind::Unauthorized => "Unauthorized",
+            ErrorKind::Forbidden => "Forbidden",
+            ErrorKind::RateLimited => "Rate Limited",
+            ErrorKind::InvalidInput => "Invalid Input",
+            ErrorKind::Internal => "Internal Error",
+            ErrorKind::Conflict => "Conflict",
+            ErrorKind::Unavailable => "Unavailable",
+            ErrorKind::BusinessRuleViolation => "Business Rule Violation",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl fmt::Debug for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ErrorKind::NotFound => "\u{1F50D} Not Found",
+            ErrorKind::Unauthorized => "\u{1F512} Unauthorized",
+            ErrorKind::Forbidden => "\u{1F6AB} Forbidden",
+            ErrorKind::RateLimited => "\u{23F1}\u{FE0F} Rate Limited",
+            ErrorKind::InvalidInput => "\u{274C} Invalid Input",
+            ErrorKind::Internal => "\u{1F4A5} Internal Error",
+            ErrorKind::Conflict => "\u{2694}\u{FE0F} Conflict",
+            ErrorKind::Unavailable => "\u{26A0}\u{FE0F} Unavailable",
+            ErrorKind::BusinessRuleViolation => "\u{1F4CB} Business Rule Violation",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 /// Indicates whether an error is worth retrying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ErrorStatus {
     /// Don't retry - the error is permanent (e.g., validation failure, not found)
     Permanent,
@@ -34,6 +68,28 @@ pub enum ErrorStatus {
     Temporary,
     /// Was retried but still failing - escalate or give up
     Persistent,
+}
+
+impl fmt::Display for ErrorStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ErrorStatus::Permanent => "Permanent",
+            ErrorStatus::Temporary => "Temporary",
+            ErrorStatus::Persistent => "Persistent",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl fmt::Debug for ErrorStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ErrorStatus::Permanent => "\u{1F6D1} Permanent",
+            ErrorStatus::Temporary => "\u{1F504} Temporary",
+            ErrorStatus::Persistent => "\u{26D4} Persistent",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 /// A flat, actionable error structure designed for both machine and human consumers.
@@ -74,7 +130,6 @@ pub enum ErrorStatus {
 /// - `wrap_internal()` - Wrap as an internal error
 /// - `wrap_unavailable()` - Wrap as an unavailable error
 /// - `wrap_conflict()` - Wrap as a conflict error
-#[derive(Debug)]
 pub struct Error {
     /// What kind of error occurred - guides the caller's response
     kind: ErrorKind,
@@ -295,28 +350,21 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Error kind with emoji for visual scanning
-        let kind_str = match self.kind {
-            ErrorKind::NotFound => "🔍 Not Found",
-            ErrorKind::Unauthorized => "🔒 Unauthorized",
-            ErrorKind::Forbidden => "🚫 Forbidden",
-            ErrorKind::RateLimited => "⏱️  Rate Limited",
-            ErrorKind::InvalidInput => "❌ Invalid Input",
-            ErrorKind::Internal => "💥 Internal Error",
-            ErrorKind::Conflict => "⚔️  Conflict",
-            ErrorKind::Unavailable => "⚠️  Unavailable",
-            ErrorKind::BusinessRuleViolation => "📋 Business Rule Violation",
-        };
+        write!(f, "{}", self.message)
+    }
+}
 
-        // Status indicator
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Status indicator with emoji
         let status_indicator = match self.status {
             ErrorStatus::Permanent => "🛑",
             ErrorStatus::Temporary => "🔄",
             ErrorStatus::Persistent => "⛔",
         };
 
-        // Main error line with kind and status
-        writeln!(f, "{} {} {}", status_indicator, kind_str, self.message)?;
+        // Main error line with status, kind (with emoji), and message
+        writeln!(f, "{} {:?} {}", status_indicator, self.kind, self.message)?;
 
         // Operation - what was being attempted
         if !self.operation.is_empty() {
@@ -334,20 +382,32 @@ impl fmt::Display for Error {
         // Location - for developers to find the code
         writeln!(f, "  Location: {}", self.location)?;
 
-        // Source chain - technical details
+        // Source chain rendering:
+        //   - replay::Error sources: recursive pretty-print with indentation (no depth bound;
+        //     each nested replay::Error handles its own chain the same way).
+        //   - External error sources: inline "Caused by:" + bounded └─ chain-walk (max depth 5).
         if let Some(source) = &self.source {
-            writeln!(f, "  Caused by: {}", source)?;
+            // For replay::Error sources: re-indent the full recursive Debug output so
+            // each nesting level is visually indented in logs.
+            // For external errors: keep the inline "Caused by:" + bounded └─ walk.
+            if (**source).downcast_ref::<Error>().is_some() {
+                writeln!(f, "  Caused by:")?;
+                for line in format!("{:?}", source).lines() {
+                    writeln!(f, "    {}", line)?;
+                }
+            } else {
+                writeln!(f, "  Caused by: {:?}", source)?;
 
-            // Walk the error chain
-            let mut current_source = source.source();
-            let mut depth = 1;
-            while let Some(src) = current_source {
-                writeln!(f, "  {}└─ {}", "  ".repeat(depth), src)?;
-                current_source = src.source();
-                depth += 1;
-                if depth > 5 {
-                    writeln!(f, "  {}└─ ...", "  ".repeat(depth))?;
-                    break;
+                let mut current_source = source.source();
+                let mut depth = 1;
+                while let Some(src) = current_source {
+                    writeln!(f, "  {}└─ {:?}", "  ".repeat(depth), src)?;
+                    current_source = src.source();
+                    depth += 1;
+                    if depth > 5 {
+                        writeln!(f, "  {}└─ ...", "  ".repeat(depth))?;
+                        break;
+                    }
                 }
             }
         }
@@ -427,12 +487,17 @@ mod tests {
             .with_context("expected_version", "5");
 
         let display = format!("{}", err);
+        let debug = format!("{:?}", err);
         tracing::info!("Error display:\n{}", err);
+        tracing::info!("Error debug:\n{:?}", err);
 
-        assert!(display.contains("version mismatch"));
-        assert!(display.contains("Operation: update_aggregate"));
-        assert!(display.contains("stream_id: urn:user:123"));
-        assert!(display.contains("expected_version: 5"));
+        // Display shows only the message
+        assert_eq!(display, "version mismatch");
+        // Debug contains full details
+        assert!(debug.contains("version mismatch"));
+        assert!(debug.contains("Operation: update_aggregate"));
+        assert!(debug.contains("stream_id: urn:user:123"));
+        assert!(debug.contains("expected_version: 5"));
     }
 
     #[test]
@@ -468,17 +533,21 @@ mod tests {
             .with_context("request_id", "abc-123");
 
         let display = format!("{}", service_error);
+        let debug = format!("{:?}", service_error);
         tracing::info!("Error chain display:\n{}", service_error);
+        tracing::info!("Error chain debug:\n{:?}", service_error);
 
-        // Verify the top-level error information
-        assert!(display.contains("User service unavailable"));
-        assert!(display.contains("Operation: get_user_profile"));
-        assert!(display.contains("request_id: abc-123"));
+        // Display shows only the message
+        assert_eq!(display, "User service unavailable");
+        // Debug contains full details
+        assert!(debug.contains("User service unavailable"));
+        assert!(debug.contains("Operation: get_user_profile"));
+        assert!(debug.contains("request_id: abc-123"));
 
-        // Verify the "Caused by" chain is present
-        assert!(display.contains("Caused by:"));
-        assert!(display.contains("Failed to query user data"));
-        assert!(display.contains("connection timeout"));
+        // Verify the "Caused by" chain is present in Debug
+        assert!(debug.contains("Caused by:"));
+        assert!(debug.contains("Failed to query user data"));
+        assert!(debug.contains("connection timeout"));
     }
 
     #[test]
@@ -534,8 +603,10 @@ mod tests {
 
         // The source should be a replay::Error with full information
         assert!(source.to_string().contains("Service down"));
-        assert!(source.to_string().contains("call_api"));
-        assert!(source.to_string().contains("payment-api"));
+        // Debug output contains full context
+        let source_debug = format!("{:?}", source);
+        assert!(source_debug.contains("call_api"));
+        assert!(source_debug.contains("payment-api"));
     }
 
     #[test]
@@ -550,5 +621,191 @@ mod tests {
         assert!(wrapped.source().is_some());
         let source = wrapped.source().unwrap();
         assert!(source.to_string().contains("config.json not found"));
+    }
+
+    #[test]
+    fn test_display_shows_only_message() {
+        let err = Error::not_found("user not found")
+            .with_operation("fetch_user")
+            .with_context("user_id", "123");
+
+        let display = format!("{}", err);
+        assert_eq!(display, "user not found");
+        // Display must NOT contain debug-only details
+        assert!(!display.contains("Operation:"));
+        assert!(!display.contains("Location:"));
+        assert!(!display.contains("Context:"));
+    }
+
+    #[test]
+    fn test_debug_shows_full_details() {
+        let err = Error::not_found("user not found")
+            .with_operation("fetch_user")
+            .with_context("user_id", "123");
+
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("user not found"));
+        assert!(debug.contains("Operation: fetch_user"));
+        assert!(debug.contains("user_id: 123"));
+        assert!(debug.contains("Location:"));
+        // Debug includes emoji hints
+        assert!(debug.contains("💡"));
+    }
+
+    #[test]
+    fn test_error_kind_display_no_emoji() {
+        assert_eq!(format!("{}", ErrorKind::NotFound), "Not Found");
+        assert_eq!(format!("{}", ErrorKind::Internal), "Internal Error");
+        assert_eq!(format!("{}", ErrorKind::InvalidInput), "Invalid Input");
+        assert_eq!(format!("{}", ErrorKind::Conflict), "Conflict");
+        assert_eq!(
+            format!("{}", ErrorKind::BusinessRuleViolation),
+            "Business Rule Violation"
+        );
+    }
+
+    #[test]
+    fn test_error_kind_debug_with_emoji() {
+        assert!(format!("{:?}", ErrorKind::NotFound).contains("🔍"));
+        assert!(format!("{:?}", ErrorKind::Internal).contains("💥"));
+        assert!(format!("{:?}", ErrorKind::InvalidInput).contains("❌"));
+        assert!(format!("{:?}", ErrorKind::Conflict).contains("⚔"));
+        assert!(format!("{:?}", ErrorKind::Unavailable).contains("⚠"));
+    }
+
+    #[test]
+    fn test_error_status_display_no_emoji() {
+        assert_eq!(format!("{}", ErrorStatus::Permanent), "Permanent");
+        assert_eq!(format!("{}", ErrorStatus::Temporary), "Temporary");
+        assert_eq!(format!("{}", ErrorStatus::Persistent), "Persistent");
+    }
+
+    #[test]
+    fn test_error_status_debug_with_emoji() {
+        assert!(format!("{:?}", ErrorStatus::Permanent).contains("🛑"));
+        assert!(format!("{:?}", ErrorStatus::Temporary).contains("🔄"));
+        assert!(format!("{:?}", ErrorStatus::Persistent).contains("⛔"));
+    }
+
+    #[test]
+    fn test_display_vs_debug_differ() {
+        let err = Error::unavailable("service temporarily down")
+            .with_operation("call_payment_api")
+            .with_context("endpoint", "https://payments.example.com");
+
+        let display = format!("{}", err);
+        let debug = format!("{:?}", err);
+
+        // Display is concise: message only
+        assert_eq!(display, "service temporarily down");
+        // Debug is verbose: includes operation, context, location, hint
+        assert!(debug.contains("call_payment_api"));
+        assert!(debug.contains("endpoint"));
+        assert!(debug.len() > display.len());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Helper: a minimal external error type with an arbitrary source chain,
+    // used to test chain-walk behaviour independently of replay::Error.
+    // ---------------------------------------------------------------------------
+    #[derive(Debug)]
+    struct ChainedError {
+        msg: String,
+        cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+
+    impl fmt::Display for ChainedError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.msg)
+        }
+    }
+
+    impl std::error::Error for ChainedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause.as_ref().map(|e| e.as_ref() as _)
+        }
+    }
+
+    #[test]
+    fn test_debug_chain_walk_shows_external_nested_causes() {
+        // Two-level external error chain: mid wraps root
+        let root = ChainedError {
+            msg: "root: disk full".into(),
+            cause: None,
+        };
+        let mid = ChainedError {
+            msg: "mid: write failed".into(),
+            cause: Some(Box::new(root)),
+        };
+
+        let err = Error::internal("Failed to persist event")
+            .with_operation("persist")
+            .with_source(mid);
+
+        let debug = format!("{:?}", err);
+
+        // Immediate source visible via "Caused by:"
+        assert!(debug.contains("mid: write failed"));
+        // Root cause visible via the chain walk (└─ link)
+        assert!(debug.contains("root: disk full"));
+        assert!(debug.contains("└─"));
+    }
+
+    #[test]
+    fn test_debug_chain_walk_truncates_after_depth_5() {
+        fn make_chain(depth: u32) -> ChainedError {
+            if depth == 0 {
+                ChainedError {
+                    msg: "root".into(),
+                    cause: None,
+                }
+            } else {
+                ChainedError {
+                    msg: format!("level {depth}"),
+                    cause: Some(Box::new(make_chain(depth - 1))),
+                }
+            }
+        }
+
+        // 8-level chain: should be truncated
+        let err = Error::internal("top-level failure").with_source(make_chain(8));
+        let debug = format!("{:?}", err);
+
+        // Truncation marker present
+        assert!(debug.contains("..."));
+        // Top of the chain is still visible
+        assert!(debug.contains("level 8"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn test_debug_chain_walk_for_replay_error_chain() {
+        let db_error = Error::unavailable("connection timeout").with_context("host", "db:5432");
+        let service_error = Error::internal("query failed").with_source(db_error);
+
+        let debug_output = format!("{:?}", service_error);
+        tracing::info!("Full debug output:\n{}", debug_output);
+
+        // Expected log output (location lines vary by line number):
+        //
+        // 🛑 💥 Internal Error query failed
+        //   Location: es/src/error.rs:XXX:YY
+        //   Caused by:
+        //     🔄 ⚠️ Unavailable connection timeout
+        //       Context:
+        //         • host: db:5432
+        //       Location: es/src/error.rs:ZZZ:WW
+        //       💡 Safe to retry immediately
+        //
+
+        // Top-level message
+        assert!(debug_output.contains("query failed"));
+        // Source error message and context appear via recursive Debug
+        assert!(debug_output.contains("connection timeout"));
+        assert!(debug_output.contains("db:5432"));
+        // Source chain is labelled
+        assert!(debug_output.contains("Caused by:"));
+        // Hint from the source error kind is present
+        assert!(debug_output.contains("💡 Safe to retry immediately"));
     }
 }
