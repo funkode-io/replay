@@ -382,9 +382,21 @@ impl fmt::Debug for Error {
         // Location - for developers to find the code
         writeln!(f, "  Location: {}", self.location)?;
 
-        // Source chain - technical details (recursive Debug for full context)
+        // Source chain - technical details (bounded walk, each link via Debug)
         if let Some(source) = &self.source {
             writeln!(f, "  Caused by: {:?}", source)?;
+
+            let mut current_source = source.source();
+            let mut depth = 1;
+            while let Some(src) = current_source {
+                writeln!(f, "  {}└─ {:?}", "  ".repeat(depth), src)?;
+                current_source = src.source();
+                depth += 1;
+                if depth > 5 {
+                    writeln!(f, "  {}└─ ...", "  ".repeat(depth))?;
+                    break;
+                }
+            }
         }
 
         // Actionable hint based on error kind
