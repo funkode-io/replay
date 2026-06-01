@@ -18,8 +18,8 @@ crate-type = ["lib"]
 name = "replay_persistence"
 
 [dependencies]
-replay = { package = "es-replay", path = "../es", version = "0.2.0" }
-replay-macros = { package = "es-replay-macros", path = "../macros", version = "0.2.0" }
+replay = { package = "es-replay", path = "../es", version = "0.3.0" }
+replay-macros = { package = "es-replay-macros", path = "../macros", version = "0.3.0" }
 
 serde = { workspace = true }
 serde_with = { workspace = true }
