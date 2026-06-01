@@ -690,4 +690,86 @@ mod tests {
         assert!(debug.contains("endpoint"));
         assert!(debug.len() > display.len());
     }
+
+    // ---------------------------------------------------------------------------
+    // Helper: a minimal external error type with an arbitrary source chain,
+    // used to test chain-walk behaviour independently of replay::Error.
+    // ---------------------------------------------------------------------------
+    #[derive(Debug)]
+    struct ChainedError {
+        msg: String,
+        cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+
+    impl fmt::Display for ChainedError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.msg)
+        }
+    }
+
+    impl std::error::Error for ChainedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause.as_ref().map(|e| e.as_ref() as _)
+        }
+    }
+
+    #[test]
+    fn test_debug_chain_walk_shows_external_nested_causes() {
+        // Two-level external error chain: mid wraps root
+        let root = ChainedError { msg: "root: disk full".into(), cause: None };
+        let mid = ChainedError {
+            msg: "mid: write failed".into(),
+            cause: Some(Box::new(root)),
+        };
+
+        let err = Error::internal("Failed to persist event")
+            .with_operation("persist")
+            .with_source(mid);
+
+        let debug = format!("{:?}", err);
+
+        // Immediate source visible via "Caused by:"
+        assert!(debug.contains("mid: write failed"));
+        // Root cause visible via the chain walk (└─ link)
+        assert!(debug.contains("root: disk full"));
+        assert!(debug.contains("└─"));
+    }
+
+    #[test]
+    fn test_debug_chain_walk_truncates_after_depth_5() {
+        fn make_chain(depth: u32) -> ChainedError {
+            if depth == 0 {
+                ChainedError { msg: "root".into(), cause: None }
+            } else {
+                ChainedError {
+                    msg: format!("level {depth}"),
+                    cause: Some(Box::new(make_chain(depth - 1))),
+                }
+            }
+        }
+
+        // 8-level chain: should be truncated
+        let err = Error::internal("top-level failure").with_source(make_chain(8));
+        let debug = format!("{:?}", err);
+
+        // Truncation marker present
+        assert!(debug.contains("..."));
+        // Top of the chain is still visible
+        assert!(debug.contains("level 8"));
+    }
+
+    #[test]
+    fn test_debug_chain_walk_for_replay_error_chain() {
+        let db_error = Error::unavailable("connection timeout")
+            .with_context("host", "db:5432");
+        let service_error = Error::internal("query failed").with_source(db_error);
+
+        let debug = format!("{:?}", service_error);
+
+        // Top-level message
+        assert!(debug.contains("query failed"));
+        // Source error message and context appear via recursive Debug
+        assert!(debug.contains("connection timeout"));
+        assert!(debug.contains("db:5432"));
+    }
 }
