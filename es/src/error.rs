@@ -350,7 +350,11 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
+        if self.kind == ErrorKind::Internal {
+            write!(f, "Internal server error")
+        } else {
+            write!(f, "{}", self.message)
+        }
     }
 }
 
@@ -537,9 +541,9 @@ mod tests {
         tracing::info!("Error chain display:\n{}", service_error);
         tracing::info!("Error chain debug:\n{:?}", service_error);
 
-        // Display shows only the message
-        assert_eq!(display, "User service unavailable");
-        // Debug contains full details
+        // Internal errors show a generic message in Display (details hidden from users)
+        assert_eq!(display, "Internal server error");
+        // Debug contains the real message and full details
         assert!(debug.contains("User service unavailable"));
         assert!(debug.contains("Operation: get_user_profile"));
         assert!(debug.contains("request_id: abc-123"));
@@ -621,6 +625,41 @@ mod tests {
         assert!(wrapped.source().is_some());
         let source = wrapped.source().unwrap();
         assert!(source.to_string().contains("config.json not found"));
+    }
+
+    #[test]
+    fn test_internal_error_display_is_generic() {
+        let err = Error::internal("database connection pool exhausted")
+            .with_operation("acquire_connection")
+            .with_context("pool", "primary");
+
+        // Display hides the real message to avoid leaking internals to users
+        assert_eq!(format!("{}", err), "Internal server error");
+        // Debug still exposes the full details for developers
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("database connection pool exhausted"));
+        assert!(debug.contains("acquire_connection"));
+        assert!(debug.contains("primary"));
+    }
+
+    #[test]
+    fn test_non_internal_error_display_shows_message() {
+        assert_eq!(
+            format!("{}", Error::not_found("order 42 not found")),
+            "order 42 not found"
+        );
+        assert_eq!(
+            format!("{}", Error::invalid_input("email is required")),
+            "email is required"
+        );
+        assert_eq!(
+            format!("{}", Error::conflict("version mismatch")),
+            "version mismatch"
+        );
+        assert_eq!(
+            format!("{}", Error::unavailable("payment service down")),
+            "payment service down"
+        );
     }
 
     #[test]
