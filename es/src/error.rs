@@ -48,11 +48,11 @@ impl fmt::Debug for ErrorKind {
             ErrorKind::NotFound => "\u{1F50D} Not Found",
             ErrorKind::Unauthorized => "\u{1F512} Unauthorized",
             ErrorKind::Forbidden => "\u{1F6AB} Forbidden",
-            ErrorKind::RateLimited => "\u{23F1}\u{FE0F}  Rate Limited",
+            ErrorKind::RateLimited => "\u{23F1}\u{FE0F} Rate Limited",
             ErrorKind::InvalidInput => "\u{274C} Invalid Input",
             ErrorKind::Internal => "\u{1F4A5} Internal Error",
-            ErrorKind::Conflict => "\u{2694}\u{FE0F}  Conflict",
-            ErrorKind::Unavailable => "\u{26A0}\u{FE0F}  Unavailable",
+            ErrorKind::Conflict => "\u{2694}\u{FE0F} Conflict",
+            ErrorKind::Unavailable => "\u{26A0}\u{FE0F} Unavailable",
             ErrorKind::BusinessRuleViolation => "\u{1F4CB} Business Rule Violation",
         };
         write!(f, "{}", s)
@@ -716,7 +716,10 @@ mod tests {
     #[test]
     fn test_debug_chain_walk_shows_external_nested_causes() {
         // Two-level external error chain: mid wraps root
-        let root = ChainedError { msg: "root: disk full".into(), cause: None };
+        let root = ChainedError {
+            msg: "root: disk full".into(),
+            cause: None,
+        };
         let mid = ChainedError {
             msg: "mid: write failed".into(),
             cause: Some(Box::new(root)),
@@ -739,7 +742,10 @@ mod tests {
     fn test_debug_chain_walk_truncates_after_depth_5() {
         fn make_chain(depth: u32) -> ChainedError {
             if depth == 0 {
-                ChainedError { msg: "root".into(), cause: None }
+                ChainedError {
+                    msg: "root".into(),
+                    cause: None,
+                }
             } else {
                 ChainedError {
                     msg: format!("level {depth}"),
@@ -760,8 +766,7 @@ mod tests {
 
     #[test]
     fn test_debug_chain_walk_for_replay_error_chain() {
-        let db_error = Error::unavailable("connection timeout")
-            .with_context("host", "db:5432");
+        let db_error = Error::unavailable("connection timeout").with_context("host", "db:5432");
         let service_error = Error::internal("query failed").with_source(db_error);
 
         let debug = format!("{:?}", service_error);
