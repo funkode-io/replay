@@ -384,17 +384,27 @@ impl fmt::Debug for Error {
 
         // Source chain - technical details (bounded walk, each link via Debug)
         if let Some(source) = &self.source {
-            writeln!(f, "  Caused by: {:?}", source)?;
+            // For replay::Error sources: re-indent the full recursive Debug output so
+            // each nesting level is visually indented in logs.
+            // For external errors: keep the inline "Caused by:" + bounded └─ walk.
+            if (**source).downcast_ref::<Error>().is_some() {
+                writeln!(f, "  Caused by:")?;
+                for line in format!("{:?}", source).lines() {
+                    writeln!(f, "    {}", line)?;
+                }
+            } else {
+                writeln!(f, "  Caused by: {:?}", source)?;
 
-            let mut current_source = source.source();
-            let mut depth = 1;
-            while let Some(src) = current_source {
-                writeln!(f, "  {}└─ {:?}", "  ".repeat(depth), src)?;
-                current_source = src.source();
-                depth += 1;
-                if depth > 5 {
-                    writeln!(f, "  {}└─ ...", "  ".repeat(depth))?;
-                    break;
+                let mut current_source = source.source();
+                let mut depth = 1;
+                while let Some(src) = current_source {
+                    writeln!(f, "  {}└─ {:?}", "  ".repeat(depth), src)?;
+                    current_source = src.source();
+                    depth += 1;
+                    if depth > 5 {
+                        writeln!(f, "  {}└─ ...", "  ".repeat(depth))?;
+                        break;
+                    }
                 }
             }
         }
@@ -777,11 +787,12 @@ mod tests {
         //
         // 🛑 💥 Internal Error query failed
         //   Location: es/src/error.rs:XXX:YY
-        //   Caused by: 🔄 ⚠️ Unavailable connection timeout
-        //   Context:
-        //     • host: db:5432
-        //   Location: es/src/error.rs:ZZZ:WW
-        //   💡 Safe to retry immediately
+        //   Caused by:
+        //     🔄 ⚠️ Unavailable connection timeout
+        //       Context:
+        //         • host: db:5432
+        //       Location: es/src/error.rs:ZZZ:WW
+        //       💡 Safe to retry immediately
         //
 
         // Top-level message
