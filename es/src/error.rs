@@ -765,16 +765,33 @@ mod tests {
     }
 
     #[test]
+    #[traced_test]
     fn test_debug_chain_walk_for_replay_error_chain() {
         let db_error = Error::unavailable("connection timeout").with_context("host", "db:5432");
         let service_error = Error::internal("query failed").with_source(db_error);
 
-        let debug = format!("{:?}", service_error);
+        let debug_output = format!("{:?}", service_error);
+        tracing::info!("Full debug output:\n{}", debug_output);
+
+        // Expected log output (location lines vary by line number):
+        //
+        // 🛑 💥 Internal Error query failed
+        //   Location: es/src/error.rs:XXX:YY
+        //   Caused by: 🔄 ⚠️ Unavailable connection timeout
+        //   Context:
+        //     • host: db:5432
+        //   Location: es/src/error.rs:ZZZ:WW
+        //   💡 Safe to retry immediately
+        //
 
         // Top-level message
-        assert!(debug.contains("query failed"));
+        assert!(debug_output.contains("query failed"));
         // Source error message and context appear via recursive Debug
-        assert!(debug.contains("connection timeout"));
-        assert!(debug.contains("db:5432"));
+        assert!(debug_output.contains("connection timeout"));
+        assert!(debug_output.contains("db:5432"));
+        // Source chain is labelled
+        assert!(debug_output.contains("Caused by:"));
+        // Hint from the source error kind is present
+        assert!(debug_output.contains("💡 Safe to retry immediately"));
     }
 }
