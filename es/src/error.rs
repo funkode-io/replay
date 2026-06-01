@@ -382,7 +382,10 @@ impl fmt::Debug for Error {
         // Location - for developers to find the code
         writeln!(f, "  Location: {}", self.location)?;
 
-        // Source chain - technical details (bounded walk, each link via Debug)
+        // Source chain rendering:
+        //   - replay::Error sources: recursive pretty-print with indentation (no depth bound;
+        //     each nested replay::Error handles its own chain the same way).
+        //   - External error sources: inline "Caused by:" + bounded └─ chain-walk (max depth 5).
         if let Some(source) = &self.source {
             // For replay::Error sources: re-indent the full recursive Debug output so
             // each nesting level is visually indented in logs.
