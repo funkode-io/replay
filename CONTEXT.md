@@ -49,6 +49,22 @@ Discarding a projection's current state (reset) and replaying the full event
 history through it to reconstruct it. Triggered when a projection's code version
 is newer than the version recorded in the store.
 
+### WASM target
+
+`replay` supports WebAssembly. The core `es` crate and the `macros` crate are
+WASM-compatible: they provide **dual, cfg-gated definitions** of the core traits —
+`Send`-bounded under `cfg(not(target_arch = "wasm32"))` for multi-threaded native
+runtimes, and `Send`-free under `cfg(target_arch = "wasm32")` for the
+single-threaded WASM environment (generated services use
+`cfg_attr(target_arch = "wasm32", async_trait(?Send))`). Any change to traits in
+`es`/`macros` must preserve both arms. The `persistence` crate (Postgres + sqlx +
+tokio) is **server-only / non-WASM**, so every projection mechanism that lives
+there — including the [Inline projection] — is a native-only feature and is free
+to use `Send` bounds. A future [Async projection] aimed at client/edge targets
+would need to honour the WASM dual-cfg pattern.
+
 [Aggregate]: #aggregate
 [Query]: #query
 [Live projection]: #live-projection
+[Inline projection]: #inline-projection
+[Async projection]: #async-projection

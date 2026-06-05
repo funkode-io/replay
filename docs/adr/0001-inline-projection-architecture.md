@@ -48,3 +48,10 @@ error (a likely bad/rolled-back deploy) rather than a silent backward rebuild.
 - `store_events` gains a second responsibility (append + project) and
   `PostgresEventStore` becomes stateful beyond its pool, but the write path stays
   single so projections can't be accidentally bypassed.
+- Inline projections are **native-only (non-WASM)**. They live in the
+  `persistence` crate, which depends on `sqlx`/`tokio`/Postgres and does not
+  target `wasm32`, so the `InlineProjection` trait is free to use `Send` bounds
+  and `BoxFuture`. WASM consumers use the core `es`/`macros` crates (which keep
+  their dual `cfg(target_arch = "wasm32")` trait arms) for the write side; a
+  WASM-facing read model would be served by the future *async projection*, which
+  must honour the no-`Send` WASM pattern.

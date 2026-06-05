@@ -30,3 +30,7 @@ so the `query_events!` machinery is reused rather than reinvented.
   per append. Negligible at catalog write volumes; if it ever matters, projections
   can be pre-indexed by `event_type` or the planned in-memory `StreamFilter`
   evaluation can pre-filter before deserialization.
+- This routing lives in the native-only `persistence` crate, so the erased
+  wrapper and its `BoxFuture`/`Send` bounds are fine. The `query_events!` macro it
+  reuses is itself WASM-compatible (it lives in `macros`); reusing it here does
+  not change that — only the Postgres-side routing is native-only.
