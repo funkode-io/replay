@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use futures::{StreamExt, TryStream, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -6,20 +8,43 @@ use sqlx::{
     types::chrono::{self, Utc},
     Pool, Postgres, QueryBuilder, Row,
 };
+use tokio::sync::Mutex;
 
 use urn::Urn;
 use uuid::Uuid;
 
+use crate::inline_projection::{ErasedInlineProjection, InlineProjection};
 use crate::{EventStore, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event, Metadata};
 
+/// A registered inline projection, guarded by a mutex so its `&mut self`
+/// `handle`/`init` methods can be driven through the shared (`&self`) store.
+type RegisteredProjection = Mutex<Box<dyn ErasedInlineProjection>>;
+
 pub struct PostgresEventStore {
     pool: Pool<Postgres>,
+    /// Builder-fixed, immutable set of inline projections. The `Vec` itself never
+    /// changes after `build()`; each projection is individually locked while applied.
+    projections: Arc<Vec<RegisteredProjection>>,
 }
 
 impl PostgresEventStore {
     pub fn new(pool: Pool<Postgres>) -> PostgresEventStore {
-        PostgresEventStore { pool }
+        PostgresEventStore {
+            pool,
+            projections: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Begin configuring a store with inline projections.
+    ///
+    /// Projections are registered on the builder and frozen by [`PostgresEventStoreBuilder::build`],
+    /// which runs their first-time `init` and records their version in the `projections` table.
+    pub fn builder(pool: Pool<Postgres>) -> PostgresEventStoreBuilder {
+        PostgresEventStoreBuilder {
+            pool,
+            projections: Vec::new(),
+        }
     }
 
     fn add_filters(query_builder: &mut QueryBuilder<Postgres>, filter: StreamFilter) {
@@ -98,6 +123,69 @@ impl PostgresEventStore {
                 query_builder.push(")");
             }
         }
+    }
+}
+
+/// Builder for a [`PostgresEventStore`] with inline projections.
+///
+/// Register projections with [`register`](Self::register), then call
+/// [`build`](Self::build) to run first-time `init` and freeze the registry.
+pub struct PostgresEventStoreBuilder {
+    pool: Pool<Postgres>,
+    projections: Vec<Box<dyn ErasedInlineProjection>>,
+}
+
+impl PostgresEventStoreBuilder {
+    /// Register an inline projection.
+    pub fn register<P>(mut self, projection: P) -> Self
+    where
+        P: InlineProjection + 'static,
+    {
+        self.projections.push(Box::new(projection));
+        self
+    }
+
+    /// Run first-time setup for the registered projections and freeze the store.
+    ///
+    /// For each projection that is not yet present in the `projections` table, runs its
+    /// `init` and inserts its version row. All setup happens in a single transaction, so a
+    /// failure leaves the registry table untouched.
+    ///
+    /// Version-drift handling (reset + replay) and the stored-newer-than-code guard are
+    /// added by later slices; this build only covers first-time registration.
+    pub async fn build(self) -> Result<PostgresEventStore, replay::Error> {
+        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+
+        let mut registered: Vec<RegisteredProjection> = Vec::with_capacity(self.projections.len());
+
+        for mut projection in self.projections {
+            let existing: Option<i32> =
+                sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
+                    .bind(projection.name())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(crate::db_error)?;
+
+            if existing.is_none() {
+                projection.init(&mut tx).await?;
+
+                sqlx::query("INSERT INTO projections (name, version) VALUES ($1, $2)")
+                    .bind(projection.name())
+                    .bind(projection.version())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(crate::db_error)?;
+            }
+
+            registered.push(Mutex::new(projection));
+        }
+
+        tx.commit().await.map_err(crate::db_error)?;
+
+        Ok(PostgresEventStore {
+            pool: self.pool,
+            projections: Arc::new(registered),
+        })
     }
 }
 
@@ -284,6 +372,7 @@ impl Clone for PostgresEventStore {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            projections: self.projections.clone(),
         }
     }
 }
