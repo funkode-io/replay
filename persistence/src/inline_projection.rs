@@ -3,17 +3,15 @@ use std::future::Future;
 use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use sqlx::PgConnection;
 
 use crate::PersistedEvent;
 use replay::Event;
 
 /// An inline projection: a persisted read model whose write is applied inside the
-/// same transaction that appends the events, against the same Postgres store.
+/// same transaction that appends the events, against the same store instance.
 ///
-/// Inline projections are intentionally **not** store-agnostic — the write handle
-/// is a concrete Postgres connection (`&mut PgConnection`, obtained from the store's
-/// own transaction). The store drives the projection while it holds that transaction,
+/// The write handle type is supplied by the store as the associated `Exec` type.
+/// The store drives the projection while it holds that transaction/connection,
 /// so the read-model write commits atomically with the events.
 ///
 /// Implementors declare the events they consume via the associated [`Event`](Self::Event)
@@ -21,6 +19,9 @@ use replay::Event;
 /// its `Deserialize` impl tries each underlying event type in turn, which lets the store
 /// route appended events by deserialize-or-skip.
 pub trait InlineProjection: Send + Sync {
+    /// Concrete write-handle type supplied by the store.
+    type Exec: Send;
+
     /// The event type this projection consumes. Typically a `query_events!`-merged enum.
     type Event: Event + DeserializeOwned;
 
@@ -39,7 +40,7 @@ pub trait InlineProjection: Send + Sync {
     /// connection so the setup participates in the registration transaction.
     fn init(
         &mut self,
-        conn: &mut PgConnection,
+        conn: &mut Self::Exec,
     ) -> impl Future<Output = Result<(), replay::Error>> + Send;
 
     /// Apply a batch of newly-appended events to the read model.
@@ -50,26 +51,26 @@ pub trait InlineProjection: Send + Sync {
     /// transaction, so they commit atomically with the appended events.
     fn handle(
         &mut self,
-        conn: &mut PgConnection,
+        conn: &mut Self::Exec,
         events: &[PersistedEvent<Self::Event>],
     ) -> impl Future<Output = Result<(), replay::Error>> + Send;
 }
 
 /// Object-safe, type-erased view of an [`InlineProjection`] used by the store's registry.
 ///
-/// The store holds projections as `Box<dyn ErasedInlineProjection>` so that projections
+/// The store holds projections as `Box<dyn ErasedInlineProjection<Exec = ...>>` so that projections
 /// over different event types can live in a single registry. The erased `handle` receives
 /// raw JSON-backed events and bridges them to the projection's typed event via
 /// deserialize-or-skip.
 pub(crate) trait ErasedInlineProjection: Send + Sync {
+    type Exec;
+
     fn name(&self) -> &str;
 
     fn version(&self) -> i32;
 
-    fn init<'a>(
-        &'a mut self,
-        conn: &'a mut PgConnection,
-    ) -> BoxFuture<'a, Result<(), replay::Error>>;
+    fn init<'a>(&'a mut self, conn: &'a mut Self::Exec)
+        -> BoxFuture<'a, Result<(), replay::Error>>;
 
     /// Route raw appended events to the underlying typed projection.
     ///
@@ -78,7 +79,7 @@ pub(crate) trait ErasedInlineProjection: Send + Sync {
     /// called.
     fn handle<'a>(
         &'a mut self,
-        conn: &'a mut PgConnection,
+        conn: &'a mut Self::Exec,
         events: &'a [PersistedEvent<Value>],
     ) -> BoxFuture<'a, Result<(), replay::Error>>;
 }
@@ -87,6 +88,8 @@ impl<T> ErasedInlineProjection for T
 where
     T: InlineProjection,
 {
+    type Exec = T::Exec;
+
     fn name(&self) -> &str {
         InlineProjection::name(self)
     }
@@ -97,14 +100,14 @@ where
 
     fn init<'a>(
         &'a mut self,
-        conn: &'a mut PgConnection,
+        conn: &'a mut Self::Exec,
     ) -> BoxFuture<'a, Result<(), replay::Error>> {
         Box::pin(InlineProjection::init(self, conn))
     }
 
     fn handle<'a>(
         &'a mut self,
-        conn: &'a mut PgConnection,
+        conn: &'a mut Self::Exec,
         events: &'a [PersistedEvent<Value>],
     ) -> BoxFuture<'a, Result<(), replay::Error>> {
         Box::pin(async move {

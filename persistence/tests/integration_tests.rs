@@ -512,6 +512,7 @@ async fn bank_account_compaction_postgres_test() {
 struct BalanceProjection;
 
 impl replay_persistence::InlineProjection for BalanceProjection {
+    type Exec = sqlx::PgConnection;
     type Event = BankAccountEvent;
 
     fn name(&self) -> &str {

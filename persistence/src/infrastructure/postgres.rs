@@ -19,7 +19,7 @@ use replay::{Compactable, Event, Metadata};
 
 /// A registered inline projection, guarded by a mutex so its `&mut self`
 /// `handle`/`init` methods can be driven through the shared (`&self`) store.
-type RegisteredProjection = Mutex<Box<dyn ErasedInlineProjection>>;
+type RegisteredProjection = Mutex<Box<dyn ErasedInlineProjection<Exec = sqlx::PgConnection>>>;
 
 pub struct PostgresEventStore {
     pool: Pool<Postgres>,
@@ -132,14 +132,14 @@ impl PostgresEventStore {
 /// [`build`](Self::build) to run first-time `init` and freeze the registry.
 pub struct PostgresEventStoreBuilder {
     pool: Pool<Postgres>,
-    projections: Vec<Box<dyn ErasedInlineProjection>>,
+    projections: Vec<Box<dyn ErasedInlineProjection<Exec = sqlx::PgConnection>>>,
 }
 
 impl PostgresEventStoreBuilder {
     /// Register an inline projection.
     pub fn register<P>(mut self, projection: P) -> Self
     where
-        P: InlineProjection + 'static,
+        P: InlineProjection<Exec = sqlx::PgConnection> + 'static,
     {
         self.projections.push(Box::new(projection));
         self
