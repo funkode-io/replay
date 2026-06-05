@@ -189,6 +189,62 @@ impl PostgresEventStoreBuilder {
     }
 }
 
+impl PostgresEventStore {
+    /// Apply the just-appended events to every registered inline projection, inside the
+    /// store's open transaction.
+    ///
+    /// The DB-assigned `version`/`created` for each appended event are read back (by id)
+    /// so projections receive faithful `PersistedEvent`s. Each projection is locked
+    /// individually and routes the batch by deserialize-or-skip; any projection error
+    /// propagates and rolls back the whole append.
+    async fn apply_projections(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        stream_id: &Urn,
+        metadata: &Metadata,
+        appended: Vec<(Uuid, String, Value)>,
+    ) -> Result<(), replay::Error> {
+        let mut events: Vec<PersistedEvent<Value>> = Vec::with_capacity(appended.len());
+
+        for (id, event_type, data) in appended {
+            let row = sqlx::query("SELECT version, created FROM events WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(crate::db_error)?;
+
+            // Absent only when the append did not insert a row (e.g. a concurrency
+            // conflict swallowed by append_event — see follow-up issue). Skip it here.
+            let Some(row) = row else { continue };
+
+            let version: i64 = row.get("version");
+            let created: chrono::DateTime<Utc> = row.get("created");
+
+            events.push(PersistedEvent {
+                id,
+                data,
+                stream_id: stream_id.clone(),
+                r#type: event_type,
+                version,
+                created,
+                metadata: metadata.clone(),
+                aggregate_version: None,
+            });
+        }
+
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        for projection in self.projections.iter() {
+            let mut projection = projection.lock().await;
+            projection.handle(&mut *conn, &events).await?;
+        }
+
+        Ok(())
+    }
+}
+
 impl EventStore for PostgresEventStore {
     async fn store_events<S: replay::EventStream>(
         &self,
@@ -201,13 +257,24 @@ impl EventStore for PostgresEventStore {
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
 
+        // Track the appended events so registered inline projections can be applied
+        // inside this same transaction. We only retain what's needed to rebuild the
+        // PersistedEvent: the generated id, the JSON payload and the event type.
+        let has_projections = !self.projections.is_empty();
+        let mut appended: Vec<(Uuid, String, Value)> = if has_projections {
+            Vec::with_capacity(domain_events.len())
+        } else {
+            Vec::new()
+        };
+
         for event in domain_events {
             let event_type = event.event_type().clone();
             let event = serde_json::to_value(event).map_err(crate::ser_error)?;
+            let id = Uuid::new_v4();
 
             sqlx::query!(
                 "SELECT append_event($1, $2, $3, $4, $5, $6, $7) ",
-                Uuid::new_v4(),
+                id,
                 event,
                 metadata.to_json(),
                 event_type,
@@ -218,6 +285,15 @@ impl EventStore for PostgresEventStore {
             .fetch_optional(&mut *transaction)
             .await
             .map_err(crate::db_error)?;
+
+            if has_projections {
+                appended.push((id, event_type, event));
+            }
+        }
+
+        if has_projections {
+            self.apply_projections(&mut transaction, &stream_id, &metadata, appended)
+                .await?;
         }
 
         transaction.commit().await.map_err(crate::db_error)?;
