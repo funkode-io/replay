@@ -973,6 +973,129 @@ async fn bank_account_inline_projection_version_drift_rebuild_postgres_test() {
     assert_eq!(version, 2);
 }
 
+// ── Inline projection version guard + no-op fast path (issue #62) ─────────────
+
+/// Building with a stored version NEWER than the code version is a hard error: a
+/// rolled-back or older deploy must not run against a view built by newer code.
+#[tokio::test]
+async fn bank_account_inline_projection_stored_newer_than_code_errors_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    // First registration at version 2 records stored version = 2.
+    let _store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(RebuildBalanceProjection { version: 2 })
+        .build()
+        .await
+        .expect("Failed to build store at projection version 2");
+
+    // Building at version 1 (older code than the stored view) must refuse to start.
+    let result = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(RebuildBalanceProjection { version: 1 })
+        .build()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "build must fail when stored version is newer than code version"
+    );
+
+    // The registry version is untouched: the guard does not downgrade the stored view.
+    let version: i32 = sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
+        .bind("rebuild_balance_view")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("projection registry row must exist");
+
+    assert_eq!(version, 2);
+}
+
+/// Re-building at the SAME code version is a no-op: no reset, no replay, no side
+/// effects. A sentinel seeded into the view survives the rebuild.
+#[tokio::test]
+async fn bank_account_inline_projection_same_version_is_noop_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    // Build at version 1 and append history (deposit 100, withdraw 40 → balance 60).
+    let store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(RebuildBalanceProjection { version: 1 })
+        .build()
+        .await
+        .expect("Failed to build store at projection version 1");
+
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let stream_id = BankAccountUrn::new("noop-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    for command in [
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        BankAccountCommand::Withdraw {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 40.0,
+        },
+    ] {
+        cqrs.execute::<BankAccount>(&stream_id, replay::Metadata::default(), command, &(), None)
+            .await
+            .unwrap();
+    }
+
+    // Seed a sentinel value. A no-op rebuild leaves it untouched; a reset+replay would
+    // wipe it and recompute 60.
+    sqlx::query(
+        "INSERT INTO rebuild_balances (stream_id, balance) VALUES ($1, 999)
+         ON CONFLICT (stream_id) DO UPDATE SET balance = 999",
+    )
+    .bind(&stream_id_str)
+    .execute(&pg_pool)
+    .await
+    .expect("seeding sentinel balance must succeed");
+
+    // Re-register the same projection at the SAME version 1: must be a no-op.
+    let _store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(RebuildBalanceProjection { version: 1 })
+        .build()
+        .await
+        .expect("Failed to rebuild store at the same projection version");
+
+    // The sentinel survives: no reset, no replay ran.
+    let balance: f64 =
+        sqlx::query_scalar("SELECT balance FROM rebuild_balances WHERE stream_id = $1")
+            .bind(&stream_id_str)
+            .fetch_one(&pg_pool)
+            .await
+            .expect("sentinel balance row must exist");
+
+    assert_eq!(balance, 999.0);
+}
+
 // ── Scoped-URN types used by the tests below ─────────────────────────────────
 
 /// A branch that owns one or more bank accounts.
