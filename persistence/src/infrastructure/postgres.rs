@@ -238,36 +238,75 @@ impl PostgresEventStoreBuilder {
         self
     }
 
-    /// Run first-time setup for the registered projections and freeze the store.
+    /// Run setup for the registered projections and freeze the store.
     ///
-    /// For each projection that is not yet present in the `projections` table, runs its
-    /// `init` and inserts its version row. All setup happens in a single transaction, so a
-    /// failure leaves the registry table untouched.
+    /// For each projection:
+    /// - **First registration** (no stored version): run `init` and record the version.
+    /// - **Version drift** (stored version older than the code version): `reset` the view,
+    ///   replay matching history through `handle`, then update the stored version **last**,
+    ///   all in the same transaction so a crash mid-rebuild never marks a half-built view
+    ///   as current.
     ///
-    /// Version-drift handling (reset + replay) and the stored-newer-than-code guard are
-    /// added by later slices; this build only covers first-time registration.
+    /// The stored-equals-code no-op fast path and the stored-newer-than-code guard are
+    /// added by a later slice; here those cases simply register without changes.
     pub async fn build(self) -> Result<PostgresEventStore, replay::Error> {
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
 
         let mut registered: Vec<RegisteredProjection> = Vec::with_capacity(self.projections.len());
 
         for mut projection in self.projections {
-            let existing: Option<i32> =
+            let stored: Option<i32> =
                 sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
                     .bind(projection.name())
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(crate::db_error)?;
 
-            if existing.is_none() {
-                projection.init(&mut tx).await?;
+            let code = projection.version();
 
-                sqlx::query("INSERT INTO projections (name, version) VALUES ($1, $2)")
-                    .bind(projection.name())
-                    .bind(projection.version())
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(crate::db_error)?;
+            match stored {
+                // First-time registration: create the view and record the version.
+                None => {
+                    projection.init(&mut tx).await?;
+
+                    sqlx::query("INSERT INTO projections (name, version) VALUES ($1, $2)")
+                        .bind(projection.name())
+                        .bind(code)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(crate::db_error)?;
+                }
+                // Version drift: the code is newer than the stored view. Reset and rebuild
+                // from history, then record the new version LAST so a crash mid-rebuild
+                // never marks a half-built view as current.
+                Some(stored) if stored < code => {
+                    tracing::info!(
+                        projection = projection.name(),
+                        stored,
+                        code,
+                        "inline projection version drift: resetting and replaying history"
+                    );
+
+                    projection.reset(&mut tx).await?;
+
+                    // Replay matching history through the projection. The projection's
+                    // stream_filter narrows which events are scanned. Loaded in one batch
+                    // for now; large histories can be chunked later without changing the
+                    // batch-handling semantics seen by `handle`.
+                    let events =
+                        Self::load_events_for_replay(&mut tx, projection.stream_filter()).await?;
+                    projection.handle(&mut tx, &events).await?;
+
+                    sqlx::query("UPDATE projections SET version = $2 WHERE name = $1")
+                        .bind(projection.name())
+                        .bind(code)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(crate::db_error)?;
+                }
+                // stored == code (no-op fast path) and stored > code (guard) are handled by
+                // a later slice; registering without changes preserves existing behavior.
+                Some(_) => {}
             }
 
             registered.push(Mutex::new(projection));
@@ -279,6 +318,32 @@ impl PostgresEventStoreBuilder {
             pool: self.pool,
             projections: Arc::new(registered),
         })
+    }
+
+    /// Load the events matching `filter` for a projection rebuild, in append order.
+    ///
+    /// Returns JSON-backed [`PersistedEvent`]s; the erased projection routes them to its
+    /// typed `handle` by deserialize-or-skip.
+    async fn load_events_for_replay(
+        tx: &mut sqlx::PgConnection,
+        filter: StreamFilter,
+    ) -> Result<Vec<PersistedEvent<Value>>, replay::Error> {
+        let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+            "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version \
+             FROM events WHERE ",
+        );
+        PostgresEventStore::add_filters(&mut query_builder, filter);
+        query_builder.push(" ORDER BY created, version ASC");
+
+        let rows = query_builder
+            .build()
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
+
+        rows.into_iter()
+            .map(PersistedEvent::<Value>::try_from)
+            .collect()
     }
 }
 

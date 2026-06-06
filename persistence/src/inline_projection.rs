@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::PersistedEvent;
+use crate::{PersistedEvent, StreamFilter};
 use replay::Event;
 
 /// An inline projection: a persisted read model whose write is applied inside the
@@ -34,6 +34,14 @@ pub trait InlineProjection: Send + Sync {
     /// Author-managed code version of this projection's logic/schema.
     fn version(&self) -> i32;
 
+    /// Events to replay when this projection is rebuilt after a version bump.
+    ///
+    /// Returned filter narrows which streams/events the store scans during a drift
+    /// rebuild, so unrelated history is not read. Defaults to [`StreamFilter::All`].
+    fn stream_filter(&self) -> StreamFilter {
+        StreamFilter::All
+    }
+
     /// Create the projection's view table and any supporting schema.
     ///
     /// Called once when the projection is first registered. Runs against the store's
@@ -42,6 +50,20 @@ pub trait InlineProjection: Send + Sync {
         &mut self,
         conn: &mut Self::Exec,
     ) -> impl Future<Output = Result<(), replay::Error>> + Send;
+
+    /// Clear the projection's view so it can be rebuilt from history.
+    ///
+    /// Called during a version-drift rebuild, before events are replayed through
+    /// [`handle`](Self::handle), inside the rebuild transaction. The default is a no-op;
+    /// projections that bump [`version`](Self::version) to trigger a rebuild should
+    /// override this to truncate their view, otherwise replay accumulates on top of the
+    /// existing data.
+    fn reset(
+        &mut self,
+        _conn: &mut Self::Exec,
+    ) -> impl Future<Output = Result<(), replay::Error>> + Send {
+        async { Ok(()) }
+    }
 
     /// Apply a batch of newly-appended events to the read model.
     ///
@@ -69,8 +91,16 @@ pub(crate) trait ErasedInlineProjection: Send + Sync {
 
     fn version(&self) -> i32;
 
+    fn stream_filter(&self) -> StreamFilter;
+
     fn init<'a>(&'a mut self, conn: &'a mut Self::Exec)
         -> BoxFuture<'a, Result<(), replay::Error>>;
+
+    /// Clear the underlying projection's view ahead of a rebuild.
+    fn reset<'a>(
+        &'a mut self,
+        conn: &'a mut Self::Exec,
+    ) -> BoxFuture<'a, Result<(), replay::Error>>;
 
     /// Route raw appended events to the underlying typed projection.
     ///
@@ -98,11 +128,22 @@ where
         InlineProjection::version(self)
     }
 
+    fn stream_filter(&self) -> StreamFilter {
+        InlineProjection::stream_filter(self)
+    }
+
     fn init<'a>(
         &'a mut self,
         conn: &'a mut Self::Exec,
     ) -> BoxFuture<'a, Result<(), replay::Error>> {
         Box::pin(InlineProjection::init(self, conn))
+    }
+
+    fn reset<'a>(
+        &'a mut self,
+        conn: &'a mut Self::Exec,
+    ) -> BoxFuture<'a, Result<(), replay::Error>> {
+        Box::pin(InlineProjection::reset(self, conn))
     }
 
     fn handle<'a>(

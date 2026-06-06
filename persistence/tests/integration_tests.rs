@@ -818,6 +818,161 @@ async fn bank_account_inline_projection_failure_rolls_back_postgres_test() {
     assert_eq!(projection_write_count, 0);
 }
 
+// ── Inline projection version drift rebuild (issue #60) ───────────────────────
+
+/// A balance view that resets and rebuilds from history on a version bump.
+///
+/// `version` is a field so the test can register the "same" projection at two
+/// different code versions to trigger a drift rebuild.
+struct RebuildBalanceProjection {
+    version: i32,
+}
+
+impl replay_persistence::InlineProjection for RebuildBalanceProjection {
+    type Exec = sqlx::PgConnection;
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "rebuild_balance_view"
+    }
+
+    fn version(&self) -> i32 {
+        self.version
+    }
+
+    async fn init(&mut self, conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS rebuild_balances (
+                stream_id text PRIMARY KEY,
+                balance   double precision NOT NULL
+            )",
+        )
+        .execute(conn)
+        .await
+        .map_err(replay_persistence::db_error)?;
+        Ok(())
+    }
+
+    async fn reset(&mut self, conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        sqlx::query("DELETE FROM rebuild_balances")
+            .execute(conn)
+            .await
+            .map_err(replay_persistence::db_error)?;
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> Result<(), replay::Error> {
+        for event in events {
+            let delta = match &event.data {
+                BankAccountEvent::Deposited { amount, .. } => *amount,
+                BankAccountEvent::Withdrawn { amount, .. } => -*amount,
+                BankAccountEvent::MonthlyClosed { .. } => continue,
+            };
+
+            sqlx::query(
+                "INSERT INTO rebuild_balances (stream_id, balance)
+                 VALUES ($1, $2)
+                 ON CONFLICT (stream_id)
+                 DO UPDATE SET balance = rebuild_balances.balance + EXCLUDED.balance",
+            )
+            .bind(event.stream_id.to_string())
+            .bind(delta)
+            .execute(&mut *conn)
+            .await
+            .map_err(replay_persistence::db_error)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Re-registering a projection at a higher code version resets its view and rebuilds
+/// it by replaying history, recording the new version.
+#[tokio::test]
+async fn bank_account_inline_projection_version_drift_rebuild_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    // Build at version 1 and append history (deposit 100, withdraw 40 → balance 60).
+    let store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(RebuildBalanceProjection { version: 1 })
+        .build()
+        .await
+        .expect("Failed to build store at projection version 1");
+
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let stream_id = BankAccountUrn::new("rebuild-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    for command in [
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        BankAccountCommand::Withdraw {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 40.0,
+        },
+    ] {
+        cqrs.execute::<BankAccount>(&stream_id, replay::Metadata::default(), command, &(), None)
+            .await
+            .unwrap();
+    }
+
+    // Corrupt the view with a sentinel value. If the rebuild fails to reset, the replay
+    // would accumulate on top of this (999 + 60 = 1059) instead of producing 60.
+    sqlx::query(
+        "INSERT INTO rebuild_balances (stream_id, balance) VALUES ($1, 999)
+         ON CONFLICT (stream_id) DO UPDATE SET balance = 999",
+    )
+    .bind(&stream_id_str)
+    .execute(&pg_pool)
+    .await
+    .expect("seeding sentinel balance must succeed");
+
+    // Re-register the same projection at version 2: triggers reset + replay rebuild.
+    let _store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(RebuildBalanceProjection { version: 2 })
+        .build()
+        .await
+        .expect("Failed to rebuild store at projection version 2");
+
+    // The view was reset (sentinel 999 gone) and rebuilt from history (100 - 40 = 60).
+    let balance: f64 =
+        sqlx::query_scalar("SELECT balance FROM rebuild_balances WHERE stream_id = $1")
+            .bind(&stream_id_str)
+            .fetch_one(&pg_pool)
+            .await
+            .expect("rebuilt balance row must exist");
+
+    assert_eq!(balance, 60.0);
+
+    // The registry records the new code version.
+    let version: i32 = sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
+        .bind("rebuild_balance_view")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("projection registry row must exist");
+
+    assert_eq!(version, 2);
+}
+
 // ── Scoped-URN types used by the tests below ─────────────────────────────────
 
 /// A branch that owns one or more bank accounts.
