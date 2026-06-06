@@ -41,6 +41,17 @@ pgadmin:
 fix:
 	cargo clippy --fix
 
+.PHONY: install-hooks
+install-hooks:
+	git config core.hooksPath .githooks
+	chmod +x .githooks/*
+	@echo "Git hooks installed (core.hooksPath -> .githooks)."
+
+.PHONY: uninstall-hooks
+uninstall-hooks:
+	git config --unset core.hooksPath
+	@echo "Git hooks uninstalled."
+
 .PHONY: wasm-test
 wasm-test:
 	wasm-pack test --headless --chrome macros-tests
