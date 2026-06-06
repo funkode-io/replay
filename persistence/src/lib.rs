@@ -12,7 +12,7 @@ pub use aggregate_version::AggregateVersion;
 pub use cqrs::Cqrs;
 pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;
-pub use infrastructure::{InMemoryEventStore, PostgresEventStore};
+pub use infrastructure::{InMemoryEventStore, PostgresEventStore, PostgresInlineProjection};
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
 pub use query::Query;
@@ -38,6 +38,6 @@ pub mod prelude {
     // Persistence types from this crate
     pub use super::{
         AggregateVersion, Cqrs, EventStore, InMemoryEventStore, InlineProjection, PersistedEvent,
-        PostgresEventStore, Query, StreamFilter,
+        PostgresEventStore, PostgresInlineProjection, Query, StreamFilter,
     };
 }

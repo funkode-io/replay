@@ -17,6 +17,14 @@ use crate::inline_projection::{ErasedInlineProjection, InlineProjection};
 use crate::{EventStore, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event, Metadata};
 
+/// Convenience marker trait for inline projections that run on Postgres.
+///
+/// Implement this by implementing [`InlineProjection`] with
+/// `type Exec = sqlx::PgConnection`; the blanket impl below wires it up.
+pub trait PostgresInlineProjection: InlineProjection<Exec = sqlx::PgConnection> {}
+
+impl<T> PostgresInlineProjection for T where T: InlineProjection<Exec = sqlx::PgConnection> {}
+
 /// A registered inline projection, guarded by a mutex so its `&mut self`
 /// `handle`/`init` methods can be driven through the shared (`&self`) store.
 type RegisteredProjection = Mutex<Box<dyn ErasedInlineProjection<Exec = sqlx::PgConnection>>>;
@@ -136,6 +144,16 @@ pub struct PostgresEventStoreBuilder {
 }
 
 impl PostgresEventStoreBuilder {
+    /// Register a new Postgres inline projection.
+    ///
+    /// This helper makes the Postgres-specific intent explicit at call sites.
+    pub fn register_new_postgres_inline_projection<P>(self, projection: P) -> Self
+    where
+        P: PostgresInlineProjection + 'static,
+    {
+        self.register(projection)
+    }
+
     /// Register an inline projection.
     pub fn register<P>(mut self, projection: P) -> Self
     where
