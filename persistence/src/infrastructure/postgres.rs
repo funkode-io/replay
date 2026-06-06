@@ -59,19 +59,16 @@ where
         self.version
     }
 
-    fn init(
-        &mut self,
-        _conn: &mut Self::Exec,
-    ) -> impl std::future::Future<Output = Result<(), replay::Error>> + Send {
-        async { Ok(()) }
+    async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        Ok(())
     }
 
-    fn handle(
+    async fn handle(
         &mut self,
         conn: &mut Self::Exec,
         events: &[PersistedEvent<Self::Event>],
-    ) -> impl std::future::Future<Output = Result<(), replay::Error>> + Send {
-        async move { (self.handler)(conn, events).await }
+    ) -> Result<(), replay::Error> {
+        (self.handler)(conn, events).await
     }
 }
 
