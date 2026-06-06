@@ -240,15 +240,6 @@ impl PostgresEventStoreBuilder {
 
     /// Run setup for the registered projections and freeze the store.
     ///
-    /// For each projection:
-    /// - **First registration** (no stored version): run `init` and record the version.
-    /// - **Version drift** (stored version older than the code version): `reset` the view,
-    ///   replay matching history through `handle`, then update the stored version **last**,
-    ///   all in the same transaction so a crash mid-rebuild never marks a half-built view
-    ///   as current.
-    ///
-    /// Run setup for the registered projections and freeze the store.
-    ///
     /// For each projection, compares the stored registry version against the code
     /// [`version`](InlineProjection::version):
     /// - **First registration** (no stored version): run `init` and record the version.
