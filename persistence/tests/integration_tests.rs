@@ -622,6 +622,137 @@ async fn bank_account_inline_projection_postgres_test() {
     assert_eq!(version, 1);
 }
 
+// ── Inline projection rollback (issue #59) ────────────────────────────────────
+
+/// An inline projection that writes to its own table and then returns an error.
+///
+/// Used to assert that a failure inside `handle` rolls back the entire append
+/// transaction — both the event rows and the projection-side writes.
+struct FailingProjection;
+
+impl replay_persistence::InlineProjection for FailingProjection {
+    type Exec = sqlx::PgConnection;
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "failing_projection"
+    }
+
+    fn version(&self) -> i32 {
+        1
+    }
+
+    async fn init(&mut self, conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS failing_projection_writes (
+                stream_id text NOT NULL,
+                amount    double precision NOT NULL
+            )",
+        )
+        .execute(conn)
+        .await
+        .map_err(replay_persistence::db_error)?;
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> Result<(), replay::Error> {
+        for event in events {
+            let amount = match &event.data {
+                BankAccountEvent::Deposited { amount, .. } => *amount,
+                BankAccountEvent::Withdrawn { amount, .. } => -*amount,
+                BankAccountEvent::MonthlyClosed { .. } => 0.0,
+            };
+
+            sqlx::query(
+                "INSERT INTO failing_projection_writes (stream_id, amount)
+                 VALUES ($1, $2)",
+            )
+            .bind(event.stream_id.to_string())
+            .bind(amount)
+            .execute(&mut *conn)
+            .await
+            .map_err(replay_persistence::db_error)?;
+        }
+
+        Err(replay::Error::internal(
+            "projection failure after writing (rollback test)",
+        ))
+    }
+}
+
+/// A projection handle error must roll back the entire append transaction.
+///
+/// The projection deliberately writes to its own table and then errors; this test
+/// verifies neither event rows nor projection-side writes persist.
+#[tokio::test]
+async fn bank_account_inline_projection_failure_rolls_back_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(FailingProjection)
+        .build()
+        .await
+        .expect("Failed to build store with failing projection");
+
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    let stream_id = BankAccountUrn::new("inline-proj-fail-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    let result = cqrs
+        .execute::<BankAccount>(
+            &stream_id,
+            replay::Metadata::default(),
+            BankAccountCommand::Deposit {
+                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                amount: 100.0,
+            },
+            &(),
+            None,
+        )
+        .await;
+
+    assert_err!(result, "projection failure after writing (rollback test)");
+
+    // Event append must be rolled back.
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE stream_id = $1 AND aggregate_version IS NULL",
+    )
+    .bind(&stream_id_str)
+    .fetch_one(&pg_pool)
+    .await
+    .expect("counting events must succeed");
+
+    assert_eq!(event_count, 0);
+
+    // Projection-side writes from handle must also be rolled back.
+    let projection_write_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM failing_projection_writes WHERE stream_id = $1")
+            .bind(&stream_id_str)
+            .fetch_one(&pg_pool)
+            .await
+            .expect("counting projection writes must succeed");
+
+    assert_eq!(projection_write_count, 0);
+}
+
 // ── Scoped-URN types used by the tests below ─────────────────────────────────
 
 /// A branch that owns one or more bank accounts.

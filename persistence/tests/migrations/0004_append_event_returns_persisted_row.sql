@@ -9,6 +9,11 @@
 -- - On successful append: returns exactly one row with persisted id/version/created.
 -- - On optimistic-concurrency mismatch: returns zero rows.
 
+-- The original append_event (0001) returns boolean. Postgres cannot change a
+-- function's return type with CREATE OR REPLACE, so drop it first. Functions are
+-- identified by argument types, so the parameter-name change below is irrelevant here.
+DROP FUNCTION IF EXISTS append_event(uuid, jsonb, jsonb, text, text, text, bigint);
+
 CREATE OR REPLACE FUNCTION append_event(
     p_id uuid,
     p_data jsonb,
