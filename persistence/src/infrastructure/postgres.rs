@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use futures::{StreamExt, TryStream, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -24,6 +25,55 @@ use replay::{Compactable, Event, Metadata};
 pub trait PostgresInlineProjection: InlineProjection<Exec = sqlx::PgConnection> {}
 
 impl<T> PostgresInlineProjection for T where T: InlineProjection<Exec = sqlx::PgConnection> {}
+
+type BoxedPostgresEventHandler<E> = Box<
+    dyn for<'a> FnMut(
+            &'a mut sqlx::PgConnection,
+            &'a [PersistedEvent<E>],
+        ) -> BoxFuture<'a, Result<(), replay::Error>>
+        + Send
+        + Sync,
+>;
+
+struct PostgresEventHandlerProjection<E>
+where
+    E: Event + DeserializeOwned + Send + Sync + 'static,
+{
+    name: String,
+    version: i32,
+    handler: BoxedPostgresEventHandler<E>,
+}
+
+impl<E> InlineProjection for PostgresEventHandlerProjection<E>
+where
+    E: Event + DeserializeOwned + Send + Sync + 'static,
+{
+    type Exec = sqlx::PgConnection;
+    type Event = E;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn version(&self) -> i32 {
+        self.version
+    }
+
+    fn init(
+        &mut self,
+        _conn: &mut Self::Exec,
+    ) -> impl std::future::Future<Output = Result<(), replay::Error>> + Send {
+        async { Ok(()) }
+    }
+
+    fn handle(
+        &mut self,
+        conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> impl std::future::Future<Output = Result<(), replay::Error>> + Send {
+        async move { (self.handler)(conn, events).await }
+    }
+}
 
 /// A registered inline projection, guarded by a mutex so its `&mut self`
 /// `handle`/`init` methods can be driven through the shared (`&self`) store.
@@ -152,6 +202,34 @@ impl PostgresEventStoreBuilder {
         P: PostgresInlineProjection + 'static,
     {
         self.register(projection)
+    }
+
+    /// Register a Postgres inline projection by providing only the event handler.
+    ///
+    /// This is the low-ceremony path for the common case where the projection's
+    /// table/indexes are created by normal SQL migrations and the runtime work is
+    /// simply "execute some SQL for each batch of events". `init` is a no-op.
+    pub fn register_postgres_event_handler<E, H>(
+        self,
+        name: impl Into<String>,
+        version: i32,
+        handler: H,
+    ) -> Self
+    where
+        E: Event + DeserializeOwned + Send + Sync + 'static,
+        H: for<'a> FnMut(
+                &'a mut sqlx::PgConnection,
+                &'a [PersistedEvent<E>],
+            ) -> BoxFuture<'a, Result<(), replay::Error>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register(PostgresEventHandlerProjection {
+            name: name.into(),
+            version,
+            handler: Box::new(handler),
+        })
     }
 
     /// Register an inline projection.

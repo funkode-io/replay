@@ -505,66 +505,6 @@ async fn bank_account_compaction_postgres_test() {
 
 // ── Inline projection (issue #58) ─────────────────────────────────────────────
 
-/// An inline projection that maintains a per-account balance in its own view table.
-///
-/// Its write is applied inside the same transaction that appends the events, so the
-/// view can never diverge from the committed event stream.
-struct BalanceProjection;
-
-impl replay_persistence::InlineProjection for BalanceProjection {
-    type Exec = sqlx::PgConnection;
-    type Event = BankAccountEvent;
-
-    fn name(&self) -> &str {
-        "account_balance_view"
-    }
-
-    fn version(&self) -> i32 {
-        1
-    }
-
-    async fn init(&mut self, conn: &mut sqlx::PgConnection) -> Result<(), replay::Error> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS account_balances (
-                stream_id text PRIMARY KEY,
-                balance   double precision NOT NULL
-            )",
-        )
-        .execute(conn)
-        .await
-        .map_err(replay_persistence::db_error)?;
-        Ok(())
-    }
-
-    async fn handle(
-        &mut self,
-        conn: &mut sqlx::PgConnection,
-        events: &[PersistedEvent<Self::Event>],
-    ) -> Result<(), replay::Error> {
-        for event in events {
-            let delta = match &event.data {
-                BankAccountEvent::Deposited { amount, .. } => *amount,
-                BankAccountEvent::Withdrawn { amount, .. } => -*amount,
-                BankAccountEvent::MonthlyClosed { .. } => continue,
-            };
-
-            sqlx::query(
-                "INSERT INTO account_balances (stream_id, balance)
-                 VALUES ($1, $2)
-                 ON CONFLICT (stream_id)
-                 DO UPDATE SET balance = account_balances.balance + EXCLUDED.balance",
-            )
-            .bind(event.stream_id.to_string())
-            .bind(delta)
-            .execute(&mut *conn)
-            .await
-            .map_err(replay_persistence::db_error)?;
-        }
-
-        Ok(())
-    }
-}
-
 /// End-to-end test for the inline-projection walking skeleton.
 ///
 /// Registers a `BalanceProjection` via the builder, executes commands through `Cqrs`,
@@ -587,10 +527,50 @@ async fn bank_account_inline_projection_postgres_test() {
         .await
         .expect("Failed to run migrations");
 
-    // Build the store with the inline projection registered. build() runs init and
-    // records the projection version.
+    // In normal usage, the projection table is created by SQL migrations rather than
+    // by the projection runtime itself.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS account_balances (
+            stream_id text PRIMARY KEY,
+            balance   double precision NOT NULL
+        )",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("Failed to create account_balances test table");
+
+    // Build the store with a low-ceremony Postgres event handler. The schema already
+    // exists, so the helper only needs the SQL to run for each event batch.
     let store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
-        .register(BalanceProjection)
+        .register_postgres_event_handler::<BankAccountEvent, _>(
+            "account_balance_view",
+            1,
+            |conn, events| {
+                Box::pin(async move {
+                    for event in events {
+                        let delta = match &event.data {
+                            BankAccountEvent::Deposited { amount, .. } => *amount,
+                            BankAccountEvent::Withdrawn { amount, .. } => -*amount,
+                            BankAccountEvent::MonthlyClosed { .. } => continue,
+                        };
+
+                        sqlx::query(
+                            "INSERT INTO account_balances (stream_id, balance)
+                             VALUES ($1, $2)
+                             ON CONFLICT (stream_id)
+                             DO UPDATE SET balance = account_balances.balance + EXCLUDED.balance",
+                        )
+                        .bind(event.stream_id.to_string())
+                        .bind(delta)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(replay_persistence::db_error)?;
+                    }
+
+                    Ok(())
+                })
+            },
+        )
         .build()
         .await
         .expect("Failed to build store with inline projection");
