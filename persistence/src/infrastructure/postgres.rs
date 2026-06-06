@@ -350,10 +350,26 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(crate::db_error)?;
 
-            if has_projections {
-                // No row means optimistic-concurrency mismatch in append_event.
-                let Some(row) = row else { continue };
+            // No row means optimistic-concurrency mismatch in append_event. Surface it as a
+            // concurrency_error (parity with the in-memory store) and let the transaction
+            // roll back so no partial append commits.
+            let Some(row) = row else {
+                let actual_version: i64 =
+                    sqlx::query_scalar("SELECT version FROM streams WHERE id = $1")
+                        .bind(stream_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await
+                        .map_err(crate::db_error)?
+                        .unwrap_or(0);
 
+                return Err(crate::concurrency_error(
+                    stream_id.clone(),
+                    expected_version.unwrap_or(actual_version),
+                    actual_version,
+                ));
+            };
+
+            if has_projections {
                 let persisted_id: Uuid = row.get("id");
                 let version: i64 = row.get("version");
                 let created: chrono::DateTime<Utc> = row.get("created");

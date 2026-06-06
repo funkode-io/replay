@@ -325,6 +325,71 @@ async fn bank_account_postgres_test() {
     assert_eq!(statement.total_transactions, 2);
 }
 
+/// A stale `expected_version` must surface as a `concurrency_error` (parity with the
+/// in-memory store), and the conflicting append must not persist.
+#[tokio::test]
+async fn bank_account_store_events_concurrency_conflict_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+
+    let stream_id = BankAccountUrn::new("concurrency-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    // First append against a fresh stream (version 0) succeeds and bumps it to version 1.
+    store
+        .store_events::<BankAccount>(
+            &stream_id,
+            "bank-account".to_string(),
+            replay::Metadata::default(),
+            &[BankAccountEvent::Deposited {
+                operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                amount: 100.0,
+            }],
+            Some(0),
+        )
+        .await
+        .expect("first append must succeed");
+
+    // Second append still expects version 0, but the stream is now at version 1.
+    let result = store
+        .store_events::<BankAccount>(
+            &stream_id,
+            "bank-account".to_string(),
+            replay::Metadata::default(),
+            &[BankAccountEvent::Deposited {
+                operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+                amount: 50.0,
+            }],
+            Some(0),
+        )
+        .await;
+
+    assert_err!(result, "Stream version mismatch");
+
+    // The conflicting append must not have persisted: only the first event remains.
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
+        .bind(&stream_id_str)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("counting events must succeed");
+
+    assert_eq!(event_count, 1);
+}
+
 async fn connect_to_postgres(host: String, port: u16) -> PgPool {
     // connect to Postgres
     PgPoolOptions::new()
