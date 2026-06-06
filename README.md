@@ -1036,6 +1036,8 @@ use replay_persistence::prelude::*;
 | `EventStore` | Trait for pluggable event store backends |
 | `InMemoryEventStore` | In-memory backend (testing) |
 | `PostgresEventStore` | PostgreSQL backend |
+| `InlineProjection` | Trait for inline read-model projections |
+| `PostgresInlineProjection` | Postgres-specific inline projection marker trait |
 | `PersistedEvent` | Wrapper holding an event with its metadata |
 | `Query` | Trait for read-model projections |
 | `StreamFilter` | Filter builder for event queries |
@@ -1261,6 +1263,119 @@ let filter = StreamFilter::for_stream_type::<BankAccountStream>()
 
 let events = store.stream_events::<BankAccountEvent>(filter);
 ```
+
+## Inline Projections (Postgres)
+
+`Query` gives you a **live** read model: it folds events in memory when you ask for it.
+
+An **inline projection** is different: it persists a read model inside the same Postgres
+transaction that appends the events. That means the event append and the projection write
+commit together or not at all.
+
+### When to use it
+
+Use an inline projection when:
+
+- the read model lives in the same Postgres datastore as the event store
+- the projection table/indexes are managed by normal SQL migrations
+- on each event batch you just want to execute SQL against that table
+
+### Migrations
+
+There are two migration concerns:
+
+1. **Your projection schema**: create the projection table/indexes in your own SQL migrations.
+2. **Replay projection metadata**: ensure the `projections` registry table exists.
+
+The registry table tracks projection `name()` and `version()`:
+
+```sql
+CREATE TABLE IF NOT EXISTS projections (
+    name        TEXT                        NOT NULL PRIMARY KEY,
+    version     INTEGER                     NOT NULL,
+    updated_at  TIMESTAMP WITH TIME ZONE    NOT NULL DEFAULT (now())
+);
+```
+
+`append_event` should also return the persisted event metadata used by inline projections
+(`id`, `version`, `created`) so the store can build `PersistedEvent`s without a second
+read-back query.
+
+### Lowest-ceremony path: register a Postgres event handler
+
+If your schema is already created by migrations, the simplest API is
+`register_postgres_event_handler(...)`. You provide:
+
+- a stable projection name
+- a projection version
+- a closure that receives `&mut sqlx::PgConnection` and the matching persisted events
+
+```rust
+use futures::future::BoxFuture;
+use replay_persistence::{Cqrs, PostgresEventStore, PersistedEvent};
+
+// Example event type from your aggregate
+use crate::BankAccountEvent;
+
+let store = PostgresEventStore::builder(pg_pool.clone())
+    .register_postgres_event_handler::<BankAccountEvent, _>(
+        "account_balance_view",
+        1,
+        |conn, events| {
+            Box::pin(async move {
+                for event in events {
+                    let delta = match &event.data {
+                        BankAccountEvent::Deposited { amount, .. } => *amount,
+                        BankAccountEvent::Withdrawn { amount, .. } => -*amount,
+                        BankAccountEvent::MonthlyClosed { .. } => continue,
+                    };
+
+                    sqlx::query(
+                        "INSERT INTO account_balances (stream_id, balance)
+                         VALUES ($1, $2)
+                         ON CONFLICT (stream_id)
+                         DO UPDATE SET balance = account_balances.balance + EXCLUDED.balance",
+                    )
+                    .bind(event.stream_id.to_string())
+                    .bind(delta)
+                    .execute(&mut *conn)
+                    .await?;
+                }
+
+                Ok(())
+            })
+        },
+    )
+    .build()
+    .await?;
+
+let cqrs = Cqrs::new(store);
+```
+
+This helper assumes:
+
+- the projection table already exists
+- `init` is a no-op
+- the only runtime work is "run SQL for this batch of events"
+
+### Full control: implement `InlineProjection`
+
+If you need more control, implement `InlineProjection` directly. This is useful when you want a
+named type, custom `init`, or more involved logic than a single handler closure.
+
+`PostgresInlineProjection` is also re-exported as a Postgres-specific marker for this case.
+
+### Runtime behavior
+
+- `PostgresEventStore::builder(...).build().await?` runs first-time projection setup and records
+  the current version in the `projections` table.
+- On each successful append, the store constructs `PersistedEvent`s from the metadata returned by
+  `append_event(...)` and passes them to every registered projection.
+- Projection handlers run inside the **same Postgres transaction** as the event append.
+- If a projection handler returns an error, the whole append rolls back.
+
+Inline projections are Postgres-only. The in-memory store remains useful for tests, but the
+transactional guarantee belongs to the Postgres backend.
 
 ## Querying Events from Multiple Aggregates
 

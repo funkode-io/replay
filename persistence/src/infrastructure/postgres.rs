@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use futures::future::BoxFuture;
 use futures::{StreamExt, TryStream, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -6,20 +9,100 @@ use sqlx::{
     types::chrono::{self, Utc},
     Pool, Postgres, QueryBuilder, Row,
 };
+use tokio::sync::Mutex;
 
 use urn::Urn;
 use uuid::Uuid;
 
+use crate::inline_projection::{ErasedInlineProjection, InlineProjection};
 use crate::{EventStore, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event, Metadata};
 
+/// Convenience marker trait for inline projections that run on Postgres.
+///
+/// Implement this by implementing [`InlineProjection`] with
+/// `type Exec = sqlx::PgConnection`; the blanket impl below wires it up.
+pub trait PostgresInlineProjection: InlineProjection<Exec = sqlx::PgConnection> {}
+
+impl<T> PostgresInlineProjection for T where T: InlineProjection<Exec = sqlx::PgConnection> {}
+
+type BoxedPostgresEventHandler<E> = Box<
+    dyn for<'a> FnMut(
+            &'a mut sqlx::PgConnection,
+            &'a [PersistedEvent<E>],
+        ) -> BoxFuture<'a, Result<(), replay::Error>>
+        + Send
+        + Sync,
+>;
+
+struct PostgresEventHandlerProjection<E>
+where
+    E: Event + DeserializeOwned + Send + Sync + 'static,
+{
+    name: String,
+    version: i32,
+    handler: BoxedPostgresEventHandler<E>,
+}
+
+impl<E> InlineProjection for PostgresEventHandlerProjection<E>
+where
+    E: Event + DeserializeOwned + Send + Sync + 'static,
+{
+    type Exec = sqlx::PgConnection;
+    type Event = E;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn version(&self) -> i32 {
+        self.version
+    }
+
+    fn init(
+        &mut self,
+        _conn: &mut Self::Exec,
+    ) -> impl std::future::Future<Output = Result<(), replay::Error>> + Send {
+        async { Ok(()) }
+    }
+
+    fn handle(
+        &mut self,
+        conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> impl std::future::Future<Output = Result<(), replay::Error>> + Send {
+        async move { (self.handler)(conn, events).await }
+    }
+}
+
+/// A registered inline projection, guarded by a mutex so its `&mut self`
+/// `handle`/`init` methods can be driven through the shared (`&self`) store.
+type RegisteredProjection = Mutex<Box<dyn ErasedInlineProjection<Exec = sqlx::PgConnection>>>;
+
 pub struct PostgresEventStore {
     pool: Pool<Postgres>,
+    /// Builder-fixed, immutable set of inline projections. The `Vec` itself never
+    /// changes after `build()`; each projection is individually locked while applied.
+    projections: Arc<Vec<RegisteredProjection>>,
 }
 
 impl PostgresEventStore {
     pub fn new(pool: Pool<Postgres>) -> PostgresEventStore {
-        PostgresEventStore { pool }
+        PostgresEventStore {
+            pool,
+            projections: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Begin configuring a store with inline projections.
+    ///
+    /// Projections are registered on the builder and frozen by [`PostgresEventStoreBuilder::build`],
+    /// which runs their first-time `init` and records their version in the `projections` table.
+    pub fn builder(pool: Pool<Postgres>) -> PostgresEventStoreBuilder {
+        PostgresEventStoreBuilder {
+            pool,
+            projections: Vec::new(),
+        }
     }
 
     fn add_filters(query_builder: &mut QueryBuilder<Postgres>, filter: StreamFilter) {
@@ -101,6 +184,131 @@ impl PostgresEventStore {
     }
 }
 
+/// Builder for a [`PostgresEventStore`] with inline projections.
+///
+/// Register projections with [`register`](Self::register), then call
+/// [`build`](Self::build) to run first-time `init` and freeze the registry.
+pub struct PostgresEventStoreBuilder {
+    pool: Pool<Postgres>,
+    projections: Vec<Box<dyn ErasedInlineProjection<Exec = sqlx::PgConnection>>>,
+}
+
+impl PostgresEventStoreBuilder {
+    /// Register a new Postgres inline projection.
+    ///
+    /// This helper makes the Postgres-specific intent explicit at call sites.
+    pub fn register_new_postgres_inline_projection<P>(self, projection: P) -> Self
+    where
+        P: PostgresInlineProjection + 'static,
+    {
+        self.register(projection)
+    }
+
+    /// Register a Postgres inline projection by providing only the event handler.
+    ///
+    /// This is the low-ceremony path for the common case where the projection's
+    /// table/indexes are created by normal SQL migrations and the runtime work is
+    /// simply "execute some SQL for each batch of events". `init` is a no-op.
+    pub fn register_postgres_event_handler<E, H>(
+        self,
+        name: impl Into<String>,
+        version: i32,
+        handler: H,
+    ) -> Self
+    where
+        E: Event + DeserializeOwned + Send + Sync + 'static,
+        H: for<'a> FnMut(
+                &'a mut sqlx::PgConnection,
+                &'a [PersistedEvent<E>],
+            ) -> BoxFuture<'a, Result<(), replay::Error>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register(PostgresEventHandlerProjection {
+            name: name.into(),
+            version,
+            handler: Box::new(handler),
+        })
+    }
+
+    /// Register an inline projection.
+    pub fn register<P>(mut self, projection: P) -> Self
+    where
+        P: InlineProjection<Exec = sqlx::PgConnection> + 'static,
+    {
+        self.projections.push(Box::new(projection));
+        self
+    }
+
+    /// Run first-time setup for the registered projections and freeze the store.
+    ///
+    /// For each projection that is not yet present in the `projections` table, runs its
+    /// `init` and inserts its version row. All setup happens in a single transaction, so a
+    /// failure leaves the registry table untouched.
+    ///
+    /// Version-drift handling (reset + replay) and the stored-newer-than-code guard are
+    /// added by later slices; this build only covers first-time registration.
+    pub async fn build(self) -> Result<PostgresEventStore, replay::Error> {
+        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+
+        let mut registered: Vec<RegisteredProjection> = Vec::with_capacity(self.projections.len());
+
+        for mut projection in self.projections {
+            let existing: Option<i32> =
+                sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
+                    .bind(projection.name())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(crate::db_error)?;
+
+            if existing.is_none() {
+                projection.init(&mut tx).await?;
+
+                sqlx::query("INSERT INTO projections (name, version) VALUES ($1, $2)")
+                    .bind(projection.name())
+                    .bind(projection.version())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(crate::db_error)?;
+            }
+
+            registered.push(Mutex::new(projection));
+        }
+
+        tx.commit().await.map_err(crate::db_error)?;
+
+        Ok(PostgresEventStore {
+            pool: self.pool,
+            projections: Arc::new(registered),
+        })
+    }
+}
+
+impl PostgresEventStore {
+    /// Apply the just-appended events to every registered inline projection, inside the
+    /// store's open transaction.
+    ///
+    /// Each projection is locked individually and routes the batch by deserialize-or-skip;
+    /// any projection error propagates and rolls back the whole append.
+    async fn apply_projections(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        events: &[PersistedEvent<Value>],
+    ) -> Result<(), replay::Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        for projection in self.projections.iter() {
+            let mut projection = projection.lock().await;
+            projection.handle(&mut *conn, events).await?;
+        }
+
+        Ok(())
+    }
+}
+
 impl EventStore for PostgresEventStore {
     async fn store_events<S: replay::EventStream>(
         &self,
@@ -113,23 +321,58 @@ impl EventStore for PostgresEventStore {
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
 
+        // Track the appended events so registered inline projections can be applied
+        // inside this same transaction. We only retain what's needed to rebuild the
+        // PersistedEvent: the generated id, the JSON payload and the event type.
+        let has_projections = !self.projections.is_empty();
+        let mut appended: Vec<PersistedEvent<Value>> = if has_projections {
+            Vec::with_capacity(domain_events.len())
+        } else {
+            Vec::new()
+        };
+
         for event in domain_events {
             let event_type = event.event_type().clone();
             let event = serde_json::to_value(event).map_err(crate::ser_error)?;
+            let id = Uuid::new_v4();
 
-            sqlx::query!(
-                "SELECT append_event($1, $2, $3, $4, $5, $6, $7) ",
-                Uuid::new_v4(),
-                event,
-                metadata.to_json(),
-                event_type,
-                stream_id.to_string(),
-                stream_type,
-                expected_version
+            let row = sqlx::query(
+                "SELECT id, version, created FROM append_event($1, $2, $3, $4, $5, $6, $7)",
             )
+            .bind(id)
+            .bind(&event)
+            .bind(metadata.to_json())
+            .bind(&event_type)
+            .bind(stream_id.to_string())
+            .bind(&stream_type)
+            .bind(expected_version)
             .fetch_optional(&mut *transaction)
             .await
             .map_err(crate::db_error)?;
+
+            if has_projections {
+                // No row means optimistic-concurrency mismatch in append_event.
+                let Some(row) = row else { continue };
+
+                let persisted_id: Uuid = row.get("id");
+                let version: i64 = row.get("version");
+                let created: chrono::DateTime<Utc> = row.get("created");
+
+                appended.push(PersistedEvent {
+                    id: persisted_id,
+                    data: event,
+                    stream_id: stream_id.clone(),
+                    r#type: event_type,
+                    version,
+                    created,
+                    metadata: metadata.clone(),
+                    aggregate_version: None,
+                });
+            }
+        }
+
+        if has_projections {
+            self.apply_projections(&mut transaction, &appended).await?;
         }
 
         transaction.commit().await.map_err(crate::db_error)?;
@@ -284,6 +527,7 @@ impl Clone for PostgresEventStore {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            projections: self.projections.clone(),
         }
     }
 }

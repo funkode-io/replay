@@ -503,6 +503,125 @@ async fn bank_account_compaction_postgres_test() {
     );
 }
 
+// ── Inline projection (issue #58) ─────────────────────────────────────────────
+
+/// End-to-end test for the inline-projection walking skeleton.
+///
+/// Registers a `BalanceProjection` via the builder, executes commands through `Cqrs`,
+/// and asserts the projection's view table reflects the events and that its version is
+/// recorded in the `projections` registry.
+#[tokio::test]
+async fn bank_account_inline_projection_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    // In normal usage, the projection table is created by SQL migrations rather than
+    // by the projection runtime itself.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS account_balances (
+            stream_id text PRIMARY KEY,
+            balance   double precision NOT NULL
+        )",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("Failed to create account_balances test table");
+
+    // Build the store with a low-ceremony Postgres event handler. The schema already
+    // exists, so the helper only needs the SQL to run for each event batch.
+    let store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register_postgres_event_handler::<BankAccountEvent, _>(
+            "account_balance_view",
+            1,
+            |conn, events| {
+                Box::pin(async move {
+                    for event in events {
+                        let delta = match &event.data {
+                            BankAccountEvent::Deposited { amount, .. } => *amount,
+                            BankAccountEvent::Withdrawn { amount, .. } => -*amount,
+                            BankAccountEvent::MonthlyClosed { .. } => continue,
+                        };
+
+                        sqlx::query(
+                            "INSERT INTO account_balances (stream_id, balance)
+                             VALUES ($1, $2)
+                             ON CONFLICT (stream_id)
+                             DO UPDATE SET balance = account_balances.balance + EXCLUDED.balance",
+                        )
+                        .bind(event.stream_id.to_string())
+                        .bind(delta)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(replay_persistence::db_error)?;
+                    }
+
+                    Ok(())
+                })
+            },
+        )
+        .build()
+        .await
+        .expect("Failed to build store with inline projection");
+
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    let stream_id = BankAccountUrn::new("inline-proj-1").unwrap();
+    let services = &();
+
+    for command in [
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        BankAccountCommand::Withdraw {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 40.0,
+        },
+    ] {
+        cqrs.execute::<BankAccount>(
+            &stream_id,
+            replay::Metadata::default(),
+            command,
+            services,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // The inline projection's view table must reflect the events (100 - 40 = 60).
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+    let balance: f64 =
+        sqlx::query_scalar("SELECT balance FROM account_balances WHERE stream_id = $1")
+            .bind(&stream_id_str)
+            .fetch_one(&pg_pool)
+            .await
+            .expect("balance view row must exist");
+
+    assert_eq!(balance, 60.0);
+
+    // The projection version must be recorded in the registry.
+    let version: i32 = sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
+        .bind("account_balance_view")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("projection registry row must exist");
+
+    assert_eq!(version, 1);
+}
+
 // ── Scoped-URN types used by the tests below ─────────────────────────────────
 
 /// A branch that owns one or more bank accounts.
