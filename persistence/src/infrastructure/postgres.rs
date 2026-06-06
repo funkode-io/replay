@@ -240,24 +240,28 @@ impl PostgresEventStoreBuilder {
 
     /// Run setup for the registered projections and freeze the store.
     ///
-    /// For each projection:
+    /// For each projection, compares the stored registry version against the code
+    /// [`version`](InlineProjection::version):
     /// - **First registration** (no stored version): run `init` and record the version.
-    /// - **Version drift** (stored version older than the code version): `reset` the view,
-    ///   replay matching history through `handle`, then update the stored version **last**,
-    ///   all in the same transaction so a crash mid-rebuild never marks a half-built view
-    ///   as current.
+    /// - **Drift** (`stored < code`): `reset` the view, replay matching history through
+    ///   `handle`, then update the stored version **last**, all in the same transaction so
+    ///   a crash mid-rebuild never marks a half-built view as current.
+    /// - **No-op** (`stored == code`): do nothing — no reset, no replay, no side effects.
+    /// - **Guard** (`stored > code`): return a hard error and refuse to start, so a
+    ///   rolled-back/older deploy can't corrupt a view built by newer code.
     ///
-    /// The stored-equals-code no-op fast path and the stored-newer-than-code guard are
-    /// added by a later slice; here those cases simply register without changes.
+    /// Emits startup logs across the lifecycle (init, drift detection, reset, replay) so
+    /// operators can see what happens at startup.
     pub async fn build(self) -> Result<PostgresEventStore, replay::Error> {
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
 
         let mut registered: Vec<RegisteredProjection> = Vec::with_capacity(self.projections.len());
 
         for mut projection in self.projections {
+            let name = projection.name().to_string();
             let stored: Option<i32> =
                 sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
-                    .bind(projection.name())
+                    .bind(&name)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(crate::db_error)?;
@@ -267,10 +271,16 @@ impl PostgresEventStoreBuilder {
             match stored {
                 // First-time registration: create the view and record the version.
                 None => {
+                    tracing::info!(
+                        projection = %name,
+                        version = code,
+                        "inline projection first-time registration: running init"
+                    );
+
                     projection.init(&mut tx).await?;
 
                     sqlx::query("INSERT INTO projections (name, version) VALUES ($1, $2)")
-                        .bind(projection.name())
+                        .bind(&name)
                         .bind(code)
                         .execute(&mut *tx)
                         .await
@@ -281,12 +291,13 @@ impl PostgresEventStoreBuilder {
                 // never marks a half-built view as current.
                 Some(stored) if stored < code => {
                     tracing::info!(
-                        projection = projection.name(),
+                        projection = %name,
                         stored,
                         code,
-                        "inline projection version drift: resetting and replaying history"
+                        "inline projection version drift detected: rebuilding"
                     );
 
+                    tracing::info!(projection = %name, "inline projection reset: clearing view");
                     projection.reset(&mut tx).await?;
 
                     // Replay matching history through the projection. The projection's
@@ -295,18 +306,39 @@ impl PostgresEventStoreBuilder {
                     // batch-handling semantics seen by `handle`.
                     let events =
                         Self::load_events_for_replay(&mut tx, projection.stream_filter()).await?;
+                    tracing::info!(
+                        projection = %name,
+                        events = events.len(),
+                        "inline projection replay: applying history"
+                    );
                     projection.handle(&mut tx, &events).await?;
 
                     sqlx::query("UPDATE projections SET version = $2 WHERE name = $1")
-                        .bind(projection.name())
+                        .bind(&name)
                         .bind(code)
                         .execute(&mut *tx)
                         .await
                         .map_err(crate::db_error)?;
                 }
-                // stored == code (no-op fast path) and stored > code (guard) are handled by
-                // a later slice; registering without changes preserves existing behavior.
-                Some(_) => {}
+                // Stored version is newer than the code: refuse to start. A rolled-back or
+                // older deploy must not run against a view built by newer code.
+                Some(stored) if stored > code => {
+                    return Err(replay::Error::invalid_input(
+                        "inline projection stored version is newer than code version",
+                    )
+                    .with_operation("build")
+                    .with_context("projection", name)
+                    .with_context("stored_version", stored)
+                    .with_context("code_version", code));
+                }
+                // stored == code: no-op fast path. No reset, no replay, no side effects.
+                Some(_) => {
+                    tracing::debug!(
+                        projection = %name,
+                        version = code,
+                        "inline projection up to date: no rebuild"
+                    );
+                }
             }
 
             registered.push(Mutex::new(projection));
