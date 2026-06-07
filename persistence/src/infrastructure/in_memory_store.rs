@@ -3,10 +3,12 @@ use std::{collections::HashMap, sync::RwLock};
 use chrono::Utc;
 use futures::TryStream;
 use serde_json::Value;
+use tokio::sync::Mutex;
 use urn::Urn;
 use uuid::Uuid;
 
-use crate::{EventStore, PersistedEvent, StreamFilter};
+use crate::inline_projection::ErasedInlineProjection;
+use crate::{EventStore, InlineProjection, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event};
 
 /// In-memory event store implementation, only for testing purpose.
@@ -15,15 +17,70 @@ use replay::{Compactable, Event};
 ///
 /// Events are stored per-stream-URN in insertion order. The `aggregate_version` field on each
 /// event distinguishes current events (`None`) from archived compaction snapshots (`Some(n)`).
+///
+/// The store can also run **best-effort inline projections** (test-only): after each
+/// successful append it routes the newly-appended events to every registered projection's
+/// `handle` by deserialize-or-skip, exactly like the Postgres store. Unlike Postgres, this
+/// path makes NO atomicity guarantee — the events are already stored when `handle` runs, and
+/// a failing `handle` does not roll them back. It exists purely to exercise projection
+/// routing and batch-handling logic in fast unit tests without a database.
 pub struct InMemoryEventStore {
     events: RwLock<HashMap<Urn, Vec<PersistedEvent<Value>>>>,
+    /// Best-effort inline projections, applied after events are appended. Each projection is
+    /// locked individually while it handles a batch. The in-memory store passes a unit (`()`)
+    /// write handle, so projections must keep their view in their own state (e.g. shared via
+    /// `Arc`).
+    projections: Vec<Mutex<Box<dyn ErasedInlineProjection<Exec = ()>>>>,
 }
 
 impl InMemoryEventStore {
     pub fn new() -> Self {
         Self {
             events: RwLock::new(HashMap::new()),
+            projections: Vec::new(),
         }
+    }
+
+    /// Register a best-effort inline projection (test-only).
+    ///
+    /// After each successful append, the store routes the newly-appended events to this
+    /// projection's [`handle`](InlineProjection::handle) by deserialize-or-skip — events that
+    /// don't deserialize into the projection's event type are skipped, and `handle` is called
+    /// at most once per append with the matching batch (never with an empty batch).
+    ///
+    /// This is NOT atomic: the events are already stored before `handle` runs, and a failing
+    /// `handle` does not roll them back (atomicity is a Postgres-only property). The store
+    /// passes a unit (`()`) write handle, so a projection keeps its view in its own state —
+    /// typically shared with the test via `Arc` for assertions. `init`/`reset`/`version` are
+    /// not invoked by the in-memory store.
+    pub fn register_projection<P>(mut self, projection: P) -> Self
+    where
+        P: InlineProjection<Exec = ()> + 'static,
+    {
+        self.projections.push(Mutex::new(Box::new(projection)));
+        self
+    }
+
+    /// Drive every registered projection over the just-appended events, best-effort.
+    ///
+    /// Each projection routes the batch by deserialize-or-skip and runs at most once with the
+    /// events that belong to it. Errors propagate to the caller, but the events have already
+    /// been stored — the in-memory store does not roll them back.
+    async fn apply_projections(
+        &self,
+        events: &[PersistedEvent<Value>],
+    ) -> Result<(), replay::Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut exec = ();
+        for projection in self.projections.iter() {
+            let mut projection = projection.lock().await;
+            projection.handle(&mut exec, events).await?;
+        }
+
+        Ok(())
     }
 
     /// Walk a filter tree and return the first `WithStreamId` URN found (used for fast lookup).
@@ -86,57 +143,79 @@ impl EventStore for InMemoryEventStore {
         domain_events: &[S::Event],
         expected_version: Option<i64>,
     ) -> Result<(), replay::Error> {
-        let mut store = self.events.write().unwrap();
         let stream_id: Urn = stream_id.clone().into();
 
-        // Only count current (non-archived) events for the sequence version.
-        let mut last_version = store
-            .get(&stream_id)
-            .map(|events| {
-                events
-                    .iter()
-                    .rfind(|e| e.aggregate_version.is_none())
-                    .map(|e| e.version)
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
+        // Append under the write lock, then release it before driving any async projections
+        // (the std `RwLockWriteGuard` is not held across an await).
+        let appended: Vec<PersistedEvent<Value>> = {
+            let mut store = self.events.write().unwrap();
 
-        if let Some(expected_version) = expected_version {
-            if last_version != expected_version {
-                return Err(crate::concurrency_error(
-                    stream_id.clone(),
-                    expected_version,
-                    last_version,
-                ));
+            // Only count current (non-archived) events for the sequence version.
+            let mut last_version = store
+                .get(&stream_id)
+                .map(|events| {
+                    events
+                        .iter()
+                        .rfind(|e| e.aggregate_version.is_none())
+                        .map(|e| e.version)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+
+            if let Some(expected_version) = expected_version {
+                if last_version != expected_version {
+                    return Err(crate::concurrency_error(
+                        stream_id.clone(),
+                        expected_version,
+                        last_version,
+                    ));
+                }
             }
+
+            let serialized_events: Result<Vec<PersistedEvent<Value>>, replay::Error> =
+                domain_events
+                    .iter()
+                    .map(|event| {
+                        let id = Uuid::new_v4();
+                        let created = Utc::now();
+                        let r#type = event.event_type();
+                        let version = last_version + 1;
+                        last_version = version;
+                        let data = serde_json::to_value(event).map_err(crate::ser_error)?;
+                        Ok(PersistedEvent {
+                            id,
+                            data,
+                            stream_id: stream_id.clone(),
+                            r#type,
+                            version,
+                            created,
+                            metadata: metadata.clone(),
+                            aggregate_version: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, replay::Error>>();
+
+            let events = serialized_events?;
+
+            // Retain a copy for best-effort projection routing only when needed.
+            let appended = if self.projections.is_empty() {
+                Vec::new()
+            } else {
+                events.clone()
+            };
+
+            let stream = store.entry(stream_id.clone()).or_default();
+            stream.extend(events);
+
+            appended
+        };
+
+        // Best-effort: drive registered projections after the events are stored and the write
+        // lock is released. No atomicity — a failing projection does not roll back the append.
+        if !self.projections.is_empty() {
+            self.apply_projections(&appended).await?;
         }
 
-        let serialized_events: Result<Vec<PersistedEvent<Value>>, replay::Error> = domain_events
-            .iter()
-            .map(|event| {
-                let id = Uuid::new_v4();
-                let created = Utc::now();
-                let r#type = event.event_type();
-                let version = last_version + 1;
-                last_version = version;
-                let data = serde_json::to_value(event).map_err(crate::ser_error)?;
-                Ok(PersistedEvent {
-                    id,
-                    data,
-                    stream_id: stream_id.clone(),
-                    r#type,
-                    version,
-                    created,
-                    metadata: metadata.clone(),
-                    aggregate_version: None,
-                })
-            })
-            .collect::<Result<Vec<_>, replay::Error>>();
-
-        let events = serialized_events?;
-        let stream = store.entry(stream_id.clone()).or_default();
-
-        stream.extend(events);
         Ok(())
     }
 
@@ -262,6 +341,9 @@ mod tests {
 
     use super::*;
     use replay::{EventStream, WithId};
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use futures::TryStreamExt;
 
@@ -544,9 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_events() {
-        let store = InMemoryEventStore {
-            events: RwLock::new(HashMap::new()),
-        };
+        let store = InMemoryEventStore::new();
 
         let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
 
@@ -584,5 +664,192 @@ mod tests {
         stream.apply_all(stream_events);
 
         assert_eq!(stream.balance, 60.0);
+    }
+
+    // ── Best-effort inline projections (issue #61) ───────────────────────────
+
+    /// A projection event type that only knows `Deposited`. A `Withdrawn` event fails to
+    /// deserialize into it, so the deserialize-or-skip router drops it before `handle`.
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    enum DepositOnlyEvent {
+        Deposited { amount: f64 },
+    }
+
+    /// An unrelated projection event type. No `BankAccountEvent` deserializes into it, so the
+    /// router never calls this projection's `handle`.
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    enum NotificationEvent {
+        Notified { message: String },
+    }
+
+    /// Records the deposit amounts it is handed and counts how many times `handle` runs, via
+    /// `Arc`-shared state so the test can assert after the projection has been moved into the store.
+    #[derive(Default)]
+    struct DepositRecorder {
+        deposits: Arc<StdMutex<Vec<f64>>>,
+        handle_calls: Arc<AtomicUsize>,
+    }
+
+    impl InlineProjection for DepositRecorder {
+        type Exec = ();
+        type Event = DepositOnlyEvent;
+
+        fn name(&self) -> &str {
+            "deposit_recorder"
+        }
+
+        fn version(&self) -> i32 {
+            1
+        }
+
+        async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+            Ok(())
+        }
+
+        async fn handle(
+            &mut self,
+            _conn: &mut Self::Exec,
+            events: &[PersistedEvent<Self::Event>],
+        ) -> Result<(), replay::Error> {
+            self.handle_calls.fetch_add(1, Ordering::SeqCst);
+            let mut deposits = self.deposits.lock().unwrap();
+            for event in events {
+                let DepositOnlyEvent::Deposited { amount } = &event.data;
+                deposits.push(*amount);
+            }
+            Ok(())
+        }
+    }
+
+    /// Counts `handle` invocations only; used to prove a non-matching projection is skipped.
+    #[derive(Default)]
+    struct NotificationRecorder {
+        handle_calls: Arc<AtomicUsize>,
+    }
+
+    impl InlineProjection for NotificationRecorder {
+        type Exec = ();
+        type Event = NotificationEvent;
+
+        fn name(&self) -> &str {
+            "notification_recorder"
+        }
+
+        fn version(&self) -> i32 {
+            1
+        }
+
+        async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+            Ok(())
+        }
+
+        async fn handle(
+            &mut self,
+            _conn: &mut Self::Exec,
+            _events: &[PersistedEvent<Self::Event>],
+        ) -> Result<(), replay::Error> {
+            self.handle_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A registered projection receives the appended events as a single batch, and the
+    /// deserialize-or-skip router drops events that don't belong to its event type.
+    #[tokio::test]
+    async fn inline_projection_routes_and_batches() {
+        let recorder = DepositRecorder::default();
+        let deposits = recorder.deposits.clone();
+        let handle_calls = recorder.handle_calls.clone();
+
+        let store = InMemoryEventStore::new().register_projection(recorder);
+
+        let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "routing").build().unwrap());
+
+        // A single append carrying both Deposited and Withdrawn events.
+        store
+            .store_events::<BankAccountStream>(
+                &stream_id,
+                "bank-account".to_string(),
+                replay::Metadata::default(),
+                &[
+                    BankAccountEvent::Deposited { amount: 100.0 },
+                    BankAccountEvent::Withdrawn { amount: 40.0 },
+                    BankAccountEvent::Deposited { amount: 25.0 },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Only the Deposited events reached the projection (Withdrawn failed to deserialize
+        // into DepositOnlyEvent and was skipped), delivered as ONE batched handle call.
+        assert_eq!(*deposits.lock().unwrap(), vec![100.0, 25.0]);
+        assert_eq!(handle_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A projection whose event type matches none of the appended events is never called.
+    #[tokio::test]
+    async fn inline_projection_skips_non_matching() {
+        let recorder = NotificationRecorder::default();
+        let handle_calls = recorder.handle_calls.clone();
+
+        let store = InMemoryEventStore::new().register_projection(recorder);
+
+        let stream_id = BankAccountUrn(UrnBuilder::new("bank-account", "skip").build().unwrap());
+
+        store
+            .store_events::<BankAccountStream>(
+                &stream_id,
+                "bank-account".to_string(),
+                replay::Metadata::default(),
+                &[BankAccountEvent::Deposited { amount: 100.0 }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // No appended event deserializes into NotificationEvent, so handle is never called.
+        assert_eq!(handle_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Appends across multiple commands each drive `handle` once with that command's batch.
+    #[tokio::test]
+    async fn inline_projection_runs_once_per_append() {
+        let recorder = DepositRecorder::default();
+        let deposits = recorder.deposits.clone();
+        let handle_calls = recorder.handle_calls.clone();
+
+        let store = InMemoryEventStore::new().register_projection(recorder);
+
+        let stream_id = BankAccountUrn(
+            UrnBuilder::new("bank-account", "per-append")
+                .build()
+                .unwrap(),
+        );
+
+        store
+            .store_events::<BankAccountStream>(
+                &stream_id,
+                "bank-account".to_string(),
+                replay::Metadata::default(),
+                &[BankAccountEvent::Deposited { amount: 10.0 }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        store
+            .store_events::<BankAccountStream>(
+                &stream_id,
+                "bank-account".to_string(),
+                replay::Metadata::default(),
+                &[BankAccountEvent::Deposited { amount: 5.0 }],
+                Some(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*deposits.lock().unwrap(), vec![10.0, 5.0]);
+        assert_eq!(handle_calls.load(Ordering::SeqCst), 2);
     }
 }
