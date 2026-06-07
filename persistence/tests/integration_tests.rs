@@ -12,6 +12,13 @@ use replay::{prelude::*, Compactable};
 use replay_macros::{define_aggregate, Urn};
 use replay_persistence::{AggregateVersion, EventStore, PersistedEvent, StreamFilter};
 
+// Re-use the README walkthrough verbatim as the source of truth. The example's
+// `main` is gated `#[cfg(not(test))]`, so including it here pulls in only the
+// domain types, the live `GlobalPositionQuery`, and the inline
+// `GlobalPositionProjection`.
+#[path = "../examples/global_position.rs"]
+mod global_position;
+
 const POSTGRES_PORT: u16 = 5432;
 
 // ── Aggregate definition via macro ───────────────────────────────────────────
@@ -1267,4 +1274,106 @@ fn test_at_rejects_scoped_scope_urn() {
     let already_scoped_branch = BranchUrn(Urn::from_str("urn:branch:london@region:uk").unwrap());
     let err = account.at(&already_scoped_branch).unwrap_err();
     assert!(err.to_string().contains("scope URN is already scoped"));
+}
+
+// ── README global-position example: live query vs inline projection ──────────
+
+/// The two read-model strategies from the README walkthrough must agree.
+///
+/// The same `User` + `BankAccount` history is driven against Postgres while the
+/// inline [`GlobalPositionProjection`](global_position::GlobalPositionProjection)
+/// materialises a user's global position into SQL tables. Reading those tables
+/// must yield exactly the same name and total balance as folding the history live
+/// with [`GlobalPositionQuery`](global_position::GlobalPositionQuery).
+#[tokio::test]
+async fn global_position_live_query_and_inline_projection_agree_postgres_test() {
+    use global_position::{
+        BankAccount, BankAccountCommand, BankAccountUrn as AccountUrn, GlobalPositionEvent,
+        GlobalPositionProjection, GlobalPositionQuery, User, UserCommand, UserUrn,
+    };
+
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    // The projection's `init` creates the `gp_account_owner` / `gp_user_position` tables.
+    let store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(GlobalPositionProjection)
+        .build()
+        .await
+        .expect("Failed to build store with the global-position projection");
+
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    let alice = UserUrn::new("alice").unwrap();
+    cqrs.execute::<User>(
+        &alice,
+        replay::Metadata::default(),
+        UserCommand::Register {
+            name: "Alice".to_string(),
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let checking = AccountUrn::new("alice-checking").unwrap();
+    let savings = AccountUrn::new("alice-savings").unwrap();
+
+    for account in [&checking, &savings] {
+        cqrs.execute::<BankAccount>(
+            account,
+            replay::Metadata::default(),
+            BankAccountCommand::OpenAccount {
+                owner: alice.clone(),
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    for (account, command) in [
+        (&checking, BankAccountCommand::Deposit { amount: 1_000.0 }),
+        (&checking, BankAccountCommand::Withdraw { amount: 250.0 }),
+        (&savings, BankAccountCommand::Deposit { amount: 500.0 }),
+    ] {
+        cqrs.execute::<BankAccount>(account, replay::Metadata::default(), command, &(), None)
+            .await
+            .unwrap();
+    }
+
+    // Read the materialised inline projection.
+    let alice_urn = Into::<Urn>::into(alice.clone()).to_string();
+    let (inline_name, inline_balance): (String, f64) =
+        sqlx::query_as("SELECT name, total_balance FROM gp_user_position WHERE user_urn = $1")
+            .bind(&alice_urn)
+            .fetch_one(&pg_pool)
+            .await
+            .expect("inline projection must have a row for alice");
+
+    // Fold the same history live.
+    let mut live = GlobalPositionQuery::for_user(alice.clone());
+    cqrs.run_query::<_, GlobalPositionEvent>(&mut live)
+        .await
+        .unwrap();
+
+    // Both strategies agree, and agree with the hand-computed total (1000 - 250 + 500).
+    assert_eq!(inline_name, "Alice");
+    assert_eq!(inline_balance, 1_250.0);
+    assert_eq!(live.position().name, inline_name);
+    assert_eq!(live.position().total_balance, inline_balance);
 }

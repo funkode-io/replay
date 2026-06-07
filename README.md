@@ -14,94 +14,81 @@ You can chose you implement just `Stream` (state will be built from events) or `
 
 ## Example
 
-Let's assume we have a bank account with a balance that is updated when there is a deposit or withdrawal.
+Let's model a small banking domain with two aggregate roots:
 
-Our domain would look something like this:
+- **`User`** — a person who can register and own accounts.
+- **`BankAccount`** — an account opened *for* a user that money flows in and out of.
+
+From those events we build the same read model — a user's **global position**
+(their name plus the summed balance of every account they own) — in two
+different ways so the trade-offs are visible side by side:
+
+- a **live** [`Query`] folded in memory on every read, and
+- an **inline** [`InlineProjection`] materialised into Postgres inside the append transaction.
+
+> The full, compilable source for everything below lives in
+> [persistence/examples/global_position.rs](persistence/examples/global_position.rs)
+> and is exercised by the integration tests, so the README stays in lock-step with
+> working code. Run the live half (no database required) with
+> `cargo run -p es-replay-persistence --example global_position`.
+
+We glob-import `replay::prelude::*` to bring the core traits (`Aggregate`,
+`EventStream`, `Compactable`, …) into scope, but import from `replay_persistence`
+explicitly: its prelude re-exports `Result`/`Error`, which would shadow the
+`std`/`serde` names the derive macros expand to.
 
 ```rust
-use replay::Stream;
-use replay_macros::Event;
-use serde::{Deserialize, Serialize};
-use urn::Urn;
+use std::collections::HashSet;
 
-//  bank account is an aggregate (id of aggregate is now part of the model)
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-struct BankAccountAggregate {
-    pub id: BankAccountUrn,
-    pub balance: f64,
-}
+use replay::prelude::*;
+use replay_macros::{define_aggregate, query_events};
+use replay_persistence::{db_error, InlineProjection, PersistedEvent, Query, StreamFilter};
+```
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-enum BankAccountCommand {
-    Deposit { amount: f64 },
-    Withdraw { amount: f64 },
-}
+### Defining the aggregates
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
-enum BankAccountEvent {
-    Deposited { amount: f64 },
-    Withdrawn { amount: f64 },
-}
+The `define_aggregate!` macro generates the aggregate struct, its strongly-typed
+URN (`UserUrn`, `BankAccountUrn`), and the command/event enums (`UserCommand`,
+`UserEvent`, …). You provide the `EventStream` (how events fold into state) and
+`Aggregate` (how commands produce events) implementations.
 
-// recommended to create an specific type for the aggregate id
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-struct BankAccountUrn(Urn);
+The URN namespace auto-derives from the type name (`User` → `"user"`), so it only
+needs to be set explicitly when you want something other than the default — as
+`BankAccount` does below.
 
-impl From<BankAccountUrn> for Urn {
-    fn from(urn: BankAccountUrn) -> Self {
-        urn.0
-    }
-}
-
-impl TryFrom<Urn> for BankAccountUrn {
-    type Error = String;
-
-    fn try_from(urn: Urn) -> Result<Self, Self::Error> {
-        if urn.nid() == "bank-account" {
-            Ok(BankAccountUrn(urn))
-        } else {
-            Err(format!("Invalid namespace: expected 'bank-account', got '{}'", urn.nid()))
+```rust
+define_aggregate! {
+    User {
+        // namespace auto-derives from the type name: `User` -> "user".
+        state: {
+            name: String,
+        },
+        commands: {
+            Register { name: String },
+        },
+        events: {
+            Registered { name: String },
         }
     }
 }
 
-#[derive(Debug, Error)]
-enum BankAccountError {
-    #[error("Insufficient funds")]
-    InsufficientFunds,
-    #[error("Persistence error: {source}")]
-    PersistenceError {
-        #[from]
-        source: replay::persistence::EventStoreError,
-    },
-}
-
-// to create an aggregate we need first to implement Stream trait
-impl replay::Stream for BankAccountAggregate {
-    type Event = BankAccountEvent;
-    type StreamId = BankAccountUrn;
+impl EventStream for User {
+    type Event = UserEvent;
 
     fn stream_type() -> String {
-        "BankAccount".to_string()
+        "User".to_string()
     }
 
-    // as you can see this method can't fail and has no side effects
     fn apply(&mut self, event: Self::Event) {
         match event {
-            BankAccountEvent::Deposited { amount } => {
-                self.balance += amount;
-            }
-            BankAccountEvent::Withdrawn { amount } => {
-                self.balance -= amount;
-            }
+            UserEvent::Registered { name } => self.name = name,
         }
     }
 }
 
-// the aggregate trait handles the commands / business logic rules / error management etc.
-impl replay::Aggregate for BankAccountAggregate {
-    type Command = BankAccountCommand;
-    type Error = BankAccountError;
+impl Aggregate for User {
+    type Command = UserCommand;
+    type Error = replay::Error;
     type Services = ();
 
     async fn handle(
@@ -110,102 +97,313 @@ impl replay::Aggregate for BankAccountAggregate {
         _services: &Self::Services,
     ) -> replay::Result<Vec<Self::Event>> {
         match command {
+            UserCommand::Register { name } => Ok(vec![UserEvent::Registered { name }]),
+        }
+    }
+}
+```
+
+A `BankAccount` is opened *for* a user: the `OpenAccount` command only references
+the owning root by its URN, it never reaches into the `User` aggregate. Only
+`AccountOpened` carries the owner; movements stay lean and the read models resolve
+account → owner from that event.
+
+```rust
+define_aggregate! {
+    BankAccount {
+        // Override the default "bank-account" with the shorter "account",
+        // so URNs read `urn:account:alice-checking`.
+        namespace: "account",
+        state: {
+            owner: Option<UserUrn>,
+            balance: f64,
+        },
+        commands: {
+            OpenAccount { owner: UserUrn },
+            Deposit { amount: f64 },
+            Withdraw { amount: f64 },
+            CloseMonth { month: chrono::NaiveDate },
+        },
+        events: {
+            AccountOpened { owner: UserUrn },
+            Deposited { amount: f64 },
+            Withdrawn { amount: f64 },
+            MonthlyClosed { month: chrono::NaiveDate, closing_balance: f64 },
+        }
+    }
+}
+
+impl EventStream for BankAccount {
+    type Event = BankAccountEvent;
+
+    fn stream_type() -> String {
+        "BankAccount".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            BankAccountEvent::AccountOpened { owner } => self.owner = Some(owner),
+            BankAccountEvent::Deposited { amount } => self.balance += amount,
+            BankAccountEvent::Withdrawn { amount } => self.balance -= amount,
+            // A checkpoint replaces the running balance with the closing one, so a
+            // compacted stream rehydrates to exactly the same state.
+            BankAccountEvent::MonthlyClosed { closing_balance, .. } => {
+                self.balance = closing_balance
+            }
+        }
+    }
+}
+
+impl Aggregate for BankAccount {
+    type Command = BankAccountCommand;
+    type Error = replay::Error;
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> replay::Result<Vec<Self::Event>> {
+        match command {
+            BankAccountCommand::OpenAccount { owner } => {
+                Ok(vec![BankAccountEvent::AccountOpened { owner }])
+            }
             BankAccountCommand::Deposit { amount } => {
-                let event = BankAccountEvent::Deposited { amount };
-                Ok(vec![event])
+                Ok(vec![BankAccountEvent::Deposited { amount }])
             }
             BankAccountCommand::Withdraw { amount } => {
                 if self.balance < amount {
-                    return Err(BankAccountError::InsufficientFunds);
+                    return Err(replay::Error::business_rule_violation("Insufficient funds")
+                        .with_operation("Withdraw")
+                        .with_context("amount_tried", amount));
                 }
-
-                let event = BankAccountEvent::Withdrawn { amount };
-                Ok(vec![event])
+                Ok(vec![BankAccountEvent::Withdrawn { amount }])
             }
+            BankAccountCommand::CloseMonth { month } => Ok(vec![BankAccountEvent::MonthlyClosed {
+                month,
+                closing_balance: self.balance,
+            }]),
         }
-    }
-
-    fn with_id(id: Self::StreamId) -> Self {
-        Self { 
-            id,
-            balance: 0.0 
-        }
-    }
-
-    fn id(&self) -> &Self::StreamId {
-        &self.id
     }
 }
 ```
 
-### Aggregate Identity Pattern
+### Compaction
 
-Aggregates in DDD must always have an identity. The `Aggregate` trait enforces this through:
-
-- **`StreamId`**: Inherited from `EventStream`, a strongly-typed identifier that must implement `Into<Urn>`, `TryFrom<Urn>`, `Clone`, and `PartialEq`
-- **`with_id(id)`**: Required constructor that creates an aggregate with an identity
-- **`with_string_id(urn_string)`**: Convenience constructor that parses a URN string
-- **`id()`**: Returns a reference to the aggregate's identity
-
-This design ensures aggregates are always created with a valid URN-based identity, following DDD principles.
+Implement `Compactable` to keep streams short. Each `MonthlyClosed` snapshots the
+balance, so everything before the most recent checkpoint is redundant once the
+balance is replaced on replay — a compacted stream rehydrates to exactly the same
+state.
 
 ```rust
-// Create aggregate with typed id
-let bank_id = BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
-let aggregate = BankAccountAggregate::with_id(bank_id);
-
-// Create aggregate from URN string
-let aggregate = BankAccountAggregate::with_string_id("urn:bank-account:456").unwrap();
-
-// Access the aggregate's id
-println!("Aggregate ID: {}", aggregate.id());
+impl Compactable for BankAccount {
+    async fn compacted_events(
+        &self,
+        events: impl futures::TryStream<Ok = BankAccountEvent, Error = replay::Error> + Send,
+    ) -> replay::Result<Vec<BankAccountEvent>> {
+        use futures::TryStreamExt;
+        events
+            .try_fold(Vec::new(), |mut tail, event| async move {
+                if matches!(event, BankAccountEvent::MonthlyClosed { .. }) {
+                    tail.clear();
+                }
+                tail.push(event);
+                Ok(tail)
+            })
+            .await
+    }
+}
 ```
 
-Now we can create a Postgres store and start storing aggregates:
+### A cross-aggregate read model
+
+`query_events!` builds one merged event type so a single reader can consume both
+streams. Its `Deserialize` impl tries each underlying type in turn
+(deserialize-or-skip), which is how unrelated events are filtered out during a
+fold or while routing to an inline projection.
 
 ```rust
-// connect to Postgres
-let pg_pool = PgPoolOptions::new()
-    .max_connections(50)
-    .idle_timeout(std::time::Duration::from_secs(5))
-    .connect(&format!(
-        "postgres://postgres:postgres@{}:{}/postgres",
-        host, port
-    ))
-    .await
-    .expect("Failed to create postgres pool");
+query_events!(GlobalPositionEvent => [UserEvent, BankAccountEvent]);
 
-// create an event store
-let store = replay::persistence::PostgresEventStore::new(pg_pool);
+/// A user's name together with the summed balance of every account they own.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GlobalPosition {
+    pub name: String,
+    pub total_balance: f64,
+}
+```
 
-let bank_id = BankAccountUrn(UrnBuilder::new("bank-account", "1").build().unwrap());
+**Strategy 1 — a live query.** `GlobalPositionQuery` folds history on demand.
+Because deposits and withdrawals do not carry the owner, it first learns which
+accounts belong to the user (from `AccountOpened`) and then applies only the
+movements on those accounts. The `stream_filter` is a hint the store pushes down
+where it can; nothing is stored, so every read folds the matched log from the
+start.
 
-let commands = vec![
-    BankAccountCommand::Deposit { amount: 100.0 },
-    BankAccountCommand::Withdraw { amount: 40.0 },
-];
-
-// Create aggregate with id
-let mut bank_account = BankAccountAggregate::with_id(bank_id.clone());
-
-let services = &();
-let expected_version = None;
-
-for command in commands {
-    let events = bank_account.handle(command, services).await.unwrap();
-    bank_account.apply_all(events);
+```rust
+pub struct GlobalPositionQuery {
+    user: UserUrn,
+    owned_accounts: HashSet<urn::Urn>,
+    position: GlobalPosition,
 }
 
-assert_eq!(bank_account.balance, 60.0);
+impl GlobalPositionQuery {
+    pub fn for_user(user: UserUrn) -> Self {
+        Self {
+            user,
+            owned_accounts: HashSet::new(),
+            position: GlobalPosition::default(),
+        }
+    }
 
-// if we try to withdraw again we will get a business error (InsufficientFunds)
-let result = bank_account.handle(
-    BankAccountCommand::Withdraw { amount: 100.0 },
-    services
-).await;
+    pub fn position(&self) -> &GlobalPosition {
+        &self.position
+    }
+}
 
-assert!(result.is_err());
+impl Query for GlobalPositionQuery {
+    type Event = GlobalPositionEvent;
+
+    fn stream_filter(&self) -> StreamFilter {
+        StreamFilter::with_stream_id::<User>(&self.user)
+            .or(StreamFilter::for_stream_type::<BankAccount>())
+    }
+
+    fn update(&mut self, event: PersistedEvent<Self::Event>) {
+        match event.data {
+            GlobalPositionEvent::UserEvent(UserEvent::Registered { name }) => {
+                self.position.name = name;
+            }
+            GlobalPositionEvent::BankAccountEvent(BankAccountEvent::AccountOpened { owner }) => {
+                if owner == self.user {
+                    self.owned_accounts.insert(event.stream_id);
+                }
+            }
+            GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Deposited { amount }) => {
+                if self.owned_accounts.contains(&event.stream_id) {
+                    self.position.total_balance += amount;
+                }
+            }
+            GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Withdrawn { amount }) => {
+                if self.owned_accounts.contains(&event.stream_id) {
+                    self.position.total_balance -= amount;
+                }
+            }
+            GlobalPositionEvent::BankAccountEvent(BankAccountEvent::MonthlyClosed { .. }) => {}
+        }
+    }
+}
 ```
+
+**Strategy 2 — a materialised inline projection.** `GlobalPositionProjection`
+maintains the same read model in two Postgres tables, written inside the very same
+transaction that appends the events. Reads become a single indexed `SELECT`, paid
+for with schema, versioning, and write-time cost. (See the full `handle`
+implementation in
+[persistence/examples/global_position.rs](persistence/examples/global_position.rs).)
+
+The view tables are owned by a migration, not created from `init`. Prefer driving
+schema from your migration history over running DDL in `init` — it keeps table
+creation and evolution auditable instead of coupling it to registration. So `init`
+stays a no-op here, and the tables come from
+[persistence/tests/migrations/0006_global_position_projection.sql](persistence/tests/migrations/0006_global_position_projection.sql).
+
+```rust
+pub struct GlobalPositionProjection;
+
+impl InlineProjection for GlobalPositionProjection {
+    type Exec = sqlx::PgConnection;
+    type Event = GlobalPositionEvent;
+
+    fn name(&self) -> &str {
+        "global_position"
+    }
+
+    fn version(&self) -> i32 {
+        1
+    }
+
+    async fn init(&mut self, _conn: &mut Self::Exec) -> replay::Result<()> {
+        // The view tables are created by a SQL migration, not here. Running DDL
+        // from `init` is discouraged because it bypasses your migration history.
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> replay::Result<()> {
+        // Upsert names from Registered, account→owner from AccountOpened, and add
+        // each Deposited/Withdrawn delta to the owner's running total.
+        # let _ = (conn, events);
+        Ok(())
+    }
+}
+```
+
+### Driving it with CQRS
+
+`Cqrs` wraps an event store. `execute` runs a command (load → handle → append),
+`fetch_aggregate` rehydrates a single aggregate, and `run_query` folds a live
+query across the streams its filter matches. The live half needs no database, so
+it runs against the in-memory store:
+
+```rust
+use replay_persistence::{Cqrs, InMemoryEventStore};
+
+let cqrs = Cqrs::new(InMemoryEventStore::new());
+
+// Register a user.
+let alice = UserUrn::new("alice").unwrap();
+cqrs.execute::<User>(
+    &alice,
+    Default::default(),
+    UserCommand::Register { name: "Alice".to_string() },
+    &(),
+    None,
+)
+.await?;
+
+// Open two accounts for Alice and move some money around.
+let checking = BankAccountUrn::new("alice-checking").unwrap();
+let savings = BankAccountUrn::new("alice-savings").unwrap();
+
+for account in [&checking, &savings] {
+    cqrs.execute::<BankAccount>(
+        account,
+        Default::default(),
+        BankAccountCommand::OpenAccount { owner: alice.clone() },
+        &(),
+        None,
+    )
+    .await?;
+}
+
+cqrs.execute::<BankAccount>(&checking, Default::default(),
+    BankAccountCommand::Deposit { amount: 1_000.0 }, &(), None).await?;
+cqrs.execute::<BankAccount>(&checking, Default::default(),
+    BankAccountCommand::Withdraw { amount: 250.0 }, &(), None).await?;
+cqrs.execute::<BankAccount>(&savings, Default::default(),
+    BankAccountCommand::Deposit { amount: 500.0 }, &(), None).await?;
+
+// A single account always knows its own balance straight from the aggregate.
+let checking_account = cqrs.fetch_aggregate::<BankAccount>(&checking).await?;
+assert_eq!(checking_account.balance, 750.0);
+
+// The global position spans every account Alice owns. Here it is folded live.
+let mut position = GlobalPositionQuery::for_user(alice.clone());
+cqrs.run_query::<_, GlobalPositionEvent>(&mut position).await?;
+
+assert_eq!(position.position().name, "Alice");
+assert_eq!(position.position().total_balance, 1_250.0); // 1000 - 250 + 500
+```
+
+Swap `InMemoryEventStore` for `PostgresEventStore` and register
+`GlobalPositionProjection` to have the same numbers materialised inside the append
+transaction — the integration test
+`global_position_live_query_and_inline_projection_agree_postgres_test` proves both
+strategies produce an identical `GlobalPosition`.
 
 ## Using Macros
 
@@ -314,7 +512,7 @@ enum BankAccountError {
     #[error("Persistence error: {source}")]
     PersistenceError {
         #[from]
-        source: replay::persistence::EventStoreError,
+        source: replay::Error,
     },
 }
 
