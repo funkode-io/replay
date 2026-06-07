@@ -40,7 +40,8 @@ use replay_persistence::{db_error, InlineProjection, PersistedEvent, Query, Stre
 
 define_aggregate! {
     User {
-        namespace: "user",
+        // No `namespace`: it auto-derives from the type name (`User` -> "user"),
+        // so `UserUrn::new("alice")` yields `urn:user:alice`.
         state: {
             name: String,
         },
@@ -89,7 +90,10 @@ impl Aggregate for User {
 
 define_aggregate! {
     BankAccount {
-        namespace: "bank-account",
+        // Override the namespace: the type name would auto-derive to
+        // "bank-account", but we pin the shorter "account" so URNs read
+        // `urn:account:alice-checking`.
+        namespace: "account",
         state: {
             owner: Option<UserUrn>,
             balance: f64,

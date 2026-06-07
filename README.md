@@ -51,10 +51,14 @@ URN (`UserUrn`, `BankAccountUrn`), and the command/event enums (`UserCommand`,
 `UserEvent`, …). You provide the `EventStream` (how events fold into state) and
 `Aggregate` (how commands produce events) implementations.
 
+The URN namespace auto-derives from the type name (`User` → `"user"`), so it only
+needs to be set explicitly when you want something other than the default — as
+`BankAccount` does below.
+
 ```rust
 define_aggregate! {
     User {
-        namespace: "user",
+        // namespace auto-derives from the type name: `User` -> "user".
         state: {
             name: String,
         },
@@ -106,7 +110,9 @@ account → owner from that event.
 ```rust
 define_aggregate! {
     BankAccount {
-        namespace: "bank-account",
+        // Override the default "bank-account" with the shorter "account",
+        // so URNs read `urn:account:alice-checking`.
+        namespace: "account",
         state: {
             owner: Option<UserUrn>,
             balance: f64,
