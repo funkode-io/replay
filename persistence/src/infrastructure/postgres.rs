@@ -242,7 +242,9 @@ impl PostgresEventStoreBuilder {
     ///
     /// For each projection, compares the stored registry version against the code
     /// [`version`](InlineProjection::version):
-    /// - **First registration** (no stored version): run `init` and record the version.
+    /// - **First registration** (no stored version): run `init`, replay matching history
+    ///   through `handle` so the new projection catches up to the existing backlog, then
+    ///   record the version **last**, all in the same transaction.
     /// - **Drift** (`stored < code`): `reset` the view, replay matching history through
     ///   `handle`, then update the stored version **last**, all in the same transaction so
     ///   a crash mid-rebuild never marks a half-built view as current.
@@ -269,7 +271,9 @@ impl PostgresEventStoreBuilder {
             let code = projection.version();
 
             match stored {
-                // First-time registration: create the view and record the version.
+                // First-time registration: create the view, replay existing history so the
+                // new projection catches up to the backlog, then record the version LAST so a
+                // crash mid-replay never marks a half-built view as current.
                 None => {
                     tracing::info!(
                         projection = %name,
@@ -278,6 +282,19 @@ impl PostgresEventStoreBuilder {
                     );
 
                     projection.init(&mut tx).await?;
+
+                    // Replay matching history through the projection so a projection added to
+                    // a store that already contains events catches up to the full backlog
+                    // (not just events appended after registration). The projection's
+                    // stream_filter narrows which events are scanned.
+                    let events =
+                        Self::load_events_for_replay(&mut tx, projection.stream_filter()).await?;
+                    tracing::info!(
+                        projection = %name,
+                        events = events.len(),
+                        "inline projection replay: applying history for new projection"
+                    );
+                    projection.handle(&mut tx, &events).await?;
 
                     sqlx::query("INSERT INTO projections (name, version) VALUES ($1, $2)")
                         .bind(&name)
