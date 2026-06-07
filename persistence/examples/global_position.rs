@@ -286,6 +286,12 @@ impl Query for GlobalPositionQuery {
 /// The events live in a single stream table; the normalised read model brings the
 /// classic owner/account/position join back. Trade-off: reads are a single indexed
 /// `SELECT`, paid for with schema, versioning, and write-time cost.
+///
+/// The view tables are owned by a SQL migration
+/// (`tests/migrations/0006_global_position_projection.sql`), not created here.
+/// Prefer migrations over DDL in [`init`](InlineProjection::init): they keep
+/// schema creation and evolution in your auditable migration history instead of
+/// coupling it to projection registration.
 pub struct GlobalPositionProjection;
 
 impl InlineProjection for GlobalPositionProjection {
@@ -300,28 +306,12 @@ impl InlineProjection for GlobalPositionProjection {
         1
     }
 
-    async fn init(&mut self, conn: &mut Self::Exec) -> replay::Result<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS gp_account_owner (
-                 account_urn text PRIMARY KEY,
-                 user_urn    text NOT NULL
-             )",
-        )
-        .execute(&mut *conn)
-        .await
-        .map_err(db_error)?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS gp_user_position (
-                 user_urn      text PRIMARY KEY,
-                 name          text NOT NULL DEFAULT '',
-                 total_balance double precision NOT NULL DEFAULT 0
-             )",
-        )
-        .execute(&mut *conn)
-        .await
-        .map_err(db_error)?;
-
+    async fn init(&mut self, _conn: &mut Self::Exec) -> replay::Result<()> {
+        // No-op: the `gp_account_owner` / `gp_user_position` tables are created by
+        // a migration, not here. Running schema DDL from `init` is discouraged
+        // because it bypasses your migration history; manage the view schema with
+        // your migration tool and keep `init` empty (or for one-off setup that
+        // genuinely can't live in a migration).
         Ok(())
     }
 

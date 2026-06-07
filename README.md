@@ -297,9 +297,15 @@ impl Query for GlobalPositionQuery {
 **Strategy 2 — a materialised inline projection.** `GlobalPositionProjection`
 maintains the same read model in two Postgres tables, written inside the very same
 transaction that appends the events. Reads become a single indexed `SELECT`, paid
-for with schema, versioning, and write-time cost. (See the full `init`/`handle`
-implementations in
+for with schema, versioning, and write-time cost. (See the full `handle`
+implementation in
 [persistence/examples/global_position.rs](persistence/examples/global_position.rs).)
+
+The view tables are owned by a migration, not created from `init`. Prefer driving
+schema from your migration history over running DDL in `init` — it keeps table
+creation and evolution auditable instead of coupling it to registration. So `init`
+stays a no-op here, and the tables come from
+[persistence/tests/migrations/0006_global_position_projection.sql](persistence/tests/migrations/0006_global_position_projection.sql).
 
 ```rust
 pub struct GlobalPositionProjection;
@@ -316,10 +322,9 @@ impl InlineProjection for GlobalPositionProjection {
         1
     }
 
-    async fn init(&mut self, conn: &mut Self::Exec) -> replay::Result<()> {
-        // CREATE TABLE gp_account_owner (account_urn PK, user_urn) and
-        // gp_user_position (user_urn PK, name, total_balance) — see the example file.
-        # let _ = conn;
+    async fn init(&mut self, _conn: &mut Self::Exec) -> replay::Result<()> {
+        // The view tables are created by a SQL migration, not here. Running DDL
+        // from `init` is discouraged because it bypasses your migration history.
         Ok(())
     }
 
