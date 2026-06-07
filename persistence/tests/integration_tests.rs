@@ -1096,6 +1096,81 @@ async fn bank_account_inline_projection_same_version_is_noop_postgres_test() {
     assert_eq!(balance, 999.0);
 }
 
+// ── Inline projection first-registration backlog replay (issue #71) ───────────
+
+/// Registering a brand-new projection against a store that already contains events
+/// replays the existing backlog so the view catches up — not just future events.
+#[tokio::test]
+async fn bank_account_inline_projection_first_registration_replays_backlog_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    // Build a store with NO projections registered and append history
+    // (deposit 100, withdraw 40 → balance 60). The projection does not exist yet.
+    let store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .build()
+        .await
+        .expect("Failed to build store without projections");
+
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let stream_id = BankAccountUrn::new("backlog-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    for command in [
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        BankAccountCommand::Withdraw {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 40.0,
+        },
+    ] {
+        cqrs.execute::<BankAccount>(&stream_id, replay::Metadata::default(), command, &(), None)
+            .await
+            .unwrap();
+    }
+
+    // Register the projection for the FIRST time against the store that already has
+    // events. First registration must replay the backlog through `handle`.
+    let _store = replay_persistence::PostgresEventStore::builder(pg_pool.clone())
+        .register(RebuildBalanceProjection { version: 1 })
+        .build()
+        .await
+        .expect("Failed to build store with first-time projection registration");
+
+    // The view reflects the full backlog (100 - 40 = 60), not an empty/future-only state.
+    let balance: f64 =
+        sqlx::query_scalar("SELECT balance FROM rebuild_balances WHERE stream_id = $1")
+            .bind(&stream_id_str)
+            .fetch_one(&pg_pool)
+            .await
+            .expect("backlog-replayed balance row must exist");
+
+    assert_eq!(balance, 60.0);
+
+    // The registry records the projection version.
+    let version: i32 = sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
+        .bind("rebuild_balance_view")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("projection registry row must exist");
+
+    assert_eq!(version, 1);
+}
+
 // ── Scoped-URN types used by the tests below ─────────────────────────────────
 
 /// A branch that owns one or more bank accounts.
