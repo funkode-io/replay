@@ -32,14 +32,15 @@ different ways so the trade-offs are visible side by side:
 > working code. Run the live half (no database required) with
 > `cargo run -p es-replay-persistence --example global_position`.
 
-We import the traits and macros explicitly rather than glob-importing
-`replay_persistence::prelude::*`: that prelude re-exports `Result`/`Error`, which
-would shadow the `std`/`serde` names the derive macros expand to.
+We glob-import `replay::prelude::*` to bring the core traits (`Aggregate`,
+`EventStream`, `Compactable`, …) into scope, but import from `replay_persistence`
+explicitly: its prelude re-exports `Result`/`Error`, which would shadow the
+`std`/`serde` names the derive macros expand to.
 
 ```rust
 use std::collections::HashSet;
 
-use replay::{prelude::*, Compactable};
+use replay::prelude::*;
 use replay_macros::{define_aggregate, query_events};
 use replay_persistence::{db_error, InlineProjection, PersistedEvent, Query, StreamFilter};
 ```

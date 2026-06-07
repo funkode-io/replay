@@ -30,7 +30,9 @@ use std::collections::HashSet;
 // NOTE: we import the traits and macros explicitly rather than glob-importing
 // `replay_persistence::prelude::*`. That prelude re-exports `Result`/`Error`,
 // which would shadow the `std`/`serde` names the derive macros expand to.
-use replay::{prelude::*, Compactable};
+// `replay::prelude` is safe to glob: it brings in the core traits
+// (`Aggregate`, `EventStream`, `Compactable`, …) without those names.
+use replay::prelude::*;
 use replay_macros::{define_aggregate, query_events};
 use replay_persistence::{db_error, InlineProjection, PersistedEvent, Query, StreamFilter};
 
