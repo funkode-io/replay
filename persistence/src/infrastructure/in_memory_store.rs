@@ -13,10 +13,13 @@ use replay::{Compactable, Event};
 
 /// In-memory event store implementation, only for testing purpose.
 ///
-/// It ignores stream type.
-///
 /// Events are stored per-stream-URN in insertion order. The `aggregate_version` field on each
 /// event distinguishes current events (`None`) from archived compaction snapshots (`Some(n)`).
+///
+/// Stream filters are normally *pushed down* to the database; the in-memory store has no
+/// schema to push down to, so it evaluates every filter as a per-event predicate instead. To
+/// support [`StreamFilter::ForStreamTypes`] it records each stream's type on append (the type
+/// is stable per stream URN) and matches against it while scanning.
 ///
 /// The store can also run **best-effort inline projections** (test-only): after each
 /// successful append it routes the newly-appended events to every registered projection's
@@ -26,6 +29,9 @@ use replay::{Compactable, Event};
 /// routing and batch-handling logic in fast unit tests without a database.
 pub struct InMemoryEventStore {
     events: RwLock<HashMap<Urn, Vec<PersistedEvent<Value>>>>,
+    /// Stream type per stream URN, recorded on append so [`StreamFilter::ForStreamTypes`] can
+    /// be evaluated per-event without a database to push the filter down to.
+    stream_types: RwLock<HashMap<Urn, String>>,
     /// Best-effort inline projections, applied after events are appended. Each projection is
     /// locked individually while it handles a batch. The in-memory store passes a unit (`()`)
     /// write handle, so projections must keep their view in their own state (e.g. shared via
@@ -37,6 +43,7 @@ impl InMemoryEventStore {
     pub fn new() -> Self {
         Self {
             events: RwLock::new(HashMap::new()),
+            stream_types: RwLock::new(HashMap::new()),
             projections: Vec::new(),
         }
     }
@@ -96,34 +103,35 @@ impl InMemoryEventStore {
 
     /// Apply a filter to a raw (un-typed) persisted event.
     ///
-    /// Returns an error if the filter contains a `ForStreamTypes` variant — that variant
-    /// requires knowledge of the concrete `EventStream` type at compile time, which is not
-    /// available when working with the raw JSON storage of the in-memory store.
+    /// Every [`StreamFilter`] variant is evaluated as a per-event predicate. `stream_type` is
+    /// the type of the stream the event belongs to (resolved from the store's side map); it is
+    /// only needed by [`StreamFilter::ForStreamTypes`].
     fn evaluate<E>(
         filter: &StreamFilter,
         event: &PersistedEvent<E>,
-    ) -> Result<bool, replay::Error> {
+        stream_type: Option<&str>,
+    ) -> bool {
         match filter {
-            StreamFilter::All => Ok(true),
-            StreamFilter::WithStreamId(stream_id) => Ok(event.stream_id == *stream_id),
-            StreamFilter::ForStreamTypes(_) => Err(replay::Error::internal(
-                "InMemoryEventStore does not support ForStreamTypes filters; \
-                 use stream_events_by_stream_id with a concrete EventStream type instead",
-            )
-            .with_operation("stream_events")),
-            StreamFilter::WithMetadata(metadata) => Ok(event.metadata == *metadata),
-            StreamFilter::AfterVersion(version) => Ok(event.version > *version),
-            StreamFilter::UpToVersion(version) => Ok(event.version <= *version),
-            StreamFilter::CreatedAfter(timestamp) => Ok(event.created > *timestamp),
-            StreamFilter::CreatedBefore(timestamp) => Ok(event.created <= *timestamp),
-            StreamFilter::WithAggregateVersion(v) => Ok(event.aggregate_version == *v),
+            StreamFilter::All => true,
+            StreamFilter::WithStreamId(stream_id) => event.stream_id == *stream_id,
+            StreamFilter::ForStreamTypes(stream_types) => {
+                stream_type.is_some_and(|st| stream_types.iter().any(|t| t == st))
+            }
+            StreamFilter::WithMetadata(metadata) => event.metadata == *metadata,
+            StreamFilter::AfterVersion(version) => event.version > *version,
+            StreamFilter::UpToVersion(version) => event.version <= *version,
+            StreamFilter::CreatedAfter(timestamp) => event.created > *timestamp,
+            StreamFilter::CreatedBefore(timestamp) => event.created <= *timestamp,
+            StreamFilter::WithAggregateVersion(v) => event.aggregate_version == *v,
             StreamFilter::And(left, right) => {
-                Ok(Self::evaluate(left, event)? && Self::evaluate(right, event)?)
+                Self::evaluate(left, event, stream_type)
+                    && Self::evaluate(right, event, stream_type)
             }
             StreamFilter::Or(left, right) => {
-                Ok(Self::evaluate(left, event)? || Self::evaluate(right, event)?)
+                Self::evaluate(left, event, stream_type)
+                    || Self::evaluate(right, event, stream_type)
             }
-            StreamFilter::Not(inner) => Ok(!Self::evaluate(inner, event)?),
+            StreamFilter::Not(inner) => !Self::evaluate(inner, event, stream_type),
         }
     }
 }
@@ -138,12 +146,18 @@ impl EventStore for InMemoryEventStore {
     async fn store_events<S: replay::EventStream>(
         &self,
         stream_id: &S::StreamId,
-        _stream_type: String,
+        stream_type: String,
         metadata: replay::Metadata,
         domain_events: &[S::Event],
         expected_version: Option<i64>,
     ) -> Result<(), replay::Error> {
         let stream_id: Urn = stream_id.clone().into();
+
+        // Record the stream's type so `ForStreamTypes` filters can be evaluated per-event.
+        self.stream_types
+            .write()
+            .unwrap()
+            .insert(stream_id.clone(), stream_type);
 
         // Append under the write lock, then release it before driving any async projections
         // (the std `RwLockWriteGuard` is not held across an await).
@@ -224,21 +238,22 @@ impl EventStore for InMemoryEventStore {
         filter: StreamFilter,
     ) -> impl TryStream<Ok = PersistedEvent<E>, Error = replay::Error> + Send {
         // Optimise: if the filter references a specific stream URN, only scan that stream.
-        let candidate_events: Vec<PersistedEvent<Value>> = {
+        let (candidate_events, stream_types): (Vec<PersistedEvent<Value>>, HashMap<Urn, String>) = {
             let store = self.events.read().unwrap();
-            if let Some(stream_id) = Self::extract_stream_id(&filter) {
+            let stream_types = self.stream_types.read().unwrap().clone();
+            let events = if let Some(stream_id) = Self::extract_stream_id(&filter) {
                 store.get(&stream_id).cloned().unwrap_or_default()
             } else {
                 store.values().flatten().cloned().collect()
-            }
+            };
+            (events, stream_types)
         };
 
         async_stream::stream! {
             for event in candidate_events {
-                match Self::evaluate(&filter, &event) {
-                    Err(e) => { yield Err(e); return; }
-                    Ok(false) => continue,
-                    Ok(true) => {}
+                let stream_type = stream_types.get(&event.stream_id).map(String::as_str);
+                if !Self::evaluate(&filter, &event, stream_type) {
+                    continue;
                 }
                 let data: E = serde_json::from_value(event.data).map_err(crate::deser_error)?;
                 yield Ok(PersistedEvent {
@@ -664,6 +679,75 @@ mod tests {
         stream.apply_all(stream_events);
 
         assert_eq!(stream.balance, 60.0);
+    }
+
+    #[tokio::test]
+    async fn stream_events_filters_by_stream_type() {
+        let store = InMemoryEventStore::new();
+
+        let checking = make_stream_id("checking");
+        let savings = make_stream_id("savings");
+
+        // Two streams recorded under two different stream types. The in-memory store
+        // remembers each stream's type so it can evaluate `ForStreamTypes` per-event
+        // (there is no database to push the filter down to).
+        store
+            .store_events::<BankAccountStream>(
+                &checking,
+                "Checking".to_string(),
+                replay::Metadata::default(),
+                &[BankAccountEvent::Deposited { amount: 100.0 }],
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .store_events::<BankAccountStream>(
+                &savings,
+                "Savings".to_string(),
+                replay::Metadata::default(),
+                &[BankAccountEvent::Deposited { amount: 50.0 }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A single stream type matches only its own events instead of erroring.
+        let checking_only: Vec<BankAccountEvent> = store
+            .stream_events::<BankAccountEvent>(StreamFilter::ForStreamTypes(vec![
+                "Checking".to_string()
+            ]))
+            .map_ok(|e| e.data)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            checking_only,
+            vec![BankAccountEvent::Deposited { amount: 100.0 }]
+        );
+
+        // Several stream types match the union of their events.
+        let both: Vec<BankAccountEvent> = store
+            .stream_events::<BankAccountEvent>(StreamFilter::ForStreamTypes(vec![
+                "Checking".to_string(),
+                "Savings".to_string(),
+            ]))
+            .map_ok(|e| e.data)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(both.len(), 2);
+
+        // A stream type nobody was stored under matches nothing.
+        let none: Vec<BankAccountEvent> = store
+            .stream_events::<BankAccountEvent>(StreamFilter::ForStreamTypes(vec![
+                "Unknown".to_string()
+            ]))
+            .map_ok(|e| e.data)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(none.is_empty());
     }
 
     // ── Best-effort inline projections (issue #61) ───────────────────────────
