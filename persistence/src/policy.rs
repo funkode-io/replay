@@ -85,8 +85,13 @@ impl Dispatch {
 
 /// A checkpointed background subscriber that reacts to events with commands.
 ///
-/// Implementors stay pure and store-agnostic: [`react`](Policy::react) takes an
-/// event and returns the commands to issue, with no I/O. The runner handles
+/// Delivery is **at-least-once**. A crash after command commit but before cursor
+/// save can re-deliver the same triggering event. Correctness therefore depends
+/// on idempotent command handling in the target aggregate, keyed by causation
+/// identity (the triggering event id), not by command-value equality.
+///
+/// Implementors stay pure and store-agnostic: [`react`](Policy::react) takes
+/// an event and returns the commands to issue, with no I/O. The runner handles
 /// reading the feed, executing the returned [`Dispatch`]es, stamping causation
 /// metadata, and advancing the cursor.
 pub trait Policy: Send + Sync {
@@ -113,6 +118,9 @@ pub trait Policy: Send + Sync {
     }
 
     /// Pure reaction: given an event, return the commands to dispatch.
+    ///
+    /// Invariant: because delivery is at-least-once, target aggregate command
+    /// handlers must absorb duplicate causation ids as no-ops.
     fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch>;
 }
 

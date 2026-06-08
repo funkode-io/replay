@@ -256,13 +256,17 @@ async fn drain_policy_once(
     let feed = read_feed(pool, policy.stream_filter(), *cursor).await?;
 
     let mut executed = 0;
-    for (global_position, raw) in feed {
-        for dispatch in policy.react_erased(&raw) {
-            execute_dispatch(cqrs, executors, &name, global_position, &raw, dispatch).await?;
-            executed += 1;
+    for (global_position, maybe_raw) in feed {
+        if let Some(raw) = maybe_raw {
+            // Real event: deliver to the policy and execute all returned dispatches.
+            for dispatch in policy.react_erased(&raw) {
+                execute_dispatch(cqrs, executors, &name, global_position, &raw, dispatch).await?;
+                executed += 1;
+            }
         }
-        // Advance only after this event's commands have committed. A crash
-        // before this point re-delivers the event on the next drain.
+        // Advance cursor regardless of whether the row was a real event or a synthetic
+        // compaction snapshot.  Synthetics must still move the cursor forward so the
+        // next poll does not re-process positions the runner has already seen.
         save_cursor(pool, &name, global_position).await?;
         *cursor = global_position;
     }
@@ -276,14 +280,18 @@ async fn drain_policy_once(
 /// BIGSERIAL positions are assigned at INSERT but become visible at COMMIT,
 /// so a higher position can appear before a lower one fills in. Stopping at
 /// the first gap guarantees we never skip an event that is still in flight.
+///
+/// Each entry is `(global_position, maybe_event)`.  When `maybe_event` is
+/// `None` the row is a synthetic compaction snapshot (`compacted_snapshot =
+/// TRUE`): the cursor must still advance past it, but no reaction is fired.
 async fn read_feed(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
     cursor: i64,
-) -> Result<Vec<(i64, PersistedEvent<Value>)>, replay::Error> {
+) -> Result<Vec<(i64, Option<PersistedEvent<Value>>)>, replay::Error> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-         global_position FROM events WHERE global_position > ",
+         global_position, compacted_snapshot FROM events WHERE global_position > ",
     );
     qb.push_bind(cursor);
     qb.push(" AND ");
@@ -300,9 +308,16 @@ async fn read_feed(
             // Gap: stop here and let the hole fill on a later poll.
             break;
         }
-        let event = PersistedEvent::<Value>::try_from(row)?;
-        feed.push((global_position, event));
         expected += 1;
+
+        let is_snapshot: bool = row.get("compacted_snapshot");
+        if is_snapshot {
+            // Synthetic row: advance the cursor past it, but deliver nothing.
+            feed.push((global_position, None));
+        } else {
+            let event = PersistedEvent::<Value>::try_from(row)?;
+            feed.push((global_position, Some(event)));
+        }
     }
 
     Ok(feed)

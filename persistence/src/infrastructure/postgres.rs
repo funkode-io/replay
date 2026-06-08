@@ -618,6 +618,8 @@ impl EventStore for PostgresEventStore {
             .map_err(crate::db_error)?;
 
         // 6. Insert compacted events as the new current stream (aggregate_version = NULL).
+        //    These synthetic rows are marked compacted_snapshot = TRUE so the Policy feed
+        //    can skip them; the archived originals (above) carry the true history.
         let stream_type = A::stream_type();
         let meta_json = metadata.to_json();
         for (seq, event) in compacted.iter().enumerate() {
@@ -626,8 +628,8 @@ impl EventStore for PostgresEventStore {
             let version = (seq as i64) + 1;
 
             sqlx::query(
-                "INSERT INTO events (id, data, metadata, stream_id, type, version, aggregate_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+                "INSERT INTO events (id, data, metadata, stream_id, type, version, aggregate_version, compacted_snapshot)
+                 VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE)",
             )
             .bind(Uuid::new_v4())
             .bind(&data)
