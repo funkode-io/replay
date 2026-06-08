@@ -298,7 +298,10 @@ impl PolicyRunner {
                         .fetch_one(&self.pool)
                         .await
                         .map_err(crate::db_error)?;
-                Ok(head.unwrap_or(0))
+                Ok(match head {
+                    Some(position) => position,
+                    None => 0,
+                })
             }
         }
     }
