@@ -2291,3 +2291,182 @@ async fn policy_lagging_behind_compaction_skips_synthetic_snapshot_postgres_test
         "cursor must have advanced past the synthetic snapshot to the final real event"
     );
 }
+
+// ── Single active runner via pg_advisory_lock (issue #82) ────────────────────
+
+/// A minimal policy used only by the advisory-lock tests.
+struct SingleRunnerPolicy;
+
+impl replay_persistence::Policy for SingleRunnerPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "single_runner_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Now
+    }
+
+    /// React to every `Deposited` event by issuing a `Withdraw` of $1.
+    /// `Withdrawn` is not a `Deposited`, so the reaction does not feed itself.
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { operation_date, .. } => {
+                let account = BankAccountUrn::try_from(event.stream_id.clone())
+                    .expect("deposit events live on bank-account streams");
+                vec![replay_persistence::Dispatch::to::<BankAccount>(
+                    account,
+                    BankAccountCommand::Withdraw {
+                        effective_on: *operation_date,
+                        amount: 1.0,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Two runners competing for the same policy do not double-process events, and
+/// the surviving runner resumes from the stored cursor after the leader stops.
+///
+/// Scenario:
+///   1. Two `PolicyRunner` instances are created with identical `SingleRunnerPolicy`.
+///   2. Both start polling. Exactly one acquires the advisory lock and becomes
+///      the leader; the other stands by.
+///   3. Two deposits are appended. Only the leader reacts → exactly 2 Withdrawn
+///      events. If both ran, we would see 4.
+///   4. The first daemon is shut down (explicit `pg_advisory_unlock`). The standby
+///      acquires the lock and resumes from the stored cursor.
+///   5. Two more deposits are appended. The new leader reacts → 2 additional
+///      Withdrawn events. Total = 4.
+#[tokio::test]
+async fn policy_single_active_runner_via_advisory_lock_postgres_test() {
+    use std::time::Duration;
+
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("advisory-lock-1").unwrap();
+    let meta = replay::Metadata::default();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    // ── Helper: count Withdrawn events in the database ────────────────────────
+    let count_withdrawn = || {
+        let pool = pg_pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE type = 'Withdrawn'")
+                .fetch_one(&pool)
+                .await
+                .expect("count query must succeed")
+        }
+    };
+
+    // Convenience builder so both runners are configured identically.
+    let build_runner = || {
+        replay_persistence::PolicyRunner::builder(cqrs.clone())
+            .register_services::<BankAccount>(())
+            .register_policy(SingleRunnerPolicy)
+            .build()
+    };
+
+    let interval = Duration::from_millis(50);
+
+    // ── Phase 1: two daemons, only the leader reacts ──────────────────────────
+    let daemon_a = build_runner().start_polling(interval);
+    let daemon_b = build_runner().start_polling(interval);
+
+    // Give both tasks time to start and one to acquire the lock.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Allow enough polling cycles for the leader to react.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let withdrawn_after_phase1 = count_withdrawn().await;
+    assert_eq!(
+        withdrawn_after_phase1, 2,
+        "only the leader must react; if both ran the count would be 4"
+    );
+
+    // ── Phase 2: shut down daemon_a; standby acquires lock and resumes ────────
+    daemon_a.shutdown().await;
+
+    // Give the surviving daemon time to notice the lock is free and become leader.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Allow the new leader to react to the two new deposits.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let withdrawn_after_phase2 = count_withdrawn().await;
+    assert_eq!(
+        withdrawn_after_phase2, 4,
+        "the standby must have resumed from the stored cursor and reacted to the two new deposits"
+    );
+
+    daemon_b.shutdown().await;
+}
