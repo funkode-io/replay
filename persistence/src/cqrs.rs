@@ -18,6 +18,11 @@ impl<ES: EventStore> Cqrs<ES> {
         }
     }
 
+    /// Shared handle to the underlying event store.
+    pub(crate) fn store(&self) -> &Arc<ES> {
+        &self.store
+    }
+
     /// Reconstruct an aggregate from its persisted event stream.
     ///
     /// - `aggregate_version`: choose which snapshot of the stream to load.  Use

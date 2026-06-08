@@ -32,6 +32,26 @@ A projection that updates an **external** system (for example a search index)
 process that compares projection progress against the event stream. Eventually
 consistent rather than strongly consistent. (Planned; not yet implemented.)
 
+### Policy
+
+An event-driven reaction in the event-sourcing domain: an appended event
+triggers a Policy, which issues a command that may raise further events. A
+Policy is **not** a [Projection] — it derives no read model; its output is a
+command and its effects are side effects on the write side. It runs in the
+background and is eventually consistent. Because a Policy re-executes side
+effects when it processes an event, it cannot be safely rebuilt by replaying
+history the way a versioned [Projection] can. (Planned; not yet implemented.)
+_Avoid_: reactor, saga, process manager, automation, trigger, reaction.
+
+### Causation
+
+The link from the event that triggered a [Policy] to the command and resulting
+events the Policy raises in response. The triggering event's identity is the
+stable key a target [Aggregate] uses to recognise a reaction it has already
+applied, and the chain of causation is what bounds how deep one event may
+cascade into further reactions.
+_Avoid_: trigger, cause, origin.
+
 ### Query
 
 The existing on-demand, in-memory fold over filtered events. It is the
@@ -60,7 +80,9 @@ single-threaded WASM environment (generated services use
 `es`/`macros` must preserve both arms. The `persistence` crate (Postgres + sqlx +
 tokio) is **server-only / non-WASM**, so every projection mechanism that lives
 there — including the [Inline projection] — is a native-only feature and is free
-to use `Send` bounds. A future [Async projection] aimed at client/edge targets
+to use `Send` bounds. A [Policy] is likewise native-only: its contract (the
+reaction itself) is portable, but its runtime is an irreducibly server-side
+background process. A future [Async projection] aimed at client/edge targets
 would need to honour the WASM dual-cfg pattern.
 
 [Aggregate]: #aggregate
@@ -68,3 +90,4 @@ would need to honour the WASM dual-cfg pattern.
 [Live projection]: #live-projection
 [Inline projection]: #inline-projection
 [Async projection]: #async-projection
+[Projection]: #projection
