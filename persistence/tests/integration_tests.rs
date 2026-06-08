@@ -1387,11 +1387,23 @@ struct WithdrawFeePolicy {
     fee: f64,
 }
 
+struct WithdrawFeePolicyStartAtNow {
+    fee: f64,
+}
+
+struct WithdrawFeePolicyStartAtBeginning {
+    fee: f64,
+}
+
 impl replay_persistence::Policy for WithdrawFeePolicy {
     type Event = BankAccountEvent;
 
     fn name(&self) -> &str {
         "withdraw_fee_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
     }
 
     fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
@@ -1410,6 +1422,64 @@ impl replay_persistence::Policy for WithdrawFeePolicy {
                     "user_id": "policy-runner",
                     "related_aggregate_id": event.stream_id.to_string(),
                 })))]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl replay_persistence::Policy for WithdrawFeePolicyStartAtNow {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "withdraw_fee_policy_start_at_now"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Now
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { operation_date, .. } => {
+                let account = BankAccountUrn::try_from(event.stream_id.clone())
+                    .expect("deposit events live on bank-account streams");
+                vec![replay_persistence::Dispatch::to::<BankAccount>(
+                    account,
+                    BankAccountCommand::Withdraw {
+                        effective_on: *operation_date,
+                        amount: self.fee,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl replay_persistence::Policy for WithdrawFeePolicyStartAtBeginning {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "withdraw_fee_policy_start_at_beginning"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { operation_date, .. } => {
+                let account = BankAccountUrn::try_from(event.stream_id.clone())
+                    .expect("deposit events live on bank-account streams");
+                vec![replay_persistence::Dispatch::to::<BankAccount>(
+                    account,
+                    BankAccountCommand::Withdraw {
+                        effective_on: *operation_date,
+                        amount: self.fee,
+                    },
+                )]
             }
             _ => Vec::new(),
         }
@@ -1551,4 +1621,245 @@ async fn withdraw_fee_policy_drain_postgres_test() {
             .await
             .expect("cursor row must exist after second drain");
     assert_eq!(cursor_after, 2);
+}
+
+#[tokio::test]
+async fn policy_start_at_now_ignores_prior_history_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("policy-start-now-1").unwrap();
+
+    // Pre-existing history before policy registration.
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(WithdrawFeePolicyStartAtNow { fee: 5.0 })
+        .build();
+
+    // First drain should not backfill pre-existing event.
+    let executed = runner.drain().await.expect("drain must succeed");
+    assert_eq!(executed, 0);
+
+    // New events appended after registration should be processed.
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let executed_after = runner.drain().await.expect("second drain must succeed");
+    assert_eq!(executed_after, 1);
+}
+
+#[tokio::test]
+async fn policy_start_at_beginning_backfills_history_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("policy-start-beginning-1").unwrap();
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+        .build();
+
+    let executed = runner.drain().await.expect("drain must succeed");
+    assert_eq!(executed, 2);
+}
+
+#[tokio::test]
+async fn policy_code_change_never_rewinds_cursor_postgres_test() {
+    struct WithdrawFeePolicyNoRewindV1;
+    struct WithdrawFeePolicyNoRewindV2;
+
+    impl replay_persistence::Policy for WithdrawFeePolicyNoRewindV1 {
+        type Event = BankAccountEvent;
+
+        fn name(&self) -> &str {
+            "withdraw_fee_policy_no_rewind"
+        }
+
+        fn start_at(&self) -> replay_persistence::StartAt {
+            replay_persistence::StartAt::Now
+        }
+
+        fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+            match &event.data {
+                BankAccountEvent::Deposited { operation_date, .. } => {
+                    let account = BankAccountUrn::try_from(event.stream_id.clone())
+                        .expect("deposit events live on bank-account streams");
+                    vec![replay_persistence::Dispatch::to::<BankAccount>(
+                        account,
+                        BankAccountCommand::Withdraw {
+                            effective_on: *operation_date,
+                            amount: 5.0,
+                        },
+                    )]
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    impl replay_persistence::Policy for WithdrawFeePolicyNoRewindV2 {
+        type Event = BankAccountEvent;
+
+        fn name(&self) -> &str {
+            "withdraw_fee_policy_no_rewind"
+        }
+
+        // Simulate a code change that attempts to switch bootstrap mode.
+        fn start_at(&self) -> replay_persistence::StartAt {
+            replay_persistence::StartAt::Beginning
+        }
+
+        fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+            match &event.data {
+                BankAccountEvent::Deposited { operation_date, .. } => {
+                    let account = BankAccountUrn::try_from(event.stream_id.clone())
+                        .expect("deposit events live on bank-account streams");
+                    vec![replay_persistence::Dispatch::to::<BankAccount>(
+                        account,
+                        BankAccountCommand::Withdraw {
+                            effective_on: *operation_date,
+                            amount: 7.0,
+                        },
+                    )]
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("policy-no-rewind-1").unwrap();
+
+    // Pre-existing event before first policy registration.
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let runner_v1 = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(WithdrawFeePolicyNoRewindV1)
+        .build();
+
+    // First run bootstraps at Now, so no backfill.
+    assert_eq!(runner_v1.drain().await.unwrap(), 0);
+
+    // Append a new event that should be processed once.
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Simulate redeploy/code change with same policy name but different start_at.
+    let runner_v2 = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(WithdrawFeePolicyNoRewindV2)
+        .build();
+
+    // Must process only the new event; the original pre-registration event
+    // must not be replayed.
+    assert_eq!(runner_v2.drain().await.unwrap(), 1);
 }

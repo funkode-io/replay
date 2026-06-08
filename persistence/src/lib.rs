@@ -17,7 +17,7 @@ pub use filters::StreamFilter;
 pub use infrastructure::{InMemoryEventStore, PostgresEventStore, PostgresInlineProjection};
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
-pub use policy::{Dispatch, Policy};
+pub use policy::{Dispatch, Policy, StartAt};
 pub use policy_runner::{PolicyRunner, PolicyRunnerBuilder};
 pub use query::Query;
 pub use store::EventStore;
@@ -43,6 +43,6 @@ pub mod prelude {
     pub use super::{
         AggregateVersion, Cqrs, Dispatch, EventStore, InMemoryEventStore, InlineProjection,
         PersistedEvent, Policy, PolicyRunner, PolicyRunnerBuilder, PostgresEventStore,
-        PostgresInlineProjection, Query, StreamFilter,
+        PostgresInlineProjection, Query, StartAt, StreamFilter,
     };
 }
