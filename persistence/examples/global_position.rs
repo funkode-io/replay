@@ -194,6 +194,91 @@ impl Compactable for BankAccount {
     }
 }
 
+// ── Policy idempotency recipe (causation guard) ─────────────────────────────
+
+// This aggregate is a copy-pasteable recipe for policy targets under
+// at-least-once delivery:
+// - command carries `causation_event_id` from the triggering event
+// - state tracks applied causation ids
+// - duplicate causation id => no-op (returns no events)
+define_aggregate! {
+    PolicyFeeLedger {
+        namespace: "policy-fee-ledger",
+        state: {
+            balance: f64,
+            applied_causation_ids: HashSet<uuid::Uuid>,
+        },
+        commands: {
+            Credit { amount: f64 },
+            ChargeFee {
+                amount: f64,
+                causation_event_id: uuid::Uuid,
+            },
+        },
+        events: {
+            Credited { amount: f64 },
+            FeeCharged {
+                amount: f64,
+                causation_event_id: uuid::Uuid,
+            },
+        }
+    }
+}
+
+impl EventStream for PolicyFeeLedger {
+    type Event = PolicyFeeLedgerEvent;
+
+    fn stream_type() -> String {
+        "PolicyFeeLedger".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            PolicyFeeLedgerEvent::Credited { amount } => self.balance += amount,
+            PolicyFeeLedgerEvent::FeeCharged {
+                amount,
+                causation_event_id,
+            } => {
+                self.applied_causation_ids.insert(causation_event_id);
+                self.balance -= amount;
+            }
+        }
+    }
+}
+
+impl Aggregate for PolicyFeeLedger {
+    type Command = PolicyFeeLedgerCommand;
+    type Error = replay::Error;
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> replay::Result<Vec<Self::Event>> {
+        match command {
+            PolicyFeeLedgerCommand::Credit { amount } => {
+                Ok(vec![PolicyFeeLedgerEvent::Credited { amount }])
+            }
+            PolicyFeeLedgerCommand::ChargeFee {
+                amount,
+                causation_event_id,
+            } => {
+                if self.applied_causation_ids.contains(&causation_event_id) {
+                    // Duplicate delivery for the same causation identity:
+                    // absorb as no-op.
+                    return Ok(Vec::new());
+                }
+
+                Ok(vec![PolicyFeeLedgerEvent::FeeCharged {
+                    amount,
+                    causation_event_id,
+                }])
+            }
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Cross-aggregate read model: a user's global position
 // ─────────────────────────────────────────────────────────────────────────────

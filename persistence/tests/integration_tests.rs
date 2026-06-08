@@ -135,6 +135,85 @@ impl Compactable for BankAccount {
     }
 }
 
+define_aggregate! {
+    IdempotentFeeAccount {
+        namespace: "idempotent-fee-account",
+        state: {
+            balance: f64,
+            applied_causation_ids: std::collections::HashSet<uuid::Uuid>,
+        },
+        commands: {
+            Open { balance: f64 },
+            ChargeFee {
+                amount: f64,
+                causation_event_id: uuid::Uuid,
+            },
+        },
+        events: {
+            Opened { balance: f64 },
+            FeeCharged {
+                amount: f64,
+                causation_event_id: uuid::Uuid,
+            },
+        }
+    }
+}
+
+impl replay::EventStream for IdempotentFeeAccount {
+    type Event = IdempotentFeeAccountEvent;
+
+    fn stream_type() -> String {
+        "IdempotentFeeAccount".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            IdempotentFeeAccountEvent::Opened { balance } => {
+                self.balance = balance;
+            }
+            IdempotentFeeAccountEvent::FeeCharged {
+                amount,
+                causation_event_id,
+            } => {
+                self.balance -= amount;
+                self.applied_causation_ids.insert(causation_event_id);
+            }
+        }
+    }
+}
+
+impl replay::Aggregate for IdempotentFeeAccount {
+    type Command = IdempotentFeeAccountCommand;
+    type Error = replay::Error;
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            IdempotentFeeAccountCommand::Open { balance } => {
+                Ok(vec![IdempotentFeeAccountEvent::Opened { balance }])
+            }
+            IdempotentFeeAccountCommand::ChargeFee {
+                amount,
+                causation_event_id,
+            } => {
+                // Causation guard recipe: duplicate causation identity is a no-op.
+                if self.applied_causation_ids.contains(&causation_event_id) {
+                    return Ok(Vec::new());
+                }
+
+                Ok(vec![IdempotentFeeAccountEvent::FeeCharged {
+                    amount,
+                    causation_event_id,
+                }])
+            }
+        }
+    }
+}
+
 struct BankAccountStatement {
     bank_account: BankAccountUrn,
     from: chrono::NaiveDate,
@@ -1395,6 +1474,12 @@ struct WithdrawFeePolicyStartAtBeginning {
     fee: f64,
 }
 
+struct ChargeFeeWithCausationPolicy {
+    source: BankAccountUrn,
+    target: IdempotentFeeAccountUrn,
+    fee: f64,
+}
+
 impl replay_persistence::Policy for WithdrawFeePolicy {
     type Event = BankAccountEvent;
 
@@ -1478,6 +1563,37 @@ impl replay_persistence::Policy for WithdrawFeePolicyStartAtBeginning {
                     BankAccountCommand::Withdraw {
                         effective_on: *operation_date,
                         amount: self.fee,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl replay_persistence::Policy for ChargeFeeWithCausationPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "charge_fee_with_causation_policy"
+    }
+
+    fn stream_filter(&self) -> replay_persistence::StreamFilter {
+        replay_persistence::StreamFilter::with_stream_id::<BankAccount>(&self.source)
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Now
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { .. } => {
+                vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
+                    self.target.clone(),
+                    IdempotentFeeAccountCommand::ChargeFee {
+                        amount: self.fee,
+                        causation_event_id: event.id,
                     },
                 )]
             }
@@ -1925,4 +2041,123 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
     );
 
     daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    let source = BankAccountUrn::new("dup-source-1").unwrap();
+    let target = IdempotentFeeAccountUrn::new("dup-target-1").unwrap();
+
+    // Open fee account with a known baseline balance.
+    cqrs.execute::<IdempotentFeeAccount>(
+        &target,
+        replay::Metadata::default(),
+        IdempotentFeeAccountCommand::Open { balance: 100.0 },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<IdempotentFeeAccount>(())
+        .register_policy(ChargeFeeWithCausationPolicy {
+            source: source.clone(),
+            target: target.clone(),
+            fee: 5.0,
+        })
+        .build();
+
+    // Bootstrap StartAt::Now cursor at current head (after target account open,
+    // before source deposit exists).
+    assert_eq!(runner.drain().await.unwrap(), 0);
+
+    // Trigger policy reaction with one source deposit (after policy
+    // registration so StartAt::Now can pick it up).
+    cqrs.execute::<BankAccount>(
+        &source,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // First delivery applies one fee charge.
+    assert_eq!(runner.drain().await.unwrap(), 1);
+    let after_first = cqrs
+        .fetch_aggregate::<IdempotentFeeAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(after_first.balance, 95.0);
+
+    let source_event_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM events WHERE stream_id = $1 AND type = $2 ORDER BY version ASC LIMIT 1",
+    )
+    .bind(Into::<Urn>::into(source.clone()).to_string())
+    .bind("Deposited")
+    .fetch_one(&pg_pool)
+    .await
+    .expect("source deposited event must exist");
+
+    let first_fee_meta: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata FROM events WHERE stream_id = $1 AND type = $2 ORDER BY version ASC LIMIT 1",
+    )
+    .bind(Into::<Urn>::into(target.clone()).to_string())
+    .bind("FeeCharged")
+    .fetch_one(&pg_pool)
+    .await
+    .expect("first fee event must exist");
+
+    // Contract: policy-emitted event metadata carries causation identity.
+    assert_eq!(
+        first_fee_meta["causation"]["event_id"],
+        source_event_id.to_string()
+    );
+
+    // Simulate redelivery by rewinding cursor below the source event.
+    sqlx::query("UPDATE policy_cursors SET position = 1 WHERE name = $1")
+        .bind("charge_fee_with_causation_policy")
+        .execute(&pg_pool)
+        .await
+        .expect("cursor rewind update must succeed");
+
+    // Second delivery issues the same causation id, and the aggregate absorbs
+    // it as a no-op.
+    assert_eq!(runner.drain().await.unwrap(), 1);
+
+    let after_second = cqrs
+        .fetch_aggregate::<IdempotentFeeAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(after_second.balance, 95.0);
+
+    let fee_event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1 AND type = $2")
+            .bind(Into::<Urn>::into(target).to_string())
+            .bind("FeeCharged")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("fee event count query must succeed");
+    assert_eq!(fee_event_count, 1);
 }
