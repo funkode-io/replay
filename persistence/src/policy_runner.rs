@@ -19,7 +19,7 @@ use sqlx::{Pool, Postgres, QueryBuilder, Row};
 
 use replay::{Aggregate, Metadata};
 
-use crate::policy::{Dispatch, ErasedPolicy, Policy};
+use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
 /// Erased, services-bound execution path for one aggregate type.
@@ -157,7 +157,7 @@ impl PolicyRunner {
 
     async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
         let name = policy.name().to_string();
-        let cursor = self.load_cursor(&name).await?;
+        let cursor = self.load_cursor(&name, policy.start_at()).await?;
         let feed = self.read_feed(policy.stream_filter(), cursor).await?;
 
         let mut executed = 0;
@@ -256,14 +256,54 @@ impl PolicyRunner {
             .await
     }
 
-    async fn load_cursor(&self, name: &str) -> Result<i64, replay::Error> {
+    async fn load_cursor(&self, name: &str, start_at: StartAt) -> Result<i64, replay::Error> {
         let position =
             sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(crate::db_error)?;
-        Ok(position.unwrap_or(0))
+
+        if let Some(position) = position {
+            return Ok(position);
+        }
+
+        let bootstrap_position = self.bootstrap_position(start_at).await?;
+        sqlx::query(
+            "INSERT INTO policy_cursors (name, position, updated_at) VALUES ($1, $2, now()) \
+             ON CONFLICT (name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(bootstrap_position)
+        .execute(&self.pool)
+        .await
+        .map_err(crate::db_error)?;
+
+        let persisted =
+            sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(crate::db_error)?;
+
+        Ok(persisted)
+    }
+
+    async fn bootstrap_position(&self, start_at: StartAt) -> Result<i64, replay::Error> {
+        match start_at {
+            StartAt::Beginning => Ok(0),
+            StartAt::Now => {
+                let head =
+                    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(global_position) FROM events")
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(crate::db_error)?;
+                Ok(match head {
+                    Some(position) => position,
+                    None => 0,
+                })
+            }
+        }
     }
 
     async fn save_cursor(&self, name: &str, position: i64) -> Result<(), replay::Error> {

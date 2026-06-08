@@ -14,6 +14,17 @@ use replay::{Aggregate, Event, Metadata};
 
 use crate::{PersistedEvent, StreamFilter};
 
+/// Cursor initialization behavior used on first policy registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StartAt {
+    /// Start from the current global head, so only newly appended events are
+    /// processed.
+    #[default]
+    Now,
+    /// Start from position 0 and process full history once.
+    Beginning,
+}
+
 /// A command a [`Policy`] wants the runner to execute against an aggregate.
 ///
 /// `Dispatch` is an *erased descriptor*: it remembers which aggregate type the
@@ -93,6 +104,14 @@ pub trait Policy: Send + Sync {
         StreamFilter::all()
     }
 
+    /// Cursor bootstrap strategy used only when this policy name is first seen.
+    ///
+    /// Defaults to [`StartAt::Now`], the safe mode that avoids retroactively
+    /// firing commands across existing history.
+    fn start_at(&self) -> StartAt {
+        StartAt::Now
+    }
+
     /// Pure reaction: given an event, return the commands to dispatch.
     fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch>;
 }
@@ -107,6 +126,8 @@ pub(crate) trait ErasedPolicy: Send + Sync {
 
     fn stream_filter(&self) -> StreamFilter;
 
+    fn start_at(&self) -> StartAt;
+
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch>;
 }
 
@@ -117,6 +138,10 @@ impl<P: Policy> ErasedPolicy for P {
 
     fn stream_filter(&self) -> StreamFilter {
         Policy::stream_filter(self)
+    }
+
+    fn start_at(&self) -> StartAt {
+        Policy::start_at(self)
     }
 
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {

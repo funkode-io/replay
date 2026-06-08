@@ -678,9 +678,13 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
                 .with_context("stored_json", data_raw.clone())
         })?;
 
-        // should not panic as we only store urns
         let stream_id_string: String = value.get("stream_id");
-        let stream_id: Urn = Urn::try_from(stream_id_string).unwrap();
+        let stream_id: Urn = Urn::try_from(stream_id_string.clone()).map_err(|e| {
+            replay::Error::internal("failed to parse persisted stream_id as URN")
+                .with_operation("postgres_row_to_persisted_event")
+                .with_context("stream_id", stream_id_string)
+                .with_source(e)
+        })?;
         let r#type: String = value.get("type");
         let version: i64 = value.get("version");
         let created: chrono::DateTime<Utc> = value.get("created");
