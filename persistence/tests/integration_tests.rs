@@ -2837,3 +2837,236 @@ async fn policy_business_rule_violation_advances_without_dead_letter_postgres_te
 
     assert_eq!(cursor, 1, "cursor must have advanced past the BRV event");
 }
+
+// ── Batching: read-batch size and checkpoint-batch size (issue #85) ───────────
+
+/// Policy with a custom read-batch size for testing.
+struct SmallBatchPolicy {
+    batch: u32,
+}
+
+impl replay_persistence::Policy for SmallBatchPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "small_batch_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn read_batch_size(&self) -> Option<u32> {
+        Some(self.batch)
+    }
+
+    fn checkpoint_batch_size(&self) -> Option<u32> {
+        // Match read_batch so the read_batch ≥ checkpoint_batch invariant
+        // does not silently raise the read batch to the default (100).
+        Some(self.batch)
+    }
+
+    fn react(&self, _: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        Vec::new() // observe-only; we care about cursor position, not commands
+    }
+}
+
+/// Policy with explicit batch sizes for checkpoint testing.
+struct CheckpointBatchPolicy {
+    read_batch: u32,
+    checkpoint_batch: u32,
+}
+
+impl replay_persistence::Policy for CheckpointBatchPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "checkpoint_batch_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn read_batch_size(&self) -> Option<u32> {
+        Some(self.read_batch)
+    }
+
+    fn checkpoint_batch_size(&self) -> Option<u32> {
+        Some(self.checkpoint_batch)
+    }
+
+    fn react(&self, _: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        Vec::new()
+    }
+}
+
+/// `read_batch_size` caps how many events a single drain call fetches.
+///
+/// With 5 events appended and `read_batch_size = 2`, each drain call
+/// processes exactly 2 events (until the last, which gets the remainder).
+/// Three drain calls are required to exhaust all 5 events.
+#[tokio::test]
+async fn policy_read_batch_limits_events_per_drain_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("batch-read-1").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    // Append 5 events.
+    for _ in 0..5 {
+        cqrs.execute::<BankAccount>(
+            &account,
+            meta.clone(),
+            BankAccountCommand::Deposit {
+                effective_on: date,
+                amount: 10.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(SmallBatchPolicy { batch: 2 })
+        .build();
+
+    // First drain: processes events at positions 1 and 2.
+    runner.drain().await.expect("drain 1 must succeed");
+    let cursor_1: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'small_batch_policy'")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("cursor must exist after drain 1");
+    assert_eq!(
+        cursor_1, 2,
+        "first drain (batch=2) must stop at global_position 2"
+    );
+
+    // Second drain: events 3 and 4.
+    runner.drain().await.expect("drain 2 must succeed");
+    let cursor_2: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'small_batch_policy'")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("cursor must exist after drain 2");
+    assert_eq!(cursor_2, 4, "second drain must stop at global_position 4");
+
+    // Third drain: event 5.
+    runner.drain().await.expect("drain 3 must succeed");
+    let cursor_3: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'small_batch_policy'")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("cursor must exist after drain 3");
+    assert_eq!(cursor_3, 5, "third drain must reach global_position 5");
+}
+
+/// Crash-recovery / skip-safety: resetting the cursor to an earlier checkpoint
+/// causes only the uncommitted tail to be reprocessed — never a skip.
+///
+/// Scenario:
+///   - 4 events appended.
+///   - `checkpoint_batch_size = 2`: the cursor is written after events 2 and 4
+///     (two checkpoint intervals).
+///   - After a full drain the cursor is at 4.
+///   - Simulate a crash by rolling the cursor back to 2 (the first checkpoint).
+///   - Re-drain: events 3 and 4 are reprocessed (at-least-once; absorbed by
+///     idempotency for dispatching policies).
+///   - Cursor ends at 4 again.
+#[tokio::test]
+async fn policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("checkpoint-batch-1").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    for _ in 0..4 {
+        cqrs.execute::<BankAccount>(
+            &account,
+            meta.clone(),
+            BankAccountCommand::Deposit {
+                effective_on: date,
+                amount: 10.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(CheckpointBatchPolicy {
+            read_batch: 4,
+            checkpoint_batch: 2,
+        })
+        .build();
+
+    // Full drain: cursor written at positions 2 and 4 (two checkpoints).
+    runner.drain().await.expect("initial drain must succeed");
+
+    let cursor_after_drain: i64 = sqlx::query_scalar(
+        "SELECT position FROM policy_cursors WHERE name = 'checkpoint_batch_policy'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("cursor must exist");
+    assert_eq!(
+        cursor_after_drain, 4,
+        "cursor must be at 4 after full drain"
+    );
+
+    // Simulate crash: roll cursor back to the first checkpoint (position 2),
+    // as if the process died after that checkpoint but before the final one.
+    sqlx::query("UPDATE policy_cursors SET position = 2 WHERE name = 'checkpoint_batch_policy'")
+        .execute(&pg_pool)
+        .await
+        .expect("cursor rollback must succeed");
+
+    // Re-drain from position 2: only events 3 and 4 are reprocessed.
+    runner.drain().await.expect("recovery drain must succeed");
+
+    let cursor_after_recovery: i64 = sqlx::query_scalar(
+        "SELECT position FROM policy_cursors WHERE name = 'checkpoint_batch_policy'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("cursor must exist after recovery");
+    assert_eq!(
+        cursor_after_recovery, 4,
+        "cursor must be back at 4 after recovery drain"
+    );
+}
