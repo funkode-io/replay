@@ -51,6 +51,7 @@ struct TypedExecutor<A: Aggregate> {
 impl<A> AggregateExecutor for TypedExecutor<A>
 where
     A: Aggregate + 'static,
+    A::Error: Into<replay::Error>,
     A::StreamId: 'static,
     A::Command: 'static,
     A::Services: Send + Sync + 'static,
@@ -73,10 +74,7 @@ where
             cqrs.execute::<A>(&id, metadata, command, &self.services, expected_version)
                 .await
                 .map(|_| ())
-                .map_err(|e| {
-                    replay::Error::internal(format!("policy command failed: {e}"))
-                        .with_operation("policy_execute")
-                })
+                .map_err(Into::into)
         })
     }
 }
@@ -96,6 +94,7 @@ impl PolicyRunnerBuilder {
     pub fn register_services<A>(mut self, services: A::Services) -> Self
     where
         A: Aggregate + 'static,
+        A::Error: Into<replay::Error>,
         A::StreamId: 'static,
         A::Command: 'static,
         A::Services: Send + Sync + 'static,
@@ -354,6 +353,17 @@ impl PolicyRunner {
     }
 }
 
+/// Maximum number of times a retryable dispatch error is retried before the
+/// event is dead-lettered.  Each retry is preceded by an exponential back-off
+/// starting at 100 ms.
+const MAX_DISPATCH_RETRIES: u32 = 3;
+
+/// Returns `true` for errors whose cause may be transient and worth retrying.
+fn is_retryable(kind: replay::ErrorKind) -> bool {
+    use replay::ErrorKind::{Conflict, RateLimited, Unavailable};
+    matches!(kind, Unavailable | RateLimited | Conflict)
+}
+
 async fn drain_policy_once(
     cqrs: &Cqrs<PostgresEventStore>,
     pool: &Pool<Postgres>,
@@ -385,12 +395,18 @@ async fn drain_policy_once(
                     "causation depth limit reached; skipping reaction to prevent runaway cascade"
                 );
             } else {
-                // Real event within depth budget: deliver to the policy.
-                for dispatch in policy.react_erased(&raw) {
-                    execute_dispatch(cqrs, executors, &name, global_position, &raw, dispatch)
-                        .await?;
-                    executed += 1;
-                }
+                // Real event within depth budget: deliver to the policy with
+                // the full resilience policy (BRV advance, retry, dead-letter).
+                executed += execute_event_reactions(
+                    cqrs,
+                    pool,
+                    executors,
+                    policy,
+                    &name,
+                    global_position,
+                    &raw,
+                )
+                .await?;
             }
         }
         // Advance cursor regardless: synthetic rows, depth-limited events, and
@@ -400,6 +416,115 @@ async fn drain_policy_once(
     }
 
     Ok(executed)
+}
+
+/// Execute all reactions for one event, applying the resilience policy:
+///
+/// | Outcome                             | Action                                |
+/// |-------------------------------------|---------------------------------------|
+/// | `Ok`                                | count as executed, continue           |
+/// | `BusinessRuleViolation`             | log + advance (aggregate said no)     |
+/// | Retryable (`Unavailable`, `Conflict`, `RateLimited`) within retry budget | back-off + retry |
+/// | Permanent or retries exhausted      | write `policy_dead_letters`, advance  |
+///
+/// The function always returns `Ok`; failures are absorbed here so the caller's
+/// cursor always advances (a circuit-breaker, never a poison pill).
+///
+/// **Re-react safety**: on retry the policy's `react` is called again for the
+/// same event.  Because `react` is a pure function and the at-least-once +
+/// causation-guard contract already guarantees idempotency, re-executing an
+/// earlier dispatch that already succeeded is safe.
+async fn execute_event_reactions(
+    cqrs: &Cqrs<PostgresEventStore>,
+    pool: &Pool<Postgres>,
+    executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    policy: &dyn ErasedPolicy,
+    policy_name: &str,
+    global_position: i64,
+    raw: &PersistedEvent<Value>,
+) -> Result<usize, replay::Error> {
+    for attempt in 0..=MAX_DISPATCH_RETRIES {
+        let dispatches = policy.react_erased(raw);
+        let mut executed = 0usize;
+        let mut need_retry = false;
+
+        for dispatch in dispatches {
+            match execute_dispatch(cqrs, executors, policy_name, global_position, raw, dispatch)
+                .await
+            {
+                Ok(()) => {
+                    executed += 1;
+                }
+                Err(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation => {
+                    tracing::info!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        global_position,
+                        error           = %e,
+                        "policy dispatch declined by aggregate business rule; advancing cursor"
+                    );
+                }
+                Err(e) if is_retryable(e.kind()) && attempt < MAX_DISPATCH_RETRIES => {
+                    tracing::warn!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        global_position,
+                        attempt,
+                        error           = %e,
+                        "policy dispatch failed with retryable error; backing off before retry"
+                    );
+                    need_retry = true;
+                    break; // skip remaining dispatches for this attempt
+                }
+                Err(e) => {
+                    // Permanent error, or retryable but retries exhausted.
+                    tracing::error!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        global_position,
+                        attempt,
+                        error           = %e,
+                        "policy dispatch failed permanently; writing dead-letter and advancing cursor"
+                    );
+                    write_dead_letter(pool, policy_name, global_position, raw, &e).await?;
+                }
+            }
+        }
+
+        if !need_retry {
+            return Ok(executed);
+        }
+
+        // Exponential back-off: 100 ms, 200 ms, 400 ms, …
+        let backoff = Duration::from_millis(100 * (1u64 << attempt.min(5)));
+        tokio::time::sleep(backoff).await;
+    }
+
+    Ok(0)
+}
+
+/// Write a dead-letter record for a dispatch that could not be executed.
+async fn write_dead_letter(
+    pool: &Pool<Postgres>,
+    policy_name: &str,
+    global_position: i64,
+    raw: &PersistedEvent<Value>,
+    error: &replay::Error,
+) -> Result<(), replay::Error> {
+    sqlx::query(
+        "INSERT INTO policy_dead_letters \
+         (policy_name, global_position, event_id, error_kind, error_message) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(policy_name)
+    .bind(global_position)
+    .bind(raw.id)
+    .bind(error.kind().to_string())
+    .bind(error.to_string())
+    .execute(pool)
+    .await
+    .map_err(crate::db_error)?;
+    Ok(())
 }
 
 /// Read the contiguous, gap-free prefix of events with `global_position >

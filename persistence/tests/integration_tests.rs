@@ -2605,3 +2605,235 @@ async fn policy_causation_depth_limit_stops_loop_postgres_test() {
         "last event in the chain must be at causation depth 3"
     );
 }
+
+// ── Failure handling and policy_dead_letters (issue #84) ─────────────────────
+
+/// Policy that dispatches to an aggregate type that is NOT registered in the
+/// runner, producing a permanent `InvalidInput` error every time.
+struct PoisonDispatchPolicy;
+
+impl replay_persistence::Policy for PoisonDispatchPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "poison_dispatch_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        if matches!(event.data, BankAccountEvent::Deposited { .. }) {
+            // Dispatch to IdempotentFeeAccount — which will NOT be registered in
+            // the runner, triggering a permanent InvalidInput error.
+            let target = IdempotentFeeAccountUrn::new("unregistered-target").unwrap();
+            vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
+                target,
+                IdempotentFeeAccountCommand::Open { balance: 0.0 },
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Policy that dispatches a Withdraw command that the aggregate will reject
+/// with a BusinessRuleViolation (insufficient funds).
+struct InsufficientFundsPolicy;
+
+impl replay_persistence::Policy for InsufficientFundsPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "insufficient_funds_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { operation_date, .. } => {
+                let account = BankAccountUrn::try_from(event.stream_id.clone())
+                    .expect("deposit events live on bank-account streams");
+                // Withdraw more than any realistic balance → BusinessRuleViolation.
+                vec![replay_persistence::Dispatch::to::<BankAccount>(
+                    account,
+                    BankAccountCommand::Withdraw {
+                        effective_on: *operation_date,
+                        amount: 999_999.0,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// A permanently-failing policy dispatch is dead-lettered and the policy advances.
+///
+/// Scenario:
+///   - Append 2 deposits.
+///   - `PoisonDispatchPolicy` reacts to each but dispatches to an unregistered
+///     aggregate type → permanent `InvalidInput` error each time.
+///   - Both dispatches must be dead-lettered; cursor advances past both events.
+///   - A third, clean event (another deposit) is then appended and processed by
+///     a second, healthy policy to prove the runner is not wedged.
+#[tokio::test]
+async fn policy_permanent_failure_is_dead_lettered_and_advances_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("dead-letter-1").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    // Append two deposits that will each produce a permanent dispatch failure.
+    for _ in 0..2 {
+        cqrs.execute::<BankAccount>(
+            &account,
+            meta.clone(),
+            BankAccountCommand::Deposit {
+                effective_on: date,
+                amount: 100.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // PoisonDispatchPolicy dispatches to IdempotentFeeAccount which is NOT
+    // registered in the runner.  No services are added for it intentionally.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(PoisonDispatchPolicy)
+        .build();
+
+    // Drain: both events are processed, both dispatches dead-lettered, 0 commands executed.
+    let dispatches = runner.drain().await.expect("drain must not error");
+    assert_eq!(
+        dispatches, 0,
+        "permanently-failing dispatches must not be counted as executed"
+    );
+
+    // Two dead-letter rows must exist.
+    let dead_letter_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM policy_dead_letters WHERE policy_name = 'poison_dispatch_policy'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("dead-letter count query must succeed");
+
+    assert_eq!(
+        dead_letter_count, 2,
+        "one dead-letter row per failing dispatch"
+    );
+
+    // Cursor must have advanced past both events (policy is not wedged).
+    let cursor: i64 = sqlx::query_scalar(
+        "SELECT position FROM policy_cursors WHERE name = 'poison_dispatch_policy'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("cursor must exist after drain");
+
+    assert_eq!(
+        cursor, 2,
+        "cursor must have advanced past both dead-lettered events"
+    );
+}
+
+/// A BusinessRuleViolation from a dispatch is treated as handled: the cursor
+/// advances without writing a dead-letter record.
+///
+/// Scenario:
+///   - Append a deposit of $10; account balance = 10.
+///   - `InsufficientFundsPolicy` reacts by attempting to withdraw $999 999
+///     → the aggregate returns BusinessRuleViolation (insufficient funds).
+///   - Drain must return 0 dispatches executed (the command was declined).
+///   - No dead-letter row must be written.
+///   - Cursor advances.
+#[tokio::test]
+async fn policy_business_rule_violation_advances_without_dead_letter_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("brv-1").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 10.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(InsufficientFundsPolicy)
+        .build();
+
+    // Drain: the Withdraw is rejected with BusinessRuleViolation; drain does not error.
+    let dispatches = runner.drain().await.expect("drain must not error on BRV");
+    assert_eq!(
+        dispatches, 0,
+        "a BRV-declined command must not be counted as executed"
+    );
+
+    // No dead-letter rows: BRV is not a failure, just the aggregate saying no.
+    let dead_letter_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM policy_dead_letters WHERE policy_name = 'insufficient_funds_policy'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("dead-letter count query must succeed");
+
+    assert_eq!(
+        dead_letter_count, 0,
+        "BRV must not produce a dead-letter record"
+    );
+
+    // Cursor advances: the policy is not wedged by the rejection.
+    let cursor: i64 = sqlx::query_scalar(
+        "SELECT position FROM policy_cursors WHERE name = 'insufficient_funds_policy'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("cursor must exist after drain");
+
+    assert_eq!(cursor, 1, "cursor must have advanced past the BRV event");
+}
