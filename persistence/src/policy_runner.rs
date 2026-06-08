@@ -177,9 +177,19 @@ impl PolicyRunner {
 
     /// Start one long-lived polling task per registered policy.
     ///
-    /// Each task owns its cursor in task-local state and periodically reads the
-    /// policy feed to execute reactions. Use [`PolicyRunnerDaemon::shutdown`] to
-    /// stop tasks cleanly.
+    /// Each task competes for a per-policy `pg_advisory_lock` before entering its
+    /// polling loop.  The lock key is derived from the policy name, so:
+    ///
+    /// - **Exactly one** service instance is the active leader for each policy at
+    ///   any moment (single-consumer correctness for the ordered global feed).
+    /// - **Different policies** may run on different instances concurrently.
+    /// - **Leader failover is automatic**: the advisory lock is session-scoped, so
+    ///   when the leader's task (or its host process) dies the lock is released and
+    ///   a standby acquires it on the next poll and resumes from the stored cursor.
+    ///
+    /// Use [`PolicyRunnerDaemon::shutdown`] to stop all tasks cleanly.  Shutdown
+    /// explicitly calls `pg_advisory_unlock` so the standby can take over without
+    /// waiting for a TCP-level session timeout.
     pub fn start_polling(&self, interval: Duration) -> PolicyRunnerDaemon {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::with_capacity(self.policies.len());
@@ -193,44 +203,131 @@ impl PolicyRunner {
 
             tasks.push(tokio::spawn(async move {
                 let name = policy.name().to_string();
-                let mut cursor = match load_cursor(&pool, &name, policy.start_at()).await {
-                    Ok(cursor) => cursor,
-                    Err(error) => {
-                        tracing::error!(
-                            policy = %name,
-                            error = %error,
-                            "policy task failed to initialize cursor"
-                        );
+
+                // Outer loop: repeatedly attempt to acquire the advisory lock.
+                // A standby instance stays in this loop, sleeping between attempts.
+                'acquire: loop {
+                    if *policy_shutdown_rx.borrow() {
                         return;
                     }
-                };
 
-                loop {
-                    if *policy_shutdown_rx.borrow() {
-                        break;
-                    }
-
-                    match drain_policy_once(&cqrs, &pool, &executors, policy.as_ref(), &mut cursor)
-                        .await
-                    {
-                        Ok(_) => {}
+                    // Hold a dedicated connection for the session-scoped lock.
+                    // Keeping this connection alive for the full leadership tenure
+                    // ensures the lock is not silently released between polls.
+                    let mut lock_conn = match pool.acquire().await {
+                        Ok(conn) => conn,
                         Err(error) => {
                             tracing::error!(
                                 policy = %name,
                                 error = %error,
-                                "policy polling iteration failed"
+                                "policy task could not acquire a connection for advisory lock"
                             );
+                            tokio::select! {
+                                _ = policy_shutdown_rx.changed() => {}
+                                _ = tokio::time::sleep(interval) => {}
+                            }
+                            continue 'acquire;
+                        }
+                    };
+
+                    // pg_try_advisory_lock is non-blocking: returns true only when
+                    // this session exclusively holds the lock for `name`.
+                    let acquired = match sqlx::query_scalar::<_, bool>(
+                        "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
+                    )
+                    .bind(&name)
+                    .fetch_one(&mut *lock_conn)
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(error) => {
+                            tracing::error!(
+                                policy = %name,
+                                error = %error,
+                                "advisory lock query failed"
+                            );
+                            tokio::select! {
+                                _ = policy_shutdown_rx.changed() => {}
+                                _ = tokio::time::sleep(interval) => {}
+                            }
+                            continue 'acquire;
+                        }
+                    };
+
+                    if !acquired {
+                        tracing::debug!(
+                            policy = %name,
+                            "advisory lock held by another instance; standing by"
+                        );
+                        drop(lock_conn);
+                        tokio::select! {
+                            _ = policy_shutdown_rx.changed() => {}
+                            _ = tokio::time::sleep(interval) => {}
+                        }
+                        continue 'acquire;
+                    }
+
+                    tracing::info!(policy = %name, "acquired advisory lock; running as leader");
+
+                    // Initialize cursor from the stored checkpoint (or bootstrap).
+                    let mut cursor = match load_cursor(&pool, &name, policy.start_at()).await {
+                        Ok(cursor) => cursor,
+                        Err(error) => {
+                            tracing::error!(
+                                policy = %name,
+                                error = %error,
+                                "leader failed to initialize cursor; releasing lock"
+                            );
+                            let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+                                .bind(&name)
+                                .execute(&mut *lock_conn)
+                                .await;
+                            return;
+                        }
+                    };
+
+                    // Leadership polling loop.
+                    loop {
+                        if *policy_shutdown_rx.borrow() {
+                            break;
+                        }
+
+                        match drain_policy_once(
+                            &cqrs,
+                            &pool,
+                            &executors,
+                            policy.as_ref(),
+                            &mut cursor,
+                        )
+                        .await
+                        {
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::error!(
+                                    policy = %name,
+                                    error = %error,
+                                    "policy polling iteration failed"
+                                );
+                            }
+                        }
+
+                        tokio::select! {
+                            changed = policy_shutdown_rx.changed() => {
+                                if changed.is_err() || *policy_shutdown_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(interval) => {}
                         }
                     }
 
-                    tokio::select! {
-                        changed = policy_shutdown_rx.changed() => {
-                            if changed.is_err() || *policy_shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
-                        _ = tokio::time::sleep(interval) => {}
-                    }
+                    // Shutdown: explicitly release the lock so a standby can take
+                    // over immediately (without waiting for a TCP session timeout).
+                    let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+                        .bind(&name)
+                        .execute(&mut *lock_conn)
+                        .await;
+                    return;
                 }
             }));
         }
