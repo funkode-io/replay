@@ -117,6 +117,20 @@ pub trait Policy: Send + Sync {
         StartAt::Now
     }
 
+    /// Maximum causation depth this policy will react to.  The runner skips any
+    /// event whose `causation.depth` is ≥ this value and logs loudly instead,
+    /// acting as a circuit breaker for runaway event → command → event cascades.
+    ///
+    /// Resolution order (most-specific-first):
+    ///   1. This per-policy override (when `Some`).
+    ///   2. Environment variable `REPLAY_MAX_CAUSATION_DEPTH`.
+    ///   3. Built-in default (10).
+    ///
+    /// Return `None` to defer to the global env var / built-in default.
+    fn max_causation_depth(&self) -> Option<u32> {
+        None
+    }
+
     /// Pure reaction: given an event, return the commands to dispatch.
     ///
     /// Invariant: because delivery is at-least-once, target aggregate command
@@ -136,6 +150,8 @@ pub(crate) trait ErasedPolicy: Send + Sync {
 
     fn start_at(&self) -> StartAt;
 
+    fn max_causation_depth_erased(&self) -> Option<u32>;
+
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch>;
 }
 
@@ -150,6 +166,10 @@ impl<P: Policy> ErasedPolicy for P {
 
     fn start_at(&self) -> StartAt {
         Policy::start_at(self)
+    }
+
+    fn max_causation_depth_erased(&self) -> Option<u32> {
+        Policy::max_causation_depth(self)
     }
 
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {

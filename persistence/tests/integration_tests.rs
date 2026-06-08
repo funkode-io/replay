@@ -2470,3 +2470,138 @@ async fn policy_single_active_runner_via_advisory_lock_postgres_test() {
 
     daemon_b.shutdown().await;
 }
+
+// ── Loop prevention via causation-depth limit (issue #83) ────────────────────
+
+/// A policy that deliberately creates a loop: every `Deposited` event triggers
+/// another `Deposit` command on the same account. Without the depth limit this
+/// would run forever.
+struct LoopPolicy {
+    max_depth: u32,
+}
+
+impl replay_persistence::Policy for LoopPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "loop_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn max_causation_depth(&self) -> Option<u32> {
+        Some(self.max_depth)
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { operation_date, .. } => {
+                let account = BankAccountUrn::try_from(event.stream_id.clone())
+                    .expect("deposit events live on bank-account streams");
+                // Self-trigger: deposit $1 back, which creates another Deposited.
+                vec![replay_persistence::Dispatch::to::<BankAccount>(
+                    account,
+                    BankAccountCommand::Deposit {
+                        effective_on: *operation_date,
+                        amount: 1.0,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// A self-triggering policy stops at the configured causation-depth limit.
+///
+/// Scenario (max_depth = 3):
+///   - gp=1  Deposited (depth=0) → reacts → gp=2 Deposited (depth=1)
+///   - gp=2  Deposited (depth=1) → reacts → gp=3 Deposited (depth=2)
+///   - gp=3  Deposited (depth=2) → reacts → gp=4 Deposited (depth=3)
+///   - gp=4  Deposited (depth=3 ≥ max_depth=3) → circuit-breaker fires, skipped
+///
+/// Exactly 3 reactions, 4 total Deposited events, cursor at gp=4.
+#[tokio::test]
+async fn policy_causation_depth_limit_stops_loop_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("loop-1").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    // Seed: one initial deposit at depth 0 (no causation metadata).
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(LoopPolicy { max_depth: 3 })
+        .build();
+
+    // Drain until the chain stabilises (circuit breaker fires and no more reactions).
+    // The upper bound of 10 ensures the test terminates even if the limit is broken.
+    let mut rounds: Vec<usize> = Vec::new();
+    for _ in 0..10 {
+        let n = runner.drain().await.expect("drain must not error");
+        rounds.push(n);
+        if n == 0 {
+            break;
+        }
+    }
+
+    // The chain must have stopped cleanly: 1 reaction per drain, then 0.
+    assert_eq!(
+        rounds,
+        vec![1, 1, 1, 0],
+        "expected 3 reactions (depths 0→1, 1→2, 2→3) then the circuit breaker to fire"
+    );
+
+    // Exactly 4 Deposited events in the DB (depths 0, 1, 2, 3).
+    let deposited_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE type = 'Deposited'")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("count query must succeed");
+    assert_eq!(
+        deposited_count, 4,
+        "chain must have produced exactly 4 Deposited events"
+    );
+
+    // The last event must carry causation.depth = 3 in its metadata.
+    let last_meta: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata FROM events WHERE type = 'Deposited' ORDER BY global_position DESC LIMIT 1",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("last deposited event must exist");
+
+    assert_eq!(
+        last_meta["causation"]["depth"],
+        serde_json::json!(3),
+        "last event in the chain must be at causation depth 3"
+    );
+}

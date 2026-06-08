@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Pool, Postgres, QueryBuilder, Row};
 use tokio::sync::watch;
@@ -287,6 +288,7 @@ impl PolicyRunner {
                     };
 
                     // Leadership polling loop.
+                    let max_depth = resolve_max_depth(policy.as_ref());
                     loop {
                         if *policy_shutdown_rx.borrow() {
                             break;
@@ -298,6 +300,7 @@ impl PolicyRunner {
                             &executors,
                             policy.as_ref(),
                             &mut cursor,
+                            max_depth,
                         )
                         .await
                         {
@@ -338,7 +341,16 @@ impl PolicyRunner {
     async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
         let name = policy.name().to_string();
         let mut cursor = load_cursor(&self.pool, &name, policy.start_at()).await?;
-        drain_policy_once(&self.cqrs, &self.pool, &self.executors, policy, &mut cursor).await
+        let max_depth = resolve_max_depth(policy);
+        drain_policy_once(
+            &self.cqrs,
+            &self.pool,
+            &self.executors,
+            policy,
+            &mut cursor,
+            max_depth,
+        )
+        .await
     }
 }
 
@@ -348,6 +360,7 @@ async fn drain_policy_once(
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     policy: &dyn ErasedPolicy,
     cursor: &mut i64,
+    max_depth: u32,
 ) -> Result<usize, replay::Error> {
     let name = policy.name().to_string();
     let feed = read_feed(pool, policy.stream_filter(), *cursor).await?;
@@ -355,15 +368,33 @@ async fn drain_policy_once(
     let mut executed = 0;
     for (global_position, maybe_raw) in feed {
         if let Some(raw) = maybe_raw {
-            // Real event: deliver to the policy and execute all returned dispatches.
-            for dispatch in policy.react_erased(&raw) {
-                execute_dispatch(cqrs, executors, &name, global_position, &raw, dispatch).await?;
-                executed += 1;
+            let depth = event_causation_depth(&raw);
+            if depth >= max_depth {
+                // Circuit breaker: the event's causation chain is too deep.
+                // Skip reactions but keep advancing so the policy is not wedged.
+                let (_, limit_source) = resolve_max_depth_with_source(policy);
+                tracing::warn!(
+                    policy        = %name,
+                    event_id      = %raw.id,
+                    stream_id     = %raw.stream_id,
+                    global_position,
+                    depth,
+                    max_depth,
+                    limit_source,
+                    causation_chain = ?parse_causation_info(&raw),
+                    "causation depth limit reached; skipping reaction to prevent runaway cascade"
+                );
+            } else {
+                // Real event within depth budget: deliver to the policy.
+                for dispatch in policy.react_erased(&raw) {
+                    execute_dispatch(cqrs, executors, &name, global_position, &raw, dispatch)
+                        .await?;
+                    executed += 1;
+                }
             }
         }
-        // Advance cursor regardless of whether the row was a real event or a synthetic
-        // compaction snapshot.  Synthetics must still move the cursor forward so the
-        // next poll does not re-process positions the runner has already seen.
+        // Advance cursor regardless: synthetic rows, depth-limited events, and
+        // normally-processed events all move the checkpoint forward.
         save_cursor(pool, &name, global_position).await?;
         *cursor = global_position;
     }
@@ -529,24 +560,92 @@ async fn save_cursor(
     Ok(())
 }
 
+/// Typed representation of the `causation` block stamped in event metadata by
+/// every policy reaction.  Using a struct instead of manual `Value` navigation
+/// ensures the write (serialization) and read (deserialization) paths stay in sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CausationInfo {
+    policy: String,
+    event_id: String,
+    stream_id: String,
+    global_position: i64,
+    /// How many policy hops deep this event is.  Root events (from normal
+    /// `append`) carry no causation block and are treated as depth 0.
+    #[serde(default)]
+    depth: u32,
+}
+
+/// Top-level metadata payload written by the runner for each policy-issued command.
+#[derive(Debug, Serialize)]
+struct CausationPayload {
+    causation: CausationInfo,
+}
+
 /// Causation metadata stamped on every command a policy issues.
 ///
-/// Records which policy reacted and which event triggered it. This is the seed
-/// of the causation chain that later slices use for idempotency (#80) and
-/// loop-depth limiting (#83).
+/// Records which policy reacted and which event triggered it, and increments the
+/// causation depth so the runner can detect runaway event→command→event cascades.
 fn causation_metadata(
     policy_name: &str,
     global_position: i64,
     raw: &PersistedEvent<Value>,
 ) -> Metadata {
-    Metadata::new(serde_json::json!({
-        "causation": {
-            "policy": policy_name,
-            "event_id": raw.id.to_string(),
-            "stream_id": raw.stream_id.to_string(),
-            "global_position": global_position,
+    Metadata::new(CausationPayload {
+        causation: CausationInfo {
+            policy: policy_name.to_string(),
+            event_id: raw.id.to_string(),
+            stream_id: raw.stream_id.to_string(),
+            global_position,
+            depth: event_causation_depth(raw) + 1,
+        },
+    })
+}
+
+/// Extract the causation depth from an event's metadata.
+///
+/// Events written by normal `append` calls carry no `causation` block and are
+/// treated as depth 0 (the root of a potential chain).  Events emitted by policy
+/// reactions carry the depth stamped in [`causation_metadata`].
+fn event_causation_depth(raw: &PersistedEvent<Value>) -> u32 {
+    parse_causation_info(raw).map(|c| c.depth).unwrap_or(0)
+}
+
+/// Deserialize the `causation` block from an event's metadata, if present.
+fn parse_causation_info(raw: &PersistedEvent<Value>) -> Option<CausationInfo> {
+    raw.metadata
+        .to_json()
+        .get("causation")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+}
+
+/// Built-in default maximum causation depth (circuit-breaker for loops).
+const DEFAULT_MAX_CAUSATION_DEPTH: u32 = 10;
+
+/// Environment variable that overrides the built-in depth limit.
+const CAUSATION_DEPTH_ENV_VAR: &str = "REPLAY_MAX_CAUSATION_DEPTH";
+
+/// Resolve the effective causation depth limit for a policy.
+///
+/// Precedence (most-specific wins):
+///   1. Per-policy override via [`Policy::max_causation_depth`]
+///   2. `REPLAY_MAX_CAUSATION_DEPTH` environment variable
+///   3. Built-in default (10)
+fn resolve_max_depth(policy: &dyn ErasedPolicy) -> u32 {
+    resolve_max_depth_with_source(policy).0
+}
+
+/// Like [`resolve_max_depth`] but also returns the source for diagnostic logging.
+fn resolve_max_depth_with_source(policy: &dyn ErasedPolicy) -> (u32, &'static str) {
+    if let Some(d) = policy.max_causation_depth_erased() {
+        return (d, "policy override");
+    }
+    if let Ok(s) = std::env::var(CAUSATION_DEPTH_ENV_VAR) {
+        if let Ok(d) = s.parse::<u32>() {
+            return (d, CAUSATION_DEPTH_ENV_VAR);
         }
-    }))
+    }
+    (DEFAULT_MAX_CAUSATION_DEPTH, "built-in default")
 }
 
 fn merge_dispatch_metadata(
