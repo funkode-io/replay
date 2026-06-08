@@ -509,6 +509,18 @@ impl EventStore for PostgresEventStore {
         }
 
         transaction.commit().await.map_err(crate::db_error)?;
+
+        // Best-effort NOTIFY: wake any waiting policy tasks immediately so they
+        // react without waiting for the next poll interval.  Errors are silently
+        // swallowed — polling remains the correctness baseline and a missed
+        // notification is caught on the next interval.
+        if !domain_events.is_empty() {
+            let _ = sqlx::query("SELECT pg_notify('replay_events', $1)")
+                .bind(&stream_type)
+                .execute(&self.pool)
+                .await;
+        }
+
         Ok(())
     }
 

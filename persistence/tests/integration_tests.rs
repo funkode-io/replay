@@ -3168,3 +3168,141 @@ async fn global_position_closure_policy_charges_deposit_fee_postgres_test() {
         "second drain must dispatch nothing (cursor already advanced)"
     );
 }
+
+// ── LISTEN/NOTIFY latency optimisation (issue #86) ───────────────────────────
+
+/// With NOTIFY enabled the daemon wakes immediately on an append, well before
+/// the poll interval would fire.
+///
+/// The test uses a 30 s poll interval but expects a reaction within 5 s — if
+/// NOTIFY is working the daemon wakes as soon as `store_events` fires the
+/// `pg_notify('replay_events', ...)` after committing.
+#[tokio::test]
+async fn policy_notify_wakes_daemon_before_poll_interval_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("notify-wake-1").unwrap();
+
+    // Start the daemon with NOTIFY enabled (default) and a very long poll interval
+    // so that any reaction *before* 5 s must have been triggered by NOTIFY.
+    let runner = std::sync::Arc::new(
+        replay_persistence::PolicyRunner::builder(cqrs.clone())
+            .register_services::<BankAccount>(())
+            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            .build(),
+    );
+    let daemon = runner
+        .clone()
+        .start_polling(std::time::Duration::from_secs(30));
+
+    // Allow the daemon task to start and acquire the advisory lock before appending.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Wait up to 5 s; the NOTIFY wakeup should trigger within ~100 ms.
+    let mut reacted = false;
+    for _ in 0..100 {
+        let state = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
+        if (state.balance - 95.0).abs() < f64::EPSILON {
+            reacted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    daemon.shutdown().await;
+
+    assert!(
+        reacted,
+        "policy must react via NOTIFY before the 30 s poll interval fires"
+    );
+}
+
+/// With notifications disabled the daemon falls back to pure polling and still
+/// reacts correctly.
+#[tokio::test]
+async fn policy_daemon_reacts_without_notify_via_polling_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("no-notify-1").unwrap();
+
+    let runner = std::sync::Arc::new(
+        replay_persistence::PolicyRunner::builder(cqrs.clone())
+            .register_services::<BankAccount>(())
+            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            // Disable NOTIFY: must still react via the polling interval.
+            .without_notifications()
+            .build(),
+    );
+    let daemon = runner
+        .clone()
+        .start_polling(std::time::Duration::from_millis(50));
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut reacted = false;
+    for _ in 0..40 {
+        let state = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
+        if (state.balance - 95.0).abs() < f64::EPSILON {
+            reacted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    daemon.shutdown().await;
+
+    assert!(
+        reacted,
+        "policy must react via polling even when NOTIFY is disabled"
+    );
+}
