@@ -2161,3 +2161,133 @@ async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test(
             .expect("fee event count query must succeed");
     assert_eq!(fee_event_count, 1);
 }
+
+// ── Compaction feed (issue #81) ───────────────────────────────────────────────
+
+/// Policy correctly walks the true log across a compaction boundary.
+///
+/// Scenario (ADR 0004):
+///   1. Two real events are appended: Deposited(100) at gp=1, MonthlyClosed at gp=2.
+///   2. Compact is called: originals archived (compacted_snapshot=false), one synthetic
+///      MonthlyClosed snapshot inserted at gp=3 (compacted_snapshot=true).
+///   3. One more real event is appended after compaction: Deposited(200) at gp=4.
+///   4. A policy with `StartAt::Beginning` is registered and drained.
+///
+/// Acceptance criteria (from the issue):
+///   - Policy processes gp=1 (Deposited) — pre-compaction original       → 1 reaction
+///   - Policy skips   gp=2 (MonthlyClosed) — no matching reaction         → 0 reactions
+///   - Policy skips   gp=3 (synthetic snapshot) without cursor deadlock   → 0 reactions
+///   - Policy processes gp=4 (Deposited) — post-compaction real event     → 1 reaction
+///   - Total dispatches = 2 (not 3, which would indicate the synthetic was
+///     mis-delivered, or 1, which would indicate the cursor stalled at gp=2).
+#[tokio::test]
+async fn policy_lagging_behind_compaction_skips_synthetic_snapshot_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("compaction-feed-1").unwrap();
+    let meta = replay::Metadata::default();
+    let jan_1 = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let feb_1 = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+
+    // ── Pre-compaction: Deposited(100) + MonthlyClosed ────────────────────────
+    cqrs.execute::<BankAccount>(
+        &account,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: jan_1,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        meta.clone(),
+        BankAccountCommand::CloseMonth { month: jan_1 },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // ── Compact: archives originals; inserts synthetic snapshot ───────────────
+    let aggregate = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
+    cqrs.compact(&aggregate, meta.clone()).await.unwrap();
+
+    // Confirm the synthetic row was written with compacted_snapshot = true.
+    let synthetic_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE compacted_snapshot = TRUE")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("synthetic row count query must succeed");
+    assert_eq!(
+        synthetic_count, 1,
+        "compact must produce exactly one synthetic row (the MonthlyClosed snapshot)"
+    );
+
+    // ── Post-compaction: append one more real event ───────────────────────────
+    cqrs.execute::<BankAccount>(
+        &account,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: feb_1,
+            amount: 200.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // At this point the global_position sequence is:
+    //   gp=1  Deposited(100)     real, archived (compacted_snapshot=false)
+    //   gp=2  MonthlyClosed      real, archived (compacted_snapshot=false)
+    //   gp=3  MonthlyClosed snap synthetic      (compacted_snapshot=true)
+    //   gp=4  Deposited(200)     real, live      (compacted_snapshot=false)
+
+    // ── Register a lagging policy that starts from the beginning ─────────────
+    // `WithdrawFeePolicyStartAtBeginning` starts at gp=0, reacts to Deposited.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+        .build();
+
+    let dispatches = runner.drain().await.expect("drain must succeed");
+
+    // Two dispatches: gp=1 (Deposited pre-compaction) + gp=4 (Deposited post-compaction).
+    // If dispatches == 3 the synthetic was mis-delivered.
+    // If dispatches < 2 the cursor stalled before gp=4 (gap-detection broken).
+    assert_eq!(
+        dispatches, 2,
+        "policy must react to both real Deposited events and skip the synthetic snapshot"
+    );
+
+    // The cursor must have advanced past the synthetic (gp=3) and reached gp=4.
+    let final_cursor: i64 = sqlx::query_scalar(
+        "SELECT position FROM policy_cursors WHERE name = 'withdraw_fee_policy_start_at_beginning'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("cursor must exist after drain");
+
+    assert_eq!(
+        final_cursor, 4,
+        "cursor must have advanced past the synthetic snapshot to the final real event"
+    );
+}
