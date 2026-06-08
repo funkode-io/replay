@@ -280,6 +280,50 @@ impl Aggregate for PolicyFeeLedger {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Deposit-fee policy (closure shortcut example)
+//
+// This section shows the low-ceremony `register_policy_fn` path.  The same
+// domain logic is exercised by the Docker-gated integration test
+// `global_position_closure_policy_charges_fee_postgres_test`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stable cursor key for the deposit-fee policy.
+pub const DEPOSIT_FEE_POLICY_NAME: &str = "deposit_fee";
+
+/// Fee fraction charged on every deposit (1 %).
+pub const DEPOSIT_FEE_RATE: f64 = 0.01;
+
+/// URN of the shared fee ledger aggregate instance.
+pub const DEPOSIT_FEE_LEDGER_ID: &str = "global-fees";
+
+/// Pure reaction for the deposit-fee policy.
+///
+/// Reacts to every [`BankAccountEvent::Deposited`] by charging a 1 % fee to
+/// the shared [`PolicyFeeLedger`].  The `causation_event_id` field in the
+/// command carries the triggering event's identity so the ledger can absorb
+/// duplicate deliveries as no-ops.
+///
+/// Exported so the integration test can pass it directly to
+/// [`PolicyRunnerBuilder::register_policy_fn`] and keep the logic in one place.
+pub fn deposit_fee_react(
+    event: &replay_persistence::PersistedEvent<BankAccountEvent>,
+) -> Vec<replay_persistence::Dispatch> {
+    match &event.data {
+        BankAccountEvent::Deposited { amount } => {
+            let ledger = PolicyFeeLedgerUrn::new(DEPOSIT_FEE_LEDGER_ID).unwrap();
+            vec![replay_persistence::Dispatch::to::<PolicyFeeLedger>(
+                ledger,
+                PolicyFeeLedgerCommand::ChargeFee {
+                    amount: amount * DEPOSIT_FEE_RATE,
+                    causation_event_id: event.id,
+                },
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Cross-aggregate read model: a user's global position
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -79,6 +79,39 @@ where
     }
 }
 
+// ── Closure-based policy adapter ─────────────────────────────────────────────
+
+/// A [`Policy`] backed by a plain closure, created via
+/// [`PolicyRunnerBuilder::register_policy_fn`].
+struct ClosurePolicy<E, F> {
+    name: String,
+    start_at: StartAt,
+    react: F,
+    _phantom: std::marker::PhantomData<E>,
+}
+
+impl<E, F> Policy for ClosurePolicy<E, F>
+where
+    E: replay::Event + 'static,
+    F: Fn(&PersistedEvent<E>) -> Vec<Dispatch> + Send + Sync + 'static,
+{
+    type Event = E;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn start_at(&self) -> StartAt {
+        self.start_at
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+        (self.react)(event)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Builds a [`PolicyRunner`] by registering aggregate services and policies.
 pub struct PolicyRunnerBuilder {
     cqrs: Cqrs<PostgresEventStore>,
@@ -111,6 +144,45 @@ impl PolicyRunnerBuilder {
     {
         self.policies.push(Arc::new(policy));
         self
+    }
+
+    /// Register a policy using a **closure** instead of a full [`Policy`] impl.
+    ///
+    /// This is the low-ceremony path for simple, single-aggregate reactions where
+    /// writing a dedicated struct + `impl Policy` would be boilerplate:
+    ///
+    /// ```rust,ignore
+    /// runner_builder
+    ///     .register_policy_fn::<BankAccountEvent, _>(
+    ///         "deposit_fee",
+    ///         StartAt::Beginning,
+    ///         |event| match &event.data {
+    ///             BankAccountEvent::Deposited { amount } => vec![
+    ///                 Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount: amount * 0.01 })
+    ///             ],
+    ///             _ => vec![],
+    ///         },
+    ///     )
+    /// ```
+    ///
+    /// The closure runs through the exact same runner machinery as a `Policy` impl:
+    /// causation stamping, failure handling, batching, advisory lock, etc.
+    pub fn register_policy_fn<E, F>(
+        self,
+        name: impl Into<String>,
+        start_at: StartAt,
+        react: F,
+    ) -> Self
+    where
+        E: replay::Event + 'static,
+        F: Fn(&PersistedEvent<E>) -> Vec<Dispatch> + Send + Sync + 'static,
+    {
+        self.register_policy(ClosurePolicy {
+            name: name.into(),
+            start_at,
+            react,
+            _phantom: std::marker::PhantomData,
+        })
     }
 
     pub fn build(self) -> PolicyRunner {

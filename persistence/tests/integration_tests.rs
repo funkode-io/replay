@@ -3070,3 +3070,101 @@ async fn policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test()
         "cursor must be back at 4 after recovery drain"
     );
 }
+
+// ── Closure shortcut: register_policy_fn (issue #87) ─────────────────────────
+
+/// `register_policy_fn` wires the deposit-fee reaction (defined in the example)
+/// through the same runner machinery as a full `impl Policy`.
+///
+/// Scenario:
+///   - User registers; opens a BankAccount.
+///   - A deposit of $100 is made.
+///   - The closure policy (defined in `global_position.rs`) reacts to the
+///     `Deposited` event and dispatches `ChargeFee { amount: 1.0 }` to the
+///     `PolicyFeeLedger`.
+///   - After drain: a `FeeCharged` event exists on the ledger stream.
+///   - Drain is idempotent: running it again produces no additional fees.
+#[tokio::test]
+async fn global_position_closure_policy_charges_deposit_fee_postgres_test() {
+    use global_position::{
+        BankAccount, BankAccountCommand, BankAccountEvent, BankAccountUrn, PolicyFeeLedger,
+        PolicyFeeLedgerUrn, DEPOSIT_FEE_LEDGER_ID, DEPOSIT_FEE_POLICY_NAME, DEPOSIT_FEE_RATE,
+    };
+
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("closure-test-1").unwrap();
+
+    // Deposit $100 into the account.
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::OpenAccount {
+            owner: global_position::UserUrn::new("alice").unwrap(),
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let deposit_amount = 100.0_f64;
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            amount: deposit_amount,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_services::<PolicyFeeLedger>(())
+        .register_policy_fn::<BankAccountEvent, _>(
+            DEPOSIT_FEE_POLICY_NAME,
+            replay_persistence::StartAt::Beginning,
+            global_position::deposit_fee_react,
+        )
+        .build();
+
+    // First drain: reacts to the Deposited event and charges the fee.
+    let dispatched = runner.drain().await.expect("first drain must succeed");
+    assert_eq!(dispatched, 1, "one FeeCharged command must be dispatched");
+
+    // The fee ledger must have a FeeCharged event for the expected amount.
+    let expected_fee = deposit_amount * DEPOSIT_FEE_RATE;
+    let ledger_urn = PolicyFeeLedgerUrn::new(DEPOSIT_FEE_LEDGER_ID).unwrap();
+    let ledger = cqrs
+        .fetch_aggregate::<PolicyFeeLedger>(&ledger_urn)
+        .await
+        .expect("fee ledger must be fetchable");
+    assert!(
+        (ledger.balance - (-expected_fee)).abs() < 1e-9,
+        "fee ledger balance must be -{expected_fee:.2}, got {:.2}",
+        ledger.balance
+    );
+
+    // Second drain: idempotent — the causation guard absorbs the duplicate.
+    let dispatched_again = runner.drain().await.expect("second drain must succeed");
+    assert_eq!(
+        dispatched_again, 0,
+        "second drain must dispatch nothing (cursor already advanced)"
+    );
+}
