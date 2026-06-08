@@ -1377,3 +1377,153 @@ async fn global_position_live_query_and_inline_projection_agree_postgres_test() 
     assert_eq!(live.position().name, inline_name);
     assert_eq!(live.position().total_balance, inline_balance);
 }
+
+// ── Policies: checkpointed background reactions (issue #77) ───────────────────
+
+/// A toy policy: whenever a deposit lands, charge a flat fee by issuing a
+/// `Withdraw` command back to the same account. Because `Withdrawn` is not a
+/// `Deposited`, the reaction does not feed itself — no loop.
+struct WithdrawFeePolicy {
+    fee: f64,
+}
+
+impl replay_persistence::Policy for WithdrawFeePolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "withdraw_fee_policy"
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { operation_date, .. } => {
+                let account = BankAccountUrn::try_from(event.stream_id.clone())
+                    .expect("deposit events live on bank-account streams");
+                vec![replay_persistence::Dispatch::to::<BankAccount>(
+                    account,
+                    BankAccountCommand::Withdraw {
+                        effective_on: *operation_date,
+                        amount: self.fee,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Pure `react` unit test — no database. Asserts the policy returns exactly one
+/// dispatch, targeting the `BankAccount` aggregate, on a deposit, and nothing on
+/// other events.
+#[test]
+fn withdraw_fee_policy_react_is_pure() {
+    use std::any::TypeId;
+
+    let policy = WithdrawFeePolicy { fee: 5.0 };
+    let stream_id: Urn = BankAccountUrn::new("pure-react-1").unwrap().into();
+
+    let deposit = PersistedEvent {
+        id: uuid::Uuid::new_v4(),
+        data: BankAccountEvent::Deposited {
+            operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        stream_id: stream_id.clone(),
+        r#type: "Deposited".to_string(),
+        version: 1,
+        created: chrono::Utc::now(),
+        metadata: replay::Metadata::default(),
+        aggregate_version: None,
+    };
+
+    let dispatches = replay_persistence::Policy::react(&policy, &deposit);
+    assert_eq!(dispatches.len(), 1);
+    assert_eq!(dispatches[0].target(), TypeId::of::<BankAccount>());
+
+    let withdrawal = PersistedEvent {
+        data: BankAccountEvent::Withdrawn {
+            operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            amount: 5.0,
+        },
+        r#type: "Withdrawn".to_string(),
+        ..deposit
+    };
+
+    assert!(replay_persistence::Policy::react(&policy, &withdrawal).is_empty());
+}
+
+/// End-to-end walking skeleton: append a deposit, drain the policy once, and
+/// assert the reaction's `Withdrawn` event landed (balance dropped by the fee)
+/// and the policy cursor advanced past the triggering event.
+#[tokio::test]
+async fn withdraw_fee_policy_drain_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    let account = BankAccountUrn::new("policy-drain-1").unwrap();
+
+    // Append the triggering event.
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(WithdrawFeePolicy { fee: 5.0 })
+        .build();
+
+    let executed = runner.drain().await.expect("drain must succeed");
+    assert_eq!(
+        executed, 1,
+        "the deposit must trigger exactly one withdrawal"
+    );
+
+    // The reaction's command landed: balance is 100 - 5 = 95.
+    let account_state = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
+    assert_eq!(account_state.balance, 95.0);
+
+    // The cursor advanced past the triggering event (global_position 1).
+    let cursor: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
+        .bind("withdraw_fee_policy")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("cursor row must exist after drain");
+    assert_eq!(cursor, 1);
+
+    // A second drain re-scans only the new `Withdrawn` event, which the policy
+    // ignores, so no further commands are issued and the cursor moves to 2.
+    let executed_again = runner.drain().await.expect("second drain must succeed");
+    assert_eq!(executed_again, 0);
+
+    let cursor_after: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
+            .bind("withdraw_fee_policy")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("cursor row must exist after second drain");
+    assert_eq!(cursor_after, 2);
+}

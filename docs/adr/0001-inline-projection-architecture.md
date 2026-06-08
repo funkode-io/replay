@@ -11,7 +11,10 @@ them to each registered projection and only commits if every projection's
 projection and the events it derives from strongly consistent — they commit
 together or not at all — and means a projection is never behind the log, so no
 checkpoint or catch-up position is ever stored (the `projections` table records
-only a version, for rebuild detection).
+only a version, for rebuild detection). This "no stored position" property is
+specific to *inline* projections; a [Policy](0003-policies-as-checkpointed-background-subscribers.md),
+being an eventually-consistent background subscriber, necessarily does store a
+catch-up position.
 
 The registry of projections is **fixed at construction** via a builder
 (`PostgresEventStore::builder(pool).register(..).build().await?`). `build()` runs

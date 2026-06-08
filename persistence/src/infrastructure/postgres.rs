@@ -102,7 +102,13 @@ impl PostgresEventStore {
         }
     }
 
-    fn add_filters(query_builder: &mut QueryBuilder<Postgres>, filter: StreamFilter) {
+    /// Accessor for the underlying connection pool (used by the policy runner to
+    /// read the event feed and policy cursors).
+    pub(crate) fn pool(&self) -> &Pool<Postgres> {
+        &self.pool
+    }
+
+    pub(crate) fn add_filters(query_builder: &mut QueryBuilder<Postgres>, filter: StreamFilter) {
         match filter {
             StreamFilter::All => {
                 query_builder.push(" 1 = 1");

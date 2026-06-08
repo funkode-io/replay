@@ -5,6 +5,8 @@ mod filters;
 mod infrastructure;
 mod inline_projection;
 mod persisted_event;
+mod policy;
+mod policy_runner;
 mod query;
 mod store;
 
@@ -15,6 +17,8 @@ pub use filters::StreamFilter;
 pub use infrastructure::{InMemoryEventStore, PostgresEventStore, PostgresInlineProjection};
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
+pub use policy::{Dispatch, Policy};
+pub use policy_runner::{PolicyRunner, PolicyRunnerBuilder};
 pub use query::Query;
 pub use store::EventStore;
 
@@ -37,7 +41,8 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, Cqrs, EventStore, InMemoryEventStore, InlineProjection, PersistedEvent,
-        PostgresEventStore, PostgresInlineProjection, Query, StreamFilter,
+        AggregateVersion, Cqrs, Dispatch, EventStore, InMemoryEventStore, InlineProjection,
+        PersistedEvent, Policy, PolicyRunner, PolicyRunnerBuilder, PostgresEventStore,
+        PostgresInlineProjection, Query, StreamFilter,
     };
 }
