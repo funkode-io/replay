@@ -12,10 +12,14 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use serde_json::{Map, Value};
 use sqlx::{Pool, Postgres, QueryBuilder, Row};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use replay::{Aggregate, Metadata};
 
@@ -80,8 +84,8 @@ where
 pub struct PolicyRunnerBuilder {
     cqrs: Cqrs<PostgresEventStore>,
     pool: Pool<Postgres>,
-    policies: Vec<Box<dyn ErasedPolicy>>,
-    executors: HashMap<TypeId, Box<dyn AggregateExecutor>>,
+    policies: Vec<Arc<dyn ErasedPolicy>>,
+    executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
 }
 
 impl PolicyRunnerBuilder {
@@ -96,7 +100,7 @@ impl PolicyRunnerBuilder {
         A::Services: Send + Sync + 'static,
     {
         self.executors
-            .insert(TypeId::of::<A>(), Box::new(TypedExecutor::<A> { services }));
+            .insert(TypeId::of::<A>(), Arc::new(TypedExecutor::<A> { services }));
         self
     }
 
@@ -105,7 +109,7 @@ impl PolicyRunnerBuilder {
     where
         P: Policy + 'static,
     {
-        self.policies.push(Box::new(policy));
+        self.policies.push(Arc::new(policy));
         self
     }
 
@@ -123,8 +127,24 @@ impl PolicyRunnerBuilder {
 pub struct PolicyRunner {
     cqrs: Cqrs<PostgresEventStore>,
     pool: Pool<Postgres>,
-    policies: Vec<Box<dyn ErasedPolicy>>,
-    executors: HashMap<TypeId, Box<dyn AggregateExecutor>>,
+    policies: Vec<Arc<dyn ErasedPolicy>>,
+    executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+}
+
+/// Handle for background policy tasks spawned by [`PolicyRunner::start_polling`].
+pub struct PolicyRunnerDaemon {
+    shutdown_tx: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl PolicyRunnerDaemon {
+    /// Signal all policy tasks to stop and await their completion.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        for task in self.tasks {
+            let _ = task.await;
+        }
+    }
 }
 
 impl PolicyRunner {
@@ -155,169 +175,246 @@ impl PolicyRunner {
         Ok(total)
     }
 
-    async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
-        let name = policy.name().to_string();
-        let cursor = self.load_cursor(&name, policy.start_at()).await?;
-        let feed = self.read_feed(policy.stream_filter(), cursor).await?;
+    /// Start one long-lived polling task per registered policy.
+    ///
+    /// Each task owns its cursor in task-local state and periodically reads the
+    /// policy feed to execute reactions. Use [`PolicyRunnerDaemon::shutdown`] to
+    /// stop tasks cleanly.
+    pub fn start_polling(&self, interval: Duration) -> PolicyRunnerDaemon {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut tasks = Vec::with_capacity(self.policies.len());
 
-        let mut executed = 0;
-        for (global_position, raw) in feed {
-            for dispatch in policy.react_erased(&raw) {
-                self.execute_dispatch(&name, global_position, &raw, dispatch)
-                    .await?;
-                executed += 1;
-            }
-            // Advance only after this event's commands have committed. A crash
-            // before this point re-delivers the event on the next drain.
-            self.save_cursor(&name, global_position).await?;
+        for policy in &self.policies {
+            let policy = Arc::clone(policy);
+            let cqrs = self.cqrs.clone();
+            let pool = self.pool.clone();
+            let executors = self.executors.clone();
+            let mut policy_shutdown_rx = shutdown_rx.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let name = policy.name().to_string();
+                let mut cursor = match load_cursor(&pool, &name, policy.start_at()).await {
+                    Ok(cursor) => cursor,
+                    Err(error) => {
+                        tracing::error!(
+                            policy = %name,
+                            error = %error,
+                            "policy task failed to initialize cursor"
+                        );
+                        return;
+                    }
+                };
+
+                loop {
+                    if *policy_shutdown_rx.borrow() {
+                        break;
+                    }
+
+                    match drain_policy_once(&cqrs, &pool, &executors, policy.as_ref(), &mut cursor)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::error!(
+                                policy = %name,
+                                error = %error,
+                                "policy polling iteration failed"
+                            );
+                        }
+                    }
+
+                    tokio::select! {
+                        changed = policy_shutdown_rx.changed() => {
+                            if changed.is_err() || *policy_shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                }
+            }));
         }
 
-        Ok(executed)
+        PolicyRunnerDaemon { shutdown_tx, tasks }
     }
 
-    /// Read the contiguous, gap-free prefix of events with
-    /// `global_position > cursor` matching `filter`, in global order.
-    ///
-    /// BIGSERIAL positions are assigned at INSERT but become visible at COMMIT,
-    /// so a higher position can appear before a lower one fills in. Stopping at
-    /// the first gap guarantees we never skip an event that is still in flight.
-    async fn read_feed(
-        &self,
-        filter: StreamFilter,
-        cursor: i64,
-    ) -> Result<Vec<(i64, PersistedEvent<Value>)>, replay::Error> {
-        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-            "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-             global_position FROM events WHERE global_position > ",
-        );
-        qb.push_bind(cursor);
-        qb.push(" AND ");
-        PostgresEventStore::add_filters(&mut qb, filter);
-        qb.push(" ORDER BY global_position ASC");
+    async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
+        let name = policy.name().to_string();
+        let mut cursor = load_cursor(&self.pool, &name, policy.start_at()).await?;
+        drain_policy_once(&self.cqrs, &self.pool, &self.executors, policy, &mut cursor).await
+    }
+}
 
-        let rows = qb
-            .build()
-            .fetch_all(&self.pool)
+async fn drain_policy_once(
+    cqrs: &Cqrs<PostgresEventStore>,
+    pool: &Pool<Postgres>,
+    executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    policy: &dyn ErasedPolicy,
+    cursor: &mut i64,
+) -> Result<usize, replay::Error> {
+    let name = policy.name().to_string();
+    let feed = read_feed(pool, policy.stream_filter(), *cursor).await?;
+
+    let mut executed = 0;
+    for (global_position, raw) in feed {
+        for dispatch in policy.react_erased(&raw) {
+            execute_dispatch(cqrs, executors, &name, global_position, &raw, dispatch).await?;
+            executed += 1;
+        }
+        // Advance only after this event's commands have committed. A crash
+        // before this point re-delivers the event on the next drain.
+        save_cursor(pool, &name, global_position).await?;
+        *cursor = global_position;
+    }
+
+    Ok(executed)
+}
+
+/// Read the contiguous, gap-free prefix of events with `global_position >
+/// cursor` matching `filter`, in global order.
+///
+/// BIGSERIAL positions are assigned at INSERT but become visible at COMMIT,
+/// so a higher position can appear before a lower one fills in. Stopping at
+/// the first gap guarantees we never skip an event that is still in flight.
+async fn read_feed(
+    pool: &Pool<Postgres>,
+    filter: StreamFilter,
+    cursor: i64,
+) -> Result<Vec<(i64, PersistedEvent<Value>)>, replay::Error> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
+         global_position FROM events WHERE global_position > ",
+    );
+    qb.push_bind(cursor);
+    qb.push(" AND ");
+    PostgresEventStore::add_filters(&mut qb, filter);
+    qb.push(" ORDER BY global_position ASC");
+
+    let rows = qb.build().fetch_all(pool).await.map_err(crate::db_error)?;
+
+    let mut feed = Vec::with_capacity(rows.len());
+    let mut expected = cursor + 1;
+    for row in rows {
+        let global_position: i64 = row.get("global_position");
+        if global_position != expected {
+            // Gap: stop here and let the hole fill on a later poll.
+            break;
+        }
+        let event = PersistedEvent::<Value>::try_from(row)?;
+        feed.push((global_position, event));
+        expected += 1;
+    }
+
+    Ok(feed)
+}
+
+async fn execute_dispatch(
+    cqrs: &Cqrs<PostgresEventStore>,
+    executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    policy_name: &str,
+    global_position: i64,
+    raw: &PersistedEvent<Value>,
+    dispatch: Dispatch,
+) -> Result<(), replay::Error> {
+    let executor = executors.get(&dispatch.target()).ok_or_else(|| {
+        replay::Error::invalid_input(
+            "no services registered for the aggregate targeted by a policy dispatch",
+        )
+        .with_operation("policy_drain")
+        .with_context("policy", policy_name)
+        .with_context("aggregate", dispatch.aggregate_name())
+    })?;
+
+    let aggregate_name = dispatch.aggregate_name();
+    let dispatch_metadata = dispatch.metadata.clone();
+
+    let metadata = merge_dispatch_metadata(
+        causation_metadata(policy_name, global_position, raw),
+        dispatch_metadata,
+    )
+    .map_err(|err| {
+        err.with_operation("policy_drain")
+            .with_context("policy", policy_name)
+            .with_context("aggregate", aggregate_name)
+    })?;
+
+    executor
+        .execute(cqrs, dispatch.payload, metadata, dispatch.expected_version)
+        .await
+}
+
+async fn load_cursor(
+    pool: &Pool<Postgres>,
+    name: &str,
+    start_at: StartAt,
+) -> Result<i64, replay::Error> {
+    let position =
+        sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pool)
             .await
             .map_err(crate::db_error)?;
 
-        let mut feed = Vec::with_capacity(rows.len());
-        let mut expected = cursor + 1;
-        for row in rows {
-            let global_position: i64 = row.get("global_position");
-            if global_position != expected {
-                // Gap: stop here and let the hole fill on a later drain.
-                break;
-            }
-            let event = PersistedEvent::<Value>::try_from(row)?;
-            feed.push((global_position, event));
-            expected += 1;
-        }
-
-        Ok(feed)
+    if let Some(position) = position {
+        return Ok(position);
     }
 
-    async fn execute_dispatch(
-        &self,
-        policy_name: &str,
-        global_position: i64,
-        raw: &PersistedEvent<Value>,
-        dispatch: Dispatch,
-    ) -> Result<(), replay::Error> {
-        let executor = self.executors.get(&dispatch.target()).ok_or_else(|| {
-            replay::Error::invalid_input(
-                "no services registered for the aggregate targeted by a policy dispatch",
-            )
-            .with_operation("policy_drain")
-            .with_context("policy", policy_name)
-            .with_context("aggregate", dispatch.aggregate_name())
-        })?;
+    let bootstrap_position = bootstrap_position(pool, start_at).await?;
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ($1, $2, now()) \
+         ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(name)
+    .bind(bootstrap_position)
+    .execute(pool)
+    .await
+    .map_err(crate::db_error)?;
 
-        let aggregate_name = dispatch.aggregate_name();
-        let dispatch_metadata = dispatch.metadata.clone();
-
-        let metadata = merge_dispatch_metadata(
-            causation_metadata(policy_name, global_position, raw),
-            dispatch_metadata,
-        )
-        .map_err(|err| {
-            err.with_operation("policy_drain")
-                .with_context("policy", policy_name)
-                .with_context("aggregate", aggregate_name)
-        })?;
-
-        executor
-            .execute(
-                &self.cqrs,
-                dispatch.payload,
-                metadata,
-                dispatch.expected_version,
-            )
+    let persisted =
+        sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
+            .bind(name)
+            .fetch_one(pool)
             .await
-    }
+            .map_err(crate::db_error)?;
 
-    async fn load_cursor(&self, name: &str, start_at: StartAt) -> Result<i64, replay::Error> {
-        let position =
-            sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(crate::db_error)?;
+    Ok(persisted)
+}
 
-        if let Some(position) = position {
-            return Ok(position);
-        }
-
-        let bootstrap_position = self.bootstrap_position(start_at).await?;
-        sqlx::query(
-            "INSERT INTO policy_cursors (name, position, updated_at) VALUES ($1, $2, now()) \
-             ON CONFLICT (name) DO NOTHING",
-        )
-        .bind(name)
-        .bind(bootstrap_position)
-        .execute(&self.pool)
-        .await
-        .map_err(crate::db_error)?;
-
-        let persisted =
-            sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
-                .bind(name)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(crate::db_error)?;
-
-        Ok(persisted)
-    }
-
-    async fn bootstrap_position(&self, start_at: StartAt) -> Result<i64, replay::Error> {
-        match start_at {
-            StartAt::Beginning => Ok(0),
-            StartAt::Now => {
-                let head =
-                    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(global_position) FROM events")
-                        .fetch_one(&self.pool)
-                        .await
-                        .map_err(crate::db_error)?;
-                Ok(match head {
-                    Some(position) => position,
-                    None => 0,
-                })
-            }
+async fn bootstrap_position(
+    pool: &Pool<Postgres>,
+    start_at: StartAt,
+) -> Result<i64, replay::Error> {
+    match start_at {
+        StartAt::Beginning => Ok(0),
+        StartAt::Now => {
+            let head =
+                sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(global_position) FROM events")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(crate::db_error)?;
+            Ok(match head {
+                Some(position) => position,
+                None => 0,
+            })
         }
     }
+}
 
-    async fn save_cursor(&self, name: &str, position: i64) -> Result<(), replay::Error> {
-        sqlx::query(
-            "INSERT INTO policy_cursors (name, position, updated_at) VALUES ($1, $2, now()) \
-             ON CONFLICT (name) DO UPDATE SET position = EXCLUDED.position, updated_at = now()",
-        )
-        .bind(name)
-        .bind(position)
-        .execute(&self.pool)
-        .await
-        .map_err(crate::db_error)?;
-        Ok(())
-    }
+async fn save_cursor(
+    pool: &Pool<Postgres>,
+    name: &str,
+    position: i64,
+) -> Result<(), replay::Error> {
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ($1, $2, now()) \
+         ON CONFLICT (name) DO UPDATE SET position = EXCLUDED.position, updated_at = now()",
+    )
+    .bind(name)
+    .bind(position)
+    .execute(pool)
+    .await
+    .map_err(crate::db_error)?;
+    Ok(())
 }
 
 /// Causation metadata stamped on every command a policy issues.

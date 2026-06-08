@@ -1863,3 +1863,66 @@ async fn policy_code_change_never_rewinds_cursor_postgres_test() {
     // must not be replayed.
     assert_eq!(runner_v2.drain().await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("policy-daemon-1").unwrap();
+
+    let runner = std::sync::Arc::new(
+        replay_persistence::PolicyRunner::builder(cqrs.clone())
+            .register_services::<BankAccount>(())
+            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            .build(),
+    );
+
+    // Start background polling before appending the triggering event.
+    let daemon = runner
+        .clone()
+        .start_polling(std::time::Duration::from_millis(50));
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Wait until the policy-generated withdrawal appears, without manual drain.
+    let mut reacted = false;
+    for _ in 0..20 {
+        let account_state = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
+        if (account_state.balance - 95.0).abs() < f64::EPSILON {
+            reacted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        reacted,
+        "expected policy daemon to react and apply withdrawal without manual drain"
+    );
+
+    daemon.shutdown().await;
+}
