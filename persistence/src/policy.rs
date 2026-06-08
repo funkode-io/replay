@@ -10,7 +10,7 @@
 
 use std::any::{Any, TypeId};
 
-use replay::{Aggregate, Event};
+use replay::{Aggregate, Event, Metadata};
 
 use crate::{PersistedEvent, StreamFilter};
 
@@ -27,6 +27,7 @@ pub struct Dispatch {
     pub(crate) aggregate_name: &'static str,
     pub(crate) payload: Box<dyn Any + Send>,
     pub(crate) expected_version: Option<i64>,
+    pub(crate) metadata: Option<Metadata>,
 }
 
 impl Dispatch {
@@ -47,7 +48,17 @@ impl Dispatch {
             aggregate_name: std::any::type_name::<A>(),
             payload: Box::new((id, command)),
             expected_version: None,
+            metadata: None,
         }
+    }
+
+    /// Attach user-defined metadata to this dispatch.
+    ///
+    /// The runner merges this metadata with causation metadata before executing
+    /// the command. Colliding top-level keys are rejected at runtime.
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     /// The [`TypeId`] of the aggregate this dispatch targets.

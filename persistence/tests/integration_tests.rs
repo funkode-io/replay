@@ -1405,7 +1405,11 @@ impl replay_persistence::Policy for WithdrawFeePolicy {
                         effective_on: *operation_date,
                         amount: self.fee,
                     },
-                )]
+                )
+                .with_metadata(replay::Metadata::new(serde_json::json!({
+                    "user_id": "policy-runner",
+                    "related_aggregate_id": event.stream_id.to_string(),
+                })))]
             }
             _ => Vec::new(),
         }
@@ -1505,6 +1509,27 @@ async fn withdraw_fee_policy_drain_postgres_test() {
     // The reaction's command landed: balance is 100 - 5 = 95.
     let account_state = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
     assert_eq!(account_state.balance, 95.0);
+
+    // The resulting command metadata includes both causation and policy-provided
+    // context fields.
+    let withdrawal_meta: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata FROM events WHERE stream_id = $1 AND type = $2 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(Into::<Urn>::into(account.clone()).to_string())
+    .bind("Withdrawn")
+    .fetch_one(&pg_pool)
+    .await
+    .expect("withdrawal event must exist");
+
+    assert_eq!(withdrawal_meta["user_id"], "policy-runner");
+    assert_eq!(
+        withdrawal_meta["related_aggregate_id"],
+        Into::<Urn>::into(account.clone()).to_string()
+    );
+    assert_eq!(
+        withdrawal_meta["causation"]["policy"],
+        "withdraw_fee_policy"
+    );
 
     // The cursor advanced past the triggering event (global_position 1).
     let cursor: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")

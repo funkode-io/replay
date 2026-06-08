@@ -14,7 +14,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
 use futures::future::BoxFuture;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sqlx::{Pool, Postgres, QueryBuilder, Row};
 
 use replay::{Aggregate, Metadata};
@@ -233,7 +233,18 @@ impl PolicyRunner {
             .with_context("aggregate", dispatch.aggregate_name())
         })?;
 
-        let metadata = causation_metadata(policy_name, global_position, raw);
+        let aggregate_name = dispatch.aggregate_name();
+        let dispatch_metadata = dispatch.metadata.clone();
+
+        let metadata = merge_dispatch_metadata(
+            causation_metadata(policy_name, global_position, raw),
+            dispatch_metadata,
+        )
+        .map_err(|err| {
+            err.with_operation("policy_drain")
+                .with_context("policy", policy_name)
+                .with_context("aggregate", aggregate_name)
+        })?;
 
         executor
             .execute(
@@ -246,8 +257,8 @@ impl PolicyRunner {
     }
 
     async fn load_cursor(&self, name: &str) -> Result<i64, replay::Error> {
-        let position: Option<i64> =
-            sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
+        let position =
+            sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await
@@ -287,4 +298,83 @@ fn causation_metadata(
             "global_position": global_position,
         }
     }))
+}
+
+fn merge_dispatch_metadata(
+    causation: Metadata,
+    dispatch: Option<Metadata>,
+) -> Result<Metadata, replay::Error> {
+    let Some(dispatch) = dispatch else {
+        return Ok(causation);
+    };
+
+    let Value::Object(mut merged) = causation.to_json() else {
+        return Err(replay::Error::internal(
+            "policy causation metadata must be a JSON object",
+        ));
+    };
+
+    let Value::Object(extra) = dispatch.to_json() else {
+        return Err(replay::Error::invalid_input(
+            "policy dispatch metadata must be a JSON object",
+        ));
+    };
+
+    merge_no_collisions(&mut merged, extra)?;
+    Ok(Metadata::new(Value::Object(merged)))
+}
+
+fn merge_no_collisions(
+    destination: &mut Map<String, Value>,
+    source: Map<String, Value>,
+) -> Result<(), replay::Error> {
+    for (key, value) in source {
+        if destination.contains_key(&key) {
+            return Err(replay::Error::invalid_input(
+                "policy dispatch metadata contains a key that collides with causation metadata",
+            )
+            .with_context("key", key));
+        }
+        destination.insert(key, value);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use replay::Metadata;
+    use serde_json::json;
+
+    use super::merge_dispatch_metadata;
+
+    #[test]
+    fn merges_dispatch_metadata_without_collisions() {
+        let causation = Metadata::new(json!({
+            "causation": { "policy": "p", "global_position": 1 }
+        }));
+        let dispatch = Metadata::new(json!({
+            "user_id": "u-1",
+            "related_aggregate_id": "urn:catalog:1"
+        }));
+
+        let merged = merge_dispatch_metadata(causation, Some(dispatch)).expect("must merge");
+        let value = merged.to_json();
+
+        assert_eq!(value["causation"]["policy"], "p");
+        assert_eq!(value["user_id"], "u-1");
+        assert_eq!(value["related_aggregate_id"], "urn:catalog:1");
+    }
+
+    #[test]
+    fn errors_on_metadata_key_collision() {
+        let causation = Metadata::new(json!({ "causation": { "policy": "p" } }));
+        let dispatch = Metadata::new(json!({ "causation": { "override": true } }));
+
+        let err = merge_dispatch_metadata(causation, Some(dispatch)).expect_err("must fail");
+
+        assert_eq!(err.kind(), replay::ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("policy dispatch metadata contains a key that collides"));
+    }
 }
