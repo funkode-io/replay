@@ -373,9 +373,12 @@ async fn drain_policy_once(
     max_depth: u32,
 ) -> Result<usize, replay::Error> {
     let name = policy.name().to_string();
-    let feed = read_feed(pool, policy.stream_filter(), *cursor).await?;
+    let checkpoint_size = resolve_checkpoint_batch_size(policy);
+    let read_batch = resolve_read_batch_size(policy, checkpoint_size);
+    let feed = read_feed(pool, policy.stream_filter(), *cursor, read_batch).await?;
 
     let mut executed = 0;
+    let mut events_since_checkpoint = 0u32;
     for (global_position, maybe_raw) in feed {
         if let Some(raw) = maybe_raw {
             let depth = event_causation_depth(&raw);
@@ -409,10 +412,23 @@ async fn drain_policy_once(
                 .await?;
             }
         }
-        // Advance cursor regardless: synthetic rows, depth-limited events, and
-        // normally-processed events all move the checkpoint forward.
-        save_cursor(pool, &name, global_position).await?;
+        // Always track in-memory position.
         *cursor = global_position;
+        events_since_checkpoint += 1;
+
+        // Write the persistent cursor every `checkpoint_size` events so that
+        // a crash re-processes at most `checkpoint_size - 1` events rather
+        // than the full drain batch (skip-safety: the cursor only advances
+        // past events whose reactions are already durably committed).
+        if events_since_checkpoint >= checkpoint_size {
+            save_cursor(pool, &name, global_position).await?;
+            events_since_checkpoint = 0;
+        }
+    }
+
+    // Final checkpoint: flush any events processed since the last periodic save.
+    if events_since_checkpoint > 0 {
+        save_cursor(pool, &name, *cursor).await?;
     }
 
     Ok(executed)
@@ -541,6 +557,7 @@ async fn read_feed(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
     cursor: i64,
+    limit: u32,
 ) -> Result<Vec<(i64, Option<PersistedEvent<Value>>)>, replay::Error> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
@@ -549,7 +566,8 @@ async fn read_feed(
     qb.push_bind(cursor);
     qb.push(" AND ");
     PostgresEventStore::add_filters(&mut qb, filter);
-    qb.push(" ORDER BY global_position ASC");
+    qb.push(" ORDER BY global_position ASC LIMIT ");
+    qb.push_bind(limit as i64);
 
     let rows = qb.build().fetch_all(pool).await.map_err(crate::db_error)?;
 
@@ -750,6 +768,18 @@ const DEFAULT_MAX_CAUSATION_DEPTH: u32 = 10;
 /// Environment variable that overrides the built-in depth limit.
 const CAUSATION_DEPTH_ENV_VAR: &str = "REPLAY_MAX_CAUSATION_DEPTH";
 
+/// Built-in default for the number of events fetched per drain call.
+const DEFAULT_READ_BATCH_SIZE: u32 = 100;
+
+/// Built-in default for the number of events between cursor persistence writes.
+const DEFAULT_CHECKPOINT_BATCH_SIZE: u32 = 100;
+
+/// Environment variable that overrides the read-batch default.
+const READ_BATCH_SIZE_ENV_VAR: &str = "REPLAY_READ_BATCH_SIZE";
+
+/// Environment variable that overrides the checkpoint-batch default.
+const CHECKPOINT_BATCH_SIZE_ENV_VAR: &str = "REPLAY_CHECKPOINT_BATCH_SIZE";
+
 /// Resolve the effective causation depth limit for a policy.
 ///
 /// Precedence (most-specific wins):
@@ -771,6 +801,37 @@ fn resolve_max_depth_with_source(policy: &dyn ErasedPolicy) -> (u32, &'static st
         }
     }
     (DEFAULT_MAX_CAUSATION_DEPTH, "built-in default")
+}
+
+/// Resolve the effective checkpoint batch size (events between cursor saves).
+///
+/// Precedence: per-policy override → `REPLAY_CHECKPOINT_BATCH_SIZE` env var → default 100.
+fn resolve_checkpoint_batch_size(policy: &dyn ErasedPolicy) -> u32 {
+    if let Some(n) = policy.checkpoint_batch_size_erased() {
+        return n.max(1);
+    }
+    if let Ok(s) = std::env::var(CHECKPOINT_BATCH_SIZE_ENV_VAR) {
+        if let Ok(n) = s.parse::<u32>() {
+            return n.max(1);
+        }
+    }
+    DEFAULT_CHECKPOINT_BATCH_SIZE
+}
+
+/// Resolve the effective read-batch size (events fetched in a single `read_feed` call).
+///
+/// Precedence: per-policy override → `REPLAY_READ_BATCH_SIZE` env var → default 100.
+/// Enforces the invariant `read_batch_size ≥ checkpoint_batch_size`.
+fn resolve_read_batch_size(policy: &dyn ErasedPolicy, checkpoint_size: u32) -> u32 {
+    let raw = if let Some(n) = policy.read_batch_size_erased() {
+        n.max(1)
+    } else if let Ok(s) = std::env::var(READ_BATCH_SIZE_ENV_VAR) {
+        s.parse::<u32>().unwrap_or(DEFAULT_READ_BATCH_SIZE).max(1)
+    } else {
+        DEFAULT_READ_BATCH_SIZE
+    };
+    // Invariant: read_batch_size ≥ checkpoint_batch_size.
+    raw.max(checkpoint_size)
 }
 
 fn merge_dispatch_metadata(

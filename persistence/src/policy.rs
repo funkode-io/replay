@@ -131,6 +131,29 @@ pub trait Policy: Send + Sync {
         None
     }
 
+    /// Maximum number of events fetched from the feed in a single drain call.
+    ///
+    /// Resolution order (most-specific-first):
+    ///   1. This per-policy override (when `Some`).
+    ///   2. Environment variable `REPLAY_READ_BATCH_SIZE`.
+    ///   3. Built-in default (100).
+    ///
+    /// The runner enforces the invariant `read_batch_size ≥ checkpoint_batch_size`.
+    fn read_batch_size(&self) -> Option<u32> {
+        None
+    }
+
+    /// How many events are processed between cursor persistence calls.  The
+    /// cursor is also written unconditionally at the end of every drain call.
+    ///
+    /// Resolution order (most-specific-first):
+    ///   1. This per-policy override (when `Some`).
+    ///   2. Environment variable `REPLAY_CHECKPOINT_BATCH_SIZE`.
+    ///   3. Built-in default (100).
+    fn checkpoint_batch_size(&self) -> Option<u32> {
+        None
+    }
+
     /// Pure reaction: given an event, return the commands to dispatch.
     ///
     /// Invariant: because delivery is at-least-once, target aggregate command
@@ -152,6 +175,10 @@ pub(crate) trait ErasedPolicy: Send + Sync {
 
     fn max_causation_depth_erased(&self) -> Option<u32>;
 
+    fn read_batch_size_erased(&self) -> Option<u32>;
+
+    fn checkpoint_batch_size_erased(&self) -> Option<u32>;
+
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch>;
 }
 
@@ -170,6 +197,14 @@ impl<P: Policy> ErasedPolicy for P {
 
     fn max_causation_depth_erased(&self) -> Option<u32> {
         Policy::max_causation_depth(self)
+    }
+
+    fn read_batch_size_erased(&self) -> Option<u32> {
+        Policy::read_batch_size(self)
+    }
+
+    fn checkpoint_batch_size_erased(&self) -> Option<u32> {
+        Policy::checkpoint_batch_size(self)
     }
 
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {
