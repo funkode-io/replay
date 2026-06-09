@@ -2162,6 +2162,128 @@ async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test(
     assert_eq!(fee_event_count, 1);
 }
 
+/// Duplicate delivery proof using the example causation-guard recipe directly.
+///
+/// Uses the exact `PolicyFeeLedger` aggregate and `deposit_fee_react` function
+/// exported from `global_position.rs` — the copy-pasteable recipe documented for
+/// policy-target aggregates.  Proves the example recipe handles at-least-once
+/// delivery correctly: a re-delivered triggering event produces no second fee charge.
+#[tokio::test]
+async fn policy_duplicate_delivery_example_recipe_postgres_test() {
+    use global_position::{
+        BankAccount, BankAccountCommand, BankAccountUrn as GpAccountUrn, PolicyFeeLedger,
+        PolicyFeeLedgerCommand, PolicyFeeLedgerUrn, DEPOSIT_FEE_LEDGER_ID, DEPOSIT_FEE_POLICY_NAME,
+        DEPOSIT_FEE_RATE,
+    };
+
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    // Open the fee ledger with a known starting balance using the Credit command.
+    let ledger_id = PolicyFeeLedgerUrn::new(DEPOSIT_FEE_LEDGER_ID).unwrap();
+    cqrs.execute::<PolicyFeeLedger>(
+        &ledger_id,
+        replay::Metadata::default(),
+        PolicyFeeLedgerCommand::Credit { amount: 1_000.0 },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Register the deposit-fee reaction using the exported example function directly.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<PolicyFeeLedger>(())
+        .register_policy_fn::<global_position::BankAccountEvent, _>(
+            DEPOSIT_FEE_POLICY_NAME,
+            replay_persistence::StartAt::Now,
+            global_position::deposit_fee_react,
+        )
+        .build();
+
+    // Bootstrap cursor at current head (after ledger open, before any deposit).
+    let n: usize = runner.drain().await.unwrap();
+    assert_eq!(n, 0);
+
+    // Make a deposit to trigger the policy: 1 000 @ 1 % = 10 fee.
+    let source = GpAccountUrn::new("dup-example-src").unwrap();
+    cqrs.execute::<BankAccount>(
+        &source,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit { amount: 1_000.0 },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // First delivery: one fee charged.
+    let n: usize = runner.drain().await.unwrap();
+    assert_eq!(n, 1);
+    let after_first = cqrs
+        .fetch_aggregate::<PolicyFeeLedger>(&ledger_id)
+        .await
+        .unwrap();
+    let expected_balance = 1_000.0 - (1_000.0 * DEPOSIT_FEE_RATE);
+    assert_eq!(after_first.balance, expected_balance);
+
+    // Simulate redelivery by rewinding the cursor to just before the deposit
+    // event. Query the actual global_position so the rewind target is stable
+    // regardless of how many events earlier setup may emit.
+    let deposit_gp: i64 = sqlx::query_scalar(
+        "SELECT global_position FROM events \
+         WHERE stream_id = $1 AND type = $2 \
+         ORDER BY global_position ASC LIMIT 1",
+    )
+    .bind(Into::<Urn>::into(source.clone()).to_string())
+    .bind("Deposited")
+    .fetch_one(&pg_pool)
+    .await
+    .expect("deposit event must exist in the global feed");
+
+    sqlx::query("UPDATE policy_cursors SET position = $1 WHERE name = $2")
+        .bind(deposit_gp - 1)
+        .bind(DEPOSIT_FEE_POLICY_NAME)
+        .execute(&pg_pool)
+        .await
+        .expect("cursor rewind must succeed");
+
+    // Second delivery: causation guard in PolicyFeeLedger absorbs the duplicate.
+    let n: usize = runner.drain().await.unwrap();
+    assert_eq!(n, 1);
+    let after_second = cqrs
+        .fetch_aggregate::<PolicyFeeLedger>(&ledger_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_second.balance, expected_balance,
+        "causation guard must prevent double-charging on redelivery"
+    );
+
+    // Exactly one FeeCharged event — no duplicate was persisted.
+    let fee_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1 AND type = $2")
+            .bind(Into::<Urn>::into(ledger_id).to_string())
+            .bind("FeeCharged")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("fee event count query must succeed");
+    assert_eq!(fee_count, 1);
+}
+
 // ── Compaction feed (issue #81) ───────────────────────────────────────────────
 
 /// Policy correctly walks the true log across a compaction boundary.
@@ -3166,5 +3288,143 @@ async fn global_position_closure_policy_charges_deposit_fee_postgres_test() {
     assert_eq!(
         dispatched_again, 0,
         "second drain must dispatch nothing (cursor already advanced)"
+    );
+}
+
+// ── LISTEN/NOTIFY latency optimisation (issue #86) ───────────────────────────
+
+/// With NOTIFY enabled the daemon wakes immediately on an append, well before
+/// the poll interval would fire.
+///
+/// The test uses a 30 s poll interval but expects a reaction within 5 s — if
+/// NOTIFY is working the daemon wakes as soon as `store_events` fires the
+/// `pg_notify('replay_events', ...)` after committing.
+#[tokio::test]
+async fn policy_notify_wakes_daemon_before_poll_interval_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("notify-wake-1").unwrap();
+
+    // Start the daemon with NOTIFY enabled (default) and a very long poll interval
+    // so that any reaction *before* 5 s must have been triggered by NOTIFY.
+    let runner = std::sync::Arc::new(
+        replay_persistence::PolicyRunner::builder(cqrs.clone())
+            .register_services::<BankAccount>(())
+            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            .build(),
+    );
+    let daemon = runner
+        .clone()
+        .start_polling(std::time::Duration::from_secs(30));
+
+    // Allow the daemon task to start and acquire the advisory lock before appending.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Wait up to 5 s; the NOTIFY wakeup should trigger within ~100 ms.
+    let mut reacted = false;
+    for _ in 0..100 {
+        let state = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
+        if (state.balance - 95.0).abs() < f64::EPSILON {
+            reacted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    daemon.shutdown().await;
+
+    assert!(
+        reacted,
+        "policy must react via NOTIFY before the 30 s poll interval fires"
+    );
+}
+
+/// With notifications disabled the daemon falls back to pure polling and still
+/// reacts correctly.
+#[tokio::test]
+async fn policy_daemon_reacts_without_notify_via_polling_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("no-notify-1").unwrap();
+
+    let runner = std::sync::Arc::new(
+        replay_persistence::PolicyRunner::builder(cqrs.clone())
+            .register_services::<BankAccount>(())
+            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            // Disable NOTIFY: must still react via the polling interval.
+            .without_notifications()
+            .build(),
+    );
+    let daemon = runner
+        .clone()
+        .start_polling(std::time::Duration::from_millis(50));
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut reacted = false;
+    for _ in 0..40 {
+        let state = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
+        if (state.balance - 95.0).abs() < f64::EPSILON {
+            reacted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    daemon.shutdown().await;
+
+    assert!(
+        reacted,
+        "policy must react via polling even when NOTIFY is disabled"
     );
 }

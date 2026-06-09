@@ -1860,3 +1860,277 @@ let archived = cqrs
     )
     .await?;
 ```
+
+## Policies
+
+A `Policy` is a checkpointed background subscriber that **reacts to events by
+issuing commands**. It is the event-sourcing equivalent of a process manager or
+saga: given an event it returns zero or more [`Dispatch`]es — commands the runner
+executes against aggregates. No read model is derived; side effects happen through
+the aggregate write path so causation, idempotency, and optimistic locking are all
+inherited for free.
+
+The `Policy` trait lives in `es-replay-persistence`. The implementor stays pure —
+`react` takes an event and returns commands with no I/O — while the
+[`PolicyRunner`] handles reading the feed, stamping causation metadata, persisting
+cursors, and executing the [`Dispatch`]es.
+
+### Implementing `Policy`
+
+The minimal implementation requires only `name` and `react`. All other methods
+have sensible defaults.
+
+```rust,ignore
+use replay_persistence::{Dispatch, PersistedEvent, Policy, StartAt, StreamFilter};
+
+struct FeePolicy {
+    ledger_id: FeeLedgerUrn,
+}
+
+impl Policy for FeePolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "deposit_fee"
+    }
+
+    fn start_at(&self) -> StartAt {
+        StartAt::Beginning // process all history on first run
+    }
+
+    fn stream_filter(&self) -> StreamFilter {
+        StreamFilter::for_stream_type::<BankAccount>()
+    }
+
+    fn react(&self, event: &PersistedEvent<BankAccountEvent>) -> Vec<Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { amount } => vec![
+                Dispatch::to::<FeeLedger>(
+                    self.ledger_id.clone(),
+                    FeeLedgerCommand::ChargeFee { amount: amount * FEE_RATE },
+                )
+            ],
+            _ => vec![],
+        }
+    }
+}
+```
+
+`react` is pure — it returns [`Dispatch`]es with no I/O. The runner automatically
+stamps causation metadata onto every dispatched command before executing it:
+
+```json
+{
+  "causation": {
+    "policy":           "deposit_fee",
+    "event_id":         "<uuid of the triggering Deposited event>",
+    "stream_id":        "urn:account:alice-checking",
+    "global_position":  42,
+    "depth":            1
+  }
+}
+```
+
+This metadata travels with the resulting events, enabling:
+
+- **Idempotency** — target aggregates can key duplicate detection on `causation.event_id` rather than command-value equality.
+- **Loop prevention** — the `depth` counter is incremented at each hop; the runner skips reactions once it reaches the configured limit (see [Loop prevention](#loop-prevention)).
+- **Observability** — every policy-driven event is traceable back to the original triggering event by `causation.event_id`.
+
+You can attach additional metadata to a specific dispatch with [`Dispatch::with_metadata`]; the runner merges it with the causation block (colliding top-level keys are rejected):
+
+```rust,ignore
+Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount })
+    .with_metadata(Metadata::from([("correlation_id", request_id)]))
+```
+
+### Closure shortcut
+
+For simple, single-aggregate reactions you can skip the struct and `impl Policy`
+entirely with `register_policy_fn`. The closure runs through the exact same runner
+machinery — causation stamping, failure handling, batching, advisory lock — as a
+full `Policy` impl.
+
+```rust,ignore
+let runner = PolicyRunnerBuilder::new(cqrs, pool)
+    .register_services::<FeeLedger>(fee_services)
+    .register_policy_fn::<BankAccountEvent, _>(
+        "deposit_fee",
+        StartAt::Beginning,
+        |event| match &event.data {
+            BankAccountEvent::Deposited { amount } => vec![
+                Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount: amount * 0.01 })
+            ],
+            _ => vec![],
+        },
+    )
+    .build();
+```
+
+### Building and starting the runner
+
+`PolicyRunnerBuilder` collects services and policies, then `build()` produces a
+`PolicyRunner`. Call `start_polling` to spawn a background daemon task per policy:
+
+```rust,ignore
+use std::time::Duration;
+use replay_persistence::{PolicyRunnerBuilder, StartAt};
+
+let runner = PolicyRunnerBuilder::new(cqrs, pool)
+    .register_services::<BankAccount>(())          // enable Dispatch::to::<BankAccount>
+    .register_services::<FeeLedger>(fee_services)
+    .register_policy(FeePolicy { ledger_id })
+    .build();
+
+let daemon = runner.start_polling(Duration::from_secs(30));
+
+// … application runs …
+
+daemon.shutdown().await; // stops all tasks cleanly
+```
+
+### Cursor checkpointing and bootstrap
+
+Each policy has a **stable name** that acts as its cursor key in the
+`policy_cursors` table. On first registration the cursor is bootstrapped according
+to `start_at()`:
+
+| `StartAt` | Behaviour |
+|-----------|-----------|
+| `StartAt::Now` (default) | Cursor begins at the current global head; only newly appended events are processed. Safe when you don't want to fire commands retroactively across existing history. |
+| `StartAt::Beginning` | Cursor begins at position 0; the full event history is drained once, then the policy follows live appends. Use this for backfill or projections derived from audit events. |
+
+The cursor is written to Postgres **at least every `checkpoint_batch_size` events**
+and unconditionally at the end of every drain pass. A crash after a command is
+executed but before the cursor is saved will re-deliver the triggering event.
+Correctness therefore depends on **idempotent command handling** keyed by
+causation identity in the target aggregate.
+
+### Advisory-lock leader election
+
+Each policy task acquires a **Postgres session-scoped advisory lock** (keyed on
+`hashtext(policy_name)`) before entering the leadership loop. At most one instance
+across the cluster holds the lock at a time, so only one instance drives reactions
+for a given policy name regardless of how many application nodes are running.
+
+A node that fails to acquire the lock stands by, retrying every `interval`. When
+the leader shuts down it explicitly calls `pg_advisory_unlock` so the standby can
+take over without waiting for a TCP session timeout.
+
+### LISTEN/NOTIFY latency optimisation
+
+After acquiring the advisory lock each task opens a `PgListener` and subscribes to
+the `replay_events` channel (the value of `REPLAY_NOTIFY_CHANNEL`). Whenever
+`store_events` commits it fires `pg_notify('replay_events', stream_type)`, waking
+the task immediately instead of waiting out the poll interval.
+
+If `PgListener` setup fails (e.g. in environments without `LISTEN` support) the
+task falls back silently to pure polling. You can also opt-out explicitly:
+
+```rust,ignore
+let runner = PolicyRunnerBuilder::new(cqrs, pool)
+    .register_policy(my_policy)
+    .without_notifications() // pure polling; no PgListener connection opened
+    .build();
+```
+
+The constant `REPLAY_NOTIFY_CHANNEL` is re-exported from `es-replay-persistence`
+so custom listeners can subscribe to the same channel:
+
+```rust,ignore
+use replay_persistence::REPLAY_NOTIFY_CHANNEL;
+
+let mut listener = PgListener::connect_with(&pool).await?;
+listener.listen(REPLAY_NOTIFY_CHANNEL).await?;
+```
+
+### Loop prevention
+
+The runner prevents runaway event→command→event cascades via a **causation-depth
+circuit breaker**. Each appended event carries a `causation.depth` counter
+(incremented by the runner on every hop). If an event's depth reaches the
+configured limit the runner skips reactions for it and logs a warning — the cursor
+still advances so the policy is never permanently wedged.
+
+Resolution order (most-specific wins):
+
+| Source | How to set |
+|--------|------------|
+| Per-policy override | `fn max_causation_depth(&self) -> Option<u32> { Some(5) }` |
+| Environment variable | `REPLAY_MAX_CAUSATION_DEPTH=5` |
+| Built-in default | `10` |
+
+### Batching
+
+Two batch sizes control throughput vs checkpoint frequency:
+
+| Setting | `Policy` override | Env var | Default |
+|---------|-------------------|---------|---------|
+| Events read per drain | `read_batch_size() -> Option<u32>` | `REPLAY_READ_BATCH_SIZE` | `100` |
+| Events between cursor saves | `checkpoint_batch_size() -> Option<u32>` | `REPLAY_CHECKPOINT_BATCH_SIZE` | `100` |
+
+The runner enforces `read_batch_size ≥ checkpoint_batch_size`.
+
+### Failure handling
+
+When a dispatch fails the runner classifies the error and responds accordingly:
+
+| Error category | Condition | Action |
+|----------------|-----------|--------|
+| **Business-rule violation** | `ErrorKind::BusinessRuleViolation` | Advance cursor immediately — the event is correct, the domain logic rejected the command. No retry, no dead-letter. |
+| **Retryable** | `Unavailable`, `RateLimited`, `Conflict` | Exponential back-off, up to `MAX_DISPATCH_RETRIES` (3) attempts. |
+| **Permanent** | All other errors, or retries exhausted | Write to `policy_dead_letters`, advance cursor. The policy keeps running. |
+
+#### `policy_dead_letters` table
+
+```sql
+CREATE TABLE IF NOT EXISTS policy_dead_letters (
+    id               BIGSERIAL   PRIMARY KEY,
+    policy_name      TEXT        NOT NULL,   -- stable policy name / cursor key
+    global_position  BIGINT      NOT NULL,   -- position of the triggering event
+    event_id         UUID        NOT NULL,   -- UUID of the triggering event
+    error_kind       TEXT        NOT NULL,   -- e.g. "Permanent", "Conflict"
+    error_message    TEXT        NOT NULL,   -- human-readable detail for triage
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dead_letters_policy
+    ON policy_dead_letters (policy_name, created_at DESC);
+```
+
+**Triage queries:**
+
+```sql
+-- Recent failures for a specific policy
+SELECT * FROM policy_dead_letters
+WHERE  policy_name = 'deposit_fee'
+ORDER  BY created_at DESC
+LIMIT  20;
+
+-- Look up the original event for manual replay
+SELECT * FROM events WHERE id = '<event_id from dead letter>';
+
+-- Discard a resolved dead-letter
+DELETE FROM policy_dead_letters WHERE id = <id>;
+```
+
+#### `A::Error: Into<replay::Error>` migration note
+
+`register_services::<A>` requires `A::Error: Into<replay::Error>`. If your
+aggregate error type is a custom enum you must provide the conversion:
+
+```rust,ignore
+impl From<MyAggregateError> for replay::Error {
+    fn from(e: MyAggregateError) -> Self {
+        match e {
+            MyAggregateError::InsufficientFunds => {
+                replay::Error::business_rule_violation("Insufficient funds")
+            }
+            MyAggregateError::Persistence(inner) => inner,
+        }
+    }
+}
+```
+
+The simplest path is `type Error = replay::Error` (used throughout the examples
+here), which satisfies the bound with the identity conversion.

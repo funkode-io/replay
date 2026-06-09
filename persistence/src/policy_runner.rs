@@ -79,6 +79,11 @@ where
     }
 }
 
+/// Postgres NOTIFY channel used to wake waiting policy tasks after an append.
+/// Policy tasks LISTEN on this channel; `PostgresEventStore::store_events`
+/// fires a NOTIFY on it after every successful commit.
+pub const REPLAY_NOTIFY_CHANNEL: &str = "replay_events";
+
 // ── Closure-based policy adapter ─────────────────────────────────────────────
 
 /// A [`Policy`] backed by a plain closure, created via
@@ -118,6 +123,7 @@ pub struct PolicyRunnerBuilder {
     pool: Pool<Postgres>,
     policies: Vec<Arc<dyn ErasedPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    notifications: bool,
 }
 
 impl PolicyRunnerBuilder {
@@ -143,6 +149,16 @@ impl PolicyRunnerBuilder {
         P: Policy + 'static,
     {
         self.policies.push(Arc::new(policy));
+        self
+    }
+
+    /// Disable the `LISTEN/NOTIFY` latency optimisation; the daemon will use
+    /// the fixed poll interval only, with no `PgListener` connection.
+    ///
+    /// Useful in environments where `pg_notify` is unavailable or for
+    /// deterministic testing without a NOTIFY wakeup.
+    pub fn without_notifications(mut self) -> Self {
+        self.notifications = false;
         self
     }
 
@@ -191,6 +207,7 @@ impl PolicyRunnerBuilder {
             pool: self.pool,
             policies: self.policies,
             executors: self.executors,
+            notifications: self.notifications,
         }
     }
 }
@@ -201,6 +218,7 @@ pub struct PolicyRunner {
     pool: Pool<Postgres>,
     policies: Vec<Arc<dyn ErasedPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    notifications: bool,
 }
 
 /// Handle for background policy tasks spawned by [`PolicyRunner::start_polling`].
@@ -228,6 +246,7 @@ impl PolicyRunner {
             pool,
             policies: Vec::new(),
             executors: HashMap::new(),
+            notifications: true,
         }
     }
 
@@ -271,6 +290,7 @@ impl PolicyRunner {
             let cqrs = self.cqrs.clone();
             let pool = self.pool.clone();
             let executors = self.executors.clone();
+            let notifications = self.notifications;
             let mut policy_shutdown_rx = shutdown_rx.clone();
 
             tasks.push(tokio::spawn(async move {
@@ -358,6 +378,42 @@ impl PolicyRunner {
                         }
                     };
 
+                    // Optionally subscribe to NOTIFY wakeups so the loop reacts to
+                    // new appends immediately rather than waiting out the poll interval.
+                    // Errors here are non-fatal: the task falls back to pure polling.
+                    let mut listener: Option<sqlx::postgres::PgListener> = if notifications {
+                        match sqlx::postgres::PgListener::connect_with(&pool).await {
+                            Ok(mut l) => match l.listen(REPLAY_NOTIFY_CHANNEL).await {
+                                Ok(()) => {
+                                    tracing::debug!(
+                                        policy = %name,
+                                        channel = REPLAY_NOTIFY_CHANNEL,
+                                        "LISTEN active; will wake on NOTIFY"
+                                    );
+                                    Some(l)
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        policy = %name,
+                                        error = %error,
+                                        "LISTEN setup failed; falling back to polling"
+                                    );
+                                    None
+                                }
+                            },
+                            Err(error) => {
+                                tracing::warn!(
+                                    policy = %name,
+                                    error = %error,
+                                    "PgListener connect failed; falling back to polling"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     // Leadership polling loop.
                     let max_depth = resolve_max_depth(policy.as_ref());
                     loop {
@@ -385,13 +441,38 @@ impl PolicyRunner {
                             }
                         }
 
-                        tokio::select! {
-                            changed = policy_shutdown_rx.changed() => {
-                                if changed.is_err() || *policy_shutdown_rx.borrow() {
-                                    break;
+                        // Wait for the next wakeup: NOTIFY (if enabled), poll
+                        // timeout, or shutdown signal — whichever fires first.
+                        if let Some(ref mut l) = listener {
+                            tokio::select! {
+                                changed = policy_shutdown_rx.changed() => {
+                                    if changed.is_err() || *policy_shutdown_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::time::sleep(interval) => {}
+                                res = l.recv() => {
+                                    if let Err(error) = res {
+                                        tracing::warn!(
+                                            policy = %name,
+                                            error = %error,
+                                            "PgListener recv error; falling back to polling"
+                                        );
+                                        listener = None;
+                                    }
+                                    // Notification received or listener dropped:
+                                    // proceed to drain immediately.
                                 }
                             }
-                            _ = tokio::time::sleep(interval) => {}
+                        } else {
+                            tokio::select! {
+                                changed = policy_shutdown_rx.changed() => {
+                                    if changed.is_err() || *policy_shutdown_rx.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::time::sleep(interval) => {}
+                            }
                         }
                     }
 
