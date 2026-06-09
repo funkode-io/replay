@@ -2240,8 +2240,22 @@ async fn policy_duplicate_delivery_example_recipe_postgres_test() {
     let expected_balance = 1_000.0 - (1_000.0 * DEPOSIT_FEE_RATE);
     assert_eq!(after_first.balance, expected_balance);
 
-    // Simulate redelivery by rewinding the cursor behind the deposit event.
-    sqlx::query("UPDATE policy_cursors SET position = 1 WHERE name = $1")
+    // Simulate redelivery by rewinding the cursor to just before the deposit
+    // event. Query the actual global_position so the rewind target is stable
+    // regardless of how many events earlier setup may emit.
+    let deposit_gp: i64 = sqlx::query_scalar(
+        "SELECT global_position FROM events \
+         WHERE stream_id = $1 AND type = $2 \
+         ORDER BY global_position ASC LIMIT 1",
+    )
+    .bind(Into::<Urn>::into(source.clone()).to_string())
+    .bind("Deposited")
+    .fetch_one(&pg_pool)
+    .await
+    .expect("deposit event must exist in the global feed");
+
+    sqlx::query("UPDATE policy_cursors SET position = $1 WHERE name = $2")
+        .bind(deposit_gp - 1)
         .bind(DEPOSIT_FEE_POLICY_NAME)
         .execute(&pg_pool)
         .await
