@@ -152,6 +152,16 @@ impl PolicyRunnerBuilder {
         self
     }
 
+    /// Disable the `LISTEN/NOTIFY` latency optimisation; the daemon will use
+    /// the fixed poll interval only, with no `PgListener` connection.
+    ///
+    /// Useful in environments where `pg_notify` is unavailable or for
+    /// deterministic testing without a NOTIFY wakeup.
+    pub fn without_notifications(mut self) -> Self {
+        self.notifications = false;
+        self
+    }
+
     /// Register a policy using a **closure** instead of a full [`Policy`] impl.
     ///
     /// This is the low-ceremony path for simple, single-aggregate reactions where
@@ -173,16 +183,6 @@ impl PolicyRunnerBuilder {
     ///
     /// The closure runs through the exact same runner machinery as a `Policy` impl:
     /// causation stamping, failure handling, batching, advisory lock, etc.
-    /// Disable the `LISTEN/NOTIFY` latency optimisation; the daemon will poll
-    /// on the fixed interval only.
-    ///
-    /// Useful in environments where `pg_notify` is unavailable or for
-    /// deterministic testing without a NOTIFY wakeup.
-    pub fn without_notifications(mut self) -> Self {
-        self.notifications = false;
-        self
-    }
-
     pub fn register_policy_fn<E, F>(
         self,
         name: impl Into<String>,

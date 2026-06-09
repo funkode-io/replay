@@ -18,7 +18,9 @@ pub use infrastructure::{InMemoryEventStore, PostgresEventStore, PostgresInlineP
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
 pub use policy::{Dispatch, Policy, StartAt};
-pub use policy_runner::{PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon};
+pub use policy_runner::{
+    PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, REPLAY_NOTIFY_CHANNEL,
+};
 pub use query::Query;
 pub use store::EventStore;
 
