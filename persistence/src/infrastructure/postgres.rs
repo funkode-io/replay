@@ -441,19 +441,22 @@ impl EventStore for PostgresEventStore {
         ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
         Sink: EventSink<S::Event> + Send,
     {
-        let domain_events: Vec<S::Event> = domain_events.try_collect().await?;
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
-        let appended_count = domain_events.len();
 
         // Track the appended events so registered inline projections can be applied
-        // inside this same transaction. We only retain what's needed to rebuild the
-        // PersistedEvent: the generated id, the JSON payload and the event type.
+        // inside this same transaction. This is the only buffer in the loop and it is
+        // populated *only* when projections are registered; bulk producers without
+        // projections stream straight through without materialising the batch.
         let has_projections = !self.projections.is_empty();
         let mut appended: Vec<PersistedEvent<Value>> = Vec::new();
-        let mut sink_events: Vec<PersistedEvent<S::Event>> = Vec::new();
+        let mut appended_count: usize = 0;
 
-        for event in domain_events {
+        // Consume the producer one event at a time so a large append (e.g. 160k rows)
+        // never has to live fully in memory.
+        let mut domain_events = std::pin::pin!(domain_events.into_stream());
+
+        while let Some(event) = domain_events.try_next().await? {
             let event_type = event.event_type().clone();
             let event_data = serde_json::to_value(&event).map_err(crate::ser_error)?;
             let id = Uuid::new_v4();
@@ -495,7 +498,10 @@ impl EventStore for PostgresEventStore {
             let version: i64 = row.get("version");
             let created: chrono::DateTime<Utc> = row.get("created");
 
-            sink_events.push(PersistedEvent {
+            // Notify the sink as each event is appended (inside the transaction) so a
+            // consumer can fold events as they stream, without the store retaining the
+            // whole batch. The sink is an infallible observer and cannot abort the txn.
+            sink.on_event(&PersistedEvent {
                 id: persisted_id,
                 data: event,
                 stream_id: stream_id.clone(),
@@ -518,6 +524,8 @@ impl EventStore for PostgresEventStore {
                     aggregate_version: None,
                 });
             }
+
+            appended_count += 1;
         }
 
         if has_projections {
@@ -525,10 +533,6 @@ impl EventStore for PostgresEventStore {
         }
 
         transaction.commit().await.map_err(crate::db_error)?;
-
-        for event in &sink_events {
-            sink.on_event(event);
-        }
 
         // Best-effort NOTIFY: wake any waiting policy tasks immediately so they
         // react without waiting for the next poll interval.  Errors are silently

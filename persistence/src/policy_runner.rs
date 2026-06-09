@@ -831,10 +831,7 @@ async fn bootstrap_position(
                     .fetch_one(pool)
                     .await
                     .map_err(crate::db_error)?;
-            Ok(match head {
-                Some(position) => position,
-                None => 0,
-            })
+            Ok(head.unwrap_or_default())
         }
     }
 }

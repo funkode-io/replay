@@ -158,7 +158,6 @@ impl EventStore for InMemoryEventStore {
         Sink: EventSink<S::Event> + Send,
     {
         let stream_id: Urn = stream_id.clone().into();
-        let domain_events: Vec<S::Event> = domain_events.try_collect().await?;
 
         // Record the stream's type so `ForStreamTypes` filters can be evaluated per-event.
         self.stream_types
@@ -166,16 +165,11 @@ impl EventStore for InMemoryEventStore {
             .unwrap()
             .insert(stream_id.clone(), stream_type);
 
-        // Append under the write lock, then release it before driving any async projections
-        // (the std `RwLockWriteGuard` is not held across an await).
-        let (stored_events, sink_events): (
-            Vec<PersistedEvent<Value>>,
-            Vec<PersistedEvent<S::Event>>,
-        ) = {
-            let mut store = self.events.write().unwrap();
-
-            // Only count current (non-archived) events for the sequence version.
-            let mut last_version = store
+        // Determine the starting version and check optimistic concurrency once, up front
+        // (mirrors the Postgres "check expected_version at the head of the transaction").
+        let mut last_version = {
+            let store = self.events.read().unwrap();
+            store
                 .get(&stream_id)
                 .map(|events| {
                     events
@@ -184,64 +178,74 @@ impl EventStore for InMemoryEventStore {
                         .map(|e| e.version)
                         .unwrap_or(0)
                 })
-                .unwrap_or(0);
-
-            if let Some(expected_version) = expected_version {
-                if last_version != expected_version {
-                    return Err(crate::concurrency_error(
-                        stream_id.clone(),
-                        expected_version,
-                        last_version,
-                    ));
-                }
-            }
-
-            let mut events = Vec::with_capacity(domain_events.len());
-            let mut sink_events = Vec::with_capacity(domain_events.len());
-            for event in domain_events {
-                let id = Uuid::new_v4();
-                let created = Utc::now();
-                let r#type = event.event_type();
-                let version = last_version + 1;
-                last_version = version;
-
-                let data = serde_json::to_value(&event).map_err(crate::ser_error)?;
-                events.push(PersistedEvent {
-                    id,
-                    data,
-                    stream_id: stream_id.clone(),
-                    r#type: r#type.clone(),
-                    version,
-                    created,
-                    metadata: metadata.clone(),
-                    aggregate_version: None,
-                });
-                sink_events.push(PersistedEvent {
-                    id,
-                    data: event,
-                    stream_id: stream_id.clone(),
-                    r#type,
-                    version,
-                    created,
-                    metadata: metadata.clone(),
-                    aggregate_version: None,
-                });
-            }
-
-            let stream = store.entry(stream_id.clone()).or_default();
-            stream.extend(events.clone());
-
-            (events, sink_events)
+                .unwrap_or(0)
         };
 
-        for event in &sink_events {
-            sink.on_event(event);
+        if let Some(expected_version) = expected_version {
+            if last_version != expected_version {
+                return Err(crate::concurrency_error(
+                    stream_id.clone(),
+                    expected_version,
+                    last_version,
+                ));
+            }
+        }
+
+        // Pull events from the producer one at a time and notify the sink as each is appended,
+        // exactly like the Postgres backend. The `std` `RwLock` guard cannot be held across the
+        // producer `await`, so events are staged into a local buffer and only published to the
+        // shared store once the whole producer has drained. A producer error therefore discards
+        // the batch (all-or-nothing, matching the Postgres transaction rollback).
+        let mut domain_events = std::pin::pin!(domain_events.into_stream());
+        let mut staged: Vec<PersistedEvent<Value>> = Vec::new();
+
+        while let Some(event) = domain_events.try_next().await? {
+            let id = Uuid::new_v4();
+            let created = Utc::now();
+            let r#type = event.event_type();
+            let version = last_version + 1;
+            last_version = version;
+
+            let data = serde_json::to_value(&event).map_err(crate::ser_error)?;
+
+            // Notify the sink with the typed event as it is appended, instead of accumulating a
+            // parallel `Vec<PersistedEvent<S::Event>>` to replay afterwards. The JSON-encoded
+            // copy staged below is what the store retains for querying and inline projections.
+            sink.on_event(&PersistedEvent {
+                id,
+                data: event,
+                stream_id: stream_id.clone(),
+                r#type: r#type.clone(),
+                version,
+                created,
+                metadata: metadata.clone(),
+                aggregate_version: None,
+            });
+
+            staged.push(PersistedEvent {
+                id,
+                data,
+                stream_id: stream_id.clone(),
+                r#type,
+                version,
+                created,
+                metadata: metadata.clone(),
+                aggregate_version: None,
+            });
+        }
+
+        // Publish the staged events atomically under the write lock, then release it before
+        // driving any async projections (the `RwLockWriteGuard` is not held across an await).
+        {
+            let mut store = self.events.write().unwrap();
+            let stream = store.entry(stream_id.clone()).or_default();
+            stream.extend(staged.iter().cloned());
         }
 
         // Best-effort: drive registered projections after the events are stored and the write
         // lock is released. No atomicity — a failing projection does not roll back the append.
         if !self.projections.is_empty() {
-            self.apply_projections(&stored_events).await?;
+            self.apply_projections(&staged).await?;
         }
 
         Ok(())
