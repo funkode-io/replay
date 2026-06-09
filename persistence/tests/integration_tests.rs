@@ -476,6 +476,133 @@ async fn bank_account_store_events_concurrency_conflict_postgres_test() {
     assert_eq!(event_count, 1);
 }
 
+#[tokio::test]
+async fn bank_account_store_events_stream_sink_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let stream_id = BankAccountUrn::new("stream-sink-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    let mut observed = Vec::new();
+    store
+        .store_events_stream::<BankAccount, _, _>(
+            &stream_id,
+            "bank-account".to_string(),
+            replay::Metadata::default(),
+            futures::stream::iter(vec![
+                Ok(BankAccountEvent::Deposited {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    amount: 100.0,
+                }),
+                Ok(BankAccountEvent::Withdrawn {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+                    amount: 40.0,
+                }),
+            ]),
+            None,
+            |event: &PersistedEvent<BankAccountEvent>| {
+                observed.push((event.version, event.data.clone()));
+            },
+        )
+        .await
+        .expect("streaming append must succeed");
+
+    assert_eq!(
+        observed,
+        vec![
+            (
+                1,
+                BankAccountEvent::Deposited {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    amount: 100.0
+                }
+            ),
+            (
+                2,
+                BankAccountEvent::Withdrawn {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+                    amount: 40.0
+                }
+            )
+        ]
+    );
+
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
+        .bind(&stream_id_str)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("counting events must succeed");
+
+    assert_eq!(event_count, 2);
+}
+
+#[tokio::test]
+async fn bank_account_store_events_stream_producer_error_rolls_back_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let stream_id = BankAccountUrn::new("stream-rollback-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+    let mut observed = 0;
+
+    let result = store
+        .store_events_stream::<BankAccount, _, _>(
+            &stream_id,
+            "bank-account".to_string(),
+            replay::Metadata::default(),
+            futures::stream::iter(vec![
+                Ok(BankAccountEvent::Deposited {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    amount: 100.0,
+                }),
+                Err(replay::Error::internal("producer failed")),
+            ]),
+            Some(0),
+            |_event: &PersistedEvent<BankAccountEvent>| {
+                observed += 1;
+            },
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(observed, 0, "sink must not observe rolled-back events");
+
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
+        .bind(&stream_id_str)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("counting events must succeed");
+
+    assert_eq!(event_count, 0, "producer error must roll back whole append");
+}
+
 async fn connect_to_postgres(host: String, port: u16) -> PgPool {
     // connect to Postgres
     PgPoolOptions::new()

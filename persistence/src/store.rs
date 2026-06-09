@@ -1,12 +1,48 @@
 use std::future::Future;
 
+use futures::stream;
 use futures::TryStream;
 
 use replay::{Compactable, Event};
 
 use super::{AggregateVersion, PersistedEvent};
 
+pub trait EventSink<E: Event>: Send {
+    fn on_event(&mut self, event: &PersistedEvent<E>);
+}
+
+impl<E, F> EventSink<E> for F
+where
+    E: Event,
+    F: FnMut(&PersistedEvent<E>) + Send,
+{
+    fn on_event(&mut self, event: &PersistedEvent<E>) {
+        self(event);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoSink;
+
+impl<E: Event> EventSink<E> for NoSink {
+    fn on_event(&mut self, _event: &PersistedEvent<E>) {}
+}
+
 pub trait EventStore: Send + Sync {
+    fn store_events_stream<S, ES, Sink>(
+        &self,
+        stream_id: &S::StreamId,
+        stream_type: String,
+        metadata: replay::Metadata,
+        domain_events: ES,
+        expected_version: Option<i64>,
+        sink: Sink,
+    ) -> impl Future<Output = Result<(), replay::Error>> + Send
+    where
+        S: replay::EventStream,
+        ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
+        Sink: EventSink<S::Event> + Send;
+
     fn store_events<S: replay::EventStream>(
         &self,
         stream_id: &S::StreamId,
@@ -14,7 +50,17 @@ pub trait EventStore: Send + Sync {
         metadata: replay::Metadata,
         domain_events: &[S::Event],
         expected_version: Option<i64>,
-    ) -> impl Future<Output = Result<(), replay::Error>> + Send;
+    ) -> impl Future<Output = Result<(), replay::Error>> + Send {
+        let domain_events = stream::iter(domain_events.iter().cloned().map(Ok::<_, replay::Error>));
+        self.store_events_stream::<S, _, _>(
+            stream_id,
+            stream_type,
+            metadata,
+            domain_events,
+            expected_version,
+            NoSink,
+        )
+    }
 
     fn stream_events<E: Event>(
         &self,

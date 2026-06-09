@@ -15,7 +15,7 @@ use urn::Urn;
 use uuid::Uuid;
 
 use crate::inline_projection::{ErasedInlineProjection, InlineProjection};
-use crate::{EventStore, PersistedEvent, StreamFilter};
+use crate::{EventSink, EventStore, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event, Metadata};
 
 /// Convenience marker trait for inline projections that run on Postgres.
@@ -427,37 +427,42 @@ impl PostgresEventStore {
 }
 
 impl EventStore for PostgresEventStore {
-    async fn store_events<S: replay::EventStream>(
+    async fn store_events_stream<S, ES, Sink>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
         metadata: replay::Metadata,
-        domain_events: &[S::Event],
+        domain_events: ES,
         expected_version: Option<i64>,
-    ) -> Result<(), replay::Error> {
+        mut sink: Sink,
+    ) -> Result<(), replay::Error>
+    where
+        S: replay::EventStream,
+        ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
+        Sink: EventSink<S::Event> + Send,
+    {
+        let domain_events: Vec<S::Event> = domain_events.try_collect().await?;
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
+        let appended_count = domain_events.len();
 
         // Track the appended events so registered inline projections can be applied
         // inside this same transaction. We only retain what's needed to rebuild the
         // PersistedEvent: the generated id, the JSON payload and the event type.
         let has_projections = !self.projections.is_empty();
-        let mut appended: Vec<PersistedEvent<Value>> = if has_projections {
-            Vec::with_capacity(domain_events.len())
-        } else {
-            Vec::new()
-        };
+        let mut appended: Vec<PersistedEvent<Value>> = Vec::new();
+        let mut sink_events: Vec<PersistedEvent<S::Event>> = Vec::new();
 
         for event in domain_events {
             let event_type = event.event_type().clone();
-            let event = serde_json::to_value(event).map_err(crate::ser_error)?;
+            let event_data = serde_json::to_value(&event).map_err(crate::ser_error)?;
             let id = Uuid::new_v4();
 
             let row = sqlx::query(
                 "SELECT id, version, created FROM append_event($1, $2, $3, $4, $5, $6, $7)",
             )
             .bind(id)
-            .bind(&event)
+            .bind(&event_data)
             .bind(metadata.to_json())
             .bind(&event_type)
             .bind(stream_id.to_string())
@@ -486,14 +491,25 @@ impl EventStore for PostgresEventStore {
                 ));
             };
 
-            if has_projections {
-                let persisted_id: Uuid = row.get("id");
-                let version: i64 = row.get("version");
-                let created: chrono::DateTime<Utc> = row.get("created");
+            let persisted_id: Uuid = row.get("id");
+            let version: i64 = row.get("version");
+            let created: chrono::DateTime<Utc> = row.get("created");
 
+            sink_events.push(PersistedEvent {
+                id: persisted_id,
+                data: event,
+                stream_id: stream_id.clone(),
+                r#type: event_type.clone(),
+                version,
+                created,
+                metadata: metadata.clone(),
+                aggregate_version: None,
+            });
+
+            if has_projections {
                 appended.push(PersistedEvent {
                     id: persisted_id,
-                    data: event,
+                    data: event_data,
                     stream_id: stream_id.clone(),
                     r#type: event_type,
                     version,
@@ -510,11 +526,15 @@ impl EventStore for PostgresEventStore {
 
         transaction.commit().await.map_err(crate::db_error)?;
 
+        for event in &sink_events {
+            sink.on_event(event);
+        }
+
         // Best-effort NOTIFY: wake any waiting policy tasks immediately so they
         // react without waiting for the next poll interval.  Errors are silently
         // swallowed — polling remains the correctness baseline and a missed
         // notification is caught on the next interval.
-        if !domain_events.is_empty() {
+        if appended_count > 0 {
             let _ = sqlx::query("SELECT pg_notify($1, $2)")
                 .bind(crate::REPLAY_NOTIFY_CHANNEL)
                 .bind(&stream_type)

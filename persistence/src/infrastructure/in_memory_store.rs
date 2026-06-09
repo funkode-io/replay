@@ -1,14 +1,14 @@
 use std::{collections::HashMap, sync::RwLock};
 
 use chrono::Utc;
-use futures::TryStream;
+use futures::{TryStream, TryStreamExt};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use urn::Urn;
 use uuid::Uuid;
 
 use crate::inline_projection::ErasedInlineProjection;
-use crate::{EventStore, InlineProjection, PersistedEvent, StreamFilter};
+use crate::{EventSink, EventStore, InlineProjection, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event};
 
 /// In-memory event store implementation, only for testing purpose.
@@ -143,15 +143,22 @@ impl Default for InMemoryEventStore {
 }
 
 impl EventStore for InMemoryEventStore {
-    async fn store_events<S: replay::EventStream>(
+    async fn store_events_stream<S, ES, Sink>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
         metadata: replay::Metadata,
-        domain_events: &[S::Event],
+        domain_events: ES,
         expected_version: Option<i64>,
-    ) -> Result<(), replay::Error> {
+        mut sink: Sink,
+    ) -> Result<(), replay::Error>
+    where
+        S: replay::EventStream,
+        ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
+        Sink: EventSink<S::Event> + Send,
+    {
         let stream_id: Urn = stream_id.clone().into();
+        let domain_events: Vec<S::Event> = domain_events.try_collect().await?;
 
         // Record the stream's type so `ForStreamTypes` filters can be evaluated per-event.
         self.stream_types
@@ -161,7 +168,10 @@ impl EventStore for InMemoryEventStore {
 
         // Append under the write lock, then release it before driving any async projections
         // (the std `RwLockWriteGuard` is not held across an await).
-        let appended: Vec<PersistedEvent<Value>> = {
+        let (stored_events, sink_events): (
+            Vec<PersistedEvent<Value>>,
+            Vec<PersistedEvent<S::Event>>,
+        ) = {
             let mut store = self.events.write().unwrap();
 
             // Only count current (non-archived) events for the sequence version.
@@ -186,48 +196,52 @@ impl EventStore for InMemoryEventStore {
                 }
             }
 
-            let serialized_events: Result<Vec<PersistedEvent<Value>>, replay::Error> =
-                domain_events
-                    .iter()
-                    .map(|event| {
-                        let id = Uuid::new_v4();
-                        let created = Utc::now();
-                        let r#type = event.event_type();
-                        let version = last_version + 1;
-                        last_version = version;
-                        let data = serde_json::to_value(event).map_err(crate::ser_error)?;
-                        Ok(PersistedEvent {
-                            id,
-                            data,
-                            stream_id: stream_id.clone(),
-                            r#type,
-                            version,
-                            created,
-                            metadata: metadata.clone(),
-                            aggregate_version: None,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, replay::Error>>();
+            let mut events = Vec::with_capacity(domain_events.len());
+            let mut sink_events = Vec::with_capacity(domain_events.len());
+            for event in domain_events {
+                let id = Uuid::new_v4();
+                let created = Utc::now();
+                let r#type = event.event_type();
+                let version = last_version + 1;
+                last_version = version;
 
-            let events = serialized_events?;
-
-            // Retain a copy for best-effort projection routing only when needed.
-            let appended = if self.projections.is_empty() {
-                Vec::new()
-            } else {
-                events.clone()
-            };
+                let data = serde_json::to_value(&event).map_err(crate::ser_error)?;
+                events.push(PersistedEvent {
+                    id,
+                    data,
+                    stream_id: stream_id.clone(),
+                    r#type: r#type.clone(),
+                    version,
+                    created,
+                    metadata: metadata.clone(),
+                    aggregate_version: None,
+                });
+                sink_events.push(PersistedEvent {
+                    id,
+                    data: event,
+                    stream_id: stream_id.clone(),
+                    r#type,
+                    version,
+                    created,
+                    metadata: metadata.clone(),
+                    aggregate_version: None,
+                });
+            }
 
             let stream = store.entry(stream_id.clone()).or_default();
-            stream.extend(events);
+            stream.extend(events.clone());
 
-            appended
+            (events, sink_events)
         };
+
+        for event in &sink_events {
+            sink.on_event(event);
+        }
 
         // Best-effort: drive registered projections after the events are stored and the write
         // lock is released. No atomicity — a failing projection does not roll back the append.
         if !self.projections.is_empty() {
-            self.apply_projections(&appended).await?;
+            self.apply_projections(&stored_events).await?;
         }
 
         Ok(())
@@ -679,6 +693,74 @@ mod tests {
         stream.apply_all(stream_events);
 
         assert_eq!(stream.balance, 60.0);
+    }
+
+    #[tokio::test]
+    async fn store_events_stream_notifies_sink_in_order() {
+        let store = InMemoryEventStore::new();
+        let stream_id = make_stream_id("stream-sink");
+        let events = vec![
+            BankAccountEvent::Deposited { amount: 100.0 },
+            BankAccountEvent::Withdrawn { amount: 40.0 },
+        ];
+
+        let mut observed = Vec::new();
+        store
+            .store_events_stream::<BankAccountStream, _, _>(
+                &stream_id,
+                "BankAccount".to_string(),
+                replay::Metadata::default(),
+                futures::stream::iter(events.clone().into_iter().map(Ok::<_, replay::Error>)),
+                None,
+                |event: &PersistedEvent<BankAccountEvent>| {
+                    observed.push((event.version, event.data.clone()));
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            observed,
+            vec![
+                (1, BankAccountEvent::Deposited { amount: 100.0 }),
+                (2, BankAccountEvent::Withdrawn { amount: 40.0 })
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_events_stream_rolls_back_on_producer_error() {
+        let store = InMemoryEventStore::new();
+        let stream_id = make_stream_id("stream-producer-error");
+
+        let result = store
+            .store_events_stream::<BankAccountStream, _, _>(
+                &stream_id,
+                "BankAccount".to_string(),
+                replay::Metadata::default(),
+                futures::stream::iter(vec![
+                    Ok(BankAccountEvent::Deposited { amount: 100.0 }),
+                    Err(replay::Error::internal("producer failed")),
+                ]),
+                None,
+                crate::NoSink,
+            )
+            .await;
+
+        assert!(result.is_err());
+
+        let stream_events = store
+            .stream_events::<BankAccountEvent>(StreamFilter::with_stream_id::<BankAccountStream>(
+                &stream_id,
+            ))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert!(
+            stream_events.is_empty(),
+            "producer error must discard the whole batch"
+        );
     }
 
     #[tokio::test]
