@@ -1916,6 +1916,34 @@ impl Policy for FeePolicy {
 }
 ```
 
+`react` is pure — it returns [`Dispatch`]es with no I/O. The runner automatically
+stamps causation metadata onto every dispatched command before executing it:
+
+```json
+{
+  "causation": {
+    "policy":           "deposit_fee",
+    "event_id":         "<uuid of the triggering Deposited event>",
+    "stream_id":        "urn:account:alice-checking",
+    "global_position":  42,
+    "depth":            1
+  }
+}
+```
+
+This metadata travels with the resulting events, enabling:
+
+- **Idempotency** — target aggregates can key duplicate detection on `causation.event_id` rather than command-value equality.
+- **Loop prevention** — the `depth` counter is incremented at each hop; the runner skips reactions once it reaches the configured limit (see [Loop prevention](#loop-prevention)).
+- **Observability** — every policy-driven event is traceable back to the original triggering event by `causation.event_id`.
+
+You can attach additional metadata to a specific dispatch with [`Dispatch::with_metadata`]; the runner merges it with the causation block (colliding top-level keys are rejected):
+
+```rust,ignore
+Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount })
+    .with_metadata(Metadata::from([("correlation_id", request_id)]))
+```
+
 ### Closure shortcut
 
 For simple, single-aggregate reactions you can skip the struct and `impl Policy`
