@@ -476,6 +476,264 @@ async fn bank_account_store_events_concurrency_conflict_postgres_test() {
     assert_eq!(event_count, 1);
 }
 
+#[tokio::test]
+async fn bank_account_store_events_stream_sink_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let stream_id = BankAccountUrn::new("stream-sink-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    let mut observed = Vec::new();
+    store
+        .store_events_stream::<BankAccount, _, _>(
+            &stream_id,
+            "bank-account".to_string(),
+            replay::Metadata::default(),
+            futures::stream::iter(vec![
+                Ok(BankAccountEvent::Deposited {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    amount: 100.0,
+                }),
+                Ok(BankAccountEvent::Withdrawn {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+                    amount: 40.0,
+                }),
+            ]),
+            None,
+            |event: &PersistedEvent<BankAccountEvent>| {
+                observed.push((event.version, event.data.clone()));
+            },
+        )
+        .await
+        .expect("streaming append must succeed");
+
+    assert_eq!(
+        observed,
+        vec![
+            (
+                1,
+                BankAccountEvent::Deposited {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    amount: 100.0
+                }
+            ),
+            (
+                2,
+                BankAccountEvent::Withdrawn {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+                    amount: 40.0
+                }
+            )
+        ]
+    );
+
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
+        .bind(&stream_id_str)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("counting events must succeed");
+
+    assert_eq!(event_count, 2);
+}
+
+#[tokio::test]
+async fn bank_account_store_events_stream_producer_error_rolls_back_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let stream_id = BankAccountUrn::new("stream-rollback-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+    let mut observed = 0;
+
+    let result = store
+        .store_events_stream::<BankAccount, _, _>(
+            &stream_id,
+            "bank-account".to_string(),
+            replay::Metadata::default(),
+            futures::stream::iter(vec![
+                Ok(BankAccountEvent::Deposited {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    amount: 100.0,
+                }),
+                Err(replay::Error::internal("producer failed")),
+            ]),
+            Some(0),
+            |_event: &PersistedEvent<BankAccountEvent>| {
+                observed += 1;
+            },
+        )
+        .await;
+
+    assert!(result.is_err());
+    // The sink is notified per event *as it is appended* inside the transaction, which is what
+    // lets very large appends stream through without the store buffering the whole batch. It is
+    // a best-effort observer: here it sees the one event appended before the producer failed.
+    // Durability is the real guarantee — the transaction rolls back so nothing is persisted.
+    assert_eq!(
+        observed, 1,
+        "sink observes events appended before the producer error"
+    );
+
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
+        .bind(&stream_id_str)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("counting events must succeed");
+
+    assert_eq!(event_count, 0, "producer error must roll back whole append");
+}
+
+/// End-to-end proof that a file can be ingested as a stream: the CSV is read row-by-row and
+/// each row becomes one event *as the store pulls it*, so the full set of rows is never
+/// materialised in memory. This is the motivating "bulk import" shape for `store_events_stream`.
+#[tokio::test]
+async fn bulk_payments_csv_streams_end_to_end_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let stream_id = BankAccountUrn::new("bulk-payments-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    // Build the event producer by reading the CSV lazily, one line at a time. Nothing here
+    // collects the rows: each line is parsed into a single event only when the store asks for
+    // the next item, so a multi-million-row file would flow through with bounded memory.
+    let csv_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/bulk_payments.csv"
+    );
+    let events = async_stream::try_stream! {
+        use tokio::io::AsyncBufReadExt;
+
+        let file = tokio::fs::File::open(csv_path)
+            .await
+            .map_err(|e| replay::Error::internal(format!("open csv: {e}")))?;
+        let mut lines = tokio::io::BufReader::new(file).lines();
+        let mut header_skipped = false;
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| replay::Error::internal(format!("read csv: {e}")))?
+        {
+            if !header_skipped {
+                header_skipped = true;
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let mut cols = line.split(',');
+            let date = cols.next().unwrap_or_default().trim();
+            let amount = cols.next().unwrap_or_default().trim();
+
+            let operation_date = chrono::NaiveDate::from_str(date)
+                .map_err(|e| replay::Error::internal(format!("bad date {date:?}: {e}")))?;
+            let amount: f64 = amount
+                .parse()
+                .map_err(|e| replay::Error::internal(format!("bad amount {amount:?}: {e}")))?;
+
+            yield BankAccountEvent::Deposited {
+                operation_date,
+                amount,
+            };
+        }
+    };
+
+    // The sink folds the running total as each event is appended — apply-as-you-stream — so the
+    // caller never holds the events either.
+    let mut rows = 0u64;
+    let mut sink_total = 0.0f64;
+    store
+        .store_events_stream::<BankAccount, _, _>(
+            &stream_id,
+            "BankAccount".to_string(),
+            replay::Metadata::default(),
+            events,
+            None,
+            |event: &PersistedEvent<BankAccountEvent>| {
+                rows += 1;
+                if let BankAccountEvent::Deposited { amount, .. } = &event.data {
+                    sink_total += *amount;
+                }
+            },
+        )
+        .await
+        .expect("streaming csv append must succeed");
+
+    assert_eq!(rows, 6, "every csv row produces exactly one event");
+    assert!(
+        (sink_total - 1938.00).abs() < 1e-9,
+        "sink observed every streamed payment: {sink_total}"
+    );
+
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
+        .bind(&stream_id_str)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("counting events must succeed");
+    assert_eq!(event_count, 6, "all rows are durably persisted");
+
+    // Read the events back as a stream and fold them to confirm the persisted total agrees,
+    // again without ever collecting the full set into memory.
+    let read_total = store
+        .stream_events_by_stream_id::<BankAccount>(&stream_id, AggregateVersion::Latest, None, None)
+        .try_fold(0.0f64, |acc, event| async move {
+            Ok(acc
+                + match event.data {
+                    BankAccountEvent::Deposited { amount, .. } => amount,
+                    _ => 0.0,
+                })
+        })
+        .await
+        .expect("streaming read must succeed");
+
+    assert!(
+        (read_total - 1938.00).abs() < 1e-9,
+        "round-tripped total matches: {read_total}"
+    );
+}
+
 async fn connect_to_postgres(host: String, port: u16) -> PgPool {
     // connect to Postgres
     PgPoolOptions::new()
