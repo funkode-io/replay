@@ -1,8 +1,17 @@
 use std::future::Future;
 
-use futures::TryStream;
+use futures::{StreamExt, TryStream};
 
 use crate::{Error, EventStream};
+
+/// The result of [`Aggregate::handle_stream`]: an owned, boxed (`Send`) event stream or an error.
+#[cfg(not(target_arch = "wasm32"))]
+type HandleStreamResult<E, Err> = Result<futures::stream::BoxStream<'static, Result<E, Err>>, Err>;
+
+/// The result of [`Aggregate::handle_stream`]: an owned, boxed (single-threaded) event stream or an error.
+#[cfg(target_arch = "wasm32")]
+type HandleStreamResult<E, Err> =
+    Result<futures::stream::LocalBoxStream<'static, Result<E, Err>>, Err>;
 
 /// An aggregate is a domain-driven design pattern that allows you to model a domain entity as a sequence of events.
 ///
@@ -25,9 +34,18 @@ use crate::{Error, EventStream};
 ///
 /// # Methods
 /// - `handle`: Validates and processes a command, returning the resulting events or an error.
+/// - `handle_stream`: Stream-first variant of `handle` that yields events lazily instead of
+///   buffering them in a `Vec`.  Use this for commands that may emit very large batches.
 /// - `handle_and_apply`: Processes a command and, if successful, applies the resulting events to the aggregate instance. This is a convenience method for typical aggregate workflows where you want to both validate and mutate state in one step.
 /// - `with_id`: Creates a new aggregate instance with the given id (recommended constructor).
 /// - `id`: Returns the aggregate's identifier (URN).
+///
+/// # `handle` vs `handle_stream`
+/// Implement **at least one** of `handle` / `handle_stream`.  They have one-directional
+/// defaults: `handle` defaults to producing no events, and `handle_stream` defaults to
+/// wrapping `handle`'s `Vec` in a stream.  Implementing only `handle` gives you a streaming
+/// path for free; implementing only `handle_stream` lets a bulk producer avoid ever building
+/// a `Vec`.  Implementing neither compiles but silently emits no events.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait Aggregate: Sync + Send + EventStream {
     type Command: Send;
@@ -39,7 +57,34 @@ pub trait Aggregate: Sync + Send + EventStream {
         &self,
         command: Self::Command,
         services: &Self::Services,
-    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> + Send {
+        let _ = (command, services);
+        async { Ok(Vec::new()) }
+    }
+
+    /// Stream-first variant of [`handle`](Aggregate::handle).
+    ///
+    /// Returns an **owned** stream of `Result<Self::Event, Self::Error>` that does not borrow
+    /// the aggregate, so a caller can fold each event into the same aggregate as it streams.
+    /// The default wraps [`handle`](Aggregate::handle), so existing aggregates get a streaming
+    /// path for free.
+    ///
+    /// The stream is boxed so that its type does not capture the `&self` borrow; this keeps it
+    /// `'static` and lets a consumer hold `&mut self` to fold events while the stream is alive.
+    fn handle_stream(
+        &self,
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> impl Future<Output = HandleStreamResult<Self::Event, Self::Error>> + Send
+    where
+        Self::Event: 'static,
+        Self::Error: 'static,
+    {
+        async move {
+            let events = self.handle(command, services).await?;
+            Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+        }
+    }
 
     fn handle_and_apply<'a>(
         &'a mut self,
@@ -75,9 +120,18 @@ pub trait Aggregate: Sync + Send + EventStream {
 ///
 /// # Methods
 /// - `handle`: Validates and processes a command, returning the resulting events or an error.
+/// - `handle_stream`: Stream-first variant of `handle` that yields events lazily instead of
+///   buffering them in a `Vec`.  Use this for commands that may emit very large batches.
 /// - `handle_and_apply`: Processes a command and, if successful, applies the resulting events to the aggregate instance. This is a convenience method for typical aggregate workflows where you want to both validate and mutate state in one step.
 /// - `with_id`: Creates a new aggregate instance with the given id (recommended constructor).
 /// - `id`: Returns the aggregate's identifier (URN).
+///
+/// # `handle` vs `handle_stream`
+/// Implement **at least one** of `handle` / `handle_stream`.  They have one-directional
+/// defaults: `handle` defaults to producing no events, and `handle_stream` defaults to
+/// wrapping `handle`'s `Vec` in a stream.  Implementing only `handle` gives you a streaming
+/// path for free; implementing only `handle_stream` lets a bulk producer avoid ever building
+/// a `Vec`.  Implementing neither compiles but silently emits no events.
 #[cfg(target_arch = "wasm32")]
 pub trait Aggregate: Sync + EventStream {
     type Command;
@@ -89,7 +143,31 @@ pub trait Aggregate: Sync + EventStream {
         &self,
         command: Self::Command,
         services: &Self::Services,
-    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>>;
+    ) -> impl Future<Output = Result<Vec<Self::Event>, Self::Error>> {
+        let _ = (command, services);
+        async { Ok(Vec::new()) }
+    }
+
+    /// Stream-first variant of [`handle`](Aggregate::handle).
+    ///
+    /// Returns an **owned** stream of `Result<Self::Event, Self::Error>` that does not borrow
+    /// the aggregate, so a caller can fold each event into the same aggregate as it streams.
+    /// The default wraps [`handle`](Aggregate::handle), so existing aggregates get a streaming
+    /// path for free.
+    fn handle_stream(
+        &self,
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> impl Future<Output = HandleStreamResult<Self::Event, Self::Error>>
+    where
+        Self::Event: 'static,
+        Self::Error: 'static,
+    {
+        async move {
+            let events = self.handle(command, services).await?;
+            Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed_local())
+        }
+    }
 
     fn handle_and_apply<'a>(
         &'a mut self,
@@ -504,5 +582,167 @@ mod tests {
         // Test with wrong namespace should fail
         let result = BankAccountAggregate::with_string_id("urn:wrong-namespace:123");
         assert!(result.is_err());
+    }
+
+    // ── handle_stream ────────────────────────────────────────────────────────
+
+    // An aggregate that implements only `handle` gets a streaming path for free:
+    // the default `handle_stream` wraps `handle`'s `Vec` in a stream.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_handle_stream_defaults_to_handle() {
+        use futures::TryStreamExt;
+        use urn::UrnBuilder;
+
+        let bank_id = BankAccountUrn(UrnBuilder::new("bank-account", "stream-1").build().unwrap());
+        let aggregate = BankAccountAggregate::with_id(bank_id);
+        let services = BankAccountServices;
+
+        let command = BankAccountCommand::OpenAccount {
+            account_number: "123456".to_string(),
+        };
+
+        // Streaming yields exactly what `handle` would have returned.
+        let stream = aggregate
+            .handle_stream(command.clone(), &services)
+            .await
+            .unwrap();
+        let streamed: Vec<BankAccountEvent> = stream.try_collect().await.unwrap();
+        let collected = aggregate.handle(command, &services).await.unwrap();
+
+        assert_eq!(streamed, collected);
+        assert_eq!(
+            streamed,
+            vec![BankAccountEvent::AccountOpened {
+                account_number: "123456".to_string()
+            }]
+        );
+    }
+
+    // A bulk aggregate that implements ONLY `handle_stream`: it never builds a
+    // `Vec`, and its `handle` default produces no events.
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+    enum ImportCommand {
+        ImportRows { count: u64 },
+    }
+
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+    enum ImportEvent {
+        RowImported { n: u64 },
+    }
+
+    impl crate::Event for ImportEvent {
+        fn event_type(&self) -> String {
+            "RowImported".to_string()
+        }
+    }
+
+    #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+    struct ImportUrn(Urn);
+
+    impl From<ImportUrn> for Urn {
+        fn from(urn: ImportUrn) -> Self {
+            urn.0
+        }
+    }
+
+    impl TryFrom<Urn> for ImportUrn {
+        type Error = String;
+
+        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+            Ok(ImportUrn(urn))
+        }
+    }
+
+    struct ImportAggregate {
+        id: ImportUrn,
+        total_rows: u64,
+    }
+
+    impl WithId for ImportAggregate {
+        type StreamId = ImportUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            ImportAggregate { id, total_rows: 0 }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
+    impl EventStream for ImportAggregate {
+        type Event = ImportEvent;
+
+        fn stream_type() -> String {
+            "Import".to_string()
+        }
+
+        fn apply(&mut self, event: Self::Event) {
+            match event {
+                ImportEvent::RowImported { .. } => self.total_rows += 1,
+            }
+        }
+    }
+
+    impl Aggregate for ImportAggregate {
+        type Command = ImportCommand;
+        type Error = crate::Error;
+        type Services = ();
+
+        // Only `handle_stream` is implemented — events are produced lazily and a
+        // `Vec` is never materialised.
+        async fn handle_stream(
+            &self,
+            command: Self::Command,
+            _services: &Self::Services,
+        ) -> HandleStreamResult<Self::Event, Self::Error> {
+            let ImportCommand::ImportRows { count } = command;
+            Ok(
+                futures::stream::iter((0..count).map(|n| Ok(ImportEvent::RowImported { n })))
+                    .boxed(),
+            )
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_bulk_aggregate_streams_without_vec() {
+        use futures::TryStreamExt;
+        use urn::UrnBuilder;
+
+        let id = ImportUrn(UrnBuilder::new("import", "file-1").build().unwrap());
+        let mut aggregate = ImportAggregate::with_id(id);
+
+        // The stream is owned ('static) and does not borrow the aggregate, so we can
+        // fold each event into `&mut aggregate` while draining the stream.
+        let mut stream = aggregate
+            .handle_stream(ImportCommand::ImportRows { count: 5 }, &())
+            .await
+            .unwrap();
+
+        while let Some(event) = stream.try_next().await.unwrap() {
+            aggregate.apply(event);
+        }
+
+        assert_eq!(aggregate.total_rows, 5);
+    }
+
+    // The `handle` default produces no events for an aggregate that overrides only
+    // `handle_stream`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_handle_default_is_empty() {
+        use urn::UrnBuilder;
+
+        let id = ImportUrn(UrnBuilder::new("import", "file-2").build().unwrap());
+        let aggregate = ImportAggregate::with_id(id);
+
+        let events = aggregate
+            .handle(ImportCommand::ImportRows { count: 3 }, &())
+            .await
+            .unwrap();
+
+        assert!(events.is_empty());
     }
 }
