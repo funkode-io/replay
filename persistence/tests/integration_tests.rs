@@ -3760,3 +3760,160 @@ async fn policy_daemon_reacts_without_notify_via_polling_postgres_test() {
         "policy must react via polling even when NOTIFY is disabled"
     );
 }
+
+// ── Stream-first aggregate via `Cqrs::execute` (issue #104) ──────────────────
+//
+// `Cqrs::execute` now drives `handle_stream` and folds each persisted event back
+// into the in-memory aggregate as it streams into the store (apply-as-you-stream).
+// The existing `bank_account_*` tests cover a `handle`-only aggregate end to end;
+// these cover an aggregate that implements *only* `handle_stream` and never builds
+// a `Vec`.
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+enum ImportEvent {
+    RowImported { n: u64 },
+}
+
+impl replay::Event for ImportEvent {
+    fn event_type(&self) -> String {
+        "RowImported".to_string()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Urn)]
+struct ImportUrn(Urn);
+
+enum ImportCommand {
+    ImportRows { count: u64 },
+}
+
+/// A bulk-import aggregate that folds only a bounded counter while emitting an
+/// arbitrarily large event stream. It implements *only* `handle_stream`, so its
+/// `handle` default produces no events and a `Vec` is never materialised.
+struct ImportAggregate {
+    id: ImportUrn,
+    total_rows: u64,
+}
+
+impl replay::WithId for ImportAggregate {
+    type StreamId = ImportUrn;
+
+    fn with_id(id: Self::StreamId) -> Self {
+        ImportAggregate { id, total_rows: 0 }
+    }
+
+    fn get_id(&self) -> &Self::StreamId {
+        &self.id
+    }
+}
+
+impl replay::EventStream for ImportAggregate {
+    type Event = ImportEvent;
+
+    fn stream_type() -> String {
+        "Import".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            ImportEvent::RowImported { .. } => self.total_rows += 1,
+        }
+    }
+}
+
+impl replay::Aggregate for ImportAggregate {
+    type Command = ImportCommand;
+    type Error = replay::Error;
+    type Services = ();
+
+    async fn handle_stream(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<futures::stream::BoxStream<'static, Result<Self::Event, Self::Error>>, Self::Error>
+    {
+        use futures::StreamExt;
+        let ImportCommand::ImportRows { count } = command;
+        Ok(futures::stream::iter((0..count).map(|n| Ok(ImportEvent::RowImported { n }))).boxed())
+    }
+}
+
+/// A `handle_stream`-only aggregate round-trips through `execute` against the
+/// in-memory store: every event is folded into the returned aggregate and every
+/// event is persisted, in order. Runs without Docker.
+#[tokio::test]
+async fn import_streaming_aggregate_executes_via_handle_stream_in_memory_test() {
+    let store = replay_persistence::InMemoryEventStore::new();
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    let stream_id = ImportUrn::new("file-in-memory").unwrap();
+
+    let aggregate = cqrs
+        .execute::<ImportAggregate>(
+            &stream_id,
+            replay::Metadata::default(),
+            ImportCommand::ImportRows { count: 1000 },
+            &(),
+            None,
+        )
+        .await
+        .expect("streaming aggregate must round-trip through execute");
+
+    // Apply-as-you-stream: the folded aggregate counts every event without buffering.
+    assert_eq!(aggregate.total_rows, 1000);
+
+    // Every produced event was persisted: replaying the stream folds back to 1000.
+    let replayed = cqrs
+        .fetch_aggregate::<ImportAggregate>(&stream_id)
+        .await
+        .expect("replaying the persisted stream must succeed");
+    assert_eq!(replayed.total_rows, 1000);
+}
+
+/// End-to-end parity with the in-memory test against a real Postgres backend: a
+/// `handle_stream`-only aggregate is appended under one transaction and the folded
+/// aggregate reflects every streamed event.
+#[tokio::test]
+async fn import_streaming_aggregate_executes_via_handle_stream_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+
+    let stream_id = ImportUrn::new("file-postgres").unwrap();
+
+    let aggregate = cqrs
+        .execute::<ImportAggregate>(
+            &stream_id,
+            replay::Metadata::default(),
+            ImportCommand::ImportRows { count: 1000 },
+            &(),
+            None,
+        )
+        .await
+        .expect("streaming aggregate must round-trip through execute");
+
+    assert_eq!(aggregate.total_rows, 1000);
+
+    // Every produced event was persisted exactly once, in order, under one transaction.
+    let persisted: Vec<PersistedEvent<ImportEvent>> = store
+        .stream_events::<ImportEvent>(StreamFilter::with_stream_id::<ImportAggregate>(&stream_id))
+        .try_collect()
+        .await
+        .expect("streaming persisted events must succeed");
+
+    assert_eq!(persisted.len(), 1000);
+    let versions: Vec<i64> = persisted.iter().map(|e| e.version).collect();
+    assert_eq!(versions, (1..=1000).collect::<Vec<_>>());
+}
