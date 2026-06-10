@@ -12,8 +12,8 @@ readme.workspace = true
 name = "replay_macros_tests"
 
 [dependencies]
-replay = { package = "es-replay", path = "../es", version = "0.5.0" }
-replay-macros = { package = "es-replay-macros", path = "../macros", version = "0.5.0" }
+replay = { package = "es-replay", path = "../es", version = "0.6.0" }
+replay-macros = { package = "es-replay-macros", path = "../macros", version = "0.6.0" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
