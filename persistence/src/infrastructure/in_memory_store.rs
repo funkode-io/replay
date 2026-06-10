@@ -800,7 +800,12 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err());
+        let err = result.expect_err("stale expected_version must conflict");
+        assert_eq!(
+            err.kind(),
+            replay::ErrorKind::Conflict,
+            "stale append must surface an optimistic-concurrency conflict"
+        );
 
         let stream_events = store
             .stream_events::<BankAccountEvent>(StreamFilter::with_stream_id::<BankAccountStream>(
