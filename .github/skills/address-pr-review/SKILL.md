@@ -40,7 +40,38 @@ contributor's fork `origin`).
    gh pr view --json number,headRefName,baseRefName,url
    ```
 
-## 1. Collect open review comments
+## 1. Review the PR title and description
+Before touching review threads, make the PR's own metadata correct.
+
+```bash
+gh pr view <number> --json title,body,files,commits
+```
+
+1. **Title follows Conventional Commits.** Ensure the title matches
+   `type(scope): summary` (e.g. `feat(api): add pagination`). Allowed types are
+   typically `feat`, `fix`, `docs`, `refactor`, `test`, `chore` — defer to the
+   repo's own list if it documents one. Many repos derive the squash-merge commit
+   message from the PR title, so this matters.
+2. **Check repo guidelines / templates.** Look for a PR template and contribution
+   guidelines and validate the description against them:
+   - `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE/` (or root /
+     `docs/` variants).
+   - `CONTRIBUTING.md`, `AGENTS.md`, `README.md` for title/description rules.
+   If required sections are missing or unfilled, plan an update to satisfy them.
+3. **Title/description matches the code.** Compare the stated intent against the
+   actual diff (`gh pr diff <number>` / the `files` and `commits` above). Flag any
+   mismatch — scope creep not mentioned, claims not backed by the diff, or a stale
+   description after later commits.
+4. **Confirm before editing.** If the title or body need changes, **notify the user
+   with the proposed new title/description and ask for an explicit yes/no**. Do NOT
+   modify the PR until the user confirms. On "yes", apply:
+   ```bash
+   gh pr edit <number> --title "type(scope): summary"
+   gh pr edit <number> --body-file <file>   # or --body "..."
+   ```
+   On "no", leave the PR untouched and continue.
+
+## 2. Collect open review comments
 Pull the unresolved review threads for the PR (use the upstream repo with
 `gh pr view` / `gh api`). Focus only on threads that are still **open/unresolved**.
 
@@ -50,7 +81,7 @@ gh pr view <number> --json reviews,comments
 gh api graphql -f query='...reviewThreads(isResolved){...}'   # filter isResolved == false
 ```
 
-## 2. Process each open comment
+## 3. Process each open comment
 For every open comment, iterate one at a time:
 
 1. **Challenge when warranted.** If the comment seems incorrect, unnecessary, or in
@@ -76,7 +107,7 @@ For every open comment, iterate one at a time:
    Leave a thread open (reply only, no resolve) when it is still blocked on user
    clarification or remains a point of disagreement.
 
-## 3. Check whether the branch is behind upstream
+## 4. Check whether the branch is behind upstream
 Fetch and compare the PR branch against the upstream default branch (commonly
 `main`):
 
@@ -108,7 +139,7 @@ git merge --abort   # if you only wanted to test for conflicts
   git merge <upstream-remote>/<default-branch>
   ```
 
-## 4. Push updates (no force)
+## 5. Push updates (no force)
 Push all new work — fixes from review and any sync merge commit — as ordinary,
 additive commits:
 
@@ -120,6 +151,9 @@ Never force-push while the PR is open. If history seems to require rewriting, st
 and ask the user instead.
 
 ## Done When
+- The PR title follows Conventional Commits and the description satisfies the repo's
+  template/guidelines and matches the actual code (with any edits confirmed by the
+  user beforehand).
 - Every open review thread has a `gh` reply stating the action taken, and resolvable
   threads are marked resolved.
 - The branch is either in sync with upstream or the user has explicitly chosen to
