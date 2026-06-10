@@ -127,12 +127,12 @@ git merge --no-commit --no-ff <upstream-remote>/<default-branch>
 git merge --abort   # if you only wanted to test for conflicts
 ```
 
-### 3a. Conflicts exist
+### 4a. Conflicts exist
 - **Ask the user** whether they want to update the branch and resolve the conflicts
   before continuing the review.
 - Only proceed to merge + resolve conflicts after the user confirms.
 
-### 3b. No conflicts
+### 4b. No conflicts
 - **Notify the user** that the branch is behind but conflict-free, then sync it by
   merging upstream into the branch (a merge commit, not a rebase):
   ```bash
