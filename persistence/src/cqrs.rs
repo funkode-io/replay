@@ -4,7 +4,7 @@ use futures::{StreamExt, TryStreamExt};
 
 use replay::{Aggregate, Event};
 
-use super::{AggregateVersion, EventStore};
+use super::{AggregateVersion, EventStore, PersistedEvent};
 
 #[derive(Clone)]
 pub struct Cqrs<ES: EventStore> {
@@ -82,7 +82,11 @@ impl<ES: EventStore> Cqrs<ES> {
         command: A::Command,
         services: &A::Services,
         expected_version: Option<i64>,
-    ) -> Result<A, A::Error> {
+    ) -> Result<A, A::Error>
+    where
+        A::Event: 'static,
+        A::Error: 'static,
+    {
         // Always load the latest (current) event stream for command handling.
         let mut aggregate = self
             .fetch_aggregate_at::<A>(id, AggregateVersion::Latest, expected_version, None)
@@ -90,14 +94,29 @@ impl<ES: EventStore> Cqrs<ES> {
 
         let stream_type = A::stream_type();
 
-        let events = aggregate.handle(command, services).await?;
+        // Stream-first: the producer yields events lazily and owns its data — it does not
+        // borrow the aggregate — so once it is built the borrow on `&aggregate` is released
+        // and we can fold each persisted event back into the same aggregate as it streams
+        // into the store (apply-as-you-stream). Events are never buffered in a `Vec`.
+        //
+        // A producer error is fatal and rolls back the whole append; it is surfaced to the
+        // store as a `replay::Error` so the streaming contract (`Error = replay::Error`) holds.
+        let event_stream = aggregate
+            .handle_stream(command, services)
+            .await?
+            .map_err(|e| replay::Error::internal("aggregate event producer failed").with_source(e));
 
         self.store
-            .store_events::<A>(id, stream_type, metadata, &events, expected_version)
+            .store_events_stream::<A, _, _>(
+                id,
+                stream_type,
+                metadata,
+                event_stream,
+                expected_version,
+                |event: &PersistedEvent<A::Event>| aggregate.apply(event.data.clone()),
+            )
             .await
             .map_err(A::Error::from)?;
-
-        aggregate.apply_all(events);
 
         Ok(aggregate)
     }
