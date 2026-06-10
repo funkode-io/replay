@@ -476,6 +476,80 @@ async fn bank_account_store_events_concurrency_conflict_postgres_test() {
     assert_eq!(event_count, 1);
 }
 
+/// Regression guard for the latent per-event concurrency bug: a multi-event streamed append
+/// against a fresh stream with a correct `expected_version` must succeed for *every* event,
+/// not just the first. Previously the expected version was re-checked per event against a
+/// stream version that incremented on each append, so the second event always conflicted.
+#[tokio::test]
+async fn bank_account_multi_event_append_with_expected_version_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+
+    let stream_id = BankAccountUrn::new("multi-event-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+
+    // Three events appended in one call, expecting the stream to start at version 0.
+    let mut observed_versions = Vec::new();
+    store
+        .store_events_stream::<BankAccount, _, _>(
+            &stream_id,
+            "bank-account".to_string(),
+            replay::Metadata::default(),
+            futures::stream::iter(vec![
+                Ok(BankAccountEvent::Deposited {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    amount: 100.0,
+                }),
+                Ok(BankAccountEvent::Withdrawn {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+                    amount: 40.0,
+                }),
+                Ok(BankAccountEvent::Deposited {
+                    operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(),
+                    amount: 10.0,
+                }),
+            ]),
+            Some(0),
+            |event: &PersistedEvent<BankAccountEvent>| observed_versions.push(event.version),
+        )
+        .await
+        .expect("multi-event append with correct expected version must succeed");
+
+    assert_eq!(
+        observed_versions,
+        vec![1, 2, 3],
+        "every event is appended with a monotonically increasing version"
+    );
+
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
+        .bind(&stream_id_str)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("counting events must succeed");
+    assert_eq!(event_count, 3, "all three events are durably persisted");
+
+    let head_version: i64 = sqlx::query_scalar("SELECT version FROM streams WHERE id = $1")
+        .bind(&stream_id_str)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("reading stream head must succeed");
+    assert_eq!(head_version, 3, "stream head advanced once per event");
+}
+
 #[tokio::test]
 async fn bank_account_store_events_stream_sink_postgres_test() {
     let container = postgres::Postgres::default().start().await.unwrap();

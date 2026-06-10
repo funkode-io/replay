@@ -733,6 +733,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_events_stream_multi_event_with_expected_version_succeeds() {
+        // Parity with the Postgres regression guard: a multi-event append with a correct
+        // expected version is validated once at the head and then appends every event.
+        let store = InMemoryEventStore::new();
+        let stream_id = make_stream_id("stream-multi-expected");
+        let events = vec![
+            BankAccountEvent::Deposited { amount: 100.0 },
+            BankAccountEvent::Withdrawn { amount: 40.0 },
+            BankAccountEvent::Deposited { amount: 10.0 },
+        ];
+
+        let mut observed_versions = Vec::new();
+        store
+            .store_events_stream::<BankAccountStream, _, _>(
+                &stream_id,
+                "BankAccount".to_string(),
+                replay::Metadata::default(),
+                futures::stream::iter(events.into_iter().map(Ok::<_, replay::Error>)),
+                Some(0),
+                |event: &PersistedEvent<BankAccountEvent>| observed_versions.push(event.version),
+            )
+            .await
+            .expect("multi-event append with correct expected version must succeed");
+
+        assert_eq!(observed_versions, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn store_events_stream_stale_expected_version_conflicts() {
+        let store = InMemoryEventStore::new();
+        let stream_id = make_stream_id("stream-stale-expected");
+
+        // Advance the stream to version 1.
+        store
+            .store_events_stream::<BankAccountStream, _, _>(
+                &stream_id,
+                "BankAccount".to_string(),
+                replay::Metadata::default(),
+                futures::stream::iter(
+                    vec![Ok::<_, replay::Error>(BankAccountEvent::Deposited {
+                        amount: 100.0,
+                    })]
+                    .into_iter(),
+                ),
+                Some(0),
+                crate::NoSink,
+            )
+            .await
+            .expect("first append must succeed");
+
+        // A second append still expecting version 0 must conflict and persist nothing new.
+        let result = store
+            .store_events_stream::<BankAccountStream, _, _>(
+                &stream_id,
+                "BankAccount".to_string(),
+                replay::Metadata::default(),
+                futures::stream::iter(
+                    vec![Ok::<_, replay::Error>(BankAccountEvent::Deposited {
+                        amount: 5.0,
+                    })]
+                    .into_iter(),
+                ),
+                Some(0),
+                crate::NoSink,
+            )
+            .await;
+
+        assert!(result.is_err());
+
+        let stream_events = store
+            .stream_events::<BankAccountEvent>(StreamFilter::with_stream_id::<BankAccountStream>(
+                &stream_id,
+            ))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(stream_events.len(), 1, "stale append must not persist");
+    }
+
+    #[tokio::test]
     async fn store_events_stream_rolls_back_on_producer_error() {
         let store = InMemoryEventStore::new();
         let stream_id = make_stream_id("stream-producer-error");

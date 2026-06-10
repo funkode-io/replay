@@ -456,10 +456,19 @@ impl EventStore for PostgresEventStore {
         // never has to live fully in memory.
         let mut domain_events = std::pin::pin!(domain_events.into_stream());
 
+        let mut is_first = true;
         while let Some(event) = domain_events.try_next().await? {
             let event_type = event.event_type().clone();
             let event_data = serde_json::to_value(&event).map_err(crate::ser_error)?;
             let id = Uuid::new_v4();
+
+            // Optimistic concurrency is checked once, on the first append only. The caller's
+            // expected version is matched against the stream head inside `append_event`,
+            // whose `SELECT ... FOR UPDATE` locks the stream row for the rest of the
+            // transaction. Subsequent appends pass a NULL expected version: the version has
+            // been incremented under the lock we already hold, so re-checking it against the
+            // original expectation would spuriously conflict.
+            let expected = if is_first { expected_version } else { None };
 
             let row = sqlx::query(
                 "SELECT id, version, created FROM append_event($1, $2, $3, $4, $5, $6, $7)",
@@ -470,14 +479,14 @@ impl EventStore for PostgresEventStore {
             .bind(&event_type)
             .bind(stream_id.to_string())
             .bind(&stream_type)
-            .bind(expected_version)
+            .bind(expected)
             .fetch_optional(&mut *transaction)
             .await
             .map_err(crate::db_error)?;
 
-            // No row means optimistic-concurrency mismatch in append_event. Surface it as a
-            // concurrency_error (parity with the in-memory store) and let the transaction
-            // roll back so no partial append commits.
+            // No row means an optimistic-concurrency mismatch in `append_event` (only
+            // possible on the first append). Surface it as a concurrency_error and let the
+            // transaction roll back so no partial append commits.
             let Some(row) = row else {
                 let actual_version: i64 =
                     sqlx::query_scalar("SELECT version FROM streams WHERE id = $1")
@@ -493,6 +502,8 @@ impl EventStore for PostgresEventStore {
                     actual_version,
                 ));
             };
+
+            is_first = false;
 
             let persisted_id: Uuid = row.get("id");
             let version: i64 = row.get("version");
