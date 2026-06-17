@@ -2134,3 +2134,62 @@ impl From<MyAggregateError> for replay::Error {
 
 The simplest path is `type Error = replay::Error` (used throughout the examples
 here), which satisfies the bound with the identity conversion.
+
+### Monitoring policy status
+
+A running policy is otherwise opaque: its cursor and dead letters live in
+internal tables. `PolicyStatusStore` turns them into a read-only health signal you
+can poll from a dashboard or health check. It is **not** a projection — it reads
+the operational tables (`policy_cursors`, the `events` head, and
+`policy_dead_letters`) in a **single** query and never scans the event log. See
+[ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md) for the
+rationale.
+
+```rust,ignore
+use replay_persistence::{PolicyStatusStore, PolicyCondition};
+
+let statuses = PolicyStatusStore::new(pool.clone()).list().await?;
+
+for s in &statuses {
+    println!(
+        "{:<20} {:<8} lag={} dead_letters={}",
+        s.name, s.condition, s.lag, s.dead_letter_count
+    );
+}
+
+// React to anything needing attention.
+let degraded: Vec<_> = statuses
+    .iter()
+    .filter(|s| s.condition == PolicyCondition::Degraded)
+    .collect();
+```
+
+Each `PolicyStatus` carries the raw numbers plus a derived condition:
+
+| Field | Meaning |
+|-------|---------|
+| `name` | Stable policy name (the cursor key). |
+| `position` | Last processed `global_position`. |
+| `head` | Current global head (`MAX(global_position)`). |
+| `lag` | Events still to process (`head - position`). |
+| `last_checkpoint_at` | When the cursor last advanced (staleness signal). |
+| `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. |
+| `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
+| `condition` | At-a-glance health label (see below). |
+
+`condition` is derived with a strict precedence — **dead letters outrank lag** —
+so a parked failure is never hidden behind a "still catching up" label:
+
+| Condition | When | Meaning |
+|-----------|------|---------|
+| `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
+| `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
+| `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
+
+`condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
+`"Degraded"`) for JSON/UI consumers.
+
+Only policies that have actually run appear: a registered-but-never-started policy
+has no `policy_cursors` row and is therefore absent from `list()`. The store only
+*observes* — retrying or discarding a dead letter is a separate, deliberate action
+(see the triage queries above).
