@@ -3917,3 +3917,228 @@ async fn import_streaming_aggregate_executes_via_handle_stream_postgres_test() {
     let versions: Vec<i64> = persisted.iter().map(|e| e.version).collect();
     assert_eq!(versions, (1..=1000).collect::<Vec<_>>());
 }
+
+// ── PolicyStatusStore: policy status read model (issue #116) ─────────────────
+
+/// A caught-up policy has `lag == 0` and condition `CaughtUp`.
+///
+/// Setup: append one event, insert a cursor row at the same global position as
+/// the head, then assert that `PolicyStatusStore::list()` returns `CaughtUp`.
+#[tokio::test]
+async fn policy_status_caught_up_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("status-caught-up-1").unwrap();
+
+    // Append one event so the global head is non-zero.
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 50.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Read the actual head position so we can place the cursor exactly there.
+    let head: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(global_position), 0) FROM events")
+            .fetch_one(&pg_pool)
+            .await
+            .expect("head query must succeed");
+
+    // Insert a cursor row at the head — simulates a fully-drained policy.
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ('caught_up_policy', $1, now())",
+    )
+    .bind(head)
+    .execute(&pg_pool)
+    .await
+    .expect("cursor insert must succeed");
+
+    // Read the status.
+    let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
+    let statuses = status_store.list().await.expect("list must succeed");
+
+    assert_eq!(statuses.len(), 1, "one policy must appear");
+    let s = &statuses[0];
+    assert_eq!(s.name, "caught_up_policy");
+    assert_eq!(
+        s.lag, 0,
+        "cursor is at head, so lag must be 0"
+    );
+    assert_eq!(
+        s.condition,
+        replay_persistence::PolicyCondition::CaughtUp,
+        "lag == 0 must yield CaughtUp"
+    );
+    assert_eq!(s.head, s.position, "head and position must be equal");
+}
+
+/// A behind policy has `lag > 0` and condition `Working`.
+///
+/// Setup: append one event but do NOT drain, so the cursor stays at 0 while
+/// the head is 1.
+#[tokio::test]
+async fn policy_status_working_behind_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("status-behind-1").unwrap();
+
+    // Append one event so the global head is non-zero.
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 50.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Bootstrap the cursor at position 0 (StartAt::Beginning) without draining.
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ('behind_policy', 0, now())",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("cursor insert must succeed");
+
+    // Read the status — policy is behind the head.
+    let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
+    let statuses = status_store.list().await.expect("list must succeed");
+
+    assert_eq!(statuses.len(), 1, "one policy must appear");
+    let s = &statuses[0];
+    assert_eq!(s.name, "behind_policy");
+    assert!(s.lag > 0, "policy behind the head must have lag > 0");
+    assert_eq!(
+        s.condition,
+        replay_persistence::PolicyCondition::Working,
+        "lag > 0 must yield Working"
+    );
+    assert_eq!(s.lag, s.head - s.position);
+}
+
+/// Multiple policies are all returned from a single `list()` call.
+///
+/// Setup: insert two cursor rows with different positions, assert both appear
+/// with correct names, lags, and conditions.
+#[tokio::test]
+async fn policy_status_multiple_policies_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("status-multi-1").unwrap();
+
+    // Append two events so the global head is 2.
+    for amount in [10.0_f64, 20.0_f64] {
+        cqrs.execute::<BankAccount>(
+            &account,
+            replay::Metadata::default(),
+            BankAccountCommand::Deposit {
+                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                amount,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Insert two cursor rows: one caught-up (position 2) and one behind (position 1).
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, position, updated_at) VALUES
+             ('alpha_policy', 2, now()),
+             ('beta_policy',  1, now())",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("cursor inserts must succeed");
+
+    let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
+    let statuses = status_store.list().await.expect("list must succeed");
+
+    // Results are ordered by name.
+    assert_eq!(statuses.len(), 2, "both policies must appear");
+
+    let alpha = statuses.iter().find(|s| s.name == "alpha_policy").unwrap();
+    assert_eq!(alpha.lag, 0);
+    assert_eq!(alpha.condition, replay_persistence::PolicyCondition::CaughtUp);
+
+    let beta = statuses.iter().find(|s| s.name == "beta_policy").unwrap();
+    assert_eq!(beta.lag, 1);
+    assert_eq!(beta.condition, replay_persistence::PolicyCondition::Working);
+}
+
+/// A policy that has never run (no `policy_cursors` row) does not appear.
+#[tokio::test]
+async fn policy_status_unregistered_policy_absent_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    // No cursor rows inserted — the table is empty.
+    let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
+    let statuses = status_store.list().await.expect("list must succeed");
+
+    assert!(
+        statuses.is_empty(),
+        "no cursor rows means no statuses must be returned"
+    );
+}
