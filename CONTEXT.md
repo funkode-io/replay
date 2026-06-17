@@ -52,6 +52,27 @@ applied, and the chain of causation is what bounds how deep one event may
 cascade into further reactions.
 _Avoid_: trigger, cause, origin.
 
+### Dead letter
+
+A recorded failure of a [Policy] reaction that could not be completed — a
+_recorded skip_, never a silent one. When a reaction fails permanently (or
+exhausts its retries) the runner stores a dead letter and advances past the
+triggering event so a single bad event never wedges the Policy. Dead letters are
+queryable so an operator can later inspect and, eventually, explicitly retry
+them.
+_Avoid_: poison message, failed event, error queue.
+
+### Policy status
+
+A point-in-time, read-only snapshot of a [Policy]'s operational progress and
+health — how far behind the event log it is and whether its reactions are
+failing — intended for a human monitoring the system. It is **not** domain
+state (an [Aggregate]'s rebuilt-from-stream state) and **not** a [Projection]
+(it derives no read model from the event log; it reports on a Policy's runtime).
+_Observing_ a Policy's status (read-only) is a separate concern from
+_controlling_ a Policy (acting on its failures, e.g. retrying a [Dead letter]).
+_Avoid_: state, policy state, health check.
+
 ### Query
 
 The existing on-demand, in-memory fold over filtered events. It is the
@@ -86,6 +107,8 @@ background process. A future [Async projection] aimed at client/edge targets
 would need to honour the WASM dual-cfg pattern.
 
 [Aggregate]: #aggregate
+[Policy]: #policy
+[Dead letter]: #dead-letter
 [Query]: #query
 [Live projection]: #live-projection
 [Inline projection]: #inline-projection

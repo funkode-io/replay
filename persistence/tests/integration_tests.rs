@@ -3958,11 +3958,10 @@ async fn policy_status_caught_up_postgres_test() {
     .unwrap();
 
     // Read the actual head position so we can place the cursor exactly there.
-    let head: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(global_position), 0) FROM events")
-            .fetch_one(&pg_pool)
-            .await
-            .expect("head query must succeed");
+    let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(global_position), 0) FROM events")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("head query must succeed");
 
     // Insert a cursor row at the head — simulates a fully-drained policy.
     sqlx::query(
@@ -3980,10 +3979,7 @@ async fn policy_status_caught_up_postgres_test() {
     assert_eq!(statuses.len(), 1, "one policy must appear");
     let s = &statuses[0];
     assert_eq!(s.name, "caught_up_policy");
-    assert_eq!(
-        s.lag, 0,
-        "cursor is at head, so lag must be 0"
-    );
+    assert_eq!(s.lag, 0, "cursor is at head, so lag must be 0");
     assert_eq!(
         s.condition,
         replay_persistence::PolicyCondition::CaughtUp,
@@ -4110,7 +4106,10 @@ async fn policy_status_multiple_policies_postgres_test() {
 
     let alpha = statuses.iter().find(|s| s.name == "alpha_policy").unwrap();
     assert_eq!(alpha.lag, 0);
-    assert_eq!(alpha.condition, replay_persistence::PolicyCondition::CaughtUp);
+    assert_eq!(
+        alpha.condition,
+        replay_persistence::PolicyCondition::CaughtUp
+    );
 
     let beta = statuses.iter().find(|s| s.name == "beta_policy").unwrap();
     assert_eq!(beta.lag, 1);
@@ -4140,5 +4139,85 @@ async fn policy_status_unregistered_policy_absent_postgres_test() {
     assert!(
         statuses.is_empty(),
         "no cursor rows means no statuses must be returned"
+    );
+}
+
+/// A policy with dead letters is `Degraded`, and dead letters take precedence
+/// over lag.
+///
+/// Setup: append two events (head = 2), insert a cursor behind the head
+/// (position 1, so `lag > 0`), and record one dead-letter row. The status must
+/// surface `dead_letter_count == 1`, a `last_dead_letter_at` timestamp, and
+/// condition `Degraded` — never `Working`, even though the policy is also behind.
+#[tokio::test]
+async fn policy_status_degraded_with_dead_letters_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("status-degraded-1").unwrap();
+
+    // Append two events so the global head is 2.
+    for amount in [10.0_f64, 20.0_f64] {
+        cqrs.execute::<BankAccount>(
+            &account,
+            replay::Metadata::default(),
+            BankAccountCommand::Deposit {
+                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                amount,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Cursor behind the head (lag > 0) so we can prove Degraded beats Working.
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ('degraded_policy', 1, now())",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("cursor insert must succeed");
+
+    // Record one dead-letter row for the policy.
+    sqlx::query(
+        "INSERT INTO policy_dead_letters \
+             (policy_name, global_position, event_id, error_kind, error_message) \
+         VALUES ('degraded_policy', 2, $1, 'Permanent', 'boom')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pg_pool)
+    .await
+    .expect("dead-letter insert must succeed");
+
+    let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
+    let statuses = status_store.list().await.expect("list must succeed");
+
+    assert_eq!(statuses.len(), 1, "one policy must appear");
+    let s = &statuses[0];
+    assert_eq!(s.name, "degraded_policy");
+    assert!(s.lag > 0, "policy is behind the head, so lag must be > 0");
+    assert_eq!(s.dead_letter_count, 1, "one dead-letter row was recorded");
+    assert!(
+        s.last_dead_letter_at.is_some(),
+        "a dead-letter timestamp must be present"
+    );
+    assert_eq!(
+        s.condition,
+        replay_persistence::PolicyCondition::Degraded,
+        "dead letters must yield Degraded even when the policy is also behind"
     );
 }
