@@ -117,7 +117,9 @@ impl PolicyStatusStore {
     ///
     /// The result is produced by a **single** SQL read that joins
     /// `policy_cursors`, `MAX(global_position)` on `events`, and a per-policy
-    /// aggregate over `policy_dead_letters`.  The event log is never scanned.
+    /// `LATERAL` aggregate over `policy_dead_letters`.  The lateral is filtered
+    /// by `pc.name`, so it uses the `(policy_name, created_at)` index instead of
+    /// aggregating the whole dead-letter table.  The event log is never scanned.
     pub async fn list(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
         let rows = sqlx::query(
             r#"
@@ -133,14 +135,13 @@ impl PolicyStatusStore {
                 SELECT COALESCE(MAX(global_position), 0) AS head
                 FROM events
             ) h
-            LEFT JOIN (
+            LEFT JOIN LATERAL (
                 SELECT
-                    policy_name,
                     COUNT(*)        AS dead_letter_count,
                     MAX(created_at) AS last_dead_letter_at
                 FROM policy_dead_letters
-                GROUP BY policy_name
-            ) dl ON dl.policy_name = pc.name
+                WHERE policy_name = pc.name
+            ) dl ON TRUE
             ORDER BY pc.name
             "#,
         )
@@ -185,11 +186,11 @@ mod tests {
 
     /// Pure derivation test — no database required.
     ///
-    /// Verifies the [`PolicyCondition::from_fields`] precedence:
-    /// `dead_letter_count > 0` → `Degraded`, else `lag > 0` → `Working`,
-    /// else `CaughtUp`.
+    /// Verifies the [`PolicyCondition::from_fields`] precedence as surfaced on a
+    /// fully-built [`PolicyStatus`]: `dead_letter_count > 0` → `Degraded`, else
+    /// `lag > 0` → `Working`, else `CaughtUp`.
     #[test]
-    fn policy_condition_derived_from_lag() {
+    fn policy_status_condition_derived_from_fields() {
         let now = Utc::now();
 
         // lag == 0, no dead letters: caught up
