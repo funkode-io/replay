@@ -3292,7 +3292,165 @@ async fn policy_business_rule_violation_advances_without_dead_letter_postgres_te
     assert_eq!(cursor, 1, "cursor must have advanced past the BRV event");
 }
 
-// ── Batching: read-batch size and checkpoint-batch size (issue #85) ───────────
+// ── PolicyStatus / dead-letter dimension (issue #117) ────────────────────────
+
+/// `policy_statuses` exposes dead-letter metrics and the `Degraded` condition.
+///
+/// Scenario:
+///   - Append 2 deposits.
+///   - `PoisonDispatchPolicy` reacts to each but dispatches to an unregistered
+///     aggregate type → permanent `InvalidInput` each time → 2 dead-letter rows.
+///   - After drain, `policy_statuses()` must return a single `PolicyStatus` where:
+///     - `dead_letter_count == 2`
+///     - `last_dead_letter_at` is `Some`
+///     - `condition == Degraded`
+///     - `lag == 0` (cursor advanced past all events, so still caught-up on lag)
+///     - raw fields (`cursor`, `global_head`, `lag`) are still present
+#[tokio::test]
+async fn policy_status_dead_letter_condition_is_degraded_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("status-dead-letter-1").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    // Append two deposits that will each trigger a permanent dispatch failure.
+    for _ in 0..2 {
+        cqrs.execute::<BankAccount>(
+            &account,
+            meta.clone(),
+            BankAccountCommand::Deposit {
+                effective_on: date,
+                amount: 50.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // PoisonDispatchPolicy dispatches to IdempotentFeeAccount which is NOT
+    // registered — every dispatch fails permanently and is dead-lettered.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(PoisonDispatchPolicy)
+        .build();
+
+    let dispatches = runner.drain().await.expect("drain must not error");
+    assert_eq!(dispatches, 0, "permanently-failing dispatches are not counted");
+
+    // Read the status snapshot.
+    let statuses = runner
+        .policy_statuses()
+        .await
+        .expect("policy_statuses must succeed");
+
+    assert_eq!(statuses.len(), 1, "exactly one policy cursor must exist");
+
+    let status = &statuses[0];
+    assert_eq!(status.name, "poison_dispatch_policy");
+    assert_eq!(
+        status.dead_letter_count, 2,
+        "two dispatches must have been dead-lettered"
+    );
+    assert!(
+        status.last_dead_letter_at.is_some(),
+        "last_dead_letter_at must be populated"
+    );
+    assert_eq!(
+        status.condition,
+        replay_persistence::PolicyCondition::Degraded,
+        "condition must be Degraded when dead letters exist"
+    );
+    // Cursor caught up with the global head (lag is 0).
+    assert_eq!(
+        status.lag, 0,
+        "cursor must have advanced past both dead-lettered events"
+    );
+    // Raw fields are still present alongside the headline.
+    assert_eq!(status.global_head, 2, "global head must reflect both appended events");
+    assert_eq!(status.cursor, 2, "cursor must be at the global head");
+}
+
+/// `policy_statuses` returns `CaughtUp` when a healthy policy has processed
+/// all events and has no dead letters.
+#[tokio::test]
+async fn policy_status_caught_up_condition_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("status-healthy-1").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    // Append a single deposit — the runner will process it cleanly.
+    cqrs.execute::<BankAccount>(
+        &account,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // A no-op policy that observes events but issues no dispatches.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy_fn::<BankAccountEvent, _>(
+            "healthy_policy",
+            replay_persistence::StartAt::Beginning,
+            |_| Vec::new(),
+        )
+        .build();
+
+    runner.drain().await.expect("drain must not error");
+
+    let statuses = runner
+        .policy_statuses()
+        .await
+        .expect("policy_statuses must succeed");
+
+    assert_eq!(statuses.len(), 1);
+    let status = &statuses[0];
+    assert_eq!(status.name, "healthy_policy");
+    assert_eq!(status.dead_letter_count, 0);
+    assert!(status.last_dead_letter_at.is_none());
+    assert_eq!(status.lag, 0);
+    assert_eq!(
+        status.condition,
+        replay_persistence::PolicyCondition::CaughtUp
+    );
+}
 
 /// Policy with a custom read-batch size for testing.
 struct SmallBatchPolicy {

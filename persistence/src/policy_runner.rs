@@ -12,9 +12,11 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -83,6 +85,76 @@ where
 /// Policy tasks LISTEN on this channel; `PostgresEventStore::store_events`
 /// fires a NOTIFY on it after every successful commit.
 pub const REPLAY_NOTIFY_CHANNEL: &str = "replay_events";
+
+// ── Policy status read model ──────────────────────────────────────────────────
+
+/// Headline health label for a [`PolicyStatus`].
+///
+/// Precedence (highest wins):
+///
+/// | Condition  | When                                |
+/// |------------|-------------------------------------|
+/// | `Degraded` | `dead_letter_count > 0`             |
+/// | `Working`  | `dead_letter_count == 0`, `lag > 0` |
+/// | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`|
+///
+/// A policy that is *both* behind and has dead letters resolves to `Degraded`
+/// so that parked failures are never hidden behind a progress label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyCondition {
+    /// No dead letters and no lag: fully healthy and up to date.
+    CaughtUp,
+    /// No dead letters but lagging behind the global head.
+    Working,
+    /// At least one dead-letter exists; needs operator attention.
+    Degraded,
+}
+
+impl fmt::Display for PolicyCondition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PolicyCondition::CaughtUp => f.write_str("CaughtUp"),
+            PolicyCondition::Working => f.write_str("Working"),
+            PolicyCondition::Degraded => f.write_str("Degraded"),
+        }
+    }
+}
+
+impl PolicyCondition {
+    /// Derive the condition from the raw `lag` and `dead_letter_count` fields.
+    pub fn from_fields(lag: i64, dead_letter_count: i64) -> Self {
+        if dead_letter_count > 0 {
+            PolicyCondition::Degraded
+        } else if lag > 0 {
+            PolicyCondition::Working
+        } else {
+            PolicyCondition::CaughtUp
+        }
+    }
+}
+
+/// Snapshot of a single policy's operational state, read from the database.
+///
+/// Returned by [`PolicyRunner::policy_statuses`]. All fields are read in a
+/// single SQL query over operational tables (`policy_cursors`, the global head
+/// aggregate, and `policy_dead_letters`); the event log is never scanned.
+#[derive(Debug, Clone)]
+pub struct PolicyStatus {
+    /// Stable name / cursor key for this policy.
+    pub name: String,
+    /// The stored cursor position (last processed `global_position`).
+    pub cursor: i64,
+    /// Current maximum `global_position` across all events (the global head).
+    pub global_head: i64,
+    /// Number of events between `cursor` and `global_head` (`global_head - cursor`).
+    pub lag: i64,
+    /// Number of dead-letter rows recorded for this policy.
+    pub dead_letter_count: i64,
+    /// Timestamp of the most recent dead-letter row, if any.
+    pub last_dead_letter_at: Option<DateTime<Utc>>,
+    /// Headline health condition derived from `lag` and `dead_letter_count`.
+    pub condition: PolicyCondition,
+}
 
 // ── Closure-based policy adapter ─────────────────────────────────────────────
 
@@ -264,6 +336,23 @@ impl PolicyRunner {
             total += self.drain_policy(policy.as_ref()).await?;
         }
         Ok(total)
+    }
+
+    /// Read the current operational status of every policy known to this runner.
+    ///
+    /// Issues a **single SQL query** that joins:
+    ///
+    /// - `policy_cursors` — one row per registered cursor with its stored position
+    /// - global head aggregate — `MAX(global_position)` over the `events` table
+    /// - `policy_dead_letters` aggregate — per-policy `COUNT(*)` and `MAX(created_at)`
+    ///
+    /// The event log is **never scanned**; only summary statistics are read.
+    ///
+    /// The returned [`PolicyStatus`] slice is ordered by policy name.  Only
+    /// policies that already have a cursor row in the database are included; a
+    /// policy that has never started (no cursor row) will not appear.
+    pub async fn policy_statuses(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
+        read_policy_statuses(&self.pool).await
     }
 
     /// Start one long-lived polling task per registered policy.
@@ -853,6 +942,63 @@ async fn save_cursor(
     Ok(())
 }
 
+/// Read the operational status of every policy that has a cursor row.
+///
+/// The query joins three sources in a single round-trip:
+///   - `policy_cursors`               — per-policy stored position
+///   - `MAX(global_position) FROM events` — current global head
+///   - `policy_dead_letters` aggregate — per-policy dead-letter count + timestamp
+///
+/// The event log is never scanned; only the aggregate scalars are read.
+async fn read_policy_statuses(pool: &Pool<Postgres>) -> Result<Vec<PolicyStatus>, replay::Error> {
+    let rows = sqlx::query(
+        "SELECT \
+             pc.name, \
+             pc.position                                   AS cursor, \
+             COALESCE(head.global_head, 0)                 AS global_head, \
+             GREATEST(COALESCE(head.global_head, 0) - pc.position, 0) AS lag, \
+             COALESCE(dl.dead_letter_count, 0)             AS dead_letter_count, \
+             dl.last_dead_letter_at \
+         FROM policy_cursors AS pc \
+         CROSS JOIN (SELECT COALESCE(MAX(global_position), 0) AS global_head FROM events) AS head \
+         LEFT JOIN ( \
+             SELECT policy_name, \
+                    COUNT(*)        AS dead_letter_count, \
+                    MAX(created_at) AS last_dead_letter_at \
+             FROM policy_dead_letters \
+             GROUP BY policy_name \
+         ) AS dl ON dl.policy_name = pc.name \
+         ORDER BY pc.name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    let statuses = rows
+        .into_iter()
+        .map(|row| {
+            let name: String = row.get("name");
+            let cursor: i64 = row.get("cursor");
+            let global_head: i64 = row.get("global_head");
+            let lag: i64 = row.get("lag");
+            let dead_letter_count: i64 = row.get("dead_letter_count");
+            let last_dead_letter_at: Option<DateTime<Utc>> = row.get("last_dead_letter_at");
+            let condition = PolicyCondition::from_fields(lag, dead_letter_count);
+            PolicyStatus {
+                name,
+                cursor,
+                global_head,
+                lag,
+                dead_letter_count,
+                last_dead_letter_at,
+                condition,
+            }
+        })
+        .collect();
+
+    Ok(statuses)
+}
+
 /// Typed representation of the `causation` block stamped in event metadata by
 /// every policy reaction.  Using a struct instead of manual `Value` navigation
 /// ensures the write (serialization) and read (deserialization) paths stay in sync.
@@ -1029,7 +1175,51 @@ mod tests {
     use replay::Metadata;
     use serde_json::json;
 
-    use super::merge_dispatch_metadata;
+    use super::{merge_dispatch_metadata, PolicyCondition};
+
+    // ── PolicyCondition precedence table ─────────────────────────────────────
+
+    #[test]
+    fn condition_caught_up_when_no_lag_and_no_dead_letters() {
+        assert_eq!(
+            PolicyCondition::from_fields(0, 0),
+            PolicyCondition::CaughtUp
+        );
+    }
+
+    #[test]
+    fn condition_working_when_lag_and_no_dead_letters() {
+        assert_eq!(
+            PolicyCondition::from_fields(5, 0),
+            PolicyCondition::Working
+        );
+    }
+
+    #[test]
+    fn condition_degraded_when_dead_letters_and_no_lag() {
+        assert_eq!(
+            PolicyCondition::from_fields(0, 3),
+            PolicyCondition::Degraded
+        );
+    }
+
+    #[test]
+    fn condition_degraded_when_behind_and_dead_lettered() {
+        // Dead letters win even when the policy is also behind.
+        assert_eq!(
+            PolicyCondition::from_fields(10, 2),
+            PolicyCondition::Degraded
+        );
+    }
+
+    #[test]
+    fn condition_display_renders_stable_string() {
+        assert_eq!(PolicyCondition::CaughtUp.to_string(), "CaughtUp");
+        assert_eq!(PolicyCondition::Working.to_string(), "Working");
+        assert_eq!(PolicyCondition::Degraded.to_string(), "Degraded");
+    }
+
+    // ── Dispatch metadata merging ─────────────────────────────────────────────
 
     #[test]
     fn merges_dispatch_metadata_without_collisions() {
