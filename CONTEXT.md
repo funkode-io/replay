@@ -58,9 +58,30 @@ A recorded failure of a [Policy] reaction that could not be completed — a
 _recorded skip_, never a silent one. When a reaction fails permanently (or
 exhausts its retries) the runner stores a dead letter and advances past the
 triggering event so a single bad event never wedges the Policy. Dead letters are
-queryable so an operator can later inspect and, eventually, explicitly retry
+queryable so an operator can later inspect them and either [Retry] or [Discard]
 them.
 _Avoid_: poison message, failed event, error queue.
+
+### Retry
+
+The _controlling_ act of re-running a parked [Policy] reaction: the triggering
+event recorded by a [Dead letter] is re-evaluated through the Policy **as it is
+defined now** and the command it raises is re-executed, judged against **current**
+[Aggregate] state. A retry reaches back to a single parked event out of band and
+never moves the Policy's cursor. Because it re-runs against today's state, a
+reaction that is now stale or no longer valid is legitimately declined rather than
+replayed blindly — guarding order-sensitive side effects is the target Aggregate's
+responsibility, not the runner's. Distinct from a [Rebuild], which resets and
+replays a whole [Projection].
+_Avoid_: reprocess, requeue, redrive.
+
+### Discard
+
+The _controlling_ act of an operator judging a [Dead letter]'s reaction
+permanently unrecoverable and dropping the record **without** re-executing it. The
+counterpart to [Retry]; together they are the controlling actions over a Policy's
+failures that [Policy status] only observes.
+_Avoid_: dismiss, drop, ignore.
 
 ### Policy status
 
@@ -70,7 +91,8 @@ failing — intended for a human monitoring the system. It is **not** domain
 state (an [Aggregate]'s rebuilt-from-stream state) and **not** a [Projection]
 (it derives no read model from the event log; it reports on a Policy's runtime).
 _Observing_ a Policy's status (read-only) is a separate concern from
-_controlling_ a Policy (acting on its failures, e.g. retrying a [Dead letter]).
+_controlling_ a Policy (acting on its failures by [Retry] or [Discard] of a
+[Dead letter]).
 _Avoid_: state, policy state, health check.
 
 ### Query
@@ -109,6 +131,10 @@ would need to honour the WASM dual-cfg pattern.
 [Aggregate]: #aggregate
 [Policy]: #policy
 [Dead letter]: #dead-letter
+[Retry]: #retry
+[Discard]: #discard
+[Rebuild]: #rebuild
+[Policy status]: #policy-status
 [Query]: #query
 [Live projection]: #live-projection
 [Inline projection]: #inline-projection
