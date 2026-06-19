@@ -19,7 +19,7 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Pool, Postgres, QueryBuilder, Row};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use replay::{Aggregate, Metadata};
@@ -266,100 +266,260 @@ impl PolicyRunner {
         Ok(total)
     }
 
-    /// Start one long-lived polling task per registered policy.
+    /// Start one long-lived worker task per registered policy, backed by two
+    /// shared per-process connections rather than two connections per policy.
     ///
-    /// Each task competes for a per-policy `pg_advisory_lock` before entering its
-    /// polling loop.  The lock key is derived from the policy name, so:
+    /// The steady-state connection footprint is **constant** in the number of
+    /// policies `P`, not `O(2P)`, which is what previously exhausted a shared
+    /// SQLx pool when many policies were registered:
     ///
-    /// - **Exactly one** service instance is the active leader for each policy at
-    ///   any moment (single-consumer correctness for the ordered global feed).
-    /// - **Different policies** may run on different instances concurrently.
-    /// - **Leader failover is automatic**: the advisory lock is session-scoped, so
-    ///   when the leader's task (or its host process) dies the lock is released and
-    ///   a standby acquires it on the next poll and resumes from the stored cursor.
+    /// - **One shared lock-manager connection** holds every policy's
+    ///   `pg_advisory_lock`. Postgres session advisory locks are per-session and a
+    ///   single session may hold many distinct lock keys, so one pinned connection
+    ///   elects leadership for all `P` policies. Each key is tried independently,
+    ///   so **different policies may still lead on different instances**, and
+    ///   **exactly one** instance leads each policy (single-consumer correctness
+    ///   for the ordered global feed). The manager publishes per-policy leadership
+    ///   on a [`watch`] channel that each worker observes.
+    /// - **One shared `PgListener` connection** receives `NOTIFY` and fans each
+    ///   wakeup out to every worker in-process via a [`broadcast`] channel, instead
+    ///   of one listener connection per policy. A missed or lagged broadcast is
+    ///   harmless: the worker still wakes on the poll `interval` (polling is the
+    ///   correctness baseline; `NOTIFY` is only a latency hint).
     ///
-    /// Use [`PolicyRunnerDaemon::shutdown`] to stop all tasks cleanly.  Shutdown
-    /// explicitly calls `pg_advisory_unlock` so the standby can take over without
-    /// waiting for a TCP-level session timeout.
+    /// **Leader failover is automatic**: the advisory locks are session-scoped, so
+    /// when a leader process dies its lock-manager connection drops and releases
+    /// all of its locks at once; a standby's lock manager acquires them on its next
+    /// tick and each worker resumes from its stored cursor. The trade-off relative
+    /// to the previous per-policy design is coarser failover granularity — a single
+    /// instance's policies fail over together — which is acceptable because each
+    /// policy is still recovered independently and exactly once.
+    ///
+    /// Use [`PolicyRunnerDaemon::shutdown`] to stop all tasks cleanly. Shutdown
+    /// releases the held advisory locks so a standby can take over without waiting
+    /// for a TCP-level session timeout.
     pub fn start_polling(&self, interval: Duration) -> PolicyRunnerDaemon {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut tasks = Vec::with_capacity(self.policies.len());
+        let mut tasks = Vec::with_capacity(self.policies.len() + 2);
 
+        // ── Shared NOTIFY listener: one connection, broadcast fan-out ─────────
+        // A single PgListener receives every append NOTIFY and rebroadcasts it to
+        // all worker tasks. Workers that lag simply fall back to interval polling.
+        let wake_tx = if self.notifications {
+            let (wake_tx, _) = broadcast::channel::<()>(16);
+            let pool = self.pool.clone();
+            let mut listener_shutdown_rx = shutdown_rx.clone();
+            let tx = wake_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                'reconnect: loop {
+                    if *listener_shutdown_rx.borrow() {
+                        return;
+                    }
+
+                    let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                        Ok(mut l) => match l.listen(REPLAY_NOTIFY_CHANNEL).await {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    channel = REPLAY_NOTIFY_CHANNEL,
+                                    "shared LISTEN active; fanning NOTIFY to workers"
+                                );
+                                l
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "shared LISTEN setup failed; workers fall back to polling"
+                                );
+                                tokio::select! {
+                                    _ = listener_shutdown_rx.changed() => return,
+                                    _ = tokio::time::sleep(interval) => {}
+                                }
+                                continue 'reconnect;
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "shared PgListener connect failed; workers fall back to polling"
+                            );
+                            tokio::select! {
+                                _ = listener_shutdown_rx.changed() => return,
+                                _ = tokio::time::sleep(interval) => {}
+                            }
+                            continue 'reconnect;
+                        }
+                    };
+
+                    loop {
+                        tokio::select! {
+                            changed = listener_shutdown_rx.changed() => {
+                                if changed.is_err() || *listener_shutdown_rx.borrow() {
+                                    return;
+                                }
+                            }
+                            res = listener.recv() => match res {
+                                // Best-effort fan-out; a send error just means no
+                                // live receivers right now, which is fine.
+                                Ok(_) => {
+                                    let _ = tx.send(());
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "shared PgListener recv error; reconnecting"
+                                    );
+                                    continue 'reconnect;
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+            Some(wake_tx)
+        } else {
+            None
+        };
+
+        // ── Shared lock manager: one connection holds every policy's lock ─────
+        // Per-policy leadership is published on a `watch<bool>` each worker
+        // observes. The manager keeps retrying keys it does not yet hold so a
+        // standby takes over when a current leader releases on shutdown.
+        let mut leadership_rx: HashMap<String, watch::Receiver<bool>> = HashMap::new();
+        let mut leadership: Vec<(String, watch::Sender<bool>)> =
+            Vec::with_capacity(self.policies.len());
+        for policy in &self.policies {
+            let name = policy.name().to_string();
+            let (l_tx, l_rx) = watch::channel(false);
+            leadership_rx.insert(name.clone(), l_rx);
+            leadership.push((name, l_tx));
+        }
+
+        {
+            let pool = self.pool.clone();
+            let mut lock_shutdown_rx = shutdown_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                // One dedicated connection pinned for the whole tenure. All of this
+                // instance's advisory locks live on this single session.
+                let mut lock_conn = loop {
+                    if *lock_shutdown_rx.borrow() {
+                        return;
+                    }
+                    match pool.acquire().await {
+                        Ok(conn) => break conn,
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "lock manager could not acquire its connection; retrying"
+                            );
+                            tokio::select! {
+                                _ = lock_shutdown_rx.changed() => return,
+                                _ = tokio::time::sleep(interval) => {}
+                            }
+                        }
+                    }
+                };
+
+                // Local record of which keys this session currently holds, so we
+                // only try to acquire keys we are not already leading.
+                let mut held = vec![false; leadership.len()];
+
+                loop {
+                    if *lock_shutdown_rx.borrow() {
+                        break;
+                    }
+
+                    for (idx, (name, tx)) in leadership.iter().enumerate() {
+                        if held[idx] {
+                            continue;
+                        }
+                        // pg_try_advisory_lock is non-blocking: returns true only
+                        // when this session exclusively holds the lock for `name`.
+                        match sqlx::query_scalar::<_, bool>(
+                            "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
+                        )
+                        .bind(name)
+                        .fetch_one(&mut *lock_conn)
+                        .await
+                        {
+                            Ok(true) => {
+                                tracing::info!(policy = %name, "acquired advisory lock; leading");
+                                held[idx] = true;
+                                let _ = tx.send(true);
+                            }
+                            Ok(false) => {
+                                tracing::debug!(
+                                    policy = %name,
+                                    "advisory lock held by another instance; standing by"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    policy = %name,
+                                    error = %error,
+                                    "advisory lock query failed"
+                                );
+                            }
+                        }
+                    }
+
+                    tokio::select! {
+                        _ = lock_shutdown_rx.changed() => break,
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                }
+
+                // Shutdown: explicitly release every held lock so a standby can
+                // take over immediately (without waiting for a TCP session timeout).
+                for (idx, (name, tx)) in leadership.iter().enumerate() {
+                    if held[idx] {
+                        let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+                            .bind(name)
+                            .execute(&mut *lock_conn)
+                            .await;
+                        let _ = tx.send(false);
+                    }
+                }
+            }));
+        }
+
+        // ── Per-policy worker tasks ───────────────────────────────────────────
         for policy in &self.policies {
             let policy = Arc::clone(policy);
             let cqrs = self.cqrs.clone();
             let pool = self.pool.clone();
             let executors = self.executors.clone();
-            let notifications = self.notifications;
             let mut policy_shutdown_rx = shutdown_rx.clone();
+            let name = policy.name().to_string();
+            let mut leader_rx = leadership_rx
+                .remove(&name)
+                .expect("every policy has a leadership channel");
+            let mut wake_rx = wake_tx.as_ref().map(broadcast::Sender::subscribe);
 
             tasks.push(tokio::spawn(async move {
-                let name = policy.name().to_string();
+                let max_depth = resolve_max_depth(policy.as_ref());
 
-                // Outer loop: repeatedly attempt to acquire the advisory lock.
-                // A standby instance stays in this loop, sleeping between attempts.
-                'acquire: loop {
+                'lifetime: loop {
                     if *policy_shutdown_rx.borrow() {
                         return;
                     }
 
-                    // Hold a dedicated connection for the session-scoped lock.
-                    // Keeping this connection alive for the full leadership tenure
-                    // ensures the lock is not silently released between polls.
-                    let mut lock_conn = match pool.acquire().await {
-                        Ok(conn) => conn,
-                        Err(error) => {
-                            tracing::error!(
-                                policy = %name,
-                                error = %error,
-                                "policy task could not acquire a connection for advisory lock"
-                            );
-                            tokio::select! {
-                                _ = policy_shutdown_rx.changed() => {}
-                                _ = tokio::time::sleep(interval) => {}
-                            }
-                            continue 'acquire;
-                        }
-                    };
-
-                    // pg_try_advisory_lock is non-blocking: returns true only when
-                    // this session exclusively holds the lock for `name`.
-                    let acquired = match sqlx::query_scalar::<_, bool>(
-                        "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
-                    )
-                    .bind(&name)
-                    .fetch_one(&mut *lock_conn)
-                    .await
-                    {
-                        Ok(v) => v,
-                        Err(error) => {
-                            tracing::error!(
-                                policy = %name,
-                                error = %error,
-                                "advisory lock query failed"
-                            );
-                            tokio::select! {
-                                _ = policy_shutdown_rx.changed() => {}
-                                _ = tokio::time::sleep(interval) => {}
-                            }
-                            continue 'acquire;
-                        }
-                    };
-
-                    if !acquired {
-                        tracing::debug!(
-                            policy = %name,
-                            "advisory lock held by another instance; standing by"
-                        );
-                        drop(lock_conn);
+                    // Wait until the shared lock manager elects this worker leader.
+                    while !*leader_rx.borrow() {
                         tokio::select! {
-                            _ = policy_shutdown_rx.changed() => {}
-                            _ = tokio::time::sleep(interval) => {}
+                            changed = policy_shutdown_rx.changed() => {
+                                if changed.is_err() || *policy_shutdown_rx.borrow() {
+                                    return;
+                                }
+                            }
+                            changed = leader_rx.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
                         }
-                        continue 'acquire;
                     }
 
-                    tracing::info!(policy = %name, "acquired advisory lock; running as leader");
+                    tracing::info!(policy = %name, "running as leader");
 
                     // Initialize cursor from the stored checkpoint (or bootstrap).
                     let mut cursor = match load_cursor(&pool, &name, policy.start_at()).await {
@@ -368,56 +528,19 @@ impl PolicyRunner {
                             tracing::error!(
                                 policy = %name,
                                 error = %error,
-                                "leader failed to initialize cursor; releasing lock"
+                                "leader failed to initialize cursor; retrying"
                             );
-                            let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
-                                .bind(&name)
-                                .execute(&mut *lock_conn)
-                                .await;
-                            return;
-                        }
-                    };
-
-                    // Optionally subscribe to NOTIFY wakeups so the loop reacts to
-                    // new appends immediately rather than waiting out the poll interval.
-                    // Errors here are non-fatal: the task falls back to pure polling.
-                    let mut listener: Option<sqlx::postgres::PgListener> = if notifications {
-                        match sqlx::postgres::PgListener::connect_with(&pool).await {
-                            Ok(mut l) => match l.listen(REPLAY_NOTIFY_CHANNEL).await {
-                                Ok(()) => {
-                                    tracing::debug!(
-                                        policy = %name,
-                                        channel = REPLAY_NOTIFY_CHANNEL,
-                                        "LISTEN active; will wake on NOTIFY"
-                                    );
-                                    Some(l)
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        policy = %name,
-                                        error = %error,
-                                        "LISTEN setup failed; falling back to polling"
-                                    );
-                                    None
-                                }
-                            },
-                            Err(error) => {
-                                tracing::warn!(
-                                    policy = %name,
-                                    error = %error,
-                                    "PgListener connect failed; falling back to polling"
-                                );
-                                None
+                            tokio::select! {
+                                _ = policy_shutdown_rx.changed() => return,
+                                _ = tokio::time::sleep(interval) => {}
                             }
+                            continue 'lifetime;
                         }
-                    } else {
-                        None
                     };
 
                     // Leadership polling loop.
-                    let max_depth = resolve_max_depth(policy.as_ref());
                     loop {
-                        if *policy_shutdown_rx.borrow() {
+                        if *policy_shutdown_rx.borrow() || !*leader_rx.borrow() {
                             break;
                         }
 
@@ -441,27 +564,28 @@ impl PolicyRunner {
                             }
                         }
 
-                        // Wait for the next wakeup: NOTIFY (if enabled), poll
-                        // timeout, or shutdown signal — whichever fires first.
-                        if let Some(ref mut l) = listener {
+                        // Wait for the next wakeup: NOTIFY broadcast (if enabled),
+                        // poll timeout, leadership change, or shutdown — whichever
+                        // fires first.
+                        if let Some(ref mut wake) = wake_rx {
                             tokio::select! {
                                 changed = policy_shutdown_rx.changed() => {
                                     if changed.is_err() || *policy_shutdown_rx.borrow() {
                                         break;
                                     }
                                 }
-                                _ = tokio::time::sleep(interval) => {}
-                                res = l.recv() => {
-                                    if let Err(error) = res {
-                                        tracing::warn!(
-                                            policy = %name,
-                                            error = %error,
-                                            "PgListener recv error; falling back to polling"
-                                        );
-                                        listener = None;
+                                changed = leader_rx.changed() => {
+                                    if changed.is_err() {
+                                        break;
                                     }
-                                    // Notification received or listener dropped:
-                                    // proceed to drain immediately.
+                                }
+                                _ = tokio::time::sleep(interval) => {}
+                                res = wake.recv() => {
+                                    // Ok or Lagged both mean "drain now"; Closed
+                                    // means the listener stopped, fall back to polling.
+                                    if let Err(broadcast::error::RecvError::Closed) = res {
+                                        wake_rx = None;
+                                    }
                                 }
                             }
                         } else {
@@ -471,18 +595,21 @@ impl PolicyRunner {
                                         break;
                                     }
                                 }
+                                changed = leader_rx.changed() => {
+                                    if changed.is_err() {
+                                        break;
+                                    }
+                                }
                                 _ = tokio::time::sleep(interval) => {}
                             }
                         }
                     }
 
-                    // Shutdown: explicitly release the lock so a standby can take
-                    // over immediately (without waiting for a TCP session timeout).
-                    let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
-                        .bind(&name)
-                        .execute(&mut *lock_conn)
-                        .await;
-                    return;
+                    if *policy_shutdown_rx.borrow() {
+                        return;
+                    }
+                    // Lost leadership without shutdown: loop back and wait to be
+                    // re-elected before draining again.
                 }
             }));
         }
