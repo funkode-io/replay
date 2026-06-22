@@ -1065,14 +1065,12 @@ async fn read_feed(
     let rows = qb.build().fetch_all(pool).await.map_err(crate::db_error)?;
 
     let mut feed = Vec::with_capacity(rows.len());
-    let mut expected = cursor + 1;
-    for row in rows {
+    for (expected, row) in (cursor + 1..).zip(rows) {
         let global_position: i64 = row.get("global_position");
         if global_position != expected {
             // Gap: stop here and let the hole fill on a later poll.
             break;
         }
-        expected += 1;
 
         let is_snapshot: bool = row.get("compacted_snapshot");
         if is_snapshot {
