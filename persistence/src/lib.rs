@@ -20,7 +20,7 @@ pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
 pub use policy::{Dispatch, Policy, StartAt};
 pub use policy_runner::{
-    PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, REPLAY_NOTIFY_CHANNEL,
+    DeadLetterRetry, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, REPLAY_NOTIFY_CHANNEL,
 };
 pub use policy_status::{PolicyCondition, PolicyStatus, PolicyStatusStore};
 pub use query::Query;
@@ -45,9 +45,9 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, Cqrs, Dispatch, EventSink, EventStore, InMemoryEventStore,
-        InlineProjection, NoSink, PersistedEvent, Policy, PolicyCondition, PolicyRunner,
-        PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
+        AggregateVersion, Cqrs, DeadLetterRetry, Dispatch, EventSink, EventStore,
+        InMemoryEventStore, InlineProjection, NoSink, PersistedEvent, Policy, PolicyCondition,
+        PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
         PostgresEventStore, PostgresInlineProjection, Query, StartAt, StreamFilter,
     };
 }

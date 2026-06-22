@@ -3292,6 +3292,501 @@ async fn policy_business_rule_violation_advances_without_dead_letter_postgres_te
     assert_eq!(cursor, 1, "cursor must have advanced past the BRV event");
 }
 
+// ── Dead-letter retry: retry_dead_letter primitive (issue #126) ───────────────
+
+// An aggregate whose command handler always fails with a permanent,
+// non-retryable, non-BusinessRuleViolation error.  Used to manufacture a
+// dead letter whose retry fails again, exercising the update-in-place path.
+define_aggregate! {
+    AlwaysFailsAccount {
+        namespace: "always-fails-account",
+        state: {
+            touched: bool,
+        },
+        commands: {
+            Touch { nonce: u64 },
+        },
+        events: {
+            Touched { nonce: u64 },
+        }
+    }
+}
+
+impl replay::EventStream for AlwaysFailsAccount {
+    type Event = AlwaysFailsAccountEvent;
+
+    fn stream_type() -> String {
+        "AlwaysFailsAccount".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            AlwaysFailsAccountEvent::Touched { .. } => self.touched = true,
+        }
+    }
+}
+
+impl replay::Aggregate for AlwaysFailsAccount {
+    type Command = AlwaysFailsAccountCommand;
+    type Error = replay::Error;
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        let AlwaysFailsAccountCommand::Touch { .. } = command;
+        Err(
+            replay::Error::invalid_input("always-fails-account rejects every command")
+                .with_operation("Touch"),
+        )
+    }
+}
+
+/// Reacts to each deposit by charging a causation-guarded fee against a fixed
+/// `IdempotentFeeAccount`.  Re-running the reaction is safe: the aggregate
+/// absorbs a duplicate causation id as a no-op.
+struct RetryFeePolicy {
+    target: IdempotentFeeAccountUrn,
+    fee: f64,
+}
+
+impl replay_persistence::Policy for RetryFeePolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "retry_fee_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { .. } => {
+                vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
+                    self.target.clone(),
+                    IdempotentFeeAccountCommand::ChargeFee {
+                        amount: self.fee,
+                        causation_event_id: event.id,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Reacts to each deposit by dispatching a `Touch` to `AlwaysFailsAccount`,
+/// which always fails permanently.
+struct AlwaysFailsPolicy {
+    target: AlwaysFailsAccountUrn,
+}
+
+impl replay_persistence::Policy for AlwaysFailsPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "always_fails_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { .. } => {
+                vec![replay_persistence::Dispatch::to::<AlwaysFailsAccount>(
+                    self.target.clone(),
+                    AlwaysFailsAccountCommand::Touch { nonce: 1 },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Append a single deposit and manufacture one dead letter for `policy` by
+/// draining a runner that does **not** register the aggregate the policy
+/// dispatches to (so the dispatch fails permanently with `InvalidInput`).
+///
+/// Returns `(pool, cqrs, dead_letter_id)`.
+async fn manufacture_dead_letter<P>(
+    policy: P,
+    policy_name: &str,
+) -> (
+    PgPool,
+    replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
+    i64,
+)
+where
+    P: replay_persistence::Policy + 'static,
+{
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    // Keep the container alive for the duration of the test by leaking it; the
+    // process exit reclaims it.  (Mirrors the lifetime needs of these tests.)
+    std::mem::forget(container);
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("retry-trigger").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Manufacturing runner: the policy is registered but the dispatch target's
+    // services are NOT, so the dispatch dead-letters.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_policy(policy)
+        .build();
+    runner
+        .drain()
+        .await
+        .expect("manufacturing drain must not error");
+
+    let id: i64 = sqlx::query_scalar("SELECT id FROM policy_dead_letters WHERE policy_name = $1")
+        .bind(policy_name)
+        .fetch_one(&pg_pool)
+        .await
+        .expect("exactly one dead letter must exist");
+
+    (pg_pool, cqrs, id)
+}
+
+async fn policy_condition(pool: &PgPool, name: &str) -> replay_persistence::PolicyCondition {
+    replay_persistence::PolicyStatusStore::new(pool.clone())
+        .list()
+        .await
+        .expect("status list must succeed")
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no status row for policy {name}"))
+        .condition
+}
+
+async fn dead_letter_count(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM policy_dead_letters WHERE policy_name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("dead-letter count query must succeed")
+}
+
+/// Retry succeeds: the reproduced reaction applies exactly once, the row is
+/// deleted, the policy is no longer `Degraded`, the cursor is untouched, and no
+/// advisory lock is ever taken (the polling daemon is never started).
+#[tokio::test]
+async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
+    let target = IdempotentFeeAccountUrn::new("retry-success-target").unwrap();
+    let (pg_pool, cqrs, id) = manufacture_dead_letter(
+        RetryFeePolicy {
+            target: target.clone(),
+            fee: 5.0,
+        },
+        "retry_fee_policy",
+    )
+    .await;
+
+    assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 1);
+    assert_eq!(
+        policy_condition(&pg_pool, "retry_fee_policy").await,
+        replay_persistence::PolicyCondition::Degraded,
+        "a parked dead letter must read as Degraded"
+    );
+
+    let cursor_before: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'retry_fee_policy'")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+
+    // Retry runner: registers the missing aggregate so the reproduced dispatch
+    // can apply.  The polling daemon is intentionally never started.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<IdempotentFeeAccount>(())
+        .register_policy(RetryFeePolicy {
+            target: target.clone(),
+            fee: 5.0,
+        })
+        .build();
+
+    let outcome = runner
+        .retry_dead_letter(id)
+        .await
+        .expect("retry must not error");
+    assert_eq!(outcome, replay_persistence::DeadLetterRetry::Resolved);
+
+    // Row deleted.
+    assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 0);
+
+    // Reaction applied exactly once (balance reflects a single fee charge).
+    let account = cqrs
+        .fetch_aggregate::<IdempotentFeeAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        account.balance, -5.0,
+        "exactly one fee must have been charged"
+    );
+
+    // Policy recovered: no longer Degraded.
+    assert_ne!(
+        policy_condition(&pg_pool, "retry_fee_policy").await,
+        replay_persistence::PolicyCondition::Degraded,
+        "after a successful retry the policy must no longer be Degraded"
+    );
+
+    // Cursor untouched.
+    let cursor_after: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'retry_fee_policy'")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        cursor_before, cursor_after,
+        "retry must not move the cursor"
+    );
+
+    // No advisory lock taken: retry needs no leadership.
+    let advisory_locks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory'")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(advisory_locks, 0, "retry must not acquire an advisory lock");
+}
+
+/// Retry still failing: the row is updated in place (count stays 1, never 2)
+/// and the policy stays `Degraded`.
+#[tokio::test]
+async fn retry_dead_letter_still_failing_updates_row_in_place_postgres_test() {
+    let target = AlwaysFailsAccountUrn::new("retry-fail-target").unwrap();
+    let (pg_pool, cqrs, id) = manufacture_dead_letter(
+        AlwaysFailsPolicy {
+            target: target.clone(),
+        },
+        "always_fails_policy",
+    )
+    .await;
+
+    assert_eq!(dead_letter_count(&pg_pool, "always_fails_policy").await, 1);
+
+    // Retry runner registers the failing aggregate, so the dispatch executes
+    // and fails again permanently.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<AlwaysFailsAccount>(())
+        .register_policy(AlwaysFailsPolicy {
+            target: target.clone(),
+        })
+        .build();
+
+    let outcome = runner
+        .retry_dead_letter(id)
+        .await
+        .expect("retry must not error");
+    assert_eq!(outcome, replay_persistence::DeadLetterRetry::StillFailing);
+
+    // Updated in place: still exactly one row, same id.
+    assert_eq!(
+        dead_letter_count(&pg_pool, "always_fails_policy").await,
+        1,
+        "a still-failing retry must update in place, never insert a second row"
+    );
+    let surviving_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM policy_dead_letters WHERE policy_name = 'always_fails_policy'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        surviving_id, id,
+        "the same row must be updated, not replaced"
+    );
+
+    assert_eq!(
+        policy_condition(&pg_pool, "always_fails_policy").await,
+        replay_persistence::PolicyCondition::Degraded,
+        "a still-failing policy stays Degraded"
+    );
+}
+
+/// Retry now stale: the aggregate declines the reproduced command with a
+/// `BusinessRuleViolation`, which is a clean resolution — the row is deleted and
+/// the policy recovers.
+#[tokio::test]
+async fn retry_dead_letter_stale_reaction_resolves_postgres_test() {
+    // `InsufficientFundsPolicy` withdraws $999 999 from the deposit's own
+    // account.  Manufactured against an unregistered `BankAccount`, it
+    // dead-letters; on retry against the (balance $100) account it is declined
+    // with a BusinessRuleViolation.
+    let (pg_pool, cqrs, id) =
+        manufacture_dead_letter(InsufficientFundsPolicy, "insufficient_funds_policy").await;
+
+    assert_eq!(
+        dead_letter_count(&pg_pool, "insufficient_funds_policy").await,
+        1
+    );
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(InsufficientFundsPolicy)
+        .build();
+
+    let outcome = runner
+        .retry_dead_letter(id)
+        .await
+        .expect("retry must not error");
+    assert_eq!(
+        outcome,
+        replay_persistence::DeadLetterRetry::Resolved,
+        "a BusinessRuleViolation on retry is a clean resolution"
+    );
+
+    assert_eq!(
+        dead_letter_count(&pg_pool, "insufficient_funds_policy").await,
+        0,
+        "a stale (BRV) reaction must delete the dead letter"
+    );
+    assert_ne!(
+        policy_condition(&pg_pool, "insufficient_funds_policy").await,
+        replay_persistence::PolicyCondition::Degraded,
+        "after a stale-resolution retry the policy must recover"
+    );
+}
+
+/// Retry is idempotent: replaying the same id twice applies the reaction at
+/// most once and the row ends deleted.
+#[tokio::test]
+async fn retry_dead_letter_is_idempotent_postgres_test() {
+    let target = IdempotentFeeAccountUrn::new("retry-idempotent-target").unwrap();
+    let (pg_pool, cqrs, id) = manufacture_dead_letter(
+        RetryFeePolicy {
+            target: target.clone(),
+            fee: 7.0,
+        },
+        "retry_fee_policy",
+    )
+    .await;
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<IdempotentFeeAccount>(())
+        .register_policy(RetryFeePolicy {
+            target: target.clone(),
+            fee: 7.0,
+        })
+        .build();
+
+    let first = runner
+        .retry_dead_letter(id)
+        .await
+        .expect("first retry must not error");
+    assert_eq!(first, replay_persistence::DeadLetterRetry::Resolved);
+
+    // Second retry of the same id: the row is already gone — a defined no-op.
+    let second = runner
+        .retry_dead_letter(id)
+        .await
+        .expect("second retry must not error");
+    assert_eq!(second, replay_persistence::DeadLetterRetry::NotFound);
+
+    // Reaction applied at most once.
+    let account = cqrs
+        .fetch_aggregate::<IdempotentFeeAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        account.balance, -7.0,
+        "the fee must be charged at most once"
+    );
+
+    assert_eq!(
+        dead_letter_count(&pg_pool, "retry_fee_policy").await,
+        0,
+        "the row must end deleted"
+    );
+}
+
+/// Error contract: an unregistered policy name and a dispatch targeting an
+/// unregistered aggregate both return a clear error; an absent id is a defined
+/// no-op (`NotFound`).
+#[tokio::test]
+async fn retry_dead_letter_error_contract_postgres_test() {
+    let target = IdempotentFeeAccountUrn::new("retry-error-target").unwrap();
+    let (pg_pool, cqrs, id) = manufacture_dead_letter(
+        RetryFeePolicy {
+            target: target.clone(),
+            fee: 3.0,
+        },
+        "retry_fee_policy",
+    )
+    .await;
+
+    // (a) Absent id → defined no-op.
+    let runner_full = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<IdempotentFeeAccount>(())
+        .register_policy(RetryFeePolicy {
+            target: target.clone(),
+            fee: 3.0,
+        })
+        .build();
+    let absent = runner_full
+        .retry_dead_letter(999_999)
+        .await
+        .expect("absent id must not error");
+    assert_eq!(absent, replay_persistence::DeadLetterRetry::NotFound);
+
+    // (b) Policy name not registered on this runner → clear error.
+    let runner_no_policy = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<IdempotentFeeAccount>(())
+        .build();
+    let err = runner_no_policy
+        .retry_dead_letter(id)
+        .await
+        .expect_err("unregistered policy must return an error");
+    assert_eq!(err.kind(), replay::ErrorKind::InvalidInput);
+
+    // (c) Dispatch targets an unregistered aggregate → clear error.
+    let runner_no_aggregate = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_policy(RetryFeePolicy {
+            target: target.clone(),
+            fee: 3.0,
+        })
+        .build();
+    let err = runner_no_aggregate
+        .retry_dead_letter(id)
+        .await
+        .expect_err("unregistered aggregate must return an error");
+    assert_eq!(err.kind(), replay::ErrorKind::InvalidInput);
+
+    // The row is untouched by the failed attempts.
+    assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 1);
+}
+
 // ── Batching: read-batch size and checkpoint-batch size (issue #85) ───────────
 
 /// Policy with a custom read-batch size for testing.
