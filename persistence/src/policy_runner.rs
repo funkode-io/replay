@@ -212,6 +212,19 @@ impl PolicyRunnerBuilder {
     }
 }
 
+/// Outcome of [`PolicyRunner::retry_dead_letter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadLetterRetry {
+    /// The reaction succeeded, or the aggregate now declines it with a
+    /// `BusinessRuleViolation`: the dead-letter row was deleted.
+    Resolved,
+    /// The reaction failed permanently again: the existing row was updated in
+    /// place with the fresh error. No second row was ever inserted.
+    StillFailing,
+    /// No dead-letter row matched the supplied id: nothing to do.
+    NotFound,
+}
+
 /// Native runner that drives registered policies against the event feed.
 pub struct PolicyRunner {
     cqrs: Cqrs<PostgresEventStore>,
@@ -264,6 +277,131 @@ impl PolicyRunner {
             total += self.drain_policy(policy.as_ref()).await?;
         }
         Ok(total)
+    }
+
+    /// Re-run a single parked dead letter's reaction against current state.
+    ///
+    /// Loads the dead-letter row `id`, looks up its owning policy by name,
+    /// reloads the triggering event it pinned, and replays the policy's pure
+    /// reaction through the same [`Cqrs`] path the live drain uses — taking no
+    /// advisory lock and never touching `policy_cursors`. The row is then
+    /// settled **after** execution:
+    ///
+    /// - the reaction succeeds, or the aggregate now declines it with a
+    ///   `BusinessRuleViolation` → the row is **deleted**
+    ///   ([`DeadLetterRetry::Resolved`]).
+    /// - the reaction fails permanently again → the existing row is **updated
+    ///   in place** with the fresh error ([`DeadLetterRetry::StillFailing`]);
+    ///   no second row is ever inserted.
+    ///
+    /// Re-execution safety comes from the causation guard (the command carries
+    /// the triggering event's id) plus the optimistic-concurrency check in
+    /// [`Cqrs::execute`], so retrying an already-applied reaction is a no-op.
+    ///
+    /// Returns [`DeadLetterRetry::NotFound`] when no row matches `id`. Returns a
+    /// clear error (never panics) when the dead letter's policy is not
+    /// registered on this runner, when a reproduced dispatch targets an
+    /// aggregate whose services are not registered, or when the pinned
+    /// triggering event can no longer be found.
+    pub async fn retry_dead_letter(&self, id: i64) -> Result<DeadLetterRetry, replay::Error> {
+        let Some(row) = sqlx::query(
+            "SELECT policy_name, global_position, event_id \
+             FROM policy_dead_letters WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(crate::db_error)?
+        else {
+            return Ok(DeadLetterRetry::NotFound);
+        };
+
+        let policy_name: String = row.get("policy_name");
+        let global_position: i64 = row.get("global_position");
+        let event_id: uuid::Uuid = row.get("event_id");
+
+        let policy = self
+            .policies
+            .iter()
+            .find(|p| p.name() == policy_name)
+            .ok_or_else(|| {
+                replay::Error::invalid_input(
+                    "no registered policy matches the dead letter's policy_name",
+                )
+                .with_operation("retry_dead_letter")
+                .with_context("policy", &policy_name)
+            })?;
+
+        let raw = load_event_by_id(&self.pool, event_id)
+            .await?
+            .ok_or_else(|| {
+                replay::Error::not_found("triggering event for dead letter no longer exists")
+                    .with_operation("retry_dead_letter")
+                    .with_context("policy", &policy_name)
+                    .with_context("event_id", event_id)
+            })?;
+
+        // Reproduce and execute every dispatch the reaction now yields. A missing
+        // executor is an operator misconfiguration (a clear error to the caller),
+        // distinct from a dispatch that executes but fails permanently (which
+        // re-parks the row in place).
+        let mut failure: Option<replay::Error> = None;
+        for dispatch in policy.react_erased(&raw) {
+            if !self.executors.contains_key(&dispatch.target()) {
+                return Err(replay::Error::invalid_input(
+                    "no services registered for the aggregate targeted by a policy dispatch",
+                )
+                .with_operation("retry_dead_letter")
+                .with_context("policy", &policy_name)
+                .with_context("aggregate", dispatch.aggregate_name()));
+            }
+
+            match execute_dispatch(
+                &self.cqrs,
+                &self.executors,
+                &policy_name,
+                global_position,
+                &raw,
+                dispatch,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation => {
+                    // Stale reaction: the aggregate now declines it. Clean
+                    // resolution — fall through to delete the row.
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+
+        match failure {
+            None => {
+                sqlx::query("DELETE FROM policy_dead_letters WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(crate::db_error)?;
+                Ok(DeadLetterRetry::Resolved)
+            }
+            Some(error) => {
+                sqlx::query(
+                    "UPDATE policy_dead_letters \
+                     SET error_kind = $2, error_message = $3 \
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .bind(error.kind().to_string())
+                .bind(error.to_string())
+                .execute(&self.pool)
+                .await
+                .map_err(crate::db_error)?;
+                Ok(DeadLetterRetry::StillFailing)
+            }
+        }
     }
 
     /// Start one long-lived worker task per registered policy, backed by two
@@ -875,6 +1013,27 @@ async fn write_dead_letter(
     .await
     .map_err(crate::db_error)?;
     Ok(())
+}
+
+/// Load a single event by its primary key, shaped exactly like [`read_feed`]
+/// so it can be fed back into a policy's erased reaction during retry.
+async fn load_event_by_id(
+    pool: &Pool<Postgres>,
+    event_id: uuid::Uuid,
+) -> Result<Option<PersistedEvent<Value>>, replay::Error> {
+    let row = sqlx::query(
+        "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
+         global_position, compacted_snapshot FROM events WHERE id = $1",
+    )
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    match row {
+        Some(row) => Ok(Some(PersistedEvent::<Value>::try_from(row)?)),
+        None => Ok(None),
+    }
 }
 
 /// Read the contiguous, gap-free prefix of events with `global_position >
