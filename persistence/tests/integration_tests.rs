@@ -3610,6 +3610,7 @@ async fn manufacture_dead_letter<P>(
     policy: P,
     policy_name: &str,
 ) -> (
+    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
     PgPool,
     replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
     i64,
@@ -3623,9 +3624,6 @@ where
         .get_host_port_ipv4(POSTGRES_PORT)
         .await
         .expect("Error getting docker port");
-    // Keep the container alive for the duration of the test by leaking it; the
-    // process exit reclaims it.  (Mirrors the lifetime needs of these tests.)
-    std::mem::forget(container);
     let pg_pool = connect_to_postgres(host, port).await;
 
     sqlx::migrate!("./tests/migrations")
@@ -3667,7 +3665,7 @@ where
         .await
         .expect("exactly one dead letter must exist");
 
-    (pg_pool, cqrs, id)
+    (container, pg_pool, cqrs, id)
 }
 
 async fn policy_condition(pool: &PgPool, name: &str) -> replay_persistence::PolicyCondition {
@@ -3695,7 +3693,7 @@ async fn dead_letter_count(pool: &PgPool, name: &str) -> i64 {
 #[tokio::test]
 async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
     let target = IdempotentFeeAccountUrn::new("retry-success-target").unwrap();
-    let (pg_pool, cqrs, id) = manufacture_dead_letter(
+    let (_container, pg_pool, cqrs, id) = manufacture_dead_letter(
         RetryFeePolicy {
             target: target.clone(),
             fee: 5.0,
@@ -3778,7 +3776,7 @@ async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
 #[tokio::test]
 async fn retry_dead_letter_still_failing_updates_row_in_place_postgres_test() {
     let target = AlwaysFailsAccountUrn::new("retry-fail-target").unwrap();
-    let (pg_pool, cqrs, id) = manufacture_dead_letter(
+    let (_container, pg_pool, cqrs, id) = manufacture_dead_letter(
         AlwaysFailsPolicy {
             target: target.clone(),
         },
@@ -3836,7 +3834,7 @@ async fn retry_dead_letter_stale_reaction_resolves_postgres_test() {
     // account.  Manufactured against an unregistered `BankAccount`, it
     // dead-letters; on retry against the (balance $100) account it is declined
     // with a BusinessRuleViolation.
-    let (pg_pool, cqrs, id) =
+    let (_container, pg_pool, cqrs, id) =
         manufacture_dead_letter(InsufficientFundsPolicy, "insufficient_funds_policy").await;
 
     assert_eq!(
@@ -3876,7 +3874,7 @@ async fn retry_dead_letter_stale_reaction_resolves_postgres_test() {
 #[tokio::test]
 async fn retry_dead_letter_is_idempotent_postgres_test() {
     let target = IdempotentFeeAccountUrn::new("retry-idempotent-target").unwrap();
-    let (pg_pool, cqrs, id) = manufacture_dead_letter(
+    let (_container, pg_pool, cqrs, id) = manufacture_dead_letter(
         RetryFeePolicy {
             target: target.clone(),
             fee: 7.0,
@@ -3929,7 +3927,7 @@ async fn retry_dead_letter_is_idempotent_postgres_test() {
 #[tokio::test]
 async fn retry_dead_letter_error_contract_postgres_test() {
     let target = IdempotentFeeAccountUrn::new("retry-error-target").unwrap();
-    let (pg_pool, cqrs, id) = manufacture_dead_letter(
+    let (_container, pg_pool, cqrs, id) = manufacture_dead_letter(
         RetryFeePolicy {
             target: target.clone(),
             fee: 3.0,

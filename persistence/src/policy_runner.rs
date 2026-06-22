@@ -390,7 +390,7 @@ impl PolicyRunner {
             Some(error) => {
                 sqlx::query(
                     "UPDATE policy_dead_letters \
-                     SET error_kind = $2, error_message = $3, created_at = now() \
+                     SET error_kind = $2, error_message = $3 \
                      WHERE id = $1",
                 )
                 .bind(id)
