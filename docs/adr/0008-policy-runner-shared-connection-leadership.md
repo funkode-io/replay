@@ -30,6 +30,15 @@ rather than linear.
   The manager publishes per-policy leadership on a `tokio::sync::watch<bool>` that
   each worker observes. On shutdown it explicitly `pg_advisory_unlock`s the held
   keys so a standby takes over without waiting for a TCP session timeout.
+- **The lock manager detects loss of its pinned session.** Because a single
+  connection holds every lock, losing it silently would otherwise leave workers
+  draining as stale leaders (Postgres releases the locks server-side, but the
+  in-memory `held` flags would not know). Each tick the manager runs a cheap
+  liveness probe on the connection while it leads at least one policy; any probe or
+  lock-query error revokes all locally-believed leadership (flipping every worker's
+  `watch` to false so they stop draining) and reconnects to recompete for the keys
+  from scratch. This bounds any split-brain window to a single poll `interval`
+  rather than "until the process restarts".
 - **One shared `PgListener` task per runner**, holding **one** connection, receives
   every append `NOTIFY` and fans each wakeup out to all workers in-process via a
   `tokio::sync::broadcast<()>` channel. This is consistent with ADR-0003's rule that
@@ -52,13 +61,13 @@ rather than linear.
   an 8-connection pool (the old design needed 24) all process the trigger event.
 - **Failover granularity is coarser**, and this is the deliberate trade-off. Because
   all of an instance's advisory locks live on one session, when that session drops
-  (process death, connection loss) **all** of that instance's policies fail over to a
-  standby together, rather than each failing over independently. This is acceptable:
-  each policy is still recovered **independently and exactly once** from its stored
-  cursor, and instance-granularity failover matches how processes actually fail (the
-  whole process, not one policy's connection). The previous per-policy failover
-  granularity was an accident of the per-policy-connection implementation, not a
-  designed guarantee.
+  (process death, or connection loss detected by the liveness probe) **all** of that
+  instance's policies fail over to a standby together, rather than each failing over
+  independently. This is acceptable: each policy is still recovered **independently
+  and exactly once** from its stored cursor, and instance-granularity failover
+  matches how processes actually fail (the whole process, not one policy's
+  connection). The previous per-policy failover granularity was an accident of the
+  per-policy-connection implementation, not a designed guarantee.
 - The `Policy` trait, `Dispatch` descriptor, cursor/checkpoint semantics, dead-letter
   handling, causation-depth loop limit, and `start_at` behaviour are all untouched —
   this is purely a change to how the *runner* maps policies onto connections. No

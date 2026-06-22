@@ -398,85 +398,139 @@ impl PolicyRunner {
             let pool = self.pool.clone();
             let mut lock_shutdown_rx = shutdown_rx.clone();
             tasks.push(tokio::spawn(async move {
-                // One dedicated connection pinned for the whole tenure. All of this
-                // instance's advisory locks live on this single session.
-                let mut lock_conn = loop {
-                    if *lock_shutdown_rx.borrow() {
-                        return;
-                    }
-                    match pool.acquire().await {
-                        Ok(conn) => break conn,
-                        Err(error) => {
-                            tracing::error!(
-                                error = %error,
-                                "lock manager could not acquire its connection; retrying"
-                            );
-                            tokio::select! {
-                                _ = lock_shutdown_rx.changed() => return,
-                                _ = tokio::time::sleep(interval) => {}
-                            }
+                // Which keys this session currently leads. Preserved across
+                // reconnects so a dropped session revokes exactly what it held.
+                let mut held = vec![false; leadership.len()];
+
+                // Revoke all locally-believed leadership. Used when the pinned
+                // session is lost: Postgres has already released the locks
+                // server-side, so we must stop the workers (set leadership false)
+                // before any standby can also acquire and double-process.
+                let revoke_all = |held: &mut [bool]| {
+                    for (idx, (_name, tx)) in leadership.iter().enumerate() {
+                        if held[idx] {
+                            held[idx] = false;
+                            let _ = tx.send(false);
                         }
                     }
                 };
 
-                // Local record of which keys this session currently holds, so we
-                // only try to acquire keys we are not already leading.
-                let mut held = vec![false; leadership.len()];
-
-                loop {
+                'session: loop {
                     if *lock_shutdown_rx.borrow() {
-                        break;
+                        break 'session;
                     }
 
-                    for (idx, (name, tx)) in leadership.iter().enumerate() {
-                        if held[idx] {
-                            continue;
+                    // (Re)acquire the single pinned connection. All of this
+                    // instance's advisory locks live on this one session; when it
+                    // drops they are all released together, so on reconnect we
+                    // recompete for every key from scratch.
+                    let mut lock_conn = loop {
+                        if *lock_shutdown_rx.borrow() {
+                            return;
                         }
-                        // pg_try_advisory_lock is non-blocking: returns true only
-                        // when this session exclusively holds the lock for `name`.
-                        match sqlx::query_scalar::<_, bool>(
-                            "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
-                        )
-                        .bind(name)
-                        .fetch_one(&mut *lock_conn)
-                        .await
-                        {
-                            Ok(true) => {
-                                tracing::info!(policy = %name, "acquired advisory lock; leading");
-                                held[idx] = true;
-                                let _ = tx.send(true);
-                            }
-                            Ok(false) => {
-                                tracing::debug!(
-                                    policy = %name,
-                                    "advisory lock held by another instance; standing by"
-                                );
-                            }
+                        match pool.acquire().await {
+                            Ok(conn) => break conn,
                             Err(error) => {
                                 tracing::error!(
-                                    policy = %name,
                                     error = %error,
-                                    "advisory lock query failed"
+                                    "lock manager could not acquire its connection; retrying"
                                 );
+                                tokio::select! {
+                                    _ = lock_shutdown_rx.changed() => return,
+                                    _ = tokio::time::sleep(interval) => {}
+                                }
                             }
                         }
-                    }
+                    };
 
-                    tokio::select! {
-                        _ = lock_shutdown_rx.changed() => break,
-                        _ = tokio::time::sleep(interval) => {}
-                    }
-                }
+                    loop {
+                        if *lock_shutdown_rx.borrow() {
+                            // Clean shutdown: explicitly release every held lock on
+                            // the live connection so a standby can take over
+                            // immediately (without waiting for a TCP session timeout).
+                            for (idx, (name, tx)) in leadership.iter().enumerate() {
+                                if held[idx] {
+                                    let _ = sqlx::query(
+                                        "SELECT pg_advisory_unlock(hashtext($1)::bigint)",
+                                    )
+                                    .bind(name)
+                                    .execute(&mut *lock_conn)
+                                    .await;
+                                    held[idx] = false;
+                                    let _ = tx.send(false);
+                                }
+                            }
+                            break 'session;
+                        }
 
-                // Shutdown: explicitly release every held lock so a standby can
-                // take over immediately (without waiting for a TCP session timeout).
-                for (idx, (name, tx)) in leadership.iter().enumerate() {
-                    if held[idx] {
-                        let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+                        // Liveness probe: if we already lead at least one policy,
+                        // verify the pinned session is still alive. A dropped
+                        // session releases ALL our advisory locks server-side, so we
+                        // must revoke leadership locally (stopping the workers before
+                        // a standby can also acquire) and reconnect to recompete.
+                        // This bounds any split-brain window to one poll interval.
+                        if held.iter().any(|h| *h) {
+                            if let Err(error) =
+                                sqlx::query("SELECT 1").execute(&mut *lock_conn).await
+                            {
+                                tracing::warn!(
+                                    error = %error,
+                                    "lock manager connection lost; revoking leadership and reconnecting"
+                                );
+                                revoke_all(&mut held);
+                                continue 'session;
+                            }
+                        }
+
+                        // Try to acquire any keys we do not yet hold.
+                        let mut connection_lost = false;
+                        for (idx, (name, tx)) in leadership.iter().enumerate() {
+                            if held[idx] {
+                                continue;
+                            }
+                            // pg_try_advisory_lock is non-blocking: returns true only
+                            // when this session exclusively holds the lock for `name`.
+                            match sqlx::query_scalar::<_, bool>(
+                                "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
+                            )
                             .bind(name)
-                            .execute(&mut *lock_conn)
-                            .await;
-                        let _ = tx.send(false);
+                            .fetch_one(&mut *lock_conn)
+                            .await
+                            {
+                                Ok(true) => {
+                                    tracing::info!(policy = %name, "acquired advisory lock; leading");
+                                    held[idx] = true;
+                                    let _ = tx.send(true);
+                                }
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        policy = %name,
+                                        "advisory lock held by another instance; standing by"
+                                    );
+                                }
+                                Err(error) => {
+                                    // A query error may mean the session has dropped:
+                                    // revoke leadership and reconnect rather than
+                                    // continuing to believe we lead the held keys.
+                                    tracing::warn!(
+                                        policy = %name,
+                                        error = %error,
+                                        "advisory lock query failed; reconnecting"
+                                    );
+                                    connection_lost = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if connection_lost {
+                            revoke_all(&mut held);
+                            continue 'session;
+                        }
+
+                        tokio::select! {
+                            _ = lock_shutdown_rx.changed() => {}
+                            _ = tokio::time::sleep(interval) => {}
+                        }
                     }
                 }
             }));
