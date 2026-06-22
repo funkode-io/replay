@@ -2925,6 +2925,198 @@ async fn policy_single_active_runner_via_advisory_lock_postgres_test() {
     daemon_b.shutdown().await;
 }
 
+// ── Bounded connection footprint with many policies (issue #125) ─────────────
+
+/// A policy that reacts to a deposit on a shared *trigger* account by withdrawing
+/// $1 from its own dedicated *target* account. Distinct target streams avoid any
+/// cross-policy write contention, so each registered policy contributes exactly
+/// one `Withdrawn` event when it processes the single trigger deposit.
+struct FootprintPolicy {
+    name: String,
+    target: BankAccountUrn,
+}
+
+impl replay_persistence::Policy for FootprintPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Now
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { operation_date, .. } => {
+                vec![replay_persistence::Dispatch::to::<BankAccount>(
+                    self.target.clone(),
+                    BankAccountCommand::Withdraw {
+                        effective_on: *operation_date,
+                        amount: 1.0,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Many registered policies share a bounded connection pool without starving.
+///
+/// Regression test for issue #125: the previous `start_polling` pinned **two**
+/// connections per policy (a dedicated advisory-lock connection plus a dedicated
+/// `PgListener` connection) for the whole leadership tenure, i.e. `O(2P)`. With
+/// more policies than `max_connections / 2`, later policies could never acquire
+/// their connections and silently stopped processing — the symptom reported as a
+/// "database connection pool timed out" in the consuming app.
+///
+/// The current design holds a **constant** number of pinned connections
+/// regardless of policy count (one shared lock manager + one shared listener), so
+/// every policy makes progress even on a pool far smaller than `2P`.
+///
+/// Scenario:
+///   1. A small pool (`max_connections = 8`) backs a single runner with **12**
+///      policies — well above `8 / 2 = 4`, so the old design would starve most.
+///   2. Each policy's target account is seeded with a deposit *before* the daemon
+///      starts, so `StartAt::Now` skips the seeds.
+///   3. One deposit is appended to the shared trigger account after the daemon is
+///      leading. Every policy reacts once → exactly 12 `Withdrawn` events.
+#[tokio::test]
+async fn policy_bounded_connection_footprint_many_policies_postgres_test() {
+    use std::time::Duration;
+
+    const POLICY_COUNT: usize = 12;
+
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    // Deliberately small pool: 8 connections for 12 policies. The old per-policy
+    // design needed 24 pinned connections and would starve; the shared design
+    // pins only ~2.
+    let pg_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(Duration::from_secs(4))
+        .connect(&format!(
+            "postgres://postgres:postgres@{}:{}/postgres",
+            host, port
+        ))
+        .await
+        .expect("Failed to create bounded postgres pool");
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let meta = replay::Metadata::default();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    // ── Seed each policy's target account with a balance to withdraw from ──────
+    // These deposits happen before the daemon starts so `StartAt::Now` skips them.
+    let targets: Vec<BankAccountUrn> = (0..POLICY_COUNT)
+        .map(|i| BankAccountUrn::new(format!("footprint-target-{i}")).unwrap())
+        .collect();
+
+    for target in &targets {
+        cqrs.execute::<BankAccount>(
+            target,
+            meta.clone(),
+            BankAccountCommand::Deposit {
+                effective_on: date,
+                amount: 100.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // ── Build a single runner with all 12 policies and start it ───────────────
+    let mut builder = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(());
+    for (i, target) in targets.iter().enumerate() {
+        builder = builder.register_policy(FootprintPolicy {
+            name: format!("footprint_policy_{i}"),
+            target: target.clone(),
+        });
+    }
+    let daemon = builder.build().start_polling(Duration::from_millis(50));
+
+    // Wait until every policy has persisted its `StartAt::Now` cursor before
+    // appending the trigger. `load_cursor` inserts the cursor row at bootstrap,
+    // so the presence of all rows proves every worker captured `Now` ahead of the
+    // trigger and cannot initialize after it and legitimately skip it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let ready = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM policy_cursors WHERE name LIKE 'footprint_policy_%'",
+        )
+        .fetch_one(&pg_pool)
+        .await
+        .expect("cursor count query must succeed");
+        if ready == POLICY_COUNT as i64 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {ready}/{POLICY_COUNT} policy cursors initialized before timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ── Append one deposit to the shared trigger account ──────────────────────
+    let trigger = BankAccountUrn::new("footprint-trigger").unwrap();
+    cqrs.execute::<BankAccount>(
+        &trigger,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: date,
+            amount: 100.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Poll until every policy has drained the trigger event rather than relying
+    // on a fixed delay; a constrained pool serializes the transient drains and a
+    // slow or contended host can take a while.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let withdrawn = loop {
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE type = 'Withdrawn'")
+                .fetch_one(&pg_pool)
+                .await
+                .expect("count query must succeed");
+        if count >= POLICY_COUNT as i64 {
+            break count;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {count}/{POLICY_COUNT} policies processed the trigger deposit before timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(
+        withdrawn, POLICY_COUNT as i64,
+        "every one of the {POLICY_COUNT} policies must process the trigger deposit on a pool \
+         far smaller than 2x the policy count; the old O(2P) design would starve most of them"
+    );
+
+    daemon.shutdown().await;
+}
+
 // ── Loop prevention via causation-depth limit (issue #83) ────────────────────
 
 /// A policy that deliberately creates a loop: every `Deposited` event triggers
