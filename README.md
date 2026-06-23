@@ -2113,8 +2113,8 @@ SELECT * FROM events WHERE id = '<event_id from dead letter>';
 
 #### Retrying and discarding dead letters
 
-Two operator controls on `PolicyRunner` resolve a parked dead letter out of
-band. Both take **no** advisory lock and **never** move the policy cursor:
+Three operator controls on `PolicyRunner` resolve parked dead letters out of
+band. None take an advisory lock or move the policy cursor:
 
 | Method | Reaction | Outcome |
 |--------|----------|---------|
