@@ -225,6 +225,15 @@ pub enum DeadLetterRetry {
     NotFound,
 }
 
+/// Outcome of [`PolicyRunner::discard_dead_letter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadLetterDiscard {
+    /// The dead-letter row was deleted.
+    Discarded,
+    /// No dead-letter row matched the supplied id: nothing to do.
+    NotFound,
+}
+
 /// Native runner that drives registered policies against the event feed.
 pub struct PolicyRunner {
     cqrs: Cqrs<PostgresEventStore>,
@@ -401,6 +410,32 @@ impl PolicyRunner {
                 .map_err(crate::db_error)?;
                 Ok(DeadLetterRetry::StillFailing)
             }
+        }
+    }
+
+    /// Discard a parked dead letter without re-running its reaction.
+    ///
+    /// Pure bookkeeping: deletes the dead-letter row `id` by primary key.
+    /// Unlike [`retry_dead_letter`](Self::retry_dead_letter) it performs **no**
+    /// `react`, executes **no** command, and therefore produces **no** new
+    /// aggregate event. It takes no advisory lock and never touches
+    /// `policy_cursors`. Once the row is gone, [`PolicyStatusStore::list`]
+    /// reports the policy leaving `Degraded` exactly as it does after a
+    /// successful retry.
+    ///
+    /// Returns [`DeadLetterDiscard::NotFound`] when no row matches `id` — a
+    /// defined no-op, never a panic.
+    pub async fn discard_dead_letter(&self, id: i64) -> Result<DeadLetterDiscard, replay::Error> {
+        let result = sqlx::query("DELETE FROM policy_dead_letters WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(crate::db_error)?;
+
+        if result.rows_affected() == 0 {
+            Ok(DeadLetterDiscard::NotFound)
+        } else {
+            Ok(DeadLetterDiscard::Discarded)
         }
     }
 
