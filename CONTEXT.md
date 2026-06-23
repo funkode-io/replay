@@ -78,9 +78,11 @@ _Avoid_: reprocess, requeue, redrive.
 ### Discard
 
 The _controlling_ act of an operator judging a [Dead letter]'s reaction
-permanently unrecoverable and dropping the record **without** re-executing it. The
-counterpart to [Retry]; together they are the controlling actions over a Policy's
-failures that [Policy status] only observes.
+permanently unrecoverable and retiring the record from the active set
+**without** re-executing it. The record is archived rather than destroyed, so
+the failure history is never lost. The counterpart to [Retry]; together they are
+the controlling actions over a Policy's failures that [Policy status] only
+observes.
 _Avoid_: dismiss, drop, ignore.
 
 ### Policy status

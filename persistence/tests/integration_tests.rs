@@ -3731,8 +3731,19 @@ async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
         .expect("retry must not error");
     assert_eq!(outcome, replay_persistence::DeadLetterRetry::Resolved);
 
-    // Row deleted.
+    // Removed from the active set.
     assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 0);
+
+    // Archived (soft delete), not destroyed: the row now lives in the archive
+    // tagged with the retry reason and its original id.
+    let archived_reason: String = sqlx::query_scalar(
+        "SELECT reason FROM discarded_dead_letters WHERE dead_letter_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pg_pool)
+    .await
+    .expect("the resolved dead letter must be archived");
+    assert_eq!(archived_reason, "retried");
 
     // Reaction applied exactly once (balance reflects a single fee charge).
     let account = cqrs
@@ -4022,8 +4033,19 @@ async fn discard_dead_letter_deletes_row_without_side_effects_postgres_test() {
         .expect("discard must not error");
     assert_eq!(outcome, replay_persistence::DeadLetterDiscard::Discarded);
 
-    // Row deleted.
+    // Removed from the active set.
     assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 0);
+
+    // Archived (soft delete), not destroyed: the row now lives in the archive
+    // tagged with the discard reason and its original id.
+    let archived_reason: String = sqlx::query_scalar(
+        "SELECT reason FROM discarded_dead_letters WHERE dead_letter_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pg_pool)
+    .await
+    .expect("the discarded dead letter must be archived");
+    assert_eq!(archived_reason, "discarded");
 
     // No new event: the events table is unchanged and the target aggregate was
     // never charged.
