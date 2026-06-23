@@ -3990,10 +3990,10 @@ async fn retry_dead_letter_error_contract_postgres_test() {
 
 // ── Dead-letter discard: discard_dead_letter primitive (issue #127) ───────────
 
-/// Discard is pure bookkeeping: it deletes the parked dead letter, produces no
-/// new event on the target aggregate, recovers the policy from `Degraded`,
-/// takes no advisory lock, never moves the cursor, and treats an absent id as a
-/// defined no-op.
+/// Discard is pure bookkeeping: it soft-deletes the parked dead letter (moving
+/// it into `discarded_dead_letters`), produces no new event on the target
+/// aggregate, recovers the policy from `Degraded`, takes no advisory lock,
+/// never moves the cursor, and treats an absent id as a defined no-op.
 #[tokio::test]
 async fn discard_dead_letter_deletes_row_without_side_effects_postgres_test() {
     let target = IdempotentFeeAccountUrn::new("discard-target").unwrap();

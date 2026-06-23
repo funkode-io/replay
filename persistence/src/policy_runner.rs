@@ -216,7 +216,8 @@ impl PolicyRunnerBuilder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadLetterRetry {
     /// The reaction succeeded, or the aggregate now declines it with a
-    /// `BusinessRuleViolation`: the dead-letter row was deleted.
+    /// `BusinessRuleViolation`: the dead-letter row was archived into
+    /// `discarded_dead_letters` (reason `retried`).
     Resolved,
     /// The reaction failed permanently again: the existing row was updated in
     /// place with the fresh error. No second row was ever inserted.
@@ -228,7 +229,8 @@ pub enum DeadLetterRetry {
 /// Outcome of [`PolicyRunner::discard_dead_letter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadLetterDiscard {
-    /// The dead-letter row was deleted.
+    /// The dead-letter row was archived into `discarded_dead_letters` (reason
+    /// `discarded`) — a soft delete, not a hard delete.
     Discarded,
     /// No dead-letter row matched the supplied id: nothing to do.
     NotFound,
@@ -390,8 +392,14 @@ impl PolicyRunner {
 
         match failure {
             None => {
-                move_dead_letter_to_archive(&self.pool, id, "retried").await?;
-                Ok(DeadLetterRetry::Resolved)
+                if move_dead_letter_to_archive(&self.pool, id, "retried").await? {
+                    Ok(DeadLetterRetry::Resolved)
+                } else {
+                    // A concurrent discard removed the row between the initial
+                    // SELECT and the archive move: nothing was archived with
+                    // reason `retried`, so report it as NotFound.
+                    Ok(DeadLetterRetry::NotFound)
+                }
             }
             Some(error) => {
                 sqlx::query(

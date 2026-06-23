@@ -34,3 +34,9 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
 
 CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy
     ON discarded_dead_letters (policy_name, discarded_at DESC);
+
+-- A dead letter is moved here at most once (its BIGSERIAL id is never reused),
+-- so dead_letter_id is unique; the index keeps audit lookups by original id
+-- from degrading into sequential scans as the archive grows.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_discarded_dead_letters_dead_letter_id
+    ON discarded_dead_letters (dead_letter_id);
