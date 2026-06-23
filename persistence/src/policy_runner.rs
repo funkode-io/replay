@@ -216,11 +216,22 @@ impl PolicyRunnerBuilder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadLetterRetry {
     /// The reaction succeeded, or the aggregate now declines it with a
-    /// `BusinessRuleViolation`: the dead-letter row was deleted.
+    /// `BusinessRuleViolation`: the dead-letter row was archived into
+    /// `discarded_dead_letters` (reason `retried`).
     Resolved,
     /// The reaction failed permanently again: the existing row was updated in
     /// place with the fresh error. No second row was ever inserted.
     StillFailing,
+    /// No dead-letter row matched the supplied id: nothing to do.
+    NotFound,
+}
+
+/// Outcome of [`PolicyRunner::discard_dead_letter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadLetterDiscard {
+    /// The dead-letter row was archived into `discarded_dead_letters` (reason
+    /// `discarded`) — a soft delete, not a hard delete.
+    Discarded,
     /// No dead-letter row matched the supplied id: nothing to do.
     NotFound,
 }
@@ -288,7 +299,8 @@ impl PolicyRunner {
     /// settled **after** execution:
     ///
     /// - the reaction succeeds, or the aggregate now declines it with a
-    ///   `BusinessRuleViolation` → the row is **deleted**
+    ///   `BusinessRuleViolation` → the row is **archived** into
+    ///   `discarded_dead_letters` with reason `retried`
     ///   ([`DeadLetterRetry::Resolved`]).
     /// - the reaction fails permanently again → the existing row is **updated
     ///   in place** with the fresh error ([`DeadLetterRetry::StillFailing`]);
@@ -369,7 +381,7 @@ impl PolicyRunner {
                 Ok(()) => {}
                 Err(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation => {
                     // Stale reaction: the aggregate now declines it. Clean
-                    // resolution — fall through to delete the row.
+                    // resolution — fall through to archive the row.
                 }
                 Err(e) => {
                     failure = Some(e);
@@ -380,12 +392,14 @@ impl PolicyRunner {
 
         match failure {
             None => {
-                sqlx::query("DELETE FROM policy_dead_letters WHERE id = $1")
-                    .bind(id)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(crate::db_error)?;
-                Ok(DeadLetterRetry::Resolved)
+                if move_dead_letter_to_archive(&self.pool, id, "retried").await? {
+                    Ok(DeadLetterRetry::Resolved)
+                } else {
+                    // A concurrent discard removed the row between the initial
+                    // SELECT and the archive move: nothing was archived with
+                    // reason `retried`, so report it as NotFound.
+                    Ok(DeadLetterRetry::NotFound)
+                }
             }
             Some(error) => {
                 sqlx::query(
@@ -401,6 +415,29 @@ impl PolicyRunner {
                 .map_err(crate::db_error)?;
                 Ok(DeadLetterRetry::StillFailing)
             }
+        }
+    }
+
+    /// Discard a parked dead letter without re-running its reaction.
+    ///
+    /// Pure bookkeeping: **archives** the dead-letter row `id` into
+    /// `discarded_dead_letters` (reason `discarded`) in a single statement —
+    /// a soft delete that removes it from the active set the status read model
+    /// scans while keeping the audit trail. Unlike
+    /// [`retry_dead_letter`](Self::retry_dead_letter) it performs **no**
+    /// `react`, executes **no** command, and therefore produces **no** new
+    /// aggregate event. It takes no advisory lock and never touches
+    /// `policy_cursors`. Once the row leaves the active table,
+    /// [`PolicyStatusStore::list`] reports the policy leaving `Degraded`
+    /// exactly as it does after a successful retry.
+    ///
+    /// Returns [`DeadLetterDiscard::NotFound`] when no active row matches `id`
+    /// — a defined no-op, never a panic.
+    pub async fn discard_dead_letter(&self, id: i64) -> Result<DeadLetterDiscard, replay::Error> {
+        if move_dead_letter_to_archive(&self.pool, id, "discarded").await? {
+            Ok(DeadLetterDiscard::Discarded)
+        } else {
+            Ok(DeadLetterDiscard::NotFound)
         }
     }
 
@@ -1013,6 +1050,41 @@ async fn write_dead_letter(
     .await
     .map_err(crate::db_error)?;
     Ok(())
+}
+
+/// Move a dead letter out of the active `policy_dead_letters` table into the
+/// `discarded_dead_letters` archive in a single statement, recording why it
+/// left (`reason`: `retried` or `discarded`).
+///
+/// The `DELETE ... RETURNING` feeds the `INSERT` so the row is removed from the
+/// active set and preserved for audit atomically. Returns `true` when a row was
+/// moved, `false` when no active row matched `id`.
+async fn move_dead_letter_to_archive(
+    pool: &Pool<Postgres>,
+    id: i64,
+    reason: &str,
+) -> Result<bool, replay::Error> {
+    let result = sqlx::query(
+        "WITH moved AS ( \
+             DELETE FROM policy_dead_letters \
+             WHERE id = $1 \
+             RETURNING id, policy_name, global_position, event_id, error_kind, \
+                       error_message, created_at \
+         ) \
+         INSERT INTO discarded_dead_letters \
+             (dead_letter_id, policy_name, global_position, event_id, error_kind, \
+              error_message, created_at, reason) \
+         SELECT id, policy_name, global_position, event_id, error_kind, \
+                error_message, created_at, $2 \
+         FROM moved",
+    )
+    .bind(id)
+    .bind(reason)
+    .execute(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 /// Load a single event by its primary key, shaped exactly like [`read_feed`]

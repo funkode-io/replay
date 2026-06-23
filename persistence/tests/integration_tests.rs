@@ -3731,8 +3731,19 @@ async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
         .expect("retry must not error");
     assert_eq!(outcome, replay_persistence::DeadLetterRetry::Resolved);
 
-    // Row deleted.
+    // Removed from the active set.
     assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 0);
+
+    // Archived (soft delete), not destroyed: the row now lives in the archive
+    // tagged with the retry reason and its original id.
+    let archived_reason: String = sqlx::query_scalar(
+        "SELECT reason FROM discarded_dead_letters WHERE dead_letter_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pg_pool)
+    .await
+    .expect("the resolved dead letter must be archived");
+    assert_eq!(archived_reason, "retried");
 
     // Reaction applied exactly once (balance reflects a single fee charge).
     let account = cqrs
@@ -3975,6 +3986,121 @@ async fn retry_dead_letter_error_contract_postgres_test() {
 
     // The row is untouched by the failed attempts.
     assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 1);
+}
+
+// ── Dead-letter discard: discard_dead_letter primitive (issue #127) ───────────
+
+/// Discard is pure bookkeeping: it soft-deletes the parked dead letter (moving
+/// it into `discarded_dead_letters`), produces no new event on the target
+/// aggregate, recovers the policy from `Degraded`, takes no advisory lock,
+/// never moves the cursor, and treats an absent id as a defined no-op.
+#[tokio::test]
+async fn discard_dead_letter_deletes_row_without_side_effects_postgres_test() {
+    let target = IdempotentFeeAccountUrn::new("discard-target").unwrap();
+    let (_container, pg_pool, cqrs, id) = manufacture_dead_letter(
+        RetryFeePolicy {
+            target: target.clone(),
+            fee: 5.0,
+        },
+        "retry_fee_policy",
+    )
+    .await;
+
+    assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 1);
+    assert_eq!(
+        policy_condition(&pg_pool, "retry_fee_policy").await,
+        replay_persistence::PolicyCondition::Degraded,
+        "a parked dead letter must read as Degraded"
+    );
+
+    let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(&pg_pool)
+        .await
+        .unwrap();
+    let cursor_before: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'retry_fee_policy'")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+
+    // Discard runner: it does not even register the target aggregate's
+    // services, because discard never executes a command.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone()).build();
+
+    let outcome = runner
+        .discard_dead_letter(id)
+        .await
+        .expect("discard must not error");
+    assert_eq!(outcome, replay_persistence::DeadLetterDiscard::Discarded);
+
+    // Removed from the active set.
+    assert_eq!(dead_letter_count(&pg_pool, "retry_fee_policy").await, 0);
+
+    // Archived (soft delete), not destroyed: the row now lives in the archive
+    // tagged with the discard reason and its original id.
+    let archived_reason: String = sqlx::query_scalar(
+        "SELECT reason FROM discarded_dead_letters WHERE dead_letter_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pg_pool)
+    .await
+    .expect("the discarded dead letter must be archived");
+    assert_eq!(archived_reason, "discarded");
+
+    // No new event: the events table is unchanged and the target aggregate was
+    // never charged.
+    let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(&pg_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        events_before, events_after,
+        "discard must not append any event"
+    );
+    let account = cqrs
+        .fetch_aggregate::<IdempotentFeeAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        account.balance, 0.0,
+        "discard must not charge the target aggregate"
+    );
+
+    // Policy recovered: no longer Degraded.
+    assert_ne!(
+        policy_condition(&pg_pool, "retry_fee_policy").await,
+        replay_persistence::PolicyCondition::Degraded,
+        "after discard the policy must no longer be Degraded"
+    );
+
+    // Cursor untouched.
+    let cursor_after: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'retry_fee_policy'")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        cursor_before, cursor_after,
+        "discard must not move the cursor"
+    );
+
+    // No advisory lock taken: discard needs no leadership.
+    let advisory_locks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory'")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        advisory_locks, 0,
+        "discard must not acquire an advisory lock"
+    );
+
+    // Discarding the same id again — now absent — is a defined no-op.
+    let second = runner
+        .discard_dead_letter(id)
+        .await
+        .expect("absent id must not error");
+    assert_eq!(second, replay_persistence::DeadLetterDiscard::NotFound);
 }
 
 // ── Batching: read-batch size and checkpoint-batch size (issue #85) ───────────

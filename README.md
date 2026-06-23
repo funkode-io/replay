@@ -2109,9 +2109,57 @@ LIMIT  20;
 
 -- Look up the original event for manual replay
 SELECT * FROM events WHERE id = '<event_id from dead letter>';
+```
 
--- Discard a resolved dead-letter
-DELETE FROM policy_dead_letters WHERE id = <id>;
+#### Retrying and discarding dead letters
+
+Two operator controls on `PolicyRunner` resolve a parked dead letter out of
+band. Both take **no** advisory lock and **never** move the policy cursor:
+
+| Method | Reaction | Outcome |
+|--------|----------|---------|
+| `retry_dead_letter(id)` | Re-runs the policy's reaction against **current** aggregate state through the same `Cqrs` path the live drain uses. | `Resolved` (succeeded, or now declined with a `BusinessRuleViolation`), `StillFailing` (re-parked in place with the fresh error), or `NotFound`. |
+| `discard_dead_letter(id)` | None — pure bookkeeping: no `react`, no command, no new event. | `Discarded` or `NotFound`. |
+
+```rust,ignore
+use replay_persistence::{DeadLetterRetry, DeadLetterDiscard};
+
+// Give a parked failure another chance against today's state.
+match runner.retry_dead_letter(id).await? {
+    DeadLetterRetry::Resolved => { /* recovered: no longer Degraded */ }
+    DeadLetterRetry::StillFailing => { /* updated in place, stays Degraded */ }
+    DeadLetterRetry::NotFound => { /* nothing matched the id */ }
+}
+
+// Or give up on it permanently.
+match runner.discard_dead_letter(id).await? {
+    DeadLetterDiscard::Discarded => { /* archived */ }
+    DeadLetterDiscard::NotFound => { /* nothing matched the id */ }
+}
+```
+
+Neither method destroys data. When a dead letter leaves the active set —
+resolved by a retry or discarded — the runner **moves** it into the
+`discarded_dead_letters` archive in a single statement, so `policy_dead_letters`
+keeps exactly the parked failures the status read model reports while the full
+history is preserved for audit:
+
+```sql
+CREATE TABLE IF NOT EXISTS discarded_dead_letters (
+    id               BIGSERIAL   PRIMARY KEY,
+    dead_letter_id   BIGINT      NOT NULL,   -- id it had in policy_dead_letters
+    policy_name      TEXT        NOT NULL,
+    global_position  BIGINT      NOT NULL,
+    event_id         UUID        NOT NULL,
+    error_kind       TEXT        NOT NULL,
+    error_message    TEXT        NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL,   -- when the dead letter was written
+    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded'
+    discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy
+    ON discarded_dead_letters (policy_name, discarded_at DESC);
 ```
 
 #### `A::Error: Into<replay::Error>` migration note
