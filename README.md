@@ -2120,6 +2120,7 @@ band. Both take **no** advisory lock and **never** move the policy cursor:
 |--------|----------|---------|
 | `retry_dead_letter(id)` | Re-runs the policy's reaction against **current** aggregate state through the same `Cqrs` path the live drain uses. | `Resolved` (succeeded, or now declined with a `BusinessRuleViolation`), `StillFailing` (re-parked in place with the fresh error), or `NotFound`. |
 | `discard_dead_letter(id)` | None — pure bookkeeping: no `react`, no command, no new event. | `Discarded` or `NotFound`. |
+| `retry_policy_dead_letters(name)` | Bulk: applies `retry_dead_letter` to every parked row for the policy, **oldest-first**. | `DeadLetterRetrySummary { resolved, still_failing }`. |
 
 ```rust,ignore
 use replay_persistence::{DeadLetterRetry, DeadLetterDiscard};
@@ -2136,6 +2137,10 @@ match runner.discard_dead_letter(id).await? {
     DeadLetterDiscard::Discarded => { /* archived */ }
     DeadLetterDiscard::NotFound => { /* nothing matched the id */ }
 }
+
+// Replay a whole backlog after a downstream outage, oldest-first.
+let summary = runner.retry_policy_dead_letters("deposit_fee").await?;
+println!("resolved {}, still failing {}", summary.resolved, summary.still_failing);
 ```
 
 Neither method destroys data. When a dead letter leaves the active set —

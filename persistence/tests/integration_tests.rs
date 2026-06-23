@@ -4103,6 +4103,320 @@ async fn discard_dead_letter_deletes_row_without_side_effects_postgres_test() {
     assert_eq!(second, replay_persistence::DeadLetterDiscard::NotFound);
 }
 
+// ── Dead-letter bulk retry: retry_policy_dead_letters (issue #128) ────────────
+
+// An aggregate that records the nonces it is touched with, in apply order, and
+// rejects odd nonces with a permanent error.  This lets one policy manufacture
+// a mix of rows that resolve (even) and stay failing (odd) on retry, and lets
+// tests assert the bulk retry replays them oldest-first.
+define_aggregate! {
+    OrderedPickyAccount {
+        namespace: "ordered-picky-account",
+        state: {
+            applied: Vec<u64>,
+        },
+        commands: {
+            Touch { nonce: u64 },
+        },
+        events: {
+            Touched { nonce: u64 },
+        }
+    }
+}
+
+impl replay::EventStream for OrderedPickyAccount {
+    type Event = OrderedPickyAccountEvent;
+
+    fn stream_type() -> String {
+        "OrderedPickyAccount".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            OrderedPickyAccountEvent::Touched { nonce } => self.applied.push(nonce),
+        }
+    }
+}
+
+impl replay::Aggregate for OrderedPickyAccount {
+    type Command = OrderedPickyAccountCommand;
+    type Error = replay::Error;
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        let OrderedPickyAccountCommand::Touch { nonce } = command;
+        if nonce % 2 == 1 {
+            Err(
+                replay::Error::invalid_input("ordered-picky-account rejects odd nonces")
+                    .with_operation("Touch"),
+            )
+        } else {
+            Ok(vec![OrderedPickyAccountEvent::Touched { nonce }])
+        }
+    }
+}
+
+/// Reacts to each deposit by touching a fixed `OrderedPickyAccount` with a
+/// nonce derived from the deposit amount (even amounts resolve, odd amounts
+/// stay failing).
+struct OrderedPickyPolicy {
+    target: OrderedPickyAccountUrn,
+}
+
+impl replay_persistence::Policy for OrderedPickyPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "ordered_picky_policy"
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { amount, .. } => {
+                vec![replay_persistence::Dispatch::to::<OrderedPickyAccount>(
+                    self.target.clone(),
+                    OrderedPickyAccountCommand::Touch {
+                        nonce: *amount as u64,
+                    },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Append one deposit per amount in `amounts` (in order) and manufacture one
+/// dead letter per deposit for `policy` by draining a runner that does **not**
+/// register the dispatch target (so each dispatch fails permanently).
+///
+/// Returns `(container, pool, cqrs)`.
+async fn manufacture_dead_letters<P>(
+    policy: P,
+    amounts: &[f64],
+) -> (
+    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
+    PgPool,
+    replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
+)
+where
+    P: replay_persistence::Policy + 'static,
+{
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("bulk-retry-trigger").unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    for amount in amounts {
+        cqrs.execute::<BankAccount>(
+            &account,
+            replay::Metadata::default(),
+            BankAccountCommand::Deposit {
+                effective_on: date,
+                amount: *amount,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Manufacturing runner: the policy is registered but the dispatch target's
+    // services are NOT, so each dispatch dead-letters.
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_policy(policy)
+        .build();
+    runner
+        .drain()
+        .await
+        .expect("manufacturing drain must not error");
+
+    (container, pg_pool, cqrs)
+}
+
+/// Bulk retry with several resolvable rows: every row resolves oldest-first,
+/// the active set empties, and the policy leaves `Degraded`.
+#[tokio::test]
+async fn retry_policy_dead_letters_resolves_all_oldest_first_postgres_test() {
+    let target = OrderedPickyAccountUrn::new("bulk-all").unwrap();
+    let (_container, pg_pool, cqrs) = manufacture_dead_letters(
+        OrderedPickyPolicy {
+            target: target.clone(),
+        },
+        &[10.0, 20.0, 30.0], // all even → all resolve
+    )
+    .await;
+
+    assert_eq!(dead_letter_count(&pg_pool, "ordered_picky_policy").await, 3);
+    assert_eq!(
+        policy_condition(&pg_pool, "ordered_picky_policy").await,
+        replay_persistence::PolicyCondition::Degraded
+    );
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<OrderedPickyAccount>(())
+        .register_policy(OrderedPickyPolicy {
+            target: target.clone(),
+        })
+        .build();
+
+    let summary = runner
+        .retry_policy_dead_letters("ordered_picky_policy")
+        .await
+        .expect("bulk retry must not error");
+    assert_eq!(
+        summary,
+        replay_persistence::DeadLetterRetrySummary {
+            resolved: 3,
+            still_failing: 0,
+        }
+    );
+
+    // Active set empty, policy recovered.
+    assert_eq!(dead_letter_count(&pg_pool, "ordered_picky_policy").await, 0);
+    assert_ne!(
+        policy_condition(&pg_pool, "ordered_picky_policy").await,
+        replay_persistence::PolicyCondition::Degraded
+    );
+
+    // Oldest-first: the target recorded the nonces in ascending deposit order.
+    let account = cqrs
+        .fetch_aggregate::<OrderedPickyAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(account.applied, vec![10, 20, 30]);
+
+    // No advisory lock taken: bulk retry needs no leadership.
+    let advisory_locks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory'")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        advisory_locks, 0,
+        "bulk retry must not acquire an advisory lock"
+    );
+}
+
+/// Bulk retry with a mix of resolvable and still-failing rows: exactly the
+/// unresolved rows remain (each updated in place, not duplicated) and the
+/// policy stays `Degraded` while any remain.
+#[tokio::test]
+async fn retry_policy_dead_letters_mixed_leaves_unresolved_postgres_test() {
+    let target = OrderedPickyAccountUrn::new("bulk-mixed").unwrap();
+    let (_container, pg_pool, cqrs) = manufacture_dead_letters(
+        OrderedPickyPolicy {
+            target: target.clone(),
+        },
+        &[2.0, 3.0, 4.0], // nonce 3 is odd → stays failing
+    )
+    .await;
+
+    let ids_before: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM policy_dead_letters WHERE policy_name = 'ordered_picky_policy' ORDER BY id",
+    )
+    .fetch_all(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(ids_before.len(), 3);
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<OrderedPickyAccount>(())
+        .register_policy(OrderedPickyPolicy {
+            target: target.clone(),
+        })
+        .build();
+
+    let summary = runner
+        .retry_policy_dead_letters("ordered_picky_policy")
+        .await
+        .expect("bulk retry must not error");
+    assert_eq!(
+        summary,
+        replay_persistence::DeadLetterRetrySummary {
+            resolved: 2,
+            still_failing: 1,
+        }
+    );
+
+    // Exactly the unresolved row remains, updated in place — its id is one of
+    // the originals, not a freshly inserted duplicate.
+    let ids_after: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM policy_dead_letters WHERE policy_name = 'ordered_picky_policy'",
+    )
+    .fetch_all(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(ids_after.len(), 1);
+    assert!(
+        ids_before.contains(&ids_after[0]),
+        "the surviving row must be updated in place, not duplicated"
+    );
+
+    // Policy stays Degraded while any parked row remains.
+    assert_eq!(
+        policy_condition(&pg_pool, "ordered_picky_policy").await,
+        replay_persistence::PolicyCondition::Degraded
+    );
+
+    // Only the even nonces resolved, recorded oldest-first.
+    let account = cqrs
+        .fetch_aggregate::<OrderedPickyAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(account.applied, vec![2, 4]);
+}
+
+/// Bulk retry for a policy with no parked dead letters is a clean no-op.
+#[tokio::test]
+async fn retry_policy_dead_letters_empty_is_noop_postgres_test() {
+    let target = OrderedPickyAccountUrn::new("bulk-empty").unwrap();
+    let (_container, _pg_pool, cqrs) = manufacture_dead_letters(
+        OrderedPickyPolicy {
+            target: target.clone(),
+        },
+        &[], // no deposits → no dead letters
+    )
+    .await;
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<OrderedPickyAccount>(())
+        .register_policy(OrderedPickyPolicy {
+            target: target.clone(),
+        })
+        .build();
+
+    let summary = runner
+        .retry_policy_dead_letters("ordered_picky_policy")
+        .await
+        .expect("empty bulk retry must not error");
+    assert_eq!(
+        summary,
+        replay_persistence::DeadLetterRetrySummary::default()
+    );
+}
+
 // ── Batching: read-batch size and checkpoint-batch size (issue #85) ───────────
 
 /// Policy with a custom read-batch size for testing.

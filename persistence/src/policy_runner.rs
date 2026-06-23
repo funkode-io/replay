@@ -236,6 +236,15 @@ pub enum DeadLetterDiscard {
     NotFound,
 }
 
+/// Summary of a bulk [`PolicyRunner::retry_policy_dead_letters`] run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeadLetterRetrySummary {
+    /// Rows that resolved and were archived (reason `retried`).
+    pub resolved: usize,
+    /// Rows that failed again and were updated in place.
+    pub still_failing: usize,
+}
+
 /// Native runner that drives registered policies against the event feed.
 pub struct PolicyRunner {
     cqrs: Cqrs<PostgresEventStore>,
@@ -439,6 +448,48 @@ impl PolicyRunner {
         } else {
             Ok(DeadLetterDiscard::NotFound)
         }
+    }
+
+    /// Bulk-retry every parked dead letter for `policy_name`, oldest-first.
+    ///
+    /// Enumerates the policy's parked dead letters in ascending
+    /// `global_position` (then `created_at`) order and applies
+    /// [`retry_dead_letter`](Self::retry_dead_letter) to each — the
+    /// bulk-recovery convenience for replaying a backlog that piled up while a
+    /// downstream dependency was down. Every row resolves or re-parks exactly
+    /// as the by-id primitive defines; this method adds only enumeration and
+    /// ordering, delegating all per-row behaviour (causation guard, optimistic
+    /// concurrency, archive-on-resolve) to the primitive. It takes no advisory
+    /// lock and never touches `policy_cursors`.
+    ///
+    /// Returns a [`DeadLetterRetrySummary`] counting how many rows resolved and
+    /// how many failed again; the policy has fully recovered when
+    /// `still_failing == 0`. A policy with no parked dead letters is a clean
+    /// no-op (a zero summary). Rows removed concurrently (e.g. by
+    /// [`discard_dead_letter`](Self::discard_dead_letter)) are skipped.
+    pub async fn retry_policy_dead_letters(
+        &self,
+        policy_name: &str,
+    ) -> Result<DeadLetterRetrySummary, replay::Error> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM policy_dead_letters \
+             WHERE policy_name = $1 \
+             ORDER BY global_position ASC, created_at ASC, id ASC",
+        )
+        .bind(policy_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::db_error)?;
+
+        let mut summary = DeadLetterRetrySummary::default();
+        for id in ids {
+            match self.retry_dead_letter(id).await? {
+                DeadLetterRetry::Resolved => summary.resolved += 1,
+                DeadLetterRetry::StillFailing => summary.still_failing += 1,
+                DeadLetterRetry::NotFound => {}
+            }
+        }
+        Ok(summary)
     }
 
     /// Start one long-lived worker task per registered policy, backed by two
