@@ -108,6 +108,45 @@ impl PostgresEventStore {
         &self.pool
     }
 
+    /// The gap-free contiguous high-water-mark of the event log.
+    ///
+    /// Returns the largest position `H` such that every `global_position` in
+    /// `1..=H` is present in the `events` table, with no gaps.
+    ///
+    /// `global_position` is a `BIGSERIAL` assigned at INSERT but only made
+    /// visible at COMMIT, so under concurrent appends a higher position can
+    /// commit before a lower one, leaving a transient gap. Consumers that need a
+    /// **stable cut** of the log (e.g. snapshotting a version at publish time)
+    /// must use this gap-free high-water-mark rather than `MAX(global_position)`:
+    /// replaying events with `global_position <= H` is then guaranteed to observe
+    /// the same set of events on every later read, because no in-flight hole can
+    /// later fill in below `H`.
+    ///
+    /// This is the scalar counterpart of the contiguous-prefix scan the policy
+    /// runner uses to avoid skipping in-flight events. Returns `0` when the log
+    /// is empty or its very first position has not yet committed.
+    pub async fn contiguous_high_water_mark(&self) -> Result<i64, replay::Error> {
+        // Number the rows in global order: the first position whose row number
+        // diverges from the value marks the first gap, so the contiguous prefix
+        // ends at that row number minus one. With no gaps every position lines up
+        // and the prefix spans the whole table (COUNT(*)).
+        let hwm: i64 = sqlx::query_scalar(
+            "SELECT COALESCE( \
+                 (SELECT MIN(rn) - 1 \
+                    FROM (SELECT global_position, \
+                                 ROW_NUMBER() OVER (ORDER BY global_position) AS rn \
+                            FROM events) numbered \
+                   WHERE global_position <> rn), \
+                 (SELECT COUNT(*) FROM events) \
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(crate::db_error)?;
+
+        Ok(hwm)
+    }
+
     pub(crate) fn add_filters(query_builder: &mut QueryBuilder<Postgres>, filter: StreamFilter) {
         match filter {
             StreamFilter::All => {
