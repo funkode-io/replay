@@ -4,6 +4,7 @@ use futures::stream;
 use futures::TryStream;
 
 use replay::{Compactable, Event};
+use urn::Urn;
 
 use super::{AggregateVersion, PersistedEvent};
 
@@ -104,6 +105,29 @@ pub trait EventStore: Send + Sync {
     ///    events, to obtain the minimal event set.
     /// 5. Persists the compacted events as the new current event stream (no version tag).
     ///
+    /// Whether the given stream has changed since it was last compacted.
+    ///
+    /// Returns `true` when at least one event has been appended past the stream's
+    /// compaction watermark (`streams.last_compacted_version`) — including a stream
+    /// that has never been compacted but has events. A blanket maintenance job uses
+    /// this as a cheap pre-check to skip [`compact`](EventStore::compact) entirely
+    /// for unchanged streams, avoiding the transaction, lock, and fold:
+    ///
+    /// ```rust,ignore
+    /// if store.needs_compaction(&stream_id).await? {
+    ///     store.compact(&aggregate, metadata).await?;
+    /// }
+    /// ```
+    ///
+    /// The check takes **no lock**: the race against a concurrent append is benign
+    /// because compaction is best-effort idempotent maintenance — an append landing
+    /// just after a `false` read is simply picked up on the next cycle. A stream that
+    /// does not exist reports `false` (nothing to compact).
+    fn needs_compaction(
+        &self,
+        stream_id: &Urn,
+    ) -> impl Future<Output = Result<bool, replay::Error>> + Send;
+
     /// Returns the archive version number that was created.
     fn compact<A>(
         &self,

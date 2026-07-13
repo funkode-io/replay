@@ -37,6 +37,11 @@ pub struct InMemoryEventStore {
     /// write handle, so projections must keep their view in their own state (e.g. shared via
     /// `Arc`).
     projections: Vec<Mutex<Box<dyn ErasedInlineProjection<Exec = ()>>>>,
+    /// Compaction watermark per stream: the live head `version` recorded at the last
+    /// compaction. `needs_compaction` compares the current live head against it so an
+    /// unchanged stream is skipped. Absent means "never compacted" (eligible if it has
+    /// events). Mirrors `streams.last_compacted_version` in the Postgres store.
+    last_compacted_version: RwLock<HashMap<Urn, i64>>,
 }
 
 impl InMemoryEventStore {
@@ -45,6 +50,7 @@ impl InMemoryEventStore {
             events: RwLock::new(HashMap::new()),
             stream_types: RwLock::new(HashMap::new()),
             projections: Vec::new(),
+            last_compacted_version: RwLock::new(HashMap::new()),
         }
     }
 
@@ -363,8 +369,41 @@ impl EventStore for InMemoryEventStore {
                 });
             }
 
+            // Advance the compaction watermark to the new live head version so
+            // `needs_compaction` skips this stream until a new event is appended.
+            self.last_compacted_version
+                .write()
+                .unwrap()
+                .insert(stream_id.clone(), compacted.len() as i64);
+
             Ok(next_version)
         }
+    }
+
+    async fn needs_compaction(&self, stream_id: &Urn) -> Result<bool, replay::Error> {
+        // Current live head version (max version among un-archived events), 0 if none.
+        let head = {
+            let store = self.events.read().unwrap();
+            match store.get(stream_id) {
+                None => return Ok(false),
+                Some(stream) => stream
+                    .iter()
+                    .filter(|e| e.aggregate_version.is_none())
+                    .map(|e| e.version)
+                    .max()
+                    .unwrap_or(0),
+            }
+        };
+
+        let watermark = self
+            .last_compacted_version
+            .read()
+            .unwrap()
+            .get(stream_id)
+            .copied()
+            .unwrap_or(0);
+
+        Ok(head > watermark)
     }
 }
 
@@ -655,6 +694,56 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), replay::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn needs_compaction_tracks_the_watermark() {
+        let store = InMemoryEventStore::new();
+        let id = make_stream_id("needs-compaction");
+        let urn: Urn = id.clone().into();
+
+        // A stream that does not exist has nothing to compact.
+        assert!(!store.needs_compaction(&urn).await.unwrap());
+
+        // A never-compacted stream with events is eligible.
+        add_events(
+            &store,
+            &id,
+            &[
+                BankAccountEvent::Deposited { amount: 100.0 },
+                BankAccountEvent::Withdrawn { amount: 40.0 },
+            ],
+        )
+        .await;
+        assert!(store.needs_compaction(&urn).await.unwrap());
+
+        // Compaction advances the watermark to the live head, so an unchanged stream
+        // is skipped — and stays skipped on repeated reads with no intervening append.
+        let mut account = BankAccountStream::with_id(id.clone());
+        for ev in live_events(&store, &id).await {
+            account.apply(ev);
+        }
+        store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert!(!store.needs_compaction(&urn).await.unwrap());
+        assert!(!store.needs_compaction(&urn).await.unwrap());
+
+        // A new append past the watermark makes it eligible again.
+        add_events(&store, &id, &[BankAccountEvent::Deposited { amount: 10.0 }]).await;
+        assert!(store.needs_compaction(&urn).await.unwrap());
+
+        // Compacting again settles it once more.
+        let mut account2 = BankAccountStream::with_id(id.clone());
+        for ev in live_events(&store, &id).await {
+            account2.apply(ev);
+        }
+        store
+            .compact(&account2, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert!(!store.needs_compaction(&urn).await.unwrap());
     }
 
     #[tokio::test]

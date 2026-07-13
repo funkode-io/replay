@@ -50,7 +50,6 @@ pub mod prelude {
         Dispatch, EventSink, EventStore, InMemoryEventStore, InlineProjection, NoSink,
         PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
         PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore, PostgresEventStore,
-        PostgresInlineProjection, Query, StartAt,
-        StreamFilter,
+        PostgresInlineProjection, Query, StartAt, StreamFilter,
     };
 }
