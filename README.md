@@ -1744,20 +1744,22 @@ under a versioned snapshot.
 
 ### The `Compactable` trait
 
-`compacted_events` receives the **current live event stream** from the store and returns the
-shortest subsequence that, when replayed from scratch, reproduces the same state. The aggregate
-does **not** need to store events in its own fields:
+`compacted_events` receives the **current live event stream** from the store and returns a
+`Compaction`: either `Rewrite(events)` with the shortest subsequence that, when replayed from
+scratch, reproduces the same state — or `AlreadyCompacted` to signal the live stream is already
+minimal so the store writes nothing. The aggregate does **not** need to store events in its own
+fields:
 
 ```rust
 use futures::TryStream;       // trait bound used in the signature
 use futures::TryStreamExt;    // .try_fold() extension method
-use replay::Compactable;
+use replay::{Compactable, Compaction};
 
 impl Compactable for BankAccountAggregate {
     async fn compacted_events(
         &self,
         events: impl TryStream<Ok = Self::Event, Error = replay::Error> + Send,
-    ) -> replay::Result<Vec<Self::Event>> {
+    ) -> replay::Result<Compaction<Self::Event>> {
         // Sliding-window via try_fold: only events from the last MonthlyClosed
         // onward are kept in the accumulator. Prior months are never buffered.
         events
@@ -1769,9 +1771,17 @@ impl Compactable for BankAccountAggregate {
                 Ok(tail)
             })
             .await
+            .map(Into::into) // Vec -> Compaction::Rewrite
     }
 }
 ```
+
+`compacted_events` must be a **fixpoint**: applied to a stream it already produced it must
+reproduce it (or return `AlreadyCompacted`). Returning `AlreadyCompacted` on an already-minimal
+stream lets `compact` skip the archive-and-rewrite entirely — it writes nothing but still advances
+the compaction watermark, so a stream that was born minimal never pays even a one-time rewrite.
+Note `Rewrite(vec![])` is *not* the same as `AlreadyCompacted`: the empty rewrite archives
+everything and leaves the stream empty (compact to nothing), the opposite write from skipping.
 
 ### Bank-account example with `MonthlyClosed`
 
@@ -1845,8 +1855,10 @@ let aggregate = cqrs
     .await?;
 
 // Compact: archives the full history and writes the minimal live stream.
-let archive_version = cqrs.compact(&aggregate, meta).await?;
-// archive_version == 1 on the first compaction, 2 on the second, etc.
+// Returns a `CompactionOutcome`: `Compacted { archive_version }` (1 on the first
+// compaction, 2 on the second, …) or `Skipped` when the aggregate reported
+// `AlreadyCompacted`.
+let outcome = cqrs.compact(&aggregate, meta).await?;
 
 // Future fetches replay only the 3 compacted events.
 let compacted = cqrs

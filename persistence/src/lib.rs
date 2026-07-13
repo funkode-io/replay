@@ -25,7 +25,7 @@ pub use policy_runner::{
 };
 pub use policy_status::{PolicyCondition, PolicyStatus, PolicyStatusStore};
 pub use query::Query;
-pub use store::{EventSink, EventStore, NoSink};
+pub use store::{CompactionOutcome, EventSink, EventStore, NoSink};
 
 /// Convenience re-exports of the most commonly used types and traits across
 /// `replay`, `replay_macros`, and `replay_persistence`.
@@ -46,10 +46,10 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary,
-        Dispatch, EventSink, EventStore, InMemoryEventStore, InlineProjection, NoSink,
-        PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
-        PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore, PostgresEventStore,
-        PostgresInlineProjection, Query, StartAt, StreamFilter,
+        AggregateVersion, CompactionOutcome, Cqrs, DeadLetterDiscard, DeadLetterRetry,
+        DeadLetterRetrySummary, Dispatch, EventSink, EventStore, InMemoryEventStore,
+        InlineProjection, NoSink, PersistedEvent, Policy, PolicyCondition, PolicyRunner,
+        PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
+        PostgresEventStore, PostgresInlineProjection, Query, StartAt, StreamFilter,
     };
 }

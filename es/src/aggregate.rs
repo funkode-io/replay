@@ -200,12 +200,22 @@ pub trait Aggregate: Sync + EventStream {
 ///
 /// # Implementation contract
 ///
-/// `compacted_events` receives the **current live event stream** supplied by the store and must
-/// return the shortest subsequence that, when replayed from a freshly constructed aggregate
-/// (via `with_id`), reproduces the identical state observable before compaction.
+/// `compacted_events` receives the **current live event stream** supplied by the store and
+/// returns a [`Compaction`]: either [`Rewrite`](Compaction::Rewrite) carrying the shortest
+/// subsequence that, when replayed from a freshly constructed aggregate (via `with_id`),
+/// reproduces the identical state observable before compaction — or
+/// [`AlreadyCompacted`](Compaction::AlreadyCompacted) to signal the live stream is already in
+/// minimal form so the store writes nothing.
 ///
 /// Implementations should process the stream lazily — buffering only the events that are truly
 /// needed in the output — rather than collecting the full history into memory first.
+///
+/// **Fixpoint contract.** `compacted_events` must be a fixpoint: applied to a stream it already
+/// produced, it must reproduce that same stream (equivalently, return `AlreadyCompacted`).
+/// Compaction relies on this to be idempotent under re-delivery and to let the store skip
+/// unchanged streams; a non-fixpoint implementation will churn or drift on repeated compaction.
+/// A `Vec` converts into `Compaction::Rewrite` via `From`, so an implementation that never
+/// short-circuits can simply return `events.into()`.
 ///
 /// # Monthly bank-account compaction example
 ///
@@ -289,7 +299,7 @@ pub trait Aggregate: Sync + EventStream {
 ///     async fn compacted_events(
 ///         &self,
 ///         events: impl TryStream<Ok = Self::Event, Error = replay::Error> + Send,
-///     ) -> replay::Result<Vec<Self::Event>> {
+///     ) -> replay::Result<replay::Compaction<Self::Event>> {
 ///         use futures::TryStreamExt;
 ///         // Sliding-window via try_fold: only keep events from the last
 ///         // MonthlyClosed onward.  Prior months are never buffered in memory.
@@ -302,6 +312,7 @@ pub trait Aggregate: Sync + EventStream {
 ///                 Ok(tail)
 ///             })
 ///             .await
+///             .map(Into::into) // Vec -> Compaction::Rewrite
 ///     }
 /// }
 /// ```
@@ -328,17 +339,40 @@ pub trait Aggregate: Sync + EventStream {
 /// Replaying the compacted stream yields `balance == 1600.00`, identical to replaying
 /// the full history. The full history remains accessible via `AggregateVersion::Version(1)`.
 pub trait Compactable: EventStream {
-    /// Consumes the current live event stream for this aggregate and returns the minimal
-    /// subsequence that, when replayed from a fresh instance, reproduces the current state.
+    /// Consumes the current live event stream for this aggregate and returns a [`Compaction`]:
+    /// [`Rewrite`](Compaction::Rewrite) with the minimal subsequence that, when replayed from a
+    /// fresh instance, reproduces the current state — or [`AlreadyCompacted`](Compaction::AlreadyCompacted)
+    /// when the live stream is already minimal, so the store writes nothing.
     ///
     /// The store passes the live stream to this method so implementations can process events
     /// one at a time without loading the entire history into memory.  Only events that must
     /// be preserved (e.g. the most recent summary + the current-period transactions) need to
-    /// be buffered.
+    /// be buffered.  A `Vec` converts into `Rewrite` via `From`, so a non-short-circuiting
+    /// implementation can return `events.into()`.
     fn compacted_events(
         &self,
         events: impl TryStream<Ok = Self::Event, Error = Error> + Send,
-    ) -> impl Future<Output = crate::Result<Vec<Self::Event>>> + Send;
+    ) -> impl Future<Output = crate::Result<Compaction<Self::Event>>> + Send;
+}
+
+/// The outcome of [`Compactable::compacted_events`].
+///
+/// Distinguishing [`AlreadyCompacted`](Compaction::AlreadyCompacted) from an empty
+/// [`Rewrite`](Compaction::Rewrite) matters: `Rewrite(vec![])` means *archive everything and
+/// leave the stream empty* (compact to nothing), the opposite write from *don't compact*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Compaction<E> {
+    /// Replace the live stream with this minimal event sequence.
+    Rewrite(Vec<E>),
+    /// The stream is already in minimal form; the store writes nothing and only records that
+    /// the stream has been settled at its current head.
+    AlreadyCompacted,
+}
+
+impl<E> From<Vec<E>> for Compaction<E> {
+    fn from(events: Vec<E>) -> Self {
+        Compaction::Rewrite(events)
+    }
 }
 
 // tests

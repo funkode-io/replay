@@ -15,7 +15,7 @@ use urn::Urn;
 use uuid::Uuid;
 
 use crate::inline_projection::{ErasedInlineProjection, InlineProjection};
-use crate::{EventSink, EventStore, PersistedEvent, StreamFilter};
+use crate::{CompactionOutcome, EventSink, EventStore, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event, Metadata};
 
 /// Convenience marker trait for inline projections that run on Postgres.
@@ -653,7 +653,7 @@ impl EventStore for PostgresEventStore {
         &self,
         aggregate: &A,
         metadata: replay::Metadata,
-    ) -> Result<i32, replay::Error>
+    ) -> Result<CompactionOutcome, replay::Error>
     where
         A: replay::Aggregate + Compactable + Sync,
     {
@@ -693,7 +693,21 @@ impl EventStore for PostgresEventStore {
             serde_json::from_value::<A::Event>(data).map_err(crate::deser_error)
         });
 
-        let compacted = aggregate.compacted_events(event_stream).await?;
+        let compacted = match aggregate.compacted_events(event_stream).await? {
+            replay::Compaction::Rewrite(events) => events,
+            replay::Compaction::AlreadyCompacted => {
+                // The author reports the live stream is already minimal: write nothing, but
+                // settle the watermark at the current head so `needs_compaction` skips this
+                // stream until a new event is appended past it.
+                sqlx::query("UPDATE streams SET last_compacted_version = version WHERE id = $1")
+                    .bind(&stream_id_str)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(crate::db_error)?;
+                tx.commit().await.map_err(crate::db_error)?;
+                return Ok(CompactionOutcome::Skipped);
+            }
+        };
 
         // 3. Determine the next archive version number.
         let next_version: i32 = sqlx::query_scalar(
@@ -762,7 +776,9 @@ impl EventStore for PostgresEventStore {
 
         tx.commit().await.map_err(crate::db_error)?;
 
-        Ok(next_version)
+        Ok(CompactionOutcome::Compacted {
+            archive_version: next_version,
+        })
     }
 }
 

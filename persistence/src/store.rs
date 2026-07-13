@@ -133,7 +133,18 @@ pub trait EventStore: Send + Sync {
         &self,
         aggregate: &A,
         metadata: replay::Metadata,
-    ) -> impl Future<Output = Result<i32, replay::Error>> + Send
+    ) -> impl Future<Output = Result<CompactionOutcome, replay::Error>> + Send
     where
         A: replay::Aggregate + Compactable + Sync;
+}
+
+/// The outcome of [`EventStore::compact`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionOutcome {
+    /// The stream was compacted; carries the archive version created (starting at 1).
+    Compacted { archive_version: i32 },
+    /// Nothing was written — the aggregate reported the live stream already minimal
+    /// (`Compaction::AlreadyCompacted`). The compaction watermark is still advanced so the
+    /// stream is skipped by [`EventStore::needs_compaction`] until a new event is appended.
+    Skipped,
 }
