@@ -1861,6 +1861,32 @@ let archived = cqrs
     .await?;
 ```
 
+### Skipping unchanged streams (`needs_compaction`)
+
+A maintenance job that compacts many streams on a schedule should not re-archive a
+stream that has not changed since its last compaction — doing so rewrites an identical
+snapshot and, because archived originals are retained for policies, grows the store for
+no reason. `needs_compaction` is a cheap pre-check that lets the job skip `compact`
+entirely for such streams:
+
+```rust,ignore
+// Blanket daily job over every stream in a catalog.
+for stream_id in stream_ids {
+    if cqrs.needs_compaction::<BankAccountAggregate>(&stream_id).await? {
+        let aggregate = cqrs.fetch_aggregate::<BankAccountAggregate>(&stream_id).await?;
+        cqrs.compact(&aggregate, meta.clone()).await?;
+    }
+    // else: nothing appended since the last compaction — no transaction, no fold.
+}
+```
+
+Each compaction records a per-stream watermark (the post-compaction stream version);
+`needs_compaction` returns `true` only when at least one event has been appended past
+it — including a stream that has never been compacted but has events. The check takes
+**no lock**: the race against a concurrent append is benign, because compaction is
+best-effort maintenance, so an append that lands just after a `false` read is simply
+picked up on the next run. Both the Postgres and in-memory stores implement it.
+
 ## Policies
 
 A `Policy` is a checkpointed background subscriber that **reacts to events by

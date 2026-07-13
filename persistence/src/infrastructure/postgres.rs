@@ -633,6 +633,22 @@ impl EventStore for PostgresEventStore {
         }
     }
 
+    async fn needs_compaction(&self, stream_id: &Urn) -> Result<bool, replay::Error> {
+        let stream_id_str = stream_id.to_string();
+
+        // Pure streams-row scalar test, no lock: has anything been appended past the
+        // watermark since the last compaction?  A missing stream reports false.
+        let needs: Option<bool> = sqlx::query_scalar(
+            "SELECT version > COALESCE(last_compacted_version, 0) FROM streams WHERE id = $1",
+        )
+        .bind(&stream_id_str)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(crate::db_error)?;
+
+        Ok(needs.unwrap_or(false))
+    }
+
     async fn compact<A>(
         &self,
         aggregate: &A,
@@ -730,15 +746,19 @@ impl EventStore for PostgresEventStore {
             .map_err(crate::db_error)?;
         }
 
-        // 7. Update the stream version to the count of compacted events.
+        // 7. Update the stream version to the count of compacted events, and advance the
+        //    compaction watermark to that same version so `needs_compaction` skips this
+        //    stream until a new event is appended past it.
         let new_stream_version = compacted.len() as i64;
-        sqlx::query("UPDATE streams SET version = $1, type = $2 WHERE id = $3")
-            .bind(new_stream_version)
-            .bind(&stream_type)
-            .bind(&stream_id_str)
-            .execute(&mut *tx)
-            .await
-            .map_err(crate::db_error)?;
+        sqlx::query(
+            "UPDATE streams SET version = $1, type = $2, last_compacted_version = $1 WHERE id = $3",
+        )
+        .bind(new_stream_version)
+        .bind(&stream_type)
+        .bind(&stream_id_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
 
         tx.commit().await.map_err(crate::db_error)?;
 

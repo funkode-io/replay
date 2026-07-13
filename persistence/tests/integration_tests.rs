@@ -986,6 +986,280 @@ async fn bank_account_compaction_postgres_test() {
     );
 }
 
+/// Guard 1 (issue #140): `needs_compaction` is a watermark pre-check that lets a
+/// blanket maintenance job skip `compact` for a stream that has not changed since
+/// its last compaction.
+///
+/// Scenario:
+///  - An unknown stream reports `false` (nothing to compact).
+///  - A never-compacted stream with events reports `true`.
+///  - After `compact`, the watermark advances to the live head, so the unchanged
+///    stream reports `false` and stays `false` on repeated reads.
+///  - A guarded blanket job therefore does not re-archive it: the next real
+///    compaction (after a new append) produces archive version 2, not 3 — proving
+///    the guarded no-op created no archive.
+#[tokio::test]
+async fn needs_compaction_watermark_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool);
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+
+    let stream_id = BankAccountUrn::new("needs-compaction-1").unwrap();
+    let services = &();
+    let meta = replay::Metadata::default();
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    // Unknown stream: nothing to compact.
+    let needs = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(!needs, "an unknown stream needs no compaction");
+
+    // Record two events.
+    for cmd in [
+        BankAccountCommand::Deposit {
+            effective_on: day,
+            amount: 1000.0,
+        },
+        BankAccountCommand::Withdraw {
+            effective_on: day,
+            amount: 200.0,
+        },
+    ] {
+        cqrs.execute::<BankAccount>(&stream_id, meta.clone(), cmd, services, None)
+            .await
+            .unwrap();
+    }
+
+    // Never compacted but has events: eligible.
+    let needs = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(needs, "a never-compacted stream with events is eligible");
+
+    // Compact → archive version 1; the watermark now makes the unchanged stream skippable.
+    let aggregate = cqrs
+        .fetch_aggregate::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    let v1 = cqrs.compact(&aggregate, meta.clone()).await.unwrap();
+    assert_eq!(v1, 1, "first compaction is archive version 1");
+
+    let needs = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(
+        !needs,
+        "an unchanged stream is skipped right after compaction"
+    );
+    let needs_again = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(
+        !needs_again,
+        "the pre-check is idempotent with no intervening append"
+    );
+
+    // Emulate the guarded blanket job over the unchanged stream: it must not compact.
+    if cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap()
+    {
+        cqrs.compact(&aggregate, meta.clone()).await.unwrap();
+    }
+
+    // A new append past the watermark makes it eligible again.
+    cqrs.execute::<BankAccount>(
+        &stream_id,
+        meta.clone(),
+        BankAccountCommand::Deposit {
+            effective_on: day,
+            amount: 50.0,
+        },
+        services,
+        None,
+    )
+    .await
+    .unwrap();
+    let needs = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(
+        needs,
+        "a new event past the watermark makes the stream eligible again"
+    );
+
+    // The guarded compaction runs and settles it again at archive version 2 —
+    // if the earlier guarded no-op had compacted, this would be version 3.
+    let aggregate2 = cqrs
+        .fetch_aggregate::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    let v2 = cqrs.compact(&aggregate2, meta.clone()).await.unwrap();
+    assert_eq!(
+        v2, 2,
+        "the guarded no-op created no archive; the next real compaction is version 2"
+    );
+    let needs = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(!needs, "compaction settles the watermark again");
+}
+
+/// Regression for the "version coincidence" edge (issue #140 review): `streams.version`
+/// can read the *same* value before a compaction and after later appends, yet the stream
+/// still needs compacting — because the watermark tracks the *post-compaction* count, not
+/// the pre-compaction version.
+///
+/// Three transactions + `CloseMonth` = 4 events (version 4). Compaction keeps only the
+/// `MonthlyClosed` snapshot, resetting version to 1 and the watermark to 1. Three more
+/// deposits climb the version back to 4 — but `needs_compaction` compares 4 against the
+/// watermark 1, not the stale 4, so it correctly reports `true`.
+#[tokio::test]
+async fn needs_compaction_survives_version_coincidence_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+
+    let stream_id = BankAccountUrn::new("version-coincidence-1").unwrap();
+    let stream_id_str = Into::<Urn>::into(stream_id.clone()).to_string();
+    let services = &();
+    let meta = replay::Metadata::default();
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    async fn stream_version(pool: &PgPool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT version FROM streams WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    // Three transactions + close = 4 events → version 4.
+    for cmd in [
+        BankAccountCommand::Deposit {
+            effective_on: day,
+            amount: 1000.0,
+        },
+        BankAccountCommand::Withdraw {
+            effective_on: day,
+            amount: 200.0,
+        },
+        BankAccountCommand::Deposit {
+            effective_on: day,
+            amount: 50.0,
+        },
+        BankAccountCommand::CloseMonth { month: day },
+    ] {
+        cqrs.execute::<BankAccount>(&stream_id, meta.clone(), cmd, services, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        stream_version(&pg_pool, &stream_id_str).await,
+        4,
+        "four events → version 4"
+    );
+
+    // Compact → keeps only [MonthlyClosed]; version and watermark both reset to 1.
+    let aggregate = cqrs
+        .fetch_aggregate::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    let v1 = cqrs.compact(&aggregate, meta.clone()).await.unwrap();
+    assert_eq!(v1, 1, "first compaction is archive version 1");
+    assert_eq!(
+        stream_version(&pg_pool, &stream_id_str).await,
+        1,
+        "compaction reset version to the compacted count (1)"
+    );
+    let needs = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(!needs, "the unchanged stream is skipped");
+
+    // Three more deposits climb the version back to 4.
+    for _ in 0..3 {
+        cqrs.execute::<BankAccount>(
+            &stream_id,
+            meta.clone(),
+            BankAccountCommand::Deposit {
+                effective_on: day,
+                amount: 5.0,
+            },
+            services,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        stream_version(&pg_pool, &stream_id_str).await,
+        4,
+        "version is back to 4 — the same value as before the first compaction"
+    );
+
+    // The key assertion: version 4 equals the pre-compaction version, but the
+    // watermark is 1, so the three new events are detected.
+    let needs = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(
+        needs,
+        "version 4 is compared against watermark 1, not the stale pre-compaction 4"
+    );
+
+    // A real second compaction runs (archive version 2) and settles it again.
+    let aggregate2 = cqrs
+        .fetch_aggregate::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    let v2 = cqrs.compact(&aggregate2, meta.clone()).await.unwrap();
+    assert_eq!(v2, 2, "the second compaction is archive version 2");
+    let needs = cqrs
+        .needs_compaction::<BankAccount>(&stream_id)
+        .await
+        .unwrap();
+    assert!(!needs, "settled again");
+}
+
 // ── Inline projection (issue #58) ─────────────────────────────────────────────
 
 /// End-to-end test for the inline-projection walking skeleton.
@@ -3736,13 +4010,12 @@ async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
 
     // Archived (soft delete), not destroyed: the row now lives in the archive
     // tagged with the retry reason and its original id.
-    let archived_reason: String = sqlx::query_scalar(
-        "SELECT reason FROM discarded_dead_letters WHERE dead_letter_id = $1",
-    )
-    .bind(id)
-    .fetch_one(&pg_pool)
-    .await
-    .expect("the resolved dead letter must be archived");
+    let archived_reason: String =
+        sqlx::query_scalar("SELECT reason FROM discarded_dead_letters WHERE dead_letter_id = $1")
+            .bind(id)
+            .fetch_one(&pg_pool)
+            .await
+            .expect("the resolved dead letter must be archived");
     assert_eq!(archived_reason, "retried");
 
     // Reaction applied exactly once (balance reflects a single fee charge).
@@ -4038,13 +4311,12 @@ async fn discard_dead_letter_deletes_row_without_side_effects_postgres_test() {
 
     // Archived (soft delete), not destroyed: the row now lives in the archive
     // tagged with the discard reason and its original id.
-    let archived_reason: String = sqlx::query_scalar(
-        "SELECT reason FROM discarded_dead_letters WHERE dead_letter_id = $1",
-    )
-    .bind(id)
-    .fetch_one(&pg_pool)
-    .await
-    .expect("the discarded dead letter must be archived");
+    let archived_reason: String =
+        sqlx::query_scalar("SELECT reason FROM discarded_dead_letters WHERE dead_letter_id = $1")
+            .bind(id)
+            .fetch_one(&pg_pool)
+            .await
+            .expect("the discarded dead letter must be archived");
     assert_eq!(archived_reason, "discarded");
 
     // No new event: the events table is unchanged and the target aggregate was

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures::{StreamExt, TryStreamExt};
 
 use replay::{Aggregate, Event};
+use urn::Urn;
 
 use super::{AggregateVersion, EventStore, PersistedEvent};
 
@@ -138,6 +139,19 @@ impl<ES: EventStore> Cqrs<ES> {
         A: replay::Aggregate + replay::Compactable + Sync,
     {
         self.store.compact(aggregate, metadata).await
+    }
+
+    /// Whether `id`'s stream has changed since it was last compacted.
+    ///
+    /// Cheap pre-check for a blanket compaction job: skip [`compact`](Self::compact)
+    /// when this returns `false`, avoiding the transaction, lock, and fold for an
+    /// unchanged stream. See [`EventStore::needs_compaction`](crate::EventStore::needs_compaction).
+    pub async fn needs_compaction<A>(&self, id: &A::StreamId) -> Result<bool, replay::Error>
+    where
+        A: replay::Aggregate,
+    {
+        let stream_id: Urn = id.clone().into();
+        self.store.needs_compaction(&stream_id).await
     }
 
     pub async fn run_query<'a, Q, E>(&'a self, query: &'a mut Q) -> Result<(), replay::Error>

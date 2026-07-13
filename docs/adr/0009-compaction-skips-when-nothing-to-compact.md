@@ -13,17 +13,20 @@ We make a no-op compaction do **nothing** — ideally without even entering
 ## Decisions
 
 - **A per-stream compaction watermark is the durable answer to "anything new since
-  we last settled this stream?"** We add `streams.last_compacted_position` — the
-  `global_position` through which the stream was last compacted. `compact` sets it
+  we last settled this stream?"** We add `streams.last_compacted_version` — the
+  stream `version` through which the stream was last compacted. `compact` sets it
   on completion, for **every** outcome (a rewrite *and* an already-minimal skip).
   This is the single source of truth both guards read; it replaces the earlier,
   rejected idea of inferring "already compacted" from the `compacted_snapshot` event
-  flag (see *Rejected* below).
+  flag (see *Rejected* below). We key off the stream `version` (bumped on every
+  append, reset by compaction) rather than `global_position` so the same watermark
+  works for the in-memory store — which models no global position — and so the check
+  is a pure `streams`-row scalar test with no events query.
 
 - **Guard 1 — cheap, caller-side pre-check (`needs_compaction`), non-breaking.**
-  `Store::needs_compaction(stream_id) -> bool` answers "does a live event exist with
-  `global_position > last_compacted_position`?" A blanket maintenance job guards the
-  call:
+  `Store::needs_compaction(stream_id) -> bool` answers "is `version >
+  last_compacted_version`?" (a never-compacted stream with events, watermark `NULL`,
+  is eligible). A blanket maintenance job guards the call:
 
   ```rust
   if store.needs_compaction(&id).await? { store.compact(&agg, meta).await?; }
@@ -34,7 +37,7 @@ We make a no-op compaction do **nothing** — ideally without even entering
   because compaction is best-effort idempotent maintenance, so an append that lands
   just after a false read is simply picked up next cycle. `compact` keeps its current
   signature; Guard 1 adds only a column, an `UPDATE` in `compact`, and a read method.
-  No append hook is needed — appends get a higher `global_position` for free.
+  No append hook is needed — appends bump the stream `version` for free.
 
 - **Guard 2 — in-`compact` domain guard (author judgment), deferred.** Guard 1 alone
   never skips the *first* compaction of a stream that was **never** compacted but is
