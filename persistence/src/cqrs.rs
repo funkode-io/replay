@@ -129,7 +129,7 @@ impl<ES: EventStore> Cqrs<ES> {
     /// [`Compactable::compacted_events`].  Returns a [`CompactionOutcome`]:
     /// `Compacted { archive_version }` (starting at `1` for the first compaction), or
     /// `Skipped` when the aggregate reports the stream is already minimal
-    /// (`Compaction::AlreadyCompacted`) — in which case nothing is written but the
+    /// ([`replay::Compaction::AlreadyCompacted`]) — in which case nothing is written but the
     /// compaction watermark is still advanced.
     ///
     /// See [`EventStore::compact`] for the full description of the algorithm.

@@ -306,21 +306,34 @@ impl EventStore for InMemoryEventStore {
     {
         let stream_id: Urn = aggregate.get_id().clone().into();
 
-        // 1. Collect current live events while holding the read lock (brief, sync).
-        //    Wrap them in a TryStream so that compacted_events can process them
+        // 1. Collect current live events and the stream head while holding the read
+        //    lock (brief, sync). Deriving the watermark head from this same snapshot —
+        //    rather than re-reading after the `compacted_events` await — ensures the
+        //    `AlreadyCompacted` branch never advances the watermark past an event that
+        //    was appended concurrently and therefore never folded.
+        //    Wrap the events in a TryStream so that compacted_events can process them
         //    without assuming an in-memory slice is available.
-        let current_events: Vec<A::Event> = {
+        let (stream_exists, head, current_events): (bool, i64, Vec<A::Event>) = {
             let store = self.events.read().unwrap();
             match store.get(&stream_id) {
-                None => Vec::new(),
-                Some(stream) => stream
-                    .iter()
-                    .filter(|e| e.aggregate_version.is_none())
-                    .map(|e| {
-                        serde_json::from_value::<A::Event>(e.data.clone())
-                            .map_err(crate::deser_error)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
+                None => (false, 0, Vec::new()),
+                Some(stream) => {
+                    let head = stream
+                        .iter()
+                        .filter(|e| e.aggregate_version.is_none())
+                        .map(|e| e.version)
+                        .max()
+                        .unwrap_or(0);
+                    let events = stream
+                        .iter()
+                        .filter(|e| e.aggregate_version.is_none())
+                        .map(|e| {
+                            serde_json::from_value::<A::Event>(e.data.clone())
+                                .map_err(crate::deser_error)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (true, head, events)
+                }
             }
         };
 
@@ -330,22 +343,15 @@ impl EventStore for InMemoryEventStore {
             replay::Compaction::Rewrite(events) => events,
             replay::Compaction::AlreadyCompacted => {
                 // The author reports the live stream is already minimal: write nothing, but
-                // settle the watermark at the current head so `needs_compaction` skips this
-                // stream until a new event is appended.
-                let head = {
-                    let store = self.events.read().unwrap();
-                    let stream = store.get(&stream_id).ok_or_else(|| {
-                        replay::Error::not_found("Stream not found")
-                            .with_operation("compact")
-                            .with_context("stream_id", stream_id.to_string())
-                    })?;
-                    stream
-                        .iter()
-                        .filter(|e| e.aggregate_version.is_none())
-                        .map(|e| e.version)
-                        .max()
-                        .unwrap_or(0)
-                };
+                // settle the watermark at the snapshot head so `needs_compaction` skips this
+                // stream until a new event is appended. Using the head from the fold snapshot
+                // (not a fresh read) avoids advancing past a concurrently appended, unfolded
+                // event. A stream that does not exist is still a NotFound.
+                if !stream_exists {
+                    return Err(replay::Error::not_found("Stream not found")
+                        .with_operation("compact")
+                        .with_context("stream_id", stream_id.to_string()));
+                }
                 self.last_compacted_version
                     .write()
                     .unwrap()

@@ -128,7 +128,12 @@ pub trait EventStore: Send + Sync {
         stream_id: &Urn,
     ) -> impl Future<Output = Result<bool, replay::Error>> + Send;
 
-    /// Returns the archive version number that was created.
+    /// Compacts the aggregate's live stream and reports the outcome as a
+    /// [`CompactionOutcome`]: `Compacted { archive_version }` (the archive version
+    /// created, starting at `1`) when events were folded and archived, or `Skipped`
+    /// when the aggregate reports the stream is already minimal
+    /// ([`replay::Compaction::AlreadyCompacted`]) — nothing is written, but the
+    /// compaction watermark is still advanced. Callers must match on both variants.
     fn compact<A>(
         &self,
         aggregate: &A,
@@ -144,7 +149,7 @@ pub enum CompactionOutcome {
     /// The stream was compacted; carries the archive version created (starting at 1).
     Compacted { archive_version: i32 },
     /// Nothing was written — the aggregate reported the live stream already minimal
-    /// (`Compaction::AlreadyCompacted`). The compaction watermark is still advanced so the
+    /// ([`replay::Compaction::AlreadyCompacted`]). The compaction watermark is still advanced so the
     /// stream is skipped by [`EventStore::needs_compaction`] until a new event is appended.
     Skipped,
 }
