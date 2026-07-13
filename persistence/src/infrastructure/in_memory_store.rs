@@ -522,6 +522,78 @@ mod tests {
         }
     }
 
+    //  stream whose compaction always emits no live events
+    struct EmptyCompactionStream {
+        pub id: EmptyCompactionUrn,
+    }
+
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    enum EmptyCompactionEvent {
+        Touched,
+    }
+
+    #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+    struct EmptyCompactionUrn(Urn);
+
+    impl From<EmptyCompactionUrn> for Urn {
+        fn from(urn: EmptyCompactionUrn) -> Self {
+            urn.0
+        }
+    }
+
+    impl TryFrom<Urn> for EmptyCompactionUrn {
+        type Error = String;
+
+        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+            Ok(EmptyCompactionUrn(urn))
+        }
+    }
+
+    impl WithId for EmptyCompactionStream {
+        type StreamId = EmptyCompactionUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            EmptyCompactionStream { id }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
+    impl replay::EventStream for EmptyCompactionStream {
+        type Event = EmptyCompactionEvent;
+
+        fn stream_type() -> String {
+            "EmptyCompaction".to_string()
+        }
+
+        fn apply(&mut self, _event: Self::Event) {}
+    }
+
+    impl Compactable for EmptyCompactionStream {
+        async fn compacted_events(
+            &self,
+            _events: impl futures::TryStream<Ok = Self::Event, Error = replay::Error> + Send,
+        ) -> replay::Result<Vec<Self::Event>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl replay::Aggregate for EmptyCompactionStream {
+        type Command = ();
+        type Error = replay::Error;
+        type Services = ();
+
+        async fn handle(
+            &self,
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> Result<Vec<Self::Event>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     fn make_stream_id(n: &str) -> BankAccountUrn {
@@ -825,6 +897,58 @@ mod tests {
             .unwrap();
         assert_eq!(v2, 2);
         assert!(!store.needs_compaction(&urn).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn needs_compaction_handles_empty_compacted_snapshot() {
+        let store = InMemoryEventStore::new();
+        let id = EmptyCompactionUrn(UrnBuilder::new("empty-compaction", "watermark").build().unwrap());
+        let urn: Urn = id.clone().into();
+
+        // A never-compacted stream with events is eligible.
+        store
+            .store_events::<EmptyCompactionStream>(
+                &id,
+                "EmptyCompaction".to_string(),
+                replay::Metadata::default(),
+                &[EmptyCompactionEvent::Touched],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store.needs_compaction(&urn).await.unwrap());
+
+        // Compaction can validly emit no live events. Watermark must still settle.
+        let aggregate = EmptyCompactionStream::with_id(id.clone());
+        let v1 = store
+            .compact(&aggregate, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(v1, 1);
+        assert!(!store.needs_compaction(&urn).await.unwrap());
+
+        let live: Vec<_> = store
+            .stream_events::<EmptyCompactionEvent>(StreamFilter::And(
+                Box::new(StreamFilter::with_stream_id::<EmptyCompactionStream>(&id)),
+                Box::new(StreamFilter::WithAggregateVersion(None)),
+            ))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(live.is_empty(), "empty compacted snapshot leaves no live events");
+
+        // A new append after empty compaction should become eligible again.
+        store
+            .store_events::<EmptyCompactionStream>(
+                &id,
+                "EmptyCompaction".to_string(),
+                replay::Metadata::default(),
+                &[EmptyCompactionEvent::Touched],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store.needs_compaction(&urn).await.unwrap());
     }
 
     #[tokio::test]

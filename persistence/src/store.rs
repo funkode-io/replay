@@ -105,6 +105,15 @@ pub trait EventStore: Send + Sync {
     ///    events, to obtain the minimal event set.
     /// 5. Persists the compacted events as the new current event stream (no version tag).
     ///
+    /// Returns the archive version number that was created.
+    fn compact<A>(
+        &self,
+        aggregate: &A,
+        metadata: replay::Metadata,
+    ) -> impl Future<Output = Result<i32, replay::Error>> + Send
+    where
+        A: replay::Aggregate + Compactable + Sync;
+    ///
     /// Whether the given stream has changed since it was last compacted.
     ///
     /// Returns `true` when at least one event has been appended past the stream's
@@ -127,13 +136,4 @@ pub trait EventStore: Send + Sync {
         &self,
         stream_id: &Urn,
     ) -> impl Future<Output = Result<bool, replay::Error>> + Send;
-
-    /// Returns the archive version number that was created.
-    fn compact<A>(
-        &self,
-        aggregate: &A,
-        metadata: replay::Metadata,
-    ) -> impl Future<Output = Result<i32, replay::Error>> + Send
-    where
-        A: replay::Aggregate + Compactable + Sync;
 }
