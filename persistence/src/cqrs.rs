@@ -5,7 +5,7 @@ use futures::{StreamExt, TryStreamExt};
 use replay::{Aggregate, Event};
 use urn::Urn;
 
-use super::{AggregateVersion, EventStore, PersistedEvent};
+use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
 
 #[derive(Clone)]
 pub struct Cqrs<ES: EventStore> {
@@ -126,15 +126,18 @@ impl<ES: EventStore> Cqrs<ES> {
     ///
     /// Archives the current full history under a new version number, then replaces
     /// the live stream with the minimal set of events returned by
-    /// [`Compactable::compacted_events`].  Returns the archive version number that
-    /// was created (starting at `1` for the first compaction).
+    /// [`Compactable::compacted_events`].  Returns a [`CompactionOutcome`]:
+    /// `Compacted { archive_version }` (starting at `1` for the first compaction), or
+    /// `Skipped` when the aggregate reports the stream is already minimal
+    /// ([`replay::Compaction::AlreadyCompacted`]) — in which case nothing is written but the
+    /// compaction watermark is still advanced.
     ///
     /// See [`EventStore::compact`] for the full description of the algorithm.
     pub async fn compact<A>(
         &self,
         aggregate: &A,
         metadata: replay::Metadata,
-    ) -> Result<i32, replay::Error>
+    ) -> Result<CompactionOutcome, replay::Error>
     where
         A: replay::Aggregate + replay::Compactable + Sync,
     {

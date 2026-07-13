@@ -8,7 +8,9 @@ use urn::Urn;
 use uuid::Uuid;
 
 use crate::inline_projection::ErasedInlineProjection;
-use crate::{EventSink, EventStore, InlineProjection, PersistedEvent, StreamFilter};
+use crate::{
+    CompactionOutcome, EventSink, EventStore, InlineProjection, PersistedEvent, StreamFilter,
+};
 use replay::{Compactable, Event};
 
 /// In-memory event store implementation, only for testing purpose.
@@ -298,33 +300,65 @@ impl EventStore for InMemoryEventStore {
         &self,
         aggregate: &A,
         metadata: replay::Metadata,
-    ) -> Result<i32, replay::Error>
+    ) -> Result<CompactionOutcome, replay::Error>
     where
         A: replay::Aggregate + Compactable + Sync,
     {
         let stream_id: Urn = aggregate.get_id().clone().into();
 
-        // 1. Collect current live events while holding the read lock (brief, sync).
-        //    Wrap them in a TryStream so that compacted_events can process them
+        // 1. Collect current live events and the stream head while holding the read
+        //    lock (brief, sync). Deriving the watermark head from this same snapshot —
+        //    rather than re-reading after the `compacted_events` await — ensures the
+        //    `AlreadyCompacted` branch never advances the watermark past an event that
+        //    was appended concurrently and therefore never folded.
+        //    Wrap the events in a TryStream so that compacted_events can process them
         //    without assuming an in-memory slice is available.
-        let current_events: Vec<A::Event> = {
+        let (stream_exists, head, current_events): (bool, i64, Vec<A::Event>) = {
             let store = self.events.read().unwrap();
             match store.get(&stream_id) {
-                None => Vec::new(),
-                Some(stream) => stream
-                    .iter()
-                    .filter(|e| e.aggregate_version.is_none())
-                    .map(|e| {
-                        serde_json::from_value::<A::Event>(e.data.clone())
-                            .map_err(crate::deser_error)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
+                None => (false, 0, Vec::new()),
+                Some(stream) => {
+                    let head = stream
+                        .iter()
+                        .filter(|e| e.aggregate_version.is_none())
+                        .map(|e| e.version)
+                        .max()
+                        .unwrap_or(0);
+                    let events = stream
+                        .iter()
+                        .filter(|e| e.aggregate_version.is_none())
+                        .map(|e| {
+                            serde_json::from_value::<A::Event>(e.data.clone())
+                                .map_err(crate::deser_error)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (true, head, events)
+                }
             }
         };
 
         let event_stream =
             futures::stream::iter(current_events.into_iter().map(Ok::<_, replay::Error>));
-        let compacted = aggregate.compacted_events(event_stream).await?;
+        let compacted = match aggregate.compacted_events(event_stream).await? {
+            replay::Compaction::Rewrite(events) => events,
+            replay::Compaction::AlreadyCompacted => {
+                // The author reports the live stream is already minimal: write nothing, but
+                // settle the watermark at the snapshot head so `needs_compaction` skips this
+                // stream until a new event is appended. Using the head from the fold snapshot
+                // (not a fresh read) avoids advancing past a concurrently appended, unfolded
+                // event. A stream that does not exist is still a NotFound.
+                if !stream_exists {
+                    return Err(replay::Error::not_found("Stream not found")
+                        .with_operation("compact")
+                        .with_context("stream_id", stream_id.to_string()));
+                }
+                self.last_compacted_version
+                    .write()
+                    .unwrap()
+                    .insert(stream_id.clone(), head);
+                return Ok(CompactionOutcome::Skipped);
+            }
+        };
 
         // 2. Determine the next archive version number and archive all current events.
         {
@@ -376,7 +410,9 @@ impl EventStore for InMemoryEventStore {
                 .unwrap()
                 .insert(stream_id.clone(), compacted.len() as i64);
 
-            Ok(next_version)
+            Ok(CompactionOutcome::Compacted {
+                archive_version: next_version,
+            })
         }
     }
 
@@ -497,14 +533,14 @@ mod tests {
         async fn compacted_events(
             &self,
             events: impl futures::TryStream<Ok = Self::Event, Error = replay::Error> + Send,
-        ) -> replay::Result<Vec<Self::Event>> {
+        ) -> replay::Result<replay::Compaction<Self::Event>> {
             use futures::TryStreamExt;
             let all: Vec<BankAccountEvent> = events.try_collect().await?;
             let balance = all.iter().fold(0.0_f64, |acc, ev| match ev {
                 BankAccountEvent::Deposited { amount } => acc + amount,
                 BankAccountEvent::Withdrawn { amount } => acc - amount,
             });
-            Ok(vec![BankAccountEvent::Deposited { amount: balance }])
+            Ok(vec![BankAccountEvent::Deposited { amount: balance }].into())
         }
     }
 
@@ -520,6 +556,121 @@ mod tests {
         ) -> Result<Vec<Self::Event>, Self::Error> {
             Ok(vec![])
         }
+    }
+
+    // ── SnapshotStream: an aggregate that exercises the Guard 2 outcomes ──────
+    // `compacted_events` returns `AlreadyCompacted` for an already-minimal stream (a
+    // lone `Snapshot`), an empty `Rewrite` when a `Reset` is present (compact to
+    // nothing), and otherwise folds to a single `Snapshot`.
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    enum SnapshotEvent {
+        Bumped,
+        Reset,
+        Snapshot { total: i64 },
+    }
+
+    struct SnapshotStream {
+        id: BankAccountUrn,
+        total: i64,
+    }
+
+    impl WithId for SnapshotStream {
+        type StreamId = BankAccountUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            SnapshotStream { id, total: 0 }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
+    impl replay::EventStream for SnapshotStream {
+        type Event = SnapshotEvent;
+
+        fn stream_type() -> String {
+            "Snapshot".to_string()
+        }
+
+        fn apply(&mut self, event: Self::Event) {
+            match event {
+                SnapshotEvent::Bumped => self.total += 1,
+                SnapshotEvent::Reset => self.total = 0,
+                SnapshotEvent::Snapshot { total } => self.total = total,
+            }
+        }
+    }
+
+    impl replay::Aggregate for SnapshotStream {
+        type Command = ();
+        type Error = replay::Error;
+        type Services = ();
+
+        async fn handle(
+            &self,
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> Result<Vec<Self::Event>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
+    impl Compactable for SnapshotStream {
+        async fn compacted_events(
+            &self,
+            events: impl futures::TryStream<Ok = Self::Event, Error = replay::Error> + Send,
+        ) -> replay::Result<replay::Compaction<Self::Event>> {
+            let all: Vec<SnapshotEvent> = events.try_collect().await?;
+            // Already minimal: a lone Snapshot and nothing else.
+            if matches!(all.as_slice(), [SnapshotEvent::Snapshot { .. }]) {
+                return Ok(replay::Compaction::AlreadyCompacted);
+            }
+            // A Reset collapses the stream to nothing (compact to empty).
+            if all.iter().any(|e| matches!(e, SnapshotEvent::Reset)) {
+                return Ok(replay::Compaction::Rewrite(vec![]));
+            }
+            let total = all.iter().fold(0_i64, |acc, e| match e {
+                SnapshotEvent::Bumped => acc + 1,
+                SnapshotEvent::Reset => 0,
+                SnapshotEvent::Snapshot { total } => *total,
+            });
+            Ok(replay::Compaction::Rewrite(vec![SnapshotEvent::Snapshot {
+                total,
+            }]))
+        }
+    }
+
+    async fn add_snapshot_events(
+        store: &InMemoryEventStore,
+        id: &BankAccountUrn,
+        events: &[SnapshotEvent],
+    ) {
+        store
+            .store_events::<SnapshotStream>(
+                id,
+                "Snapshot".to_string(),
+                replay::Metadata::default(),
+                events,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn live_snapshot_events(
+        store: &InMemoryEventStore,
+        id: &BankAccountUrn,
+    ) -> Vec<SnapshotEvent> {
+        store
+            .stream_events::<SnapshotEvent>(StreamFilter::And(
+                Box::new(StreamFilter::with_stream_id::<SnapshotStream>(id)),
+                Box::new(StreamFilter::WithAggregateVersion(None)),
+            ))
+            .map_ok(|e| e.data)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -604,7 +755,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(archive_version, 1);
+        assert_eq!(
+            archive_version,
+            CompactionOutcome::Compacted { archive_version: 1 }
+        );
 
         // Live stream is now a single synthetic Deposited event.
         let live = live_events(&store, &id).await;
@@ -666,7 +820,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(archive_version2, 2);
+        assert_eq!(
+            archive_version2,
+            CompactionOutcome::Compacted { archive_version: 2 }
+        );
 
         let live = live_events(&store, &id).await;
         assert_eq!(live, vec![BankAccountEvent::Deposited { amount: 120.0 }]);
@@ -782,7 +939,7 @@ mod tests {
             .compact(&account, replay::Metadata::default())
             .await
             .unwrap();
-        assert_eq!(v1, 1);
+        assert_eq!(v1, CompactionOutcome::Compacted { archive_version: 1 });
         assert_eq!(
             live_events(&store, &id).await.len(),
             1,
@@ -823,8 +980,111 @@ mod tests {
             .compact(&account2, replay::Metadata::default())
             .await
             .unwrap();
-        assert_eq!(v2, 2);
+        assert_eq!(v2, CompactionOutcome::Compacted { archive_version: 2 });
         assert!(!store.needs_compaction(&urn).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn already_compacted_skips_and_writes_nothing() {
+        let store = InMemoryEventStore::new();
+        let id = make_stream_id("already-compacted");
+        let urn: Urn = id.clone().into();
+
+        // Born minimal: a single Snapshot event, never compacted.
+        add_snapshot_events(&store, &id, &[SnapshotEvent::Snapshot { total: 5 }]).await;
+        assert!(store.needs_compaction(&urn).await.unwrap());
+
+        // compact → the author reports AlreadyCompacted → nothing written.
+        let account = SnapshotStream::with_id(id.clone());
+        let outcome = store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome, CompactionOutcome::Skipped);
+
+        // The live stream is untouched and no archive row was written.
+        assert_eq!(
+            live_snapshot_events(&store, &id).await,
+            vec![SnapshotEvent::Snapshot { total: 5 }]
+        );
+        let all = store
+            .stream_events::<SnapshotEvent>(StreamFilter::with_stream_id::<SnapshotStream>(&id))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "AlreadyCompacted must neither archive nor insert any row"
+        );
+
+        // The watermark advanced, so a re-check skips it, and a direct re-compaction
+        // is still Skipped (fixpoint).
+        assert!(!store.needs_compaction(&urn).await.unwrap());
+        let outcome2 = store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome2, CompactionOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn compact_folds_then_reports_already_compacted() {
+        let store = InMemoryEventStore::new();
+        let id = make_stream_id("fold-then-fixpoint");
+        let urn: Urn = id.clone().into();
+
+        add_snapshot_events(&store, &id, &[SnapshotEvent::Bumped, SnapshotEvent::Bumped]).await;
+
+        // Real work: folds two Bumped into a single Snapshot.
+        let account = SnapshotStream::with_id(id.clone());
+        let outcome = store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome, CompactionOutcome::Compacted { archive_version: 1 });
+        assert_eq!(
+            live_snapshot_events(&store, &id).await,
+            vec![SnapshotEvent::Snapshot { total: 2 }]
+        );
+        assert!(!store.needs_compaction(&urn).await.unwrap());
+
+        // The live stream is now a lone Snapshot, so a direct re-compaction is a
+        // no-op skip — the guards do not over-fold a settled stream.
+        let outcome2 = store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome2, CompactionOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn empty_rewrite_archives_to_empty_distinct_from_skip() {
+        let store = InMemoryEventStore::new();
+        let id = make_stream_id("empty-rewrite");
+
+        add_snapshot_events(&store, &id, &[SnapshotEvent::Bumped, SnapshotEvent::Reset]).await;
+
+        // Rewrite(vec![]) is a real compaction: it archives everything and empties the
+        // live stream — the opposite write from Skipped, which writes nothing.
+        let account = SnapshotStream::with_id(id.clone());
+        let outcome = store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome, CompactionOutcome::Compacted { archive_version: 1 });
+        assert!(live_snapshot_events(&store, &id).await.is_empty());
+
+        // The two originals were archived under version 1.
+        let archived = store
+            .stream_events::<SnapshotEvent>(StreamFilter::And(
+                Box::new(StreamFilter::with_stream_id::<SnapshotStream>(&id)),
+                Box::new(StreamFilter::WithAggregateVersion(Some(1))),
+            ))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(archived.len(), 2);
     }
 
     #[tokio::test]

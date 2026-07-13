@@ -177,7 +177,7 @@ impl Compactable for BankAccount {
     async fn compacted_events(
         &self,
         events: impl futures::TryStream<Ok = BankAccountEvent, Error = replay::Error> + Send,
-    ) -> replay::Result<Vec<BankAccountEvent>> {
+    ) -> replay::Result<replay::Compaction<BankAccountEvent>> {
         use futures::TryStreamExt;
         // Keep only the tail after the most recent monthly checkpoint: each
         // `MonthlyClosed` snapshots the balance, so everything before it is
@@ -191,6 +191,7 @@ impl Compactable for BankAccount {
                 Ok(tail)
             })
             .await
+            .map(Into::into)
     }
 }
 

@@ -4,7 +4,7 @@ mod event;
 mod metadata;
 mod stream;
 
-pub use aggregate::{Aggregate, Compactable};
+pub use aggregate::{Aggregate, Compactable, Compaction};
 pub use error::{Error, ErrorKind, ErrorStatus, Result};
 pub use event::Event;
 pub use metadata::Metadata;
@@ -24,5 +24,5 @@ pub use stream::{EventStream, ScopedUrn, WithId};
 /// let branch: BranchUrn = scoped.extract_scope::<BranchUrn>()?;
 /// ```
 pub mod prelude {
-    pub use super::{Aggregate, Compactable, Event, EventStream, ScopedUrn, WithId};
+    pub use super::{Aggregate, Compactable, Compaction, Event, EventStream, ScopedUrn, WithId};
 }

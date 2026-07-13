@@ -10,7 +10,9 @@ use urn::Urn;
 
 use replay::{prelude::*, Compactable};
 use replay_macros::{define_aggregate, Urn};
-use replay_persistence::{AggregateVersion, EventStore, PersistedEvent, StreamFilter};
+use replay_persistence::{
+    AggregateVersion, CompactionOutcome, EventStore, PersistedEvent, StreamFilter,
+};
 
 // Re-use the README walkthrough verbatim as the source of truth. The example's
 // `main` is gated `#[cfg(not(test))]`, so including it here pulls in only the
@@ -121,7 +123,7 @@ impl Compactable for BankAccount {
     async fn compacted_events(
         &self,
         events: impl futures::TryStream<Ok = BankAccountEvent, Error = replay::Error> + Send,
-    ) -> replay::Result<Vec<BankAccountEvent>> {
+    ) -> replay::Result<replay::Compaction<BankAccountEvent>> {
         use futures::TryStreamExt;
         events
             .try_fold(Vec::new(), |mut tail, event| async move {
@@ -132,6 +134,77 @@ impl Compactable for BankAccount {
                 Ok(tail)
             })
             .await
+            .map(Into::into)
+    }
+}
+
+// An aggregate that exercises Guard 2 (`AlreadyCompacted`) on Postgres: a lone
+// `Snapshot` is already minimal, anything else folds into one.
+define_aggregate! {
+    SnapshotBox {
+        namespace: "snapshot-box",
+        state: {
+            total: i64,
+        },
+        commands: {
+            Bump { by: i64 },
+        },
+        events: {
+            Bumped { by: i64 },
+            Snapshot { total: i64 },
+        }
+    }
+}
+
+impl replay::EventStream for SnapshotBox {
+    type Event = SnapshotBoxEvent;
+
+    fn stream_type() -> String {
+        "SnapshotBox".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            SnapshotBoxEvent::Bumped { by } => self.total += by,
+            SnapshotBoxEvent::Snapshot { total } => self.total = total,
+        }
+    }
+}
+
+impl replay::Aggregate for SnapshotBox {
+    type Command = SnapshotBoxCommand;
+    type Error = replay::Error;
+    type Services = ();
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            SnapshotBoxCommand::Bump { by } => Ok(vec![SnapshotBoxEvent::Bumped { by }]),
+        }
+    }
+}
+
+impl Compactable for SnapshotBox {
+    async fn compacted_events(
+        &self,
+        events: impl futures::TryStream<Ok = SnapshotBoxEvent, Error = replay::Error> + Send,
+    ) -> replay::Result<replay::Compaction<SnapshotBoxEvent>> {
+        use futures::TryStreamExt;
+        let all: Vec<SnapshotBoxEvent> = events.try_collect().await?;
+        // Already minimal: a lone Snapshot and nothing else.
+        if matches!(all.as_slice(), [SnapshotBoxEvent::Snapshot { .. }]) {
+            return Ok(replay::Compaction::AlreadyCompacted);
+        }
+        let total = all.iter().fold(0_i64, |acc, e| match e {
+            SnapshotBoxEvent::Bumped { by } => acc + by,
+            SnapshotBoxEvent::Snapshot { total } => *total,
+        });
+        Ok(replay::Compaction::Rewrite(vec![
+            SnapshotBoxEvent::Snapshot { total },
+        ]))
     }
 }
 
@@ -926,7 +999,8 @@ async fn bank_account_compaction_postgres_test() {
     // ── Compact ──────────────────────────────────────────────────────────────
     let archive_version = cqrs.compact(&aggregate, meta.clone()).await.unwrap();
     assert_eq!(
-        archive_version, 1,
+        archive_version,
+        CompactionOutcome::Compacted { archive_version: 1 },
         "First compaction must produce archive version 1"
     );
 
@@ -1059,7 +1133,11 @@ async fn needs_compaction_watermark_postgres_test() {
         .await
         .unwrap();
     let v1 = cqrs.compact(&aggregate, meta.clone()).await.unwrap();
-    assert_eq!(v1, 1, "first compaction is archive version 1");
+    assert_eq!(
+        v1,
+        CompactionOutcome::Compacted { archive_version: 1 },
+        "first compaction is archive version 1"
+    );
 
     let needs = cqrs
         .needs_compaction::<BankAccount>(&stream_id)
@@ -1117,7 +1195,8 @@ async fn needs_compaction_watermark_postgres_test() {
         .unwrap();
     let v2 = cqrs.compact(&aggregate2, meta.clone()).await.unwrap();
     assert_eq!(
-        v2, 2,
+        v2,
+        CompactionOutcome::Compacted { archive_version: 2 },
         "the guarded no-op created no archive; the next real compaction is version 2"
     );
     let needs = cqrs
@@ -1202,7 +1281,11 @@ async fn needs_compaction_survives_version_coincidence_postgres_test() {
         .await
         .unwrap();
     let v1 = cqrs.compact(&aggregate, meta.clone()).await.unwrap();
-    assert_eq!(v1, 1, "first compaction is archive version 1");
+    assert_eq!(
+        v1,
+        CompactionOutcome::Compacted { archive_version: 1 },
+        "first compaction is archive version 1"
+    );
     assert_eq!(
         stream_version(&pg_pool, &stream_id_str).await,
         1,
@@ -1252,12 +1335,105 @@ async fn needs_compaction_survives_version_coincidence_postgres_test() {
         .await
         .unwrap();
     let v2 = cqrs.compact(&aggregate2, meta.clone()).await.unwrap();
-    assert_eq!(v2, 2, "the second compaction is archive version 2");
+    assert_eq!(
+        v2,
+        CompactionOutcome::Compacted { archive_version: 2 },
+        "the second compaction is archive version 2"
+    );
     let needs = cqrs
         .needs_compaction::<BankAccount>(&stream_id)
         .await
         .unwrap();
     assert!(!needs, "settled again");
+}
+
+/// Guard 2 (issue #141) on Postgres: when the aggregate reports `AlreadyCompacted`,
+/// `compact` writes nothing, returns `Skipped`, and still advances the watermark so the
+/// stream is skipped thereafter — while a stream with real work still folds to `Compacted`.
+#[tokio::test]
+async fn already_compacted_skips_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+
+    let stream_id = SnapshotBoxUrn::new("already-compacted-1").unwrap();
+    let services = &();
+    let meta = replay::Metadata::default();
+
+    // Born minimal: a lone Snapshot event, never compacted.
+    store
+        .store_events::<SnapshotBox>(
+            &stream_id,
+            "SnapshotBox".to_string(),
+            meta.clone(),
+            &[SnapshotBoxEvent::Snapshot { total: 5 }],
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(cqrs
+        .needs_compaction::<SnapshotBox>(&stream_id)
+        .await
+        .unwrap());
+
+    // compact → the author reports AlreadyCompacted → nothing written, Skipped returned.
+    let aggregate = cqrs
+        .fetch_aggregate::<SnapshotBox>(&stream_id)
+        .await
+        .unwrap();
+    let outcome = cqrs.compact(&aggregate, meta.clone()).await.unwrap();
+    assert_eq!(outcome, CompactionOutcome::Skipped);
+
+    // The live stream is untouched (one event, no synthetic snapshot) and the watermark
+    // advanced so the stream is now skipped.
+    let live = store
+        .stream_events_by_stream_id::<SnapshotBox>(&stream_id, AggregateVersion::Latest, None, None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 1, "AlreadyCompacted must write nothing");
+    assert!(!cqrs
+        .needs_compaction::<SnapshotBox>(&stream_id)
+        .await
+        .unwrap());
+
+    // Positive control: real work still folds to Compacted.
+    cqrs.execute::<SnapshotBox>(
+        &stream_id,
+        meta.clone(),
+        SnapshotBoxCommand::Bump { by: 3 },
+        services,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(cqrs
+        .needs_compaction::<SnapshotBox>(&stream_id)
+        .await
+        .unwrap());
+    let aggregate2 = cqrs
+        .fetch_aggregate::<SnapshotBox>(&stream_id)
+        .await
+        .unwrap();
+    let outcome2 = cqrs.compact(&aggregate2, meta.clone()).await.unwrap();
+    assert_eq!(
+        outcome2,
+        CompactionOutcome::Compacted { archive_version: 1 }
+    );
 }
 
 // ── Inline projection (issue #58) ─────────────────────────────────────────────
@@ -5695,7 +5871,10 @@ async fn contiguous_high_water_mark_postgres_test() {
         .fetch_one(&pg_pool)
         .await
         .expect("head query must succeed");
-    assert_eq!(head, 3, "raw head still reports the gappy MAX(global_position)");
+    assert_eq!(
+        head, 3,
+        "raw head still reports the gappy MAX(global_position)"
+    );
 
     assert_eq!(
         store
