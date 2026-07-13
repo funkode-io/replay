@@ -128,17 +128,18 @@ impl PostgresEventStore {
     pub async fn contiguous_high_water_mark(&self) -> Result<i64, replay::Error> {
         // Number the rows in global order: the first position whose row number
         // diverges from the value marks the first gap, so the contiguous prefix
-        // ends at that row number minus one. With no gaps every position lines up
+        // ends at that row number minus one. A single scan over the numbered
+        // rows yields both the first gap (a FILTERed MIN, NULL when there is
+        // none) and the total row count; with no gaps every position lines up
         // and the prefix spans the whole table (COUNT(*)).
         let hwm: i64 = sqlx::query_scalar(
             "SELECT COALESCE( \
-                 (SELECT MIN(rn) - 1 \
-                    FROM (SELECT global_position, \
-                                 ROW_NUMBER() OVER (ORDER BY global_position) AS rn \
-                            FROM events) numbered \
-                   WHERE global_position <> rn), \
-                 (SELECT COUNT(*) FROM events) \
-             )",
+                 MIN(rn) FILTER (WHERE global_position <> rn) - 1, \
+                 COUNT(*) \
+             ) \
+               FROM (SELECT global_position, \
+                            ROW_NUMBER() OVER (ORDER BY global_position) AS rn \
+                       FROM events) numbered",
         )
         .fetch_one(&self.pool)
         .await
