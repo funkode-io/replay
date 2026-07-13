@@ -2230,6 +2230,15 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
 | `condition` | At-a-glance health label (see below). |
 
+`head` is the raw `MAX(global_position)`. Because `global_position` is a
+`BIGSERIAL` assigned at INSERT but only made visible at COMMIT, a higher position
+can commit before a lower one, so the head can momentarily contain gaps. When you
+need a **stable cut** of the log — the largest position `H` such that every
+position in `1..=H` is present, e.g. to freeze a version at publish time — use
+`PostgresEventStore::contiguous_high_water_mark()` instead of `head`; replaying
+events with `global_position <= H` then observes the same set of events on every
+later read.
+
 `condition` is derived with a strict precedence — **dead letters outrank lag** —
 so a parked failure is never hidden behind a "still catching up" label:
 

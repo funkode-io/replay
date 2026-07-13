@@ -5346,3 +5346,91 @@ async fn policy_status_degraded_with_dead_letters_postgres_test() {
         "dead letters must yield Degraded even when the policy is also behind"
     );
 }
+
+// ── PostgresEventStore::contiguous_high_water_mark (issue #135) ───────────────
+
+/// The gap-free contiguous high-water-mark reflects the longest prefix of
+/// `global_position` values present with no holes.
+///
+/// Setup covers three regimes:
+///   1. Empty log → `0`.
+///   2. Three contiguous events (gp 1,2,3) → `3`.
+///   3. A manufactured gap (delete gp=2, leaving 1,3) → `1`, even though
+///      `MAX(global_position)` is still `3`.
+#[tokio::test]
+async fn contiguous_high_water_mark_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+
+    // 1. Empty log: no positions present, so the high-water-mark is 0.
+    assert_eq!(
+        store
+            .contiguous_high_water_mark()
+            .await
+            .expect("hwm query must succeed on an empty log"),
+        0,
+        "an empty log has a contiguous high-water-mark of 0"
+    );
+
+    // 2. Append three events (one stream): global_position 1, 2, 3 contiguous.
+    let account = BankAccountUrn::new("hwm-1").unwrap();
+    for day in 1..=3 {
+        cqrs.execute::<BankAccount>(
+            &account,
+            replay::Metadata::default(),
+            BankAccountCommand::Deposit {
+                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
+                amount: 10.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        store
+            .contiguous_high_water_mark()
+            .await
+            .expect("hwm query must succeed"),
+        3,
+        "three contiguous positions yield a high-water-mark of 3"
+    );
+
+    // 3. Manufacture a gap: delete the middle position (gp=2), leaving 1 and 3.
+    //    The contiguous prefix now stops at 1, even though MAX(global_position)
+    //    is still 3.
+    sqlx::query("DELETE FROM events WHERE global_position = 2")
+        .execute(&pg_pool)
+        .await
+        .expect("delete must succeed");
+
+    let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(global_position), 0) FROM events")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("head query must succeed");
+    assert_eq!(head, 3, "raw head still reports the gappy MAX(global_position)");
+
+    assert_eq!(
+        store
+            .contiguous_high_water_mark()
+            .await
+            .expect("hwm query must succeed"),
+        1,
+        "a gap at position 2 caps the contiguous high-water-mark at 1"
+    );
+}
