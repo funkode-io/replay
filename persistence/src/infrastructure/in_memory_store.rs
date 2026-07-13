@@ -747,6 +747,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn needs_compaction_survives_version_coincidence() {
+        // A stream can read the same live head version before a compaction and after
+        // later appends, yet still need compacting: the watermark tracks the
+        // post-compaction count (1), not the pre-compaction version (4).
+        let store = InMemoryEventStore::new();
+        let id = make_stream_id("version-coincidence");
+        let urn: Urn = id.clone().into();
+
+        add_events(
+            &store,
+            &id,
+            &[
+                BankAccountEvent::Deposited { amount: 100.0 },
+                BankAccountEvent::Deposited { amount: 50.0 },
+                BankAccountEvent::Withdrawn { amount: 30.0 },
+                BankAccountEvent::Deposited { amount: 10.0 },
+            ],
+        )
+        .await;
+        assert_eq!(
+            live_events(&store, &id).await.len(),
+            4,
+            "four live events — version 4"
+        );
+        assert!(store.needs_compaction(&urn).await.unwrap());
+
+        // Compact 4 → 1: the watermark becomes 1.
+        let mut account = BankAccountStream::with_id(id.clone());
+        for ev in live_events(&store, &id).await {
+            account.apply(ev);
+        }
+        let v1 = store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(v1, 1);
+        assert_eq!(
+            live_events(&store, &id).await.len(),
+            1,
+            "compacted to a single event"
+        );
+        assert!(!store.needs_compaction(&urn).await.unwrap());
+
+        // Three more events climb the live head version back to 4.
+        add_events(
+            &store,
+            &id,
+            &[
+                BankAccountEvent::Deposited { amount: 5.0 },
+                BankAccountEvent::Deposited { amount: 5.0 },
+                BankAccountEvent::Deposited { amount: 5.0 },
+            ],
+        )
+        .await;
+        assert_eq!(
+            live_events(&store, &id).await.len(),
+            4,
+            "live head version is 4 again — the same value as before the first compaction"
+        );
+
+        // The key assertion: version 4 equals the pre-compaction version, but the
+        // watermark is 1, so the three new events are detected.
+        assert!(
+            store.needs_compaction(&urn).await.unwrap(),
+            "version 4 is compared against watermark 1, not the stale pre-compaction 4"
+        );
+
+        // A real second compaction runs (archive version 2) and settles it again.
+        let mut account2 = BankAccountStream::with_id(id.clone());
+        for ev in live_events(&store, &id).await {
+            account2.apply(ev);
+        }
+        let v2 = store
+            .compact(&account2, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(v2, 2);
+        assert!(!store.needs_compaction(&urn).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_store_events() {
         let store = InMemoryEventStore::new();
 
