@@ -65,7 +65,9 @@ impl Metadata {
 
 impl From<Metadata> for Value {
     fn from(metadata: Metadata) -> Self {
-        Arc::try_unwrap(metadata.value).unwrap_or_else(|shared| (*shared).clone())
+        // Takes the document out when this is the last handle to it, and only
+        // copies when other events still share it.
+        Arc::unwrap_or_clone(metadata.value)
     }
 }
 
