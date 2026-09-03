@@ -13,6 +13,15 @@ impl Metadata {
         }
     }
 
+    /// Build metadata from a JSON document the caller already owns.
+    ///
+    /// Unlike [`Metadata::new`], which serializes its input, this takes the
+    /// [`Value`] by move: no re-serialization, no deep copy. Use it wherever the
+    /// document is already a `Value` — notably when mapping a stored row.
+    pub fn from_json(value: Value) -> Self {
+        Metadata { value }
+    }
+
     pub fn to_json(&self) -> Value {
         self.value.clone()
     }
@@ -49,5 +58,25 @@ impl Metadata {
 impl From<Metadata> for Value {
     fn from(metadata: Metadata) -> Self {
         metadata.to_json()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn metadata_from_owned_json_matches_metadata_from_serialize() {
+        let value = json!({ "tenant": "acme", "user": "alice" });
+
+        assert_eq!(Metadata::from_json(value.clone()), Metadata::new(&value));
+    }
+
+    #[test]
+    fn metadata_from_owned_json_round_trips_the_document() {
+        let value = json!({ "tenant": "acme", "nested": { "n": 1 } });
+
+        assert_eq!(Metadata::from_json(value.clone()).to_json(), value);
     }
 }
