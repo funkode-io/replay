@@ -484,6 +484,11 @@ impl EventStore for PostgresEventStore {
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
 
+        // Metadata is constant for the whole append, so its JSON is built once here
+        // rather than once per event; each event then shares the document behind the
+        // cheap `Metadata` handle.
+        let metadata_json = metadata.to_json();
+
         // Track the appended events so registered inline projections can be applied
         // inside this same transaction. This is the only buffer in the loop and it is
         // populated *only* when projections are registered; bulk producers without
@@ -515,7 +520,7 @@ impl EventStore for PostgresEventStore {
             )
             .bind(id)
             .bind(&event_data)
-            .bind(metadata.to_json())
+            .bind(&metadata_json)
             .bind(&event_type)
             .bind(stream_id.to_string())
             .bind(&stream_type)

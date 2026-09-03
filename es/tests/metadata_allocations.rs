@@ -98,3 +98,24 @@ fn building_metadata_from_an_owned_value_does_not_re_serialize_it() {
          for {payload_bytes} bytes of JSON)"
     );
 }
+
+#[test]
+fn cloning_metadata_shares_the_document_instead_of_copying_it() {
+    let payload_bytes = fat_metadata().to_string().len();
+    let metadata = Metadata::from_json(fat_metadata());
+
+    // Warm up: first-touch lazy initialisation must not land inside a measurement.
+    let _ = allocated_bytes(|| metadata.clone());
+
+    let (clone, clone_bytes) = allocated_bytes(|| metadata.clone());
+
+    assert_eq!(clone, metadata);
+
+    // Metadata is constant for a whole append and is carried by every event in it,
+    // so a clone must be a cheap handle, not a copy of the document.
+    assert!(
+        clone_bytes < 1024,
+        "cloning metadata allocated {clone_bytes} bytes for a {payload_bytes} byte document; \
+         a clone must share the document, not copy it"
+    );
+}

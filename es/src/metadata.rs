@@ -1,15 +1,22 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A JSON document attached to every event of an append.
+///
+/// The document is shared behind an [`Arc`]: metadata is constant for a whole
+/// append yet carried by every event in it, so cloning must be a cheap handle
+/// copy rather than a deep copy of the tree.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Metadata {
-    value: Value,
+    value: Arc<Value>,
 }
 
 impl Metadata {
     pub fn new<S: Serialize>(value: S) -> Self {
         Metadata {
-            value: serde_json::to_value(value).unwrap(),
+            value: Arc::new(serde_json::to_value(value).unwrap()),
         }
     }
 
@@ -19,11 +26,13 @@ impl Metadata {
     /// [`Value`] by move: no re-serialization, no deep copy. Use it wherever the
     /// document is already a `Value` — notably when mapping a stored row.
     pub fn from_json(value: Value) -> Self {
-        Metadata { value }
+        Metadata {
+            value: Arc::new(value),
+        }
     }
 
     pub fn to_json(&self) -> Value {
-        self.value.clone()
+        (*self.value).clone()
     }
 
     /// Check if one metadata matches another.
@@ -34,10 +43,9 @@ impl Metadata {
     ///
     /// If metadata is an object we compare only common fields
     pub fn matches(&self, other: &Metadata) -> bool {
-        let self_json = self.to_json();
-        let other_json = other.to_json();
-
-        match (&self_json, &other_json) {
+        // Compared by reference: matching a filter against every event of a feed
+        // must not deep-copy either document.
+        match (&*self.value, &*other.value) {
             (Value::Object(self_map), Value::Object(other_map)) => {
                 for (key, value) in other_map {
                     if let Some(self_value) = self_map.get(key) {
@@ -50,14 +58,14 @@ impl Metadata {
                 }
                 true
             }
-            _ => self_json == other_json,
+            (self_json, other_json) => self_json == other_json,
         }
     }
 }
 
 impl From<Metadata> for Value {
     fn from(metadata: Metadata) -> Self {
-        metadata.to_json()
+        Arc::try_unwrap(metadata.value).unwrap_or_else(|shared| (*shared).clone())
     }
 }
 
@@ -78,5 +86,17 @@ mod tests {
         let value = json!({ "tenant": "acme", "nested": { "n": 1 } });
 
         assert_eq!(Metadata::from_json(value.clone()).to_json(), value);
+    }
+
+    #[test]
+    fn metadata_serializes_as_a_wrapped_document() {
+        let metadata = Metadata::from_json(json!({ "tenant": "acme" }));
+        let serialized = serde_json::to_value(&metadata).unwrap();
+
+        assert_eq!(serialized, json!({ "value": { "tenant": "acme" } }));
+        assert_eq!(
+            serde_json::from_value::<Metadata>(serialized).unwrap(),
+            metadata
+        );
     }
 }

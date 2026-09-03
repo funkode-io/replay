@@ -208,7 +208,8 @@ async fn a_row_that_fails_to_deserialize_reports_the_stored_json() {
         .pop()
         .expect("expected the seeded row");
 
-    let error = PersistedEvent::<FatEvent>::try_from(row).expect_err("expected a deserialize error");
+    let error =
+        PersistedEvent::<FatEvent>::try_from(row).expect_err("expected a deserialize error");
 
     let stored_json = error
         .context()
