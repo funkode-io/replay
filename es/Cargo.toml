@@ -17,6 +17,7 @@ name = "replay"
 targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [dependencies]
+# `rc`: `Metadata` shares its JSON document behind an `Arc` so cloning it per event is cheap.
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 
