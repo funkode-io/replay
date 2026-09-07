@@ -27,7 +27,8 @@ use super::Event;
 /// let scoped: BankAccountUrn = account.at(&branch)?;  // branch is still usable after this
 ///
 /// // round-trip
-/// let extracted: BranchUrn = scoped.extract_scope::<BranchUrn>()?;
+/// let extracted: BranchUrn      = scoped.extract_scope::<BranchUrn>()?;  // the scope
+/// let account:   BankAccountUrn = scoped.unscoped()?;                    // what was scoped
 /// ```
 pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::Debug> {
     /// Scopes `self` under `other`, returning a new URN whose NSS is
@@ -85,6 +86,9 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
 
     /// Extracts the scope URN embedded by [`Self::at`], converting it into
     /// the output type `O`.
+    ///
+    /// This reads the URN that was scoped **under**; for the URN that was
+    /// scoped, see [`Self::unscoped`].
     ///
     /// `O::try_from` is responsible for NID validation, so passing the wrong
     /// output type returns an error rather than silently succeeding.
@@ -159,10 +163,74 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
             Ok(o) => Ok(o),
         }
     }
+
+    /// Removes the scope appended by [`Self::at`], returning the URN as it was
+    /// before scoping.
+    ///
+    /// The inverse of [`Self::at`], and the counterpart of
+    /// [`Self::extract_scope`]: that one reads the URN embedded as the scope,
+    /// this one reads the URN it was embedded into. Together they take a
+    /// scoped URN apart without a caller having to know how scoping is spelled.
+    ///
+    /// Fails if `self` is not scoped (no `@` in the NSS), or if the NSS holds
+    /// more than one `@` -- which no [`Self::at`] can produce, and whose scope
+    /// would be ambiguous.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // urn:product:sku123@catalog:that  →  urn:product:sku123
+    /// let product: ProductUrn = scoped_product.unscoped()?;
+    /// ```
+    #[track_caller]
+    fn unscoped(&self) -> crate::Result<Self> {
+        let current_urn: Urn = self.clone().into();
+        let nss = current_urn.nss();
+
+        let own_nss = match nss.split_once('@') {
+            None => {
+                return Err(Error::invalid_input("URN is not scoped (no '@' in NSS)")
+                    .with_operation("unscoped")
+                    .with_context("urn", current_urn.to_string()))
+            }
+            Some((_, scope)) if scope.contains('@') => {
+                return Err(
+                    Error::invalid_input("URN has multiple '@' in NSS (ambiguous scope)")
+                        .with_operation("unscoped")
+                        .with_context("urn", current_urn.to_string()),
+                )
+            }
+            Some(("", _)) => {
+                return Err(Error::invalid_input("URN has empty NSS before '@'")
+                    .with_operation("unscoped")
+                    .with_context("urn", current_urn.to_string()))
+            }
+            Some((own_nss, _)) => own_nss,
+        };
+
+        let unscoped_urn = match urn::UrnBuilder::new(current_urn.nid(), own_nss).build() {
+            Err(e) => {
+                return Err(Error::invalid_input("Failed to build unscoped URN")
+                    .with_operation("unscoped")
+                    .with_context("nss", own_nss.to_string())
+                    .with_context("error", format!("{:?}", e)))
+            }
+            Ok(u) => u,
+        };
+
+        match Self::try_from(unscoped_urn) {
+            Err(e) => Err(
+                Error::invalid_input("Failed to convert unscoped URN to expected type")
+                    .with_operation("unscoped")
+                    .with_context("error", format!("{:?}", e)),
+            ),
+            Ok(s) => Ok(s),
+        }
+    }
 }
 
 /// Blanket impl: every type with `Into<Urn> + TryFrom<Urn> + Clone` gets
-/// `at` and `extract_scope` for free.
+/// `at`, `extract_scope` and `unscoped` for free.
 impl<T> ScopedUrn for T where T: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::Debug> {}
 
 /// A trait for types that have a stream identifier.
@@ -243,6 +311,23 @@ pub trait WithId: Sized {
         O: TryFrom<Urn, Error: std::fmt::Debug>,
     {
         self.get_id().extract_scope()
+    }
+
+    /// Returns a new instance whose stream ID has the scope appended by
+    /// [`Self::at`] removed.
+    ///
+    /// Delegates to [`ScopedUrn::unscoped`] on `StreamId`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // urn:product:sku123@catalog:that  →  urn:product:sku123
+    /// let product: ProductStream = scoped_product.unscoped()?;
+    /// ```
+    #[track_caller]
+    fn unscoped(&self) -> crate::Result<Self> {
+        let unscoped_id = self.get_id().unscoped()?;
+        Ok(Self::with_id(unscoped_id))
     }
 }
 
@@ -661,6 +746,75 @@ mod tests {
         let product = ProductStream::with_string_id("urn:product:sku@nid:").unwrap();
         let err = product.extract_scope::<CatalogUrn>().unwrap_err();
         assert!(err.to_string().contains("Scope NSS is empty"));
+    }
+
+    #[test]
+    fn test_unscoped_returns_the_urn_that_was_scoped() {
+        // urn:product:sku123@catalog:that → urn:product:sku123
+        let product = ProductStream::with_string_id("urn:product:sku123@catalog:that").unwrap();
+        let unscoped: Urn = product.unscoped().unwrap().get_id().clone().into();
+        assert_eq!(unscoped.to_string(), "urn:product:sku123");
+    }
+
+    #[test]
+    fn test_unscoped_is_the_inverse_of_at() {
+        let product = ProductStream::with_string_id("urn:product:sku-999").unwrap();
+        let catalog = CatalogUrn(Urn::from_str("urn:catalog:books").unwrap());
+
+        let round_tripped = product.at(catalog).unwrap().unscoped().unwrap();
+
+        assert_eq!(round_tripped.get_id(), product.get_id());
+    }
+
+    #[test]
+    fn test_unscoped_and_extract_scope_take_a_urn_fully_apart() {
+        let product = ProductStream::with_string_id("urn:product:sku123@catalog:that").unwrap();
+
+        let base: Urn = product.unscoped().unwrap().get_id().clone().into();
+        let scope: Urn = product.extract_scope::<CatalogUrn>().unwrap().into();
+
+        assert_eq!(base.to_string(), "urn:product:sku123");
+        assert_eq!(scope.to_string(), "urn:catalog:that");
+    }
+
+    #[test]
+    fn test_unscoped_preserves_a_nss_containing_colons() {
+        // The NSS before @ may hold anything a URN allows, colons included.
+        let product = ProductStream::with_string_id("urn:product:eu:sku:123@catalog:that").unwrap();
+        let unscoped: Urn = product.unscoped().unwrap().get_id().clone().into();
+        assert_eq!(unscoped.nss(), "eu:sku:123");
+    }
+
+    #[test]
+    fn test_unscoped_fails_if_not_scoped() {
+        let product = ProductStream::with_string_id("urn:product:sku123").unwrap();
+        let err = product.unscoped().unwrap_err();
+        assert!(err.to_string().contains("not scoped"));
+    }
+
+    #[test]
+    fn test_unscoped_fails_on_multiple_at() {
+        // urn:product:sku123@catalog:that@tenant:acme — which one is the scope?
+        let product =
+            ProductStream::with_string_id("urn:product:sku123@catalog:that@tenant:acme").unwrap();
+        let err = product.unscoped().unwrap_err();
+        assert!(err.to_string().contains("multiple '@'"));
+    }
+
+    #[test]
+    fn test_unscoped_fails_on_empty_own_nss() {
+        // urn:product:@catalog:that — nothing was scoped
+        let product = ProductStream::with_string_id("urn:product:@catalog:that").unwrap();
+        let err = product.unscoped().unwrap_err();
+        assert!(err.to_string().contains("empty NSS before"));
+    }
+
+    #[test]
+    fn test_unscoped_directly_on_urn_type() {
+        // The blanket impl works on a URN newtype, not just a stream.
+        let scoped = ProductUrn(Urn::from_str("urn:product:sku123@catalog:that").unwrap());
+        let unscoped: Urn = scoped.unscoped().unwrap().into();
+        assert_eq!(unscoped.to_string(), "urn:product:sku123");
     }
 
     #[test]
