@@ -484,6 +484,11 @@ impl EventStore for PostgresEventStore {
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
 
+        // Metadata is constant for the whole append, so its JSON is built once here
+        // rather than once per event; each event then shares the document behind the
+        // cheap `Metadata` handle.
+        let metadata_json = metadata.to_json();
+
         // Track the appended events so registered inline projections can be applied
         // inside this same transaction. This is the only buffer in the loop and it is
         // populated *only* when projections are registered; bulk producers without
@@ -515,7 +520,7 @@ impl EventStore for PostgresEventStore {
             )
             .bind(id)
             .bind(&event_data)
-            .bind(metadata.to_json())
+            .bind(&metadata_json)
             .bind(&event_type)
             .bind(stream_id.to_string())
             .bind(&stream_type)
@@ -798,10 +803,15 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
         let id: Uuid = value.get("id");
 
         let data_raw: Value = value.get("data");
-        let data: D = serde_json::from_value(data_raw.clone()).map_err(|e| {
+        // `from_value` takes ownership, so the document is moved in: strings are
+        // moved into `D` rather than deep-copied. The `stored_json` diagnostic is
+        // built lazily, by decoding the column again on the failure branch only —
+        // the happy path must not pay for a diagnostic it never reads.
+        let data: D = serde_json::from_value(data_raw).map_err(|e| {
+            let stored_json: Value = value.get("data");
             crate::deser_error(e)
                 .with_context("operation", "serde json from store")
-                .with_context("stored_json", data_raw.clone())
+                .with_context("stored_json", stored_json)
         })?;
 
         let stream_id_string: String = value.get("stream_id");
@@ -815,7 +825,9 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
         let version: i64 = value.get("version");
         let created: chrono::DateTime<Utc> = value.get("created");
         let metadata: Value = value.get("metadata");
-        let metadata: Metadata = Metadata::new(metadata);
+        // Already a `Value`: move it in instead of round-tripping it through the
+        // serializer, which would deep-copy the document for every row.
+        let metadata: Metadata = Metadata::from_json(metadata);
         let aggregate_version: Option<i32> = value.get("aggregate_version");
 
         Ok(PersistedEvent {
