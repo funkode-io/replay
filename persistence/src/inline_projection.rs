@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use futures::future::BoxFuture;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
 use crate::{PersistedEvent, StreamFilter};
@@ -104,9 +104,9 @@ pub(crate) trait ErasedInlineProjection: Send + Sync {
 
     /// Route raw appended events to the underlying typed projection.
     ///
-    /// Each event's JSON `data` is deserialized into the projection's event type; events
-    /// that do not match are skipped. If no events match, the underlying `handle` is not
-    /// called.
+    /// Each event's JSON `data` is deserialized *by borrow* into the projection's event
+    /// type; events that do not match are skipped. If no events match, the underlying
+    /// `handle` is not called.
     fn handle<'a>(
         &'a mut self,
         conn: &'a mut Self::Exec,
@@ -153,12 +153,17 @@ where
     ) -> BoxFuture<'a, Result<(), replay::Error>> {
         Box::pin(async move {
             // Deserialize-or-skip: keep only events that belong to this projection.
+            //
+            // `&serde_json::Value` is itself a `Deserializer`, so the payload is read by
+            // borrow: a matching payload yields `Ok`, a non-matching one a recoverable
+            // `Err`, exactly as `from_value` did — but without deep-copying the JSON.
+            // The envelope is re-made from the borrowed event for the same reason, so
+            // the batch is not duplicated once per registered projection.
             let typed: Vec<PersistedEvent<T::Event>> = events
                 .iter()
                 .filter_map(|event| {
-                    serde_json::from_value::<T::Event>(event.data.clone())
-                        .ok()
-                        .map(|data| event.clone().with_data(data))
+                    let data = T::Event::deserialize(&event.data).ok()?;
+                    Some(event.with_data_from(data))
                 })
                 .collect();
 

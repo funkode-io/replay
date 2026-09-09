@@ -8,9 +8,6 @@
 //! context that clone used to feed must still be there when a row fails to
 //! deserialize.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, postgres::PgRow, PgPool};
@@ -22,51 +19,15 @@ use uuid::Uuid;
 
 use replay_persistence::PersistedEvent;
 
-const POSTGRES_PORT: u16 = 5432;
+mod common;
+use common::alloc::{allocated_bytes, CountingAllocator};
 
-/// Counts the bytes allocated *by the calling thread*, so a measurement taken in a
-/// synchronous block is unaffected by anything the test harness runs in parallel.
-struct CountingAllocator;
-
-thread_local! {
-    static ALLOCATED: Cell<usize> = const { Cell::new(0) };
-}
-
-fn record(bytes: usize) {
-    let _ = ALLOCATED.try_with(|allocated| allocated.set(allocated.get() + bytes));
-}
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        record(layout.size());
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        record(new_size.saturating_sub(layout.size()));
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        record(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
-    }
-}
-
+/// Every test binary registers its own global allocator; the counting itself is
+/// shared (`tests/common/alloc.rs`).
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-/// Runs `f` and returns the bytes it allocated on this thread.
-fn allocated_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    let before = ALLOCATED.with(Cell::get);
-    let value = f();
-    let after = ALLOCATED.with(Cell::get);
-    (value, after - before)
-}
+const POSTGRES_PORT: u16 = 5432;
 
 /// The stored shape of the events these tests read back: a few fat text blocks,
 /// like the localized Markdown payloads that surfaced the amplification.

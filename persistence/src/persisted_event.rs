@@ -46,4 +46,24 @@ impl<E> PersistedEvent<E> {
             aggregate_version: self.aggregate_version,
         }
     }
+
+    /// Re-envelope a *borrowed* event with new data.
+    ///
+    /// The counterpart to [`with_data`](Self::with_data) for the erasure bridges, which
+    /// only ever hold `&PersistedEvent<Value>`: the payload is not copied at all (the
+    /// caller supplies it, typically deserialized by borrow from `self.data`), and the
+    /// envelope's owned fields are cloned individually rather than by cloning the whole
+    /// event — which would drag the JSON payload along with them.
+    pub(crate) fn with_data_from<Other: Event>(&self, data: Other) -> PersistedEvent<Other> {
+        PersistedEvent {
+            id: self.id,
+            data,
+            stream_id: self.stream_id.clone(),
+            r#type: self.r#type.clone(),
+            version: self.version,
+            created: self.created,
+            metadata: self.metadata.clone(),
+            aggregate_version: self.aggregate_version,
+        }
+    }
 }
