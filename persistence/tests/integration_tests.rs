@@ -2046,6 +2046,10 @@ async fn bank_account_inline_projection_first_registration_replays_backlog_postg
 #[derive(Clone, Serialize, Deserialize, Debug, Urn)]
 struct BranchUrn(Urn);
 
+/// A region that owns one or more branches — the outer level in the nesting tests.
+#[derive(Clone, Serialize, Deserialize, Debug, Urn)]
+struct RegionUrn(Urn);
+
 // ── Scoped-URN tests (no Postgres required) ───────────────────────────────────
 
 /// A bank-account URN can be scoped to a branch:
@@ -2127,14 +2131,33 @@ fn test_scoped_urn_string_round_trip() {
     assert_eq!(branch.0.nss(), "tokyo");
 }
 
-/// Scoping with an already-scoped branch URN must fail.
+/// A scope may itself be scoped: an account under a branch under a region.
+/// Each `extract_scope` peels exactly one level.
 #[test]
-fn test_at_rejects_scoped_scope_urn() {
+fn test_account_scoped_to_a_branch_that_is_scoped_to_a_region() {
     let account = BankAccountUrn::new("acct-1").unwrap();
-    // Construct a BranchUrn whose NSS itself contains '@' — simulating a scoped scope
-    let already_scoped_branch = BranchUrn(Urn::from_str("urn:branch:london@region:uk").unwrap());
-    let err = account.at(&already_scoped_branch).unwrap_err();
-    assert!(err.to_string().contains("scope URN is already scoped"));
+    let branch = BranchUrn::new("london").unwrap();
+    let region = RegionUrn::new("uk").unwrap();
+
+    let branch_in_region: BranchUrn = branch.at(&region).unwrap();
+    let scoped: BankAccountUrn = account.at(&branch_in_region).unwrap();
+
+    let scoped_urn: Urn = scoped.clone().into();
+    assert_eq!(
+        scoped_urn.to_string(),
+        "urn:bank-account:acct-1@branch:london@region:uk"
+    );
+
+    // Peel one level at a time; the base falls out in a single step.
+    let peeled_branch: BranchUrn = scoped.extract_scope::<BranchUrn>().unwrap();
+    assert_eq!(peeled_branch.0.to_string(), "urn:branch:london@region:uk");
+
+    let peeled_region: RegionUrn = peeled_branch.extract_scope::<RegionUrn>().unwrap();
+    assert_eq!(peeled_region.0.to_string(), "urn:region:uk");
+
+    let base: BankAccountUrn = scoped.unscoped().unwrap();
+    let base_urn: Urn = base.into();
+    assert_eq!(base_urn.to_string(), "urn:bank-account:acct-1");
 }
 
 // ── README global-position example: live query vs inline projection ──────────
