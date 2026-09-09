@@ -1466,7 +1466,7 @@ fn merge_dispatch_metadata(
     };
 
     merge_no_collisions(&mut merged, extra)?;
-    Ok(Metadata::new(Value::Object(merged)))
+    Ok(Metadata::from_json(Value::Object(merged)))
 }
 
 fn merge_no_collisions(
