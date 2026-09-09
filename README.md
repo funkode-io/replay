@@ -1179,7 +1179,7 @@ let wrong: BankAccountUrn = scoped.extract_scope::<BankAccountUrn>()?; // Err: N
 
 | Condition | Error |
 | --- | --- |
-| Current URN's NSS already contains `@` | "URN is already scoped" |
+| Current URN's NSS already contains `@` | "URN is already scoped (contains '@')" |
 
 The scope argument may already be scoped — see [Nested scopes](#nested-scopes).
 
@@ -1187,9 +1187,9 @@ The scope argument may already be scoped — see [Nested scopes](#nested-scopes)
 
 | Input NSS | Error |
 | --- | --- |
-| `acct-1` — no `@` | "not scoped (no '@' in NSS)" |
-| `@branch:london` — empty own NSS | "empty NSS before '@'" |
-| `acct-1@branch` — no `:` after `@` | "missing ':' (expected '`<nid>:<nss>`')" |
+| `acct-1` — no `@` | "URN is not scoped (no '@' in NSS)" |
+| `@branch:london` — empty own NSS | "URN has empty NSS before '@'" |
+| `acct-1@branch` — no `:` after `@` | "Scope part after '@' is missing ':' (expected '`<nid>:<nss>`')" |
 | `acct@:nss` — empty scope NID | "Scope NID is empty" |
 | `acct@nid:` — empty scope NSS | "Scope NSS is empty" |
 | wrong output type | "NID mismatch" (from `TryFrom<Urn>` on the output type) |
