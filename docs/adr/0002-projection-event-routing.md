@@ -26,10 +26,14 @@ so the `query_events!` machinery is reused rather than reinvented.
 - Routing is by JSON *shape*: two aggregates with structurally compatible event
   payloads could in principle mis-route. Event enums are externally tagged by
   variant name, so collisions are unlikely; revisit if it bites.
-- Each registered projection pays a `from_value` attempt (with a `Value` clone)
-  per append. Negligible at catalog write volumes; if it ever matters, projections
-  can be pre-indexed by `event_type` or the planned in-memory `StreamFilter`
-  evaluation can pre-filter before deserialization.
+- Each registered inline projection pays a deserialize attempt per append, read *by
+  borrow* from the stored `serde_json::Value` (`T::Event::deserialize(&event.data)`),
+  so the JSON payload is not copied per inline projection. The residual per-inline-
+  projection cost is the envelope's owned fields (`stream_id`, `type`; `metadata` is an
+  `Arc<Value>`, so it is a handle copy). If routing cost ever matters beyond that,
+  inline projections can be pre-indexed by `event_type` or the planned in-memory
+  `StreamFilter` evaluation can pre-filter before deserialization. Guarded by
+  `persistence/tests/inline_projection_allocations.rs`.
 - This routing lives in the native-only `persistence` crate, so the erased
   wrapper and its `BoxFuture`/`Send` bounds are fine. The `query_events!` macro it
   reuses is itself WASM-compatible (it lives in `macros`); reusing it here does

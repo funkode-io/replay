@@ -157,22 +157,13 @@ where
             // `&serde_json::Value` is itself a `Deserializer`, so the payload is read by
             // borrow: a matching payload yields `Ok`, a non-matching one a recoverable
             // `Err`, exactly as `from_value` did — but without deep-copying the JSON.
-            // The envelope is rebuilt field by field for the same reason, so the batch is
-            // not duplicated once per registered projection.
+            // The envelope is re-made from the borrowed event for the same reason, so
+            // the batch is not duplicated once per registered projection.
             let typed: Vec<PersistedEvent<T::Event>> = events
                 .iter()
                 .filter_map(|event| {
                     let data = T::Event::deserialize(&event.data).ok()?;
-                    Some(PersistedEvent {
-                        id: event.id,
-                        data,
-                        stream_id: event.stream_id.clone(),
-                        r#type: event.r#type.clone(),
-                        version: event.version,
-                        created: event.created,
-                        metadata: event.metadata.clone(),
-                        aggregate_version: event.aggregate_version,
-                    })
+                    Some(event.with_data_from(data))
                 })
                 .collect();
 
