@@ -1572,6 +1572,25 @@ named type, custom `init`, or more involved logic than a single handler closure.
 - Projection handlers run inside the **same Postgres transaction** as the event append.
 - If a projection handler returns an error, the whole append rolls back.
 
+### Batching: a single append may arrive as several calls
+
+A streamed append pulls its producer one event at a time, so a bulk import never has to fit
+in memory. Registered projections would break that, since the store has to keep each appended
+event to hand it over. It therefore flushes in bounded chunks: at most `flush_size` events are
+held, applied to every projection **on the same transaction**, then dropped.
+
+So an append of `B` events reaches `handle` as `⌈B / flush_size⌉` calls, in order, all
+committing or rolling back together — a failure in the last chunk rolls back the writes of the
+first. **Do not assume one call carries a whole append**: keep anything that must span an
+append in the projection's own fields or its view, not in a local of one `handle` call. Which
+events arrive, and their order, are unchanged.
+
+| Setting | Store override | Env var | Default |
+|---------|----------------|---------|---------|
+| Events held before a projection flush | `builder(pool).projection_flush_size(n)` | `REPLAY_PROJECTION_FLUSH_SIZE` | `500` |
+
+Stores with no projections registered never buffer at all.
+
 Inline projections are Postgres-only. The in-memory store remains useful for tests, but the
 transactional guarantee belongs to the Postgres backend.
 
