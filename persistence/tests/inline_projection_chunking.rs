@@ -1,5 +1,5 @@
-//! Chunked projection flush: a streamed append must stay bounded in memory when
-//! inline projections are registered.
+//! Chunked inline-projection flush: a streamed append must stay bounded in memory
+//! when inline projections are registered.
 //!
 //! `store_events_stream` consumes its producer one event at a time, but it used to
 //! retain every appended event as a `serde_json::Value` until `commit()` so the
@@ -89,7 +89,7 @@ async fn start_postgres() -> (
     (pool, container)
 }
 
-/// Records the length and contents of every `handle` call it receives.
+/// An inline projection that records the length and contents of every `handle` call.
 #[derive(Clone, Default)]
 struct CallLog {
     batches: Arc<Mutex<Vec<Vec<f64>>>>,
@@ -155,7 +155,7 @@ impl InlineProjection for RecordingProjection {
 /// The store must never hand a projection more than the configured chunk, however
 /// large the append — and the chunks must reassemble into the original sequence.
 #[tokio::test]
-async fn streamed_append_flushes_projections_in_bounded_chunks_postgres_test() {
+async fn streamed_append_flushes_inline_projections_in_bounded_chunks_postgres_test() {
     let (pool, _container) = start_postgres().await;
 
     let log = CallLog::default();
@@ -231,7 +231,8 @@ async fn append_smaller_than_the_chunk_arrives_in_one_call_postgres_test() {
     assert_eq!(log.batch_sizes(), vec![3]);
 }
 
-/// Writes every event to its own table, then fails once it has seen `fail_after`
+/// An inline projection that writes every event to its own table, then fails once it
+/// has seen `fail_after`
 /// events — i.e. part-way through a later chunk, after earlier chunks have written.
 struct FailsPartWayProjection {
     seen: usize,

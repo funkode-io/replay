@@ -1,6 +1,8 @@
 # Projection event routing by deserialize-or-skip over JSON
 
 **Status:** accepted
+**Amended by:** [ADR-0011](0011-inline-projections-flushed-in-bounded-chunks.md) — `handle` is now
+called once per bounded chunk, not once per append.
 
 Inline projections declare their consumed events as a `query_events!`-merged enum
 (`type Event`), exactly like the existing live `Query`, and the store routes
@@ -10,7 +12,8 @@ storage anyway) and the batch is offered to every registered projection; the
 internal erased wrapper deserializes the batch into `Vec<PersistedEvent<P::Event>>`,
 dropping events that aren't one of the projection's types, and calls the typed
 `handle` once with whatever remains (skipping the projection entirely if nothing
-matches). This lets the store hold a heterogeneous `Vec` of projections without
+matches; since ADR-0011, once per chunk of a chunked append). This lets the store hold
+a heterogeneous `Vec` of projections without
 naming each one's event type, and keeps inline projections symmetric with `Query`
 so the `query_events!` machinery is reused rather than reinvented.
 

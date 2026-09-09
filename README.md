@@ -1589,7 +1589,10 @@ events arrive, and their order, are unchanged.
 |---------|----------------|---------|---------|
 | Events held before a projection flush | `builder(pool).projection_flush_size(n)` | `REPLAY_PROJECTION_FLUSH_SIZE` | `500` |
 
-Stores with no projections registered never buffer at all.
+Stores with no projections registered never buffer at all. This applies to appends; the
+history replayed on first registration or a version-drift rebuild is still loaded and
+applied in one batch. See
+[ADR-0011](docs/adr/0011-inline-projections-flushed-in-bounded-chunks.md).
 
 Inline projections are Postgres-only. The in-memory store remains useful for tests, but the
 transactional guarantee belongs to the Postgres backend.

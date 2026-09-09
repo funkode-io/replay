@@ -28,14 +28,14 @@ impl<T> PostgresInlineProjection for T where T: InlineProjection<Exec = sqlx::Pg
 
 /// Built-in default for how many appended events are held before being flushed to the
 /// registered inline projections.
-pub const DEFAULT_PROJECTION_FLUSH_SIZE: usize = 500;
+const DEFAULT_PROJECTION_FLUSH_SIZE: usize = 500;
 
 /// Environment variable that overrides the projection-flush default.
 const PROJECTION_FLUSH_SIZE_ENV_VAR: &str = "REPLAY_PROJECTION_FLUSH_SIZE";
 
-/// Resolve the effective projection flush size.
+/// Resolve the effective projection flush size (events held before a flush).
 ///
-/// Precedence: per-store override → `REPLAY_PROJECTION_FLUSH_SIZE` → default 500.
+/// Precedence: per-store override → `REPLAY_PROJECTION_FLUSH_SIZE` env var → default 500.
 fn resolve_projection_flush_size(store_override: Option<usize>) -> usize {
     resolve_flush_size(
         store_override,
@@ -274,10 +274,13 @@ pub struct PostgresEventStoreBuilder {
 
 impl PostgresEventStoreBuilder {
     /// Cap how many appended events are held before being flushed to the registered
-    /// projections, inside the append transaction.
+    /// inline projections, inside the append transaction.
     ///
-    /// Overrides `REPLAY_PROJECTION_FLUSH_SIZE` and the built-in default of
-    /// [`DEFAULT_PROJECTION_FLUSH_SIZE`]. Values below 1 are clamped to 1.
+    /// Overrides the `REPLAY_PROJECTION_FLUSH_SIZE` env var and the built-in default of
+    /// 500. Values below 1 are clamped to 1, so a flush always makes progress.
+    ///
+    /// Applies to appends only — the history replayed by [`build`](Self::build) on first
+    /// registration or version drift is still loaded and applied in one batch.
     pub fn projection_flush_size(mut self, events: usize) -> Self {
         self.projection_flush_size = Some(events);
         self

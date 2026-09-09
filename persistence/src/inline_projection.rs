@@ -78,7 +78,9 @@ pub trait InlineProjection: Send + Sync {
     /// committing or rolling back together. Do not assume a call carries an append in its
     /// entirety: state that must span an append belongs in the projection's own fields or
     /// its view, not in a local of one `handle` call. The events delivered, and their
-    /// order, are otherwise unchanged. See `PostgresEventStoreBuilder::projection_flush_size`.
+    /// order, are otherwise unchanged. See `PostgresEventStoreBuilder::projection_flush_size`
+    /// and ADR-0011. (The history replayed on first registration or version drift is still
+    /// delivered in one call.)
     fn handle(
         &mut self,
         conn: &mut Self::Exec,
