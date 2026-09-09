@@ -352,7 +352,7 @@ mod tests {
             r#type: "Frozen".to_string(),
             version: 7,
             created: Utc::now(),
-            metadata: Metadata::new(json!({ "correlation": "c-1" })),
+            metadata: Metadata::from_json(json!({ "correlation": "c-1" })),
             aggregate_version: None,
         }
     }
