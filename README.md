@@ -1181,7 +1181,7 @@ let wrong: BankAccountUrn = scoped.extract_scope::<BankAccountUrn>()?; // Err: N
 | --- | --- |
 | Current URN's NSS already contains `@` | "URN is already scoped" |
 
-The scope argument, by contrast, **may** already be scoped — see [Nested scopes](#nested-scopes).
+The scope argument may already be scoped — see [Nested scopes](#nested-scopes).
 
 **Validation rules enforced by `extract_scope`:**
 
@@ -1200,7 +1200,7 @@ a `TenantUrn`, or any other domain type, as long as the NID embedded in the scop
 
 #### Nested scopes
 
-A scope may itself be scoped, so scopes nest to any depth:
+A scope may itself be scoped:
 
 ```rust
 let region: RegionUrn = RegionUrn::new("uk")?;
@@ -1208,19 +1208,17 @@ let branch: BranchUrn = BranchUrn::new("london")?.at(&region)?;   // urn:branch:
 let account: BankAccountUrn = BankAccountUrn::new("acct-1")?.at(&branch)?;
 // urn:bank-account:acct-1@branch:london@region:uk
 
-// extract_scope peels exactly one level — the result is still scoped
+// extract_scope peels one level — the result is still scoped
 let branch: BranchUrn = account.extract_scope::<BranchUrn>()?;    // urn:branch:london@region:uk
 let region: RegionUrn = branch.extract_scope::<RegionUrn>()?;     // urn:region:uk
 
-// unscoped drops the whole scope in one step, whatever its depth
+// unscoped drops the whole scope
 let base: BankAccountUrn = account.unscoped()?;                   // urn:bank-account:acct-1
 ```
 
-This is unambiguous because of the invariant `at` enforces on its receiver:
-**an aggregate's own NSS never contains `@`, so the left-most `@` is always the outermost
-scope boundary.** Every decomposition splits there. Re-scoping an already-scoped URN is
-therefore refused — call `unscoped()` first. See
-[ADR-0010](docs/adr/0010-nested-scoped-urns-parse-at-the-first-at-sign.md).
+Re-scoping an already-scoped URN is refused — call `unscoped()` first. That guard is what
+makes the left-most `@` the outermost scope
+([ADR-0010](docs/adr/0010-nested-scoped-urns-parse-at-the-first-at-sign.md)).
 
 ### Prelude
 

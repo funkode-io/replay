@@ -32,7 +32,7 @@ struct BankAccountUrn(Urn);
 #[urn(namespace = "file")]
 struct FileManagerUrn(Urn);
 
-// Nested-scope fixtures: a watchlist owned by a user who is scoped by wallet type.
+// Nested-scope fixtures: a watchlist owned by a wallet-scoped user.
 #[derive(Clone, Debug, Serialize, Deserialize, Urn)]
 struct WatchlistUrn(Urn);
 
@@ -181,10 +181,7 @@ fn test_scoped_at_and_extract() {
     assert_eq!(scoped.extract_scope::<BranchUrn>().unwrap(), branch_urn);
 }
 
-/// Nested scopes on `#[derive(Urn)]` types: a scope that is itself scoped.
-///
-/// The motivating shape is a wallet-scoped user owning a watchlist:
-/// `urn:watchlist:main@user:0x78@wallet-type:evm`.
+/// urn:watchlist:main@user:0x78@wallet-type:evm
 #[test]
 fn test_scoped_at_and_extract_nested() {
     let wallet_type = WalletTypeUrn::new("evm").unwrap();
@@ -196,24 +193,24 @@ fn test_scoped_at_and_extract_nested() {
         "urn:watchlist:main@user:0x78@wallet-type:evm"
     );
 
-    // extract_scope peels one level: the user comes back still scoped
+    // peels one level: the user comes back still scoped
     let peeled_user: UserUrn = watchlist.extract_scope::<UserUrn>().unwrap();
     assert_eq!(peeled_user, user);
     assert_eq!(peeled_user.to_string(), "urn:user:0x78@wallet-type:evm");
 
-    // ...and peels again to the wallet type
+    // ...and again, to the wallet type
     assert_eq!(
         peeled_user.extract_scope::<WalletTypeUrn>().unwrap(),
         wallet_type
     );
 
-    // unscoped drops the whole scope in one step, whatever its depth
+    // unscoped drops the whole scope
     assert_eq!(
         watchlist.unscoped().unwrap(),
         WatchlistUrn::new("main").unwrap()
     );
 
-    // the base's own NSS never holds an '@' — re-scoping is still refused
+    // re-scoping a scoped URN is still refused
     let err = watchlist.at(&wallet_type).unwrap_err();
     assert!(err.to_string().contains("already scoped"));
 }

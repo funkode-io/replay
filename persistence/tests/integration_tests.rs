@@ -2046,7 +2046,7 @@ async fn bank_account_inline_projection_first_registration_replays_backlog_postg
 #[derive(Clone, Serialize, Deserialize, Debug, Urn)]
 struct BranchUrn(Urn);
 
-/// A region that owns one or more branches — the outer level in the nesting tests.
+/// A region that owns one or more branches.
 #[derive(Clone, Serialize, Deserialize, Debug, Urn)]
 struct RegionUrn(Urn);
 
@@ -2131,8 +2131,7 @@ fn test_scoped_urn_string_round_trip() {
     assert_eq!(branch.0.nss(), "tokyo");
 }
 
-/// A scope may itself be scoped: an account under a branch under a region.
-/// Each `extract_scope` peels exactly one level.
+/// urn:bank-account:acct-1@branch:london@region:uk
 #[test]
 fn test_account_scoped_to_a_branch_that_is_scoped_to_a_region() {
     let account = BankAccountUrn::new("acct-1").unwrap();
@@ -2148,7 +2147,7 @@ fn test_account_scoped_to_a_branch_that_is_scoped_to_a_region() {
         "urn:bank-account:acct-1@branch:london@region:uk"
     );
 
-    // Peel one level at a time; the base falls out in a single step.
+    // Peel one level at a time; the base falls out in one step.
     let peeled_branch: BranchUrn = scoped.extract_scope::<BranchUrn>().unwrap();
     assert_eq!(peeled_branch.0.to_string(), "urn:branch:london@region:uk");
 

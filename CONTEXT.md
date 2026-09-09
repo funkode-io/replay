@@ -99,18 +99,16 @@ _Avoid_: state, policy state, health check.
 
 ### Scoped URN
 
-A stream identifier that carries its owner inside itself, by embedding a second
-URN as a suffix of its NSS: `urn:<nid>:<nss>@<scope_nid>:<scope_nss>` — for
-example `urn:bank-account:acct-1@branch:london`. The embedded URN is the
-**scope**; the part before the `@` is the **base**. Composed with `at`,
-decomposed with `extract_scope` (returns the scope) and `unscoped` (returns the
-base). A scope may itself be a Scoped URN, so scopes nest to any depth
-(`urn:watchlist:main@user:0x78@wallet-type:evm`); `extract_scope` peels exactly
-one level. The **left-most `@` is always the outermost scope boundary**, because
-`at` refuses to scope an already-scoped URN and so a base's NSS never contains
-`@` — see [ADR-0010](docs/adr/0010-nested-scoped-urns-parse-at-the-first-at-sign.md).
-A Scoped URN is an identity, not a [Query]: it records which [Aggregate] owns
-this one, and the event store treats the whole thing as an opaque stream id.
+A stream identifier carrying its owner as a suffix:
+`urn:bank-account:acct-1@branch:london`. The embedded URN is the **scope**, the
+part before the `@` the **base**. Composed with `at`, taken apart with
+`extract_scope` (the scope) and `unscoped` (the base). Scopes nest —
+`urn:watchlist:main@user:0x78@wallet-type:evm` — and `extract_scope` peels one
+level at a time. `at` refuses to scope an already-scoped URN, which is what makes
+the left-most `@` the outermost scope
+([ADR-0010](docs/adr/0010-nested-scoped-urns-parse-at-the-first-at-sign.md)). It
+is an identity, not a [Query]: the event store treats the whole string as an
+opaque stream id.
 _Avoid_: qualified URN, namespaced URN, parent/child URN, compound key.
 
 ### Query
