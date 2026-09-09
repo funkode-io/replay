@@ -1132,7 +1132,8 @@ assert_eq!(active_products.len(), 2);
 ### Composing Scoped URNs
 
 When two streams are related (e.g., a bank account belonging to a branch), you can embed that
-relationship directly in the URN using `ScopedUrn::at` and recover it with `ScopedUrn::extract_scope`.
+relationship directly in the URN using `ScopedUrn::at`, recover it with
+`ScopedUrn::extract_scope`, and drop it again with `ScopedUrn::unscoped`.
 
 The resulting URN uses the format `urn:<nid>:<nss>@<scope_nid>:<scope_nss>`.
 
@@ -1179,7 +1180,8 @@ let wrong: BankAccountUrn = scoped.extract_scope::<BankAccountUrn>()?; // Err: N
 | Condition | Error |
 | --- | --- |
 | Current URN's NSS already contains `@` | "URN is already scoped" |
-| `other`'s NSS contains `@` | "scope URN is already scoped" |
+
+The scope argument, by contrast, **may** already be scoped — see [Nested scopes](#nested-scopes).
 
 **Validation rules enforced by `extract_scope`:**
 
@@ -1190,12 +1192,35 @@ let wrong: BankAccountUrn = scoped.extract_scope::<BankAccountUrn>()?; // Err: N
 | `acct-1@branch` — no `:` after `@` | "missing ':' (expected '`<nid>:<nss>`')" |
 | `acct@:nss` — empty scope NID | "Scope NID is empty" |
 | `acct@nid:` — empty scope NSS | "Scope NSS is empty" |
-| `a@b:c@d:e` — multiple `@` | "multiple '@' in NSS (ambiguous scope)" |
 | wrong output type | "NID mismatch" (from `TryFrom<Urn>` on the output type) |
 
 The output type can be any type that implements `TryFrom<Urn>` — it does not have to be the
 same as the original URN's type. This allows a `BankAccountUrn` to extract a `BranchUrn`,
 a `TenantUrn`, or any other domain type, as long as the NID embedded in the scope part matches.
+
+#### Nested scopes
+
+A scope may itself be scoped, so scopes nest to any depth:
+
+```rust
+let region: RegionUrn = RegionUrn::new("uk")?;
+let branch: BranchUrn = BranchUrn::new("london")?.at(&region)?;   // urn:branch:london@region:uk
+let account: BankAccountUrn = BankAccountUrn::new("acct-1")?.at(&branch)?;
+// urn:bank-account:acct-1@branch:london@region:uk
+
+// extract_scope peels exactly one level — the result is still scoped
+let branch: BranchUrn = account.extract_scope::<BranchUrn>()?;    // urn:branch:london@region:uk
+let region: RegionUrn = branch.extract_scope::<RegionUrn>()?;     // urn:region:uk
+
+// unscoped drops the whole scope in one step, whatever its depth
+let base: BankAccountUrn = account.unscoped()?;                   // urn:bank-account:acct-1
+```
+
+This is unambiguous because of the invariant `at` enforces on its receiver:
+**an aggregate's own NSS never contains `@`, so the left-most `@` is always the outermost
+scope boundary.** Every decomposition splits there. Re-scoping an already-scoped URN is
+therefore refused — call `unscoped()` first. See
+[ADR-0010](docs/adr/0010-nested-scoped-urns-parse-at-the-first-at-sign.md).
 
 ### Prelude
 
@@ -1209,7 +1234,7 @@ use replay::prelude::*;
 
 | Export | Purpose |
 | --- | --- |
-| `ScopedUrn` | `at` and `extract_scope` on URN types |
+| `ScopedUrn` | `at`, `extract_scope` and `unscoped` on URN types |
 | `WithId` | `with_id`, `get_id`, `with_string_id` on aggregate structs |
 | `EventStream` | `apply`, `stream_type` |
 | `Aggregate` | `handle` |

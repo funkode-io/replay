@@ -32,6 +32,17 @@ struct BankAccountUrn(Urn);
 #[urn(namespace = "file")]
 struct FileManagerUrn(Urn);
 
+// Nested-scope fixtures: a watchlist owned by a user who is scoped by wallet type.
+#[derive(Clone, Debug, Serialize, Deserialize, Urn)]
+struct WatchlistUrn(Urn);
+
+#[derive(Clone, Debug, Serialize, Deserialize, Urn)]
+struct UserUrn(Urn);
+
+/// Auto-derived namespace: `WalletTypeUrn` → `WalletType` → kebab → `"wallet-type"`.
+#[derive(Clone, Debug, Serialize, Deserialize, Urn)]
+struct WalletTypeUrn(Urn);
+
 // ── Auto-derived namespace (no attribute) ────────────────────────────────────
 
 #[test]
@@ -168,6 +179,43 @@ fn test_scoped_at_and_extract() {
 
     // round-trip: extract the scope back out
     assert_eq!(scoped.extract_scope::<BranchUrn>().unwrap(), branch_urn);
+}
+
+/// Nested scopes on `#[derive(Urn)]` types: a scope that is itself scoped.
+///
+/// The motivating shape is a wallet-scoped user owning a watchlist:
+/// `urn:watchlist:main@user:0x78@wallet-type:evm`.
+#[test]
+fn test_scoped_at_and_extract_nested() {
+    let wallet_type = WalletTypeUrn::new("evm").unwrap();
+    let user = UserUrn::new("0x78").unwrap().at(&wallet_type).unwrap();
+    let watchlist = WatchlistUrn::new("main").unwrap().at(&user).unwrap();
+
+    assert_eq!(
+        watchlist.to_string(),
+        "urn:watchlist:main@user:0x78@wallet-type:evm"
+    );
+
+    // extract_scope peels one level: the user comes back still scoped
+    let peeled_user: UserUrn = watchlist.extract_scope::<UserUrn>().unwrap();
+    assert_eq!(peeled_user, user);
+    assert_eq!(peeled_user.to_string(), "urn:user:0x78@wallet-type:evm");
+
+    // ...and peels again to the wallet type
+    assert_eq!(
+        peeled_user.extract_scope::<WalletTypeUrn>().unwrap(),
+        wallet_type
+    );
+
+    // unscoped drops the whole scope in one step, whatever its depth
+    assert_eq!(
+        watchlist.unscoped().unwrap(),
+        WatchlistUrn::new("main").unwrap()
+    );
+
+    // the base's own NSS never holds an '@' — re-scoping is still refused
+    let err = watchlist.at(&wallet_type).unwrap_err();
+    assert!(err.to_string().contains("already scoped"));
 }
 
 // ── new(id) — namespace attribute ────────────────────────────────────────────
