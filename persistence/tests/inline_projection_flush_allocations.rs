@@ -1,88 +1,29 @@
 //! Allocation regression test for the inline-projection flush.
 //!
-//! [`inline_projection_chunking`](./inline_projection_chunking.rs) asserts the store hands a
-//! projection no more than the configured chunk. That is a bound on the *buffer*, and it
-//! cannot see a second structure quietly growing with the append. This test measures what
-//! actually matters — bytes held live at once — through the same `#[global_allocator]`
-//! harness as `read_path_allocations.rs`.
+//! [`inline_projection_chunking`](./inline_projection_chunking.rs) asserts the store hands
+//! an inline projection no more than the configured chunk. That is a bound on the
+//! *buffer*, and it cannot see a second structure quietly growing with the append. This
+//! test measures what actually matters — bytes held live at once — through the shared
+//! allocation harness.
 //!
 //! Each event carries a fat payload, so the retained JSON dominates every other
 //! allocation on the thread; an append of `EVENTS` events with a flush size of `FLUSH`
 //! must peak near `FLUSH` payloads, not `EVENTS` of them.
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
 use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
-const POSTGRES_PORT: u16 = 5432;
+mod common;
+use common::alloc::{peak_live_bytes, reset_peak, CountingAllocator};
 
-/// Tracks bytes live *on the calling thread* — allocated minus freed — and the high-water
-/// mark of that figure. `#[tokio::test]` runs a current-thread runtime, so the whole
-/// append happens on this thread and nothing the harness does elsewhere is counted.
-struct PeakAllocator;
-
-thread_local! {
-    static LIVE: Cell<isize> = const { Cell::new(0) };
-    static PEAK: Cell<isize> = const { Cell::new(0) };
-}
-
-fn grow(bytes: usize) {
-    let _ = LIVE.try_with(|live| {
-        let now = live.get() + bytes as isize;
-        live.set(now);
-        let _ = PEAK.try_with(|peak| {
-            if now > peak.get() {
-                peak.set(now);
-            }
-        });
-    });
-}
-
-fn shrink(bytes: usize) {
-    let _ = LIVE.try_with(|live| live.set(live.get() - bytes as isize));
-}
-
-unsafe impl GlobalAlloc for PeakAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        grow(layout.size());
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        shrink(layout.size());
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if new_size >= layout.size() {
-            grow(new_size - layout.size());
-        } else {
-            shrink(layout.size() - new_size);
-        }
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        grow(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
-    }
-}
-
+/// Every test binary registers its own global allocator; the counting itself is
+/// shared (`tests/common/alloc.rs`).
 #[global_allocator]
-static ALLOCATOR: PeakAllocator = PeakAllocator;
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-fn reset_peak() {
-    LIVE.with(|live| live.set(0));
-    PEAK.with(|peak| peak.set(0));
-}
-
-fn peak_bytes() -> isize {
-    PEAK.with(|peak| peak.get())
-}
+const POSTGRES_PORT: u16 = 5432;
 
 // ── Fixture: an aggregate whose events carry a fat payload ───────────────────
 
@@ -264,7 +205,7 @@ async fn peak_live_bytes_scale_with_the_flush_size_not_the_append_postgres_test(
         .await
         .expect("streamed append must succeed");
 
-    let peak = peak_bytes();
+    let peak = peak_live_bytes();
 
     // The retained JSON is the dominant term. Budget six payloads per buffered event —
     // the `Value` tree, the serialized row parameter, and slack for sqlx's per-row work
