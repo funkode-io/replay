@@ -17,6 +17,7 @@ use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
 mod common;
 use common::alloc::{peak_live_bytes, reset_peak, CountingAllocator};
+use common::report::report;
 
 /// Every test binary registers its own global allocator; the counting itself is
 /// shared (`tests/common/alloc.rs`).
@@ -213,6 +214,14 @@ async fn peak_live_bytes_scale_with_the_flush_size_not_the_append_postgres_test(
     // without, against a ~492 KB budget.
     let bounded = (FLUSH * PAYLOAD_BYTES * 6) as isize;
     let whole_append = (EVENTS * PAYLOAD_BYTES) as isize;
+
+    report(
+        "inline_projection_flush",
+        "peak_live_bytes",
+        peak as i128,
+        bounded as i128,
+        "bytes",
+    );
 
     assert!(
         peak < bounded,
