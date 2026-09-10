@@ -26,6 +26,35 @@ pub trait PostgresInlineProjection: InlineProjection<Exec = sqlx::PgConnection> 
 
 impl<T> PostgresInlineProjection for T where T: InlineProjection<Exec = sqlx::PgConnection> {}
 
+/// Built-in default for how many appended events are held before being flushed to the
+/// registered inline projections.
+const DEFAULT_PROJECTION_FLUSH_SIZE: usize = 500;
+
+/// Environment variable that overrides the projection-flush default.
+const PROJECTION_FLUSH_SIZE_ENV_VAR: &str = "REPLAY_PROJECTION_FLUSH_SIZE";
+
+/// Resolve the effective projection flush size (events held before a flush).
+///
+/// Precedence: per-store override → `REPLAY_PROJECTION_FLUSH_SIZE` env var → default 500.
+fn resolve_projection_flush_size(store_override: Option<usize>) -> usize {
+    resolve_flush_size(
+        store_override,
+        std::env::var(PROJECTION_FLUSH_SIZE_ENV_VAR).ok(),
+    )
+}
+
+/// The precedence itself, over values rather than the process environment, so it is
+/// testable without mutating global state.
+fn resolve_flush_size(store_override: Option<usize>, env: Option<String>) -> usize {
+    if let Some(n) = store_override {
+        return n.max(1);
+    }
+    if let Some(n) = env.and_then(|s| s.parse::<usize>().ok()) {
+        return n.max(1);
+    }
+    DEFAULT_PROJECTION_FLUSH_SIZE
+}
+
 type BoxedPostgresEventHandler<E> = Box<
     dyn for<'a> FnMut(
             &'a mut sqlx::PgConnection,
@@ -81,6 +110,10 @@ pub struct PostgresEventStore {
     /// Builder-fixed, immutable set of inline projections. The `Vec` itself never
     /// changes after `build()`; each projection is individually locked while applied.
     projections: Arc<Vec<RegisteredProjection>>,
+    /// How many appended events may be retained before they are flushed to the
+    /// projections. Bounds the memory a streamed append holds; see
+    /// [`resolve_projection_flush_size`].
+    projection_flush_size: usize,
 }
 
 impl PostgresEventStore {
@@ -88,6 +121,7 @@ impl PostgresEventStore {
         PostgresEventStore {
             pool,
             projections: Arc::new(Vec::new()),
+            projection_flush_size: resolve_projection_flush_size(None),
         }
     }
 
@@ -99,6 +133,7 @@ impl PostgresEventStore {
         PostgresEventStoreBuilder {
             pool,
             projections: Vec::new(),
+            projection_flush_size: None,
         }
     }
 
@@ -234,9 +269,22 @@ impl PostgresEventStore {
 pub struct PostgresEventStoreBuilder {
     pool: Pool<Postgres>,
     projections: Vec<Box<dyn ErasedInlineProjection<Exec = sqlx::PgConnection>>>,
+    projection_flush_size: Option<usize>,
 }
 
 impl PostgresEventStoreBuilder {
+    /// Cap how many appended events are held before being flushed to the registered
+    /// inline projections, inside the append transaction.
+    ///
+    /// Overrides the `REPLAY_PROJECTION_FLUSH_SIZE` env var and the built-in default of
+    /// 500. Values below 1 are clamped to 1, so a flush always makes progress.
+    ///
+    /// Applies to appends only — the history replayed by [`build`](Self::build) on first
+    /// registration or version drift is still loaded and applied in one batch.
+    pub fn projection_flush_size(mut self, events: usize) -> Self {
+        self.projection_flush_size = Some(events);
+        self
+    }
     /// Register a new Postgres inline projection.
     ///
     /// This helper makes the Postgres-specific intent explicit at call sites.
@@ -412,6 +460,7 @@ impl PostgresEventStoreBuilder {
         Ok(PostgresEventStore {
             pool: self.pool,
             projections: Arc::new(registered),
+            projection_flush_size: resolve_projection_flush_size(self.projection_flush_size),
         })
     }
 
@@ -490,10 +539,12 @@ impl EventStore for PostgresEventStore {
         let metadata_json = metadata.to_json();
 
         // Track the appended events so registered inline projections can be applied
-        // inside this same transaction. This is the only buffer in the loop and it is
-        // populated *only* when projections are registered; bulk producers without
-        // projections stream straight through without materialising the batch.
+        // inside this same transaction. The buffer is populated *only* when projections
+        // are registered — bulk producers without projections stream straight through —
+        // and is flushed every `projection_flush_size` events, so peak retention is
+        // O(flush size) rather than O(append size).
         let has_projections = !self.projections.is_empty();
+        let flush_size = self.projection_flush_size;
         let mut appended: Vec<PersistedEvent<Value>> = Vec::new();
         let mut appended_count: usize = 0;
 
@@ -579,13 +630,23 @@ impl EventStore for PostgresEventStore {
                     metadata: metadata.clone(),
                     aggregate_version: None,
                 });
+
+                // Flush on the same transaction, then drop the events. A failure here
+                // aborts the append exactly as an end-of-batch failure would, rolling
+                // back the chunks already applied along with the event rows.
+                if appended.len() >= flush_size {
+                    self.apply_projections(&mut transaction, &appended).await?;
+                    appended.clear();
+                }
             }
 
             appended_count += 1;
         }
 
-        if has_projections {
+        // Whatever the last chunk left over.
+        if has_projections && !appended.is_empty() {
             self.apply_projections(&mut transaction, &appended).await?;
+            appended.clear();
         }
 
         transaction.commit().await.map_err(crate::db_error)?;
@@ -792,6 +853,7 @@ impl Clone for PostgresEventStore {
         Self {
             pool: self.pool.clone(),
             projections: self.projections.clone(),
+            projection_flush_size: self.projection_flush_size,
         }
     }
 }
@@ -840,5 +902,42 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
             metadata,
             aggregate_version,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_flush_size, DEFAULT_PROJECTION_FLUSH_SIZE};
+
+    #[test]
+    fn flush_size_falls_back_to_the_built_in_default() {
+        assert_eq!(
+            resolve_flush_size(None, None),
+            DEFAULT_PROJECTION_FLUSH_SIZE
+        );
+    }
+
+    #[test]
+    fn flush_size_reads_the_env_var_when_there_is_no_store_override() {
+        assert_eq!(resolve_flush_size(None, Some("32".into())), 32);
+    }
+
+    #[test]
+    fn store_override_beats_the_env_var() {
+        assert_eq!(resolve_flush_size(Some(8), Some("32".into())), 8);
+    }
+
+    #[test]
+    fn an_unparseable_env_var_falls_back_to_the_default() {
+        assert_eq!(
+            resolve_flush_size(None, Some("not-a-number".into())),
+            DEFAULT_PROJECTION_FLUSH_SIZE
+        );
+    }
+
+    #[test]
+    fn zero_is_clamped_to_one_so_a_flush_always_makes_progress() {
+        assert_eq!(resolve_flush_size(Some(0), None), 1);
+        assert_eq!(resolve_flush_size(None, Some("0".into())), 1);
     }
 }
