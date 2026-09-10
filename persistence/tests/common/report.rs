@@ -12,7 +12,7 @@
 //! ```
 //!
 //! CI runs the allocation tests with `--nocapture`, collects these lines, and renders
-//! them into the run summary and a pull-request comment. The format is deliberately
+//! them into the run summary. The format is deliberately
 //! flat `key=value` so it survives being grepped out of interleaved test output.
 
 /// Emits one budget line, then returns `measured` so a call reads as a passthrough:

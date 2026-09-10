@@ -33,7 +33,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -59,6 +58,11 @@ jobs:
       # What was measured, against what budget, and how much headroom is left.
       # Headroom is the number worth watching: a budget sitting at 3% is a
       # regression that has not landed yet.
+      #
+      # The table goes to the run summary rather than a pull-request comment:
+      # PRs here come from forks, and a `pull_request` event from a fork gets a
+      # read-only `GITHUB_TOKEN` that no repository setting can elevate on a
+      # public repo. A commenting step would 403 on every real PR.
       - name: Render allocation budgets
         if: always()
         run: |
@@ -96,28 +100,6 @@ jobs:
             fi
           } > alloc-summary.md
           cat alloc-summary.md >> "$GITHUB_STEP_SUMMARY"
-
-      # One comment per pull request, updated in place, so the thread shows the
-      # current numbers rather than a history of every push.
-      - name: Comment on the pull request
-        if: always() && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.number }}
-        run: |
-          MARKER='<!-- allocation-budgets -->'
-          { echo "$MARKER"; cat alloc-summary.md; } > comment.md
-
-          existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
-            --jq "[.[] | select(.body | startswith(\"$MARKER\"))] | .[0].id // empty")
-
-          if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
-              -F body=@comment.md > /dev/null
-          else
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
-              -F body=@comment.md > /dev/null
-          fi
 
       # The table is published either way, then the job takes the suite's verdict.
       - name: Fail if the suite failed
