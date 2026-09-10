@@ -8,7 +8,7 @@
 //! So every budgeted measurement also emits one line on stdout:
 //!
 //! ```text
-//! ALLOC name=read_path_batch metric=bytes_per_payload measured=112 budget=150 unit=percent
+//! ALLOC name=read_path_batch metric=allocated_over_payload measured=106 budget=150 unit=percent
 //! ```
 //!
 //! CI runs the allocation tests with `--nocapture`, collects these lines, and renders
@@ -18,7 +18,7 @@
 /// Emits one budget line, then returns `measured` so a call reads as a passthrough:
 ///
 /// ```ignore
-/// assert!(report("read_path_batch", "bytes_per_payload", pct, 150, "percent") < 150);
+/// assert!(report("read_path_batch", "allocated_over_payload", pct, 150, "percent") < 150);
 /// ```
 ///
 /// Called *before* the assertion, so a failing run still reports the number that
