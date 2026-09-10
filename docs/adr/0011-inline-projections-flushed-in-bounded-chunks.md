@@ -30,7 +30,9 @@ which is not unique, so the paging cannot skip rows.
 One transaction is not by itself one snapshot: at the default READ COMMITTED isolation
 every page query takes a fresh one, so an append committed mid-rebuild would be folded
 into the replay of a history it was never part of. The build transaction therefore runs at
-`REPEATABLE READ`.
+`REPEATABLE READ`. That pins the cut; it does not close it — an event committed past the
+cut is replayed by nobody, which predates this change and is tracked in
+[issue #162](https://github.com/funkode-io/replay/issues/162).
 
 The cost is a contract change — a projection no longer sees an append in one call. We take
 it rather than bound the buffer by bytes or spill to disk, because the events a projection

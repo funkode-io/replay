@@ -353,8 +353,13 @@ impl PostgresEventStoreBuilder {
     /// [`projection_flush_size`](Self::projection_flush_size) events at a time, all inside
     /// the one transaction, so what a rebuild holds scales with the chunk rather than with
     /// the log. That transaction runs at `REPEATABLE READ`, so every page reads the one
-    /// snapshot the build started from; an append committed mid-rebuild is not replayed
-    /// into the view and belongs to whoever reads the store next.
+    /// snapshot the build started from.
+    ///
+    /// **Concurrent appends are not replayed.** An event committed after that snapshot is
+    /// outside the rebuild, and nothing applies it afterwards — inline projections run on
+    /// append and on rebuild only — so the version is recorded with that event missing from
+    /// the view. This predates the chunked replay; see
+    /// [issue #162](https://github.com/funkode-io/replay/issues/162).
     pub async fn build(self) -> Result<PostgresEventStore, replay::Error> {
         // The same tunable that bounds an append's flush bounds a rebuild's replay: both
         // are "events held before they are handed to `handle`", and a deployment that has
@@ -567,7 +572,10 @@ impl PostgresEventStoreBuilder {
 
         query_builder
             .push(" ORDER BY created, version, id ASC LIMIT ")
-            .push_bind(chunk_size as i64);
+            // Saturating rather than `as`: a wrapped cast would send Postgres a negative
+            // LIMIT. Unreachable in practice — no buffer holds `i64::MAX` events — but the
+            // clamp costs nothing and the wrap fails obscurely.
+            .push_bind(i64::try_from(chunk_size).unwrap_or(i64::MAX));
 
         let rows = query_builder
             .build()
