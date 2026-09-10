@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test + allocation budgets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--nocapture` so the budgeted tests' `ALLOC …` lines reach stdout. The
+      # whole suite runs here rather than a named list of allocation tests: a new
+      # budget then reports itself, instead of waiting for someone to remember
+      # this file. `println!` holds the stdout lock, so a line survives parallel
+      # tests intact.
+      #
+      # The Postgres-backed tests start their own containers via testcontainers,
+      # so no service container is declared; ubuntu-latest ships a Docker daemon.
+      - name: cargo test
+        id: test
+        run: |
+          set -o pipefail
+          cargo test --workspace -- --nocapture 2>&1 | tee test-output.txt
+        continue-on-error: true
+
+      # What was measured, against what budget, and how much headroom is left.
+      # Headroom is the number worth watching: a budget sitting at 3% is a
+      # regression that has not landed yet.
+      #
+      # The table goes to the run summary rather than a pull-request comment:
+      # PRs here come from forks, and a `pull_request` event from a fork gets a
+      # read-only `GITHUB_TOKEN` that no repository setting can elevate on a
+      # public repo. A commenting step would 403 on every real PR.
+      - name: Render allocation budgets
+        if: always()
+        run: |
+          grep '^ALLOC ' test-output.txt | sort -u > alloc-lines.txt || true
+          {
+            echo "### Allocation budgets"
+            echo
+            if [ ! -s alloc-lines.txt ]; then
+              echo "No measurements emitted. Either no budgeted test ran, or one"
+              echo "failed before reporting — check the job log."
+            else
+              echo "| Measurement | Metric | Measured | Budget | Headroom |"
+              echo "|---|---|---:|---:|---:|"
+              while read -r line; do
+                # Each line is flat `key=value` pairs: name, metric, measured,
+                # budget, unit. Assigning them directly keeps the renderer honest
+                # about the format the tests actually emit.
+                name=''; metric=''; measured=0; budget=0; unit=''
+                for pair in ${line#ALLOC }; do
+                  case "$pair" in
+                    name=*)     name=${pair#name=} ;;
+                    metric=*)   metric=${pair#metric=} ;;
+                    measured=*) measured=${pair#measured=} ;;
+                    budget=*)   budget=${pair#budget=} ;;
+                    unit=*)     unit=${pair#unit=} ;;
+                  esac
+                done
+                if [ "$budget" -gt 0 ] 2>/dev/null; then
+                  headroom="$(( 100 - (measured * 100 / budget) ))%"
+                else
+                  headroom="n/a"
+                fi
+                echo "| \`$name\` | $metric | $measured $unit | $budget $unit | $headroom |"
+              done < alloc-lines.txt
+            fi
+          } > alloc-summary.md
+          cat alloc-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      # The table is published either way, then the job takes the suite's verdict.
+      - name: Fail if the suite failed
+        if: always() && steps.test.outcome == 'failure'
+        run: |
+          echo "cargo test failed; the allocation table above is still published." >&2
+          exit 1
