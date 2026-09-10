@@ -81,8 +81,17 @@ fn sources() -> Vec<PathBuf> {
     out
 }
 
-/// Counts `fetch_all(` occurrences per file, ignoring comments so that prose about
-/// the rule — including this file's own doc comment — never trips it.
+/// Whether a line calls `fetch_all`, tolerating whitespace before the paren so that
+/// `fetch_all (` is not a way past the guard.
+fn calls_fetch_all(line: &str) -> bool {
+    line.match_indices("fetch_all")
+        .any(|(at, _)| line[at + "fetch_all".len()..].trim_start().starts_with('('))
+}
+
+/// Counts `fetch_all` call sites per file, skipping lines whose first non-whitespace
+/// is `//` so that prose about the rule — including this file's own doc comment —
+/// doesn't trip it. Block comments and trailing `//` are not handled: this is a
+/// review prompt, not a parser.
 fn fetch_all_sites() -> Vec<(String, usize)> {
     sources()
         .into_iter()
@@ -91,7 +100,7 @@ fn fetch_all_sites() -> Vec<(String, usize)> {
             let count = text
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
-                .filter(|line| line.contains("fetch_all("))
+                .filter(|line| calls_fetch_all(line))
                 .count();
 
             if count == 0 {
@@ -119,9 +128,16 @@ fn every_fetch_all_is_reviewed_for_boundedness() {
     for (file, found) in fetch_all_sites() {
         let expected = REVIEWED.iter().filter(|r| r.file == file).count();
 
+        let sites = if found == 1 {
+            "call site"
+        } else {
+            "call sites"
+        };
+        let verb = if expected == 1 { "is" } else { "are" };
+
         assert_eq!(
             found, expected,
-            "\n{file} has {found} `fetch_all` call site(s), but {expected} are reviewed in \
+            "\n{file} has {found} `fetch_all` {sites}, but {expected} {verb} reviewed in \
              persistence/tests/bounded_queries.rs.\n\n\
              If you added one: list it in REVIEWED with the bound that makes it safe — a \
              SQL LIMIT, a fixed set, a chunked loop. If the result set grows with the data, \
