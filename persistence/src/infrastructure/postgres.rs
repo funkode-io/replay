@@ -279,8 +279,8 @@ impl PostgresEventStoreBuilder {
     /// Overrides the `REPLAY_PROJECTION_FLUSH_SIZE` env var and the built-in default of
     /// 500. Values below 1 are clamped to 1, so a flush always makes progress.
     ///
-    /// Applies to appends only — the history replayed by [`build`](Self::build) on first
-    /// registration or version drift is still loaded and applied in one batch.
+    /// The same size bounds the history replayed by [`build`](Self::build) on first
+    /// registration or version drift: it is paged through in chunks of this many events.
     pub fn projection_flush_size(mut self, events: usize) -> Self {
         self.projection_flush_size = Some(events);
         self
@@ -348,8 +348,36 @@ impl PostgresEventStoreBuilder {
     ///
     /// Emits startup logs across the lifecycle (init, drift detection, reset, replay) so
     /// operators can see what happens at startup.
+    ///
+    /// Replay is chunked: the history is paged through
+    /// [`projection_flush_size`](Self::projection_flush_size) events at a time, all inside
+    /// the one transaction, so what a rebuild holds scales with the chunk rather than with
+    /// the log. That transaction runs at `REPEATABLE READ`, so every page reads the one
+    /// snapshot the build started from.
+    ///
+    /// **Concurrent appends are not replayed.** An event committed after that snapshot is
+    /// outside the rebuild, and nothing applies it afterwards — inline projections run on
+    /// append and on rebuild only — so the version is recorded with that event missing from
+    /// the view. This predates the chunked replay; see
+    /// [issue #162](https://github.com/funkode-io/replay/issues/162).
     pub async fn build(self) -> Result<PostgresEventStore, replay::Error> {
+        // The same tunable that bounds an append's flush bounds a rebuild's replay: both
+        // are "events held before they are handed to `handle`", and a deployment that has
+        // sized one has sized the other.
+        let chunk_size = resolve_projection_flush_size(self.projection_flush_size);
+
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+
+        // Pin one snapshot for the whole build. A chunked replay reads the history over
+        // many statements, and the default READ COMMITTED gives each statement a fresh
+        // snapshot — so an append committed mid-rebuild would be folded into the replay of
+        // a history it was never part of, or skipped if its key sorts behind the cursor.
+        // REPEATABLE READ makes every page read the snapshot the replay started from.
+        // Postgres requires this before the transaction's first query.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
 
         let mut registered: Vec<RegisteredProjection> = Vec::with_capacity(self.projections.len());
 
@@ -381,14 +409,13 @@ impl PostgresEventStoreBuilder {
                     // a store that already contains events catches up to the full backlog
                     // (not just events appended after registration). The projection's
                     // stream_filter narrows which events are scanned.
-                    let events =
-                        Self::load_events_for_replay(&mut tx, projection.stream_filter()).await?;
+                    let replayed =
+                        Self::replay_history(&mut tx, &mut *projection, chunk_size).await?;
                     tracing::info!(
                         projection = %name,
-                        events = events.len(),
-                        "inline projection replay: applying history for new projection"
+                        events = replayed,
+                        "inline projection replay: applied history for new projection"
                     );
-                    projection.handle(&mut tx, &events).await?;
 
                     sqlx::query("INSERT INTO projections (name, version) VALUES ($1, $2)")
                         .bind(&name)
@@ -412,17 +439,14 @@ impl PostgresEventStoreBuilder {
                     projection.reset(&mut tx).await?;
 
                     // Replay matching history through the projection. The projection's
-                    // stream_filter narrows which events are scanned. Loaded in one batch
-                    // for now; large histories can be chunked later without changing the
-                    // batch-handling semantics seen by `handle`.
-                    let events =
-                        Self::load_events_for_replay(&mut tx, projection.stream_filter()).await?;
+                    // stream_filter narrows which events are scanned.
+                    let replayed =
+                        Self::replay_history(&mut tx, &mut *projection, chunk_size).await?;
                     tracing::info!(
                         projection = %name,
-                        events = events.len(),
-                        "inline projection replay: applying history"
+                        events = replayed,
+                        "inline projection replay: applied history"
                     );
-                    projection.handle(&mut tx, &events).await?;
 
                     sqlx::query("UPDATE projections SET version = $2 WHERE name = $1")
                         .bind(&name)
@@ -464,20 +488,94 @@ impl PostgresEventStoreBuilder {
         })
     }
 
-    /// Load the events matching `filter` for a projection rebuild, in append order.
+    /// Replay the history matching `projection`'s filter through its `handle`, in chunks
+    /// of at most `chunk_size` events, on the rebuild transaction. Returns how many
+    /// events were replayed.
+    ///
+    /// Peak retention is O(chunk), not O(history): each chunk is loaded, handed over and
+    /// dropped before the next is read. The replay stays inside the caller's transaction,
+    /// which `build` has pinned to `REPEATABLE READ`, so every page reads one snapshot and
+    /// the whole rebuild rolls back as a unit — that is why the chunks are paged with a
+    /// keyset cursor rather than streamed from a second connection, which would leave the
+    /// transaction and read a different snapshot.
+    async fn replay_history(
+        tx: &mut sqlx::PgConnection,
+        projection: &mut dyn ErasedInlineProjection<Exec = sqlx::PgConnection>,
+        chunk_size: usize,
+    ) -> Result<usize, replay::Error> {
+        let filter = projection.stream_filter();
+        let mut cursor: Option<ReplayCursor> = None;
+        let mut replayed = 0usize;
+
+        loop {
+            let events =
+                Self::load_replay_chunk(&mut *tx, filter.clone(), cursor, chunk_size).await?;
+
+            let Some(last) = events.last() else { break };
+
+            cursor = Some(ReplayCursor {
+                created: last.created,
+                version: last.version,
+                id: last.id,
+            });
+
+            let fetched = events.len();
+            replayed += fetched;
+
+            // The page is dropped here, before the next is read: only one chunk is ever
+            // live.
+            projection.handle(&mut *tx, &events).await?;
+            drop(events);
+
+            // A short page is the last one: the cursor has passed the final row.
+            if fetched < chunk_size {
+                break;
+            }
+        }
+
+        Ok(replayed)
+    }
+
+    /// Load one page of at most `chunk_size` events matching `filter`, starting after
+    /// `after`, in replay order.
     ///
     /// Returns JSON-backed [`PersistedEvent`]s; the erased projection routes them to its
     /// typed `handle` by deserialize-or-skip.
-    async fn load_events_for_replay(
+    async fn load_replay_chunk(
         tx: &mut sqlx::PgConnection,
         filter: StreamFilter,
+        after: Option<ReplayCursor>,
+        chunk_size: usize,
     ) -> Result<Vec<PersistedEvent<Value>>, replay::Error> {
         let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
             "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version \
-             FROM events WHERE ",
+             FROM events WHERE (",
         );
         PostgresEventStore::add_filters(&mut query_builder, filter);
-        query_builder.push(" ORDER BY created, version ASC");
+        query_builder.push(")");
+
+        if let Some(ReplayCursor {
+            created,
+            version,
+            id,
+        }) = after
+        {
+            query_builder
+                .push(" AND (created, version, id) > (")
+                .push_bind(created)
+                .push(", ")
+                .push_bind(version)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+
+        query_builder
+            .push(" ORDER BY created, version, id ASC LIMIT ")
+            // Saturating rather than `as`: a wrapped cast would send Postgres a negative
+            // LIMIT. Unreachable in practice — no buffer holds `i64::MAX` events — but the
+            // clamp costs nothing and the wrap fails obscurely.
+            .push_bind(i64::try_from(chunk_size).unwrap_or(i64::MAX));
 
         let rows = query_builder
             .build()
@@ -489,6 +587,20 @@ impl PostgresEventStoreBuilder {
             .map(PersistedEvent::<Value>::try_from)
             .collect()
     }
+}
+
+/// Where a chunked replay left off: the sort key of the last event handed over.
+///
+/// Replay order is `(created, version)`, which is not unique — versions restart per
+/// stream and separate transactions can share a `created` instant — so a `>` cursor on
+/// that pair alone would skip every row after the first of a tied group. `id` breaks the
+/// tie, making the key a total order and the paging lossless, without changing the order
+/// events are replayed in.
+#[derive(Clone, Copy)]
+struct ReplayCursor {
+    created: chrono::DateTime<Utc>,
+    version: i64,
+    id: Uuid,
 }
 
 impl PostgresEventStore {

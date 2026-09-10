@@ -75,12 +75,13 @@ pub trait InlineProjection: Send + Sync {
     /// **A single append may arrive as several calls.** The store bounds how many events
     /// it holds before flushing them here, so an append larger than that bound is
     /// delivered in order across ⌈size / flush⌉ calls — all on the same transaction,
-    /// committing or rolling back together. Do not assume a call carries an append in its
-    /// entirety: state that must span an append belongs in the projection's own fields or
-    /// its view, not in a local of one `handle` call. The events delivered, and their
-    /// order, are otherwise unchanged. See `PostgresEventStoreBuilder::projection_flush_size`
-    /// and ADR-0011. (The history replayed on first registration or version drift is still
-    /// delivered in one call.)
+    /// committing or rolling back together. The history replayed on first registration or
+    /// a version-drift rebuild is delivered the same way, in chunks of the same size, on
+    /// the rebuild transaction. Do not assume a call carries an append in its entirety:
+    /// state that must span an append belongs in the projection's own fields or its view,
+    /// not in a local of one `handle` call. The events delivered, and their order, are
+    /// otherwise unchanged. See `PostgresEventStoreBuilder::projection_flush_size`
+    /// and ADR-0011.
     fn handle(
         &mut self,
         conn: &mut Self::Exec,

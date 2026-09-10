@@ -17,6 +17,23 @@ Peak retention becomes O(N) instead of O(B). Atomicity is untouched: every chunk
 to the transaction the append already owns, so a failure in the last chunk rolls back the
 writes of the first.
 
+The rebuild path — the replay `PostgresEventStoreBuilder::build` runs on first
+registration or version drift — is bounded the same way and by the same `flush_size`. It
+is the worse of the two: an append is bounded by what a caller submits, while a rebuild
+loads *all* matching history, at startup, on the deploy that bumped a projection version.
+Because the replay must stay in the rebuild transaction (one snapshot, one rollback), the
+chunks are paged with a keyset cursor — `WHERE (created, version, id) > (…) ORDER BY
+created, version, id LIMIT N` — rather than read from a row stream, which cannot borrow
+the transaction while `handle` writes to it. `id` breaks ties in `(created, version)`,
+which is not unique, so the paging cannot skip rows.
+
+One transaction is not by itself one snapshot: at the default READ COMMITTED isolation
+every page query takes a fresh one, so an append committed mid-rebuild would be folded
+into the replay of a history it was never part of. The build transaction therefore runs at
+`REPEATABLE READ`. That pins the cut; it does not close it — an event committed past the
+cut is replayed by nobody, which predates this change and is tracked in
+[issue #162](https://github.com/funkode-io/replay/issues/162).
+
 The cost is a contract change — a projection no longer sees an append in one call. We take
 it rather than bound the buffer by bytes or spill to disk, because the events a projection
 receives, and their order, are unchanged, and every in-tree projection already folds per
@@ -33,15 +50,29 @@ event. `flush_size` follows the crate's tunable convention: store override →
 - **Leave it, document the memory cost.** The promise `store_events_stream` makes in its
   own doc comment is bounded memory; a footnote retracting it for anyone with a projection
   is not a fix.
+- **Read the rebuild's history from a second connection.** Lets the row stream be consumed
+  while `handle` writes, but the read then leaves the rebuild's transaction and sees a
+  different snapshot — wrong for a rebuild, which must replay exactly the history its
+  transaction committed against.
+- **A separate tunable for rebuild chunks.** Both are "events held before `handle` sees
+  them"; a second knob would have to be discovered and sized separately to fix the path
+  that fails at startup.
 
 ## Consequences
 
 - A projection that accumulated state in a local of one `handle` call now sees it reset
   per chunk. Such state belongs in the projection's own fields or its view. Documented on
   `InlineProjection::handle` and in the README.
-- **Rebuild replay is not chunked.** `PostgresEventStoreBuilder::build` still loads matching
-  history with one `fetch_all` and calls `handle` once. Same unbounded shape, different path;
-  not addressed here.
+- **A rebuild costs one round trip per chunk.** Keyset paging reissues a bounded query per
+  chunk instead of scanning once, and it reads `(created, version, id)` order, indexed by
+  migration `0013_replay_keyset_index.sql` (which supersedes the `(created, version)` index
+  from `0005`).
+- **A rebuild can now fail on a serialization error.** `REPEATABLE READ` aborts rather
+  than blocks when a concurrent writer touches a row it has written, so two instances
+  rebuilding the same projection at once end with one loud startup failure instead of a
+  silently double-applied view.
+- **Replay order is now fully determined.** Events that tie on `(created, version)` used to
+  arrive in whatever order the scan produced; they now arrive by `id` within the tie.
 - The in-memory store applies projections after a whole append by construction and is
   test-only, so it keeps single-call delivery. A projection written against it and deployed
   on Postgres must not rely on that.
