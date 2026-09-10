@@ -48,62 +48,35 @@ or before any PR exists for it.
 
 ## Bounded memory: no unbounded collections in library code
 
-This library streams. A caller may hand us a `Vec` and a caller may ask for one back —
-that is their memory. But **inside** the library, no buffer may grow with the size of
-the data it is reading or writing.
+A caller's `Vec` is the caller's memory. **Inside** the library, no buffer may grow
+with the size of the data it reads or writes. Every internal path must be:
 
-Every internal path must be one of:
+- **streamed** — `TryStream`, fold as you go (`stream_events`, `fetch_aggregate_at`,
+  `Cqrs::execute`, `compact`);
+- **limited** — SQL carrying a `LIMIT` bound by a tunable (`read_feed`);
+- **chunked** — a buffer of fixed maximum, flushed and cleared
+  (`store_events_stream`'s projection flush, bounded by `projection_flush_size`).
 
-- **streamed** — `.fetch()`, `TryStream`, fold as you go (`stream_events`,
-  `fetch_aggregate_at`, `Cqrs::execute`, `compact`);
-- **limited** — the SQL carries a `LIMIT` bound by a tunable (`read_feed`);
-- **chunked** — a buffer of a fixed maximum, flushed and cleared
-  (`store_events_stream`'s projection flush).
+"Small in practice" is not a bound. A bound is a number in the code.
 
-"Small in practice" is not a bound. Neither is "our biggest customer only has a
-thousand". A bound is a number in the code.
+This is a rule, not a preference: a `Vec<PersistedEvent>` in `store_events_stream` that
+grew with the append put 769 MB on a consuming service's heap and OOM-killed it roughly
+every nine minutes (#146). ADR-0005 scoped "stream-first" to the command → store write
+path; the inline-projection paths were written later and nobody asked whether the rule
+applied. It did — the rule is the whole library.
 
-### Why this is a rule and not a preference
+When reviewing `es/` or `persistence/`, treat these as violations of a documented
+standard, not style notes:
 
-It has already cost a production outage. A `Vec<PersistedEvent>` in
-`store_events_stream` that grew with the append put 769 MB on the heap of a consuming
-service and OOM-killed it roughly every nine minutes (funkode-io/replay#146, symbolized
-against the unstripped binary). The buffer was three lines and looked harmless.
+- `fetch_all`, `collect::<Vec<_>>()` or `try_collect()` whose length comes from the data;
+- a `Vec` accumulating in a loop over a stream without a flush;
+- a new internal seam taking `&[T]` or returning `Vec<T>` sized by the data — ask whether
+  it should stream, as `Compactable::compacted_events` does;
+- a doc comment promising bounded memory over code that buffers.
 
-ADR-0005 decided "stream-first" but scoped it to the command → store write path. The
-inline-projection paths were written later, against a batch-shaped
-`InlineProjection::handle(&[PersistedEvent])`, and nobody asked whether the rule
-applied to them. It did. **The rule is the whole library, not the path the ADR that
-coined it happened to be about.**
-
-### What enforces it
-
-- `persistence/tests/bounded_queries.rs` — every `fetch_all` in `persistence/src` must
-  be listed with the bound that makes it safe. A new one fails the build until its
-  author writes that sentence. It is a review prompt, not a proof: it cannot tell a
-  bounded query from an unbounded one, only whether the question was asked.
-- The allocation-budget tests (`*_allocations.rs`) pin specific paths, in bytes, and
-  CI publishes the measurements on every pull request.
-
-Both are point defences. Neither can see a new path that allocates in a new way, which
-is why this section exists.
-
-### Reviewing for it
-
-When reviewing a change to `es/` or `persistence/`, treat these as findings against a
-documented standard, not as style notes:
-
-- `fetch_all`, `collect::<Vec<_>>()`, or `try_collect()` over a query or a stream whose
-  length comes from the data;
-- a `Vec` that accumulates inside a loop over a stream without a flush;
-- a new trait method taking `&[T]` or returning `Vec<T>` on an internal seam, where the
-  slice's length is the size of the data — ask whether it should take a stream, as
-  `Compactable::compacted_events` does;
-- a doc comment promising bounded memory ("never has to live fully in memory") where the
-  code beneath it buffers.
-
-And when the answer is a deliberate bounded buffer, say what bounds it — in the code, in
-a comment, or in the allowlist.
+When a buffer is a deliberate bounded one, say what bounds it, in the code. The
+allocation-budget tests (`*_allocations.rs`) pin specific paths in bytes, but they are a
+point defence: they cannot see a new path, which is why this section exists.
 
 ## Agent skills
 
