@@ -46,6 +46,38 @@ Rules while a PR is under review:
 The only time history may be rewritten is before a branch has ever been pushed
 or before any PR exists for it.
 
+## Bounded memory: no unbounded collections in library code
+
+A caller's `Vec` is the caller's memory. **Inside** the library, no buffer may grow
+with the size of the data it reads or writes. Every internal path must be:
+
+- **streamed** — `TryStream`, fold as you go (`stream_events`, `fetch_aggregate_at`,
+  `Cqrs::execute`, `compact`);
+- **limited** — SQL carrying a `LIMIT` bound by a tunable (`read_feed`);
+- **chunked** — a buffer of fixed maximum, flushed and cleared
+  (`store_events_stream`'s projection flush, bounded by `projection_flush_size`).
+
+"Small in practice" is not a bound. A bound is a number in the code.
+
+This is a rule, not a preference: a `Vec<PersistedEvent>` in `store_events_stream` that
+grew with the append put 769 MB on a consuming service's heap and OOM-killed it roughly
+every nine minutes (#146). ADR-0005 scoped "stream-first" to the command → store write
+path; the inline-projection paths were written later and nobody asked whether the rule
+applied. It did — the rule is the whole library.
+
+When reviewing `es/` or `persistence/`, treat these as violations of a documented
+standard, not style notes:
+
+- `fetch_all`, `collect::<Vec<_>>()` or `try_collect()` whose length comes from the data;
+- a `Vec` accumulating in a loop over a stream without a flush;
+- a new internal seam taking `&[T]` or returning `Vec<T>` sized by the data — ask whether
+  it should stream, as `Compactable::compacted_events` does;
+- a doc comment promising bounded memory over code that buffers.
+
+When a buffer is a deliberate bounded one, say what bounds it, in the code. The
+allocation-budget tests (`*_allocations.rs`) pin specific paths in bytes, but they are a
+point defence: they cannot see a new path, which is why this section exists.
+
 ## Agent skills
 
 The skills themselves are vendored in `.github/skills/` so they travel with the repo
