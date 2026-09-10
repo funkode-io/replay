@@ -97,6 +97,20 @@ _controlling_ a Policy (acting on its failures by [Retry] or [Discard] of a
 [Dead letter]).
 _Avoid_: state, policy state, health check.
 
+### Scoped URN
+
+A stream identifier carrying its owner as a suffix:
+`urn:bank-account:acct-1@branch:london`. The embedded URN is the **scope**, the
+part before the `@` the **base**. Composed with `at`, taken apart with
+`extract_scope` (the scope) and `unscoped` (the base). Scopes nest —
+`urn:watchlist:main@user:0x78@wallet-type:evm` — and `extract_scope` peels one
+level at a time. `at` refuses to scope an already-scoped URN, which is what makes
+the left-most `@` the outermost scope
+([ADR-0010](docs/adr/0010-nested-scoped-urns-parse-at-the-first-at-sign.md)). It
+is an identity, not a [Query]: the event store treats the whole string as an
+opaque stream id.
+_Avoid_: qualified URN, namespaced URN, parent/child URN, compound key.
+
 ### Query
 
 The existing on-demand, in-memory fold over filtered events. It is the
@@ -138,6 +152,7 @@ would need to honour the WASM dual-cfg pattern.
 [Rebuild]: #rebuild
 [Policy status]: #policy-status
 [Query]: #query
+[Scoped URN]: #scoped-urn
 [Live projection]: #live-projection
 [Inline projection]: #inline-projection
 [Async projection]: #async-projection

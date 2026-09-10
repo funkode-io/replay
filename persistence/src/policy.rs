@@ -10,6 +10,8 @@
 
 use std::any::{Any, TypeId};
 
+use serde::Deserialize;
+
 use replay::{Aggregate, Event, Metadata};
 
 use crate::{PersistedEvent, StreamFilter};
@@ -210,12 +212,187 @@ impl<P: Policy> ErasedPolicy for P {
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {
         // Deserialize-or-skip: events whose payload isn't this policy's Event
         // type simply produce no reaction.
-        match serde_json::from_value::<P::Event>(raw.data.clone()) {
+        //
+        // Read by borrow — `&serde_json::Value` is itself a `Deserializer`, so a
+        // non-matching payload still yields a recoverable `Err` without the feed
+        // paying a deep copy of every event it offers. The envelope is re-made
+        // from the borrowed event rather than cloned, which would drag the JSON
+        // payload along with it.
+        match P::Event::deserialize(&raw.data) {
             Ok(event) => {
-                let typed = raw.clone().with_data(event);
+                let typed = raw.with_data_from(event);
                 self.react(&typed)
             }
             Err(_) => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use serde::{Deserialize, Serialize};
+    use serde_json::json;
+    use urn::{Urn, UrnBuilder};
+    use uuid::Uuid;
+
+    use replay::{Metadata, WithId};
+    use replay_macros::Event;
+
+    use super::*;
+
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    enum AccountEvent {
+        Frozen { reason: String },
+    }
+
+    /// An unrelated event type: no `AccountEvent` payload deserializes into it.
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Event)]
+    enum ShippingEvent {
+        Shipped { tracking: String },
+    }
+
+    #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+    struct AccountUrn(Urn);
+
+    impl From<AccountUrn> for Urn {
+        fn from(urn: AccountUrn) -> Self {
+            urn.0
+        }
+    }
+
+    impl TryFrom<Urn> for AccountUrn {
+        type Error = String;
+
+        fn try_from(urn: Urn) -> Result<Self, Self::Error> {
+            Ok(AccountUrn(urn))
+        }
+    }
+
+    struct Account {
+        id: AccountUrn,
+    }
+
+    impl WithId for Account {
+        type StreamId = AccountUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            Account { id }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
+    impl replay::EventStream for Account {
+        type Event = AccountEvent;
+
+        fn stream_type() -> String {
+            "Account".to_string()
+        }
+
+        fn apply(&mut self, _event: Self::Event) {}
+    }
+
+    impl Aggregate for Account {
+        type Command = String;
+        type Error = replay::Error;
+        type Services = ();
+
+        async fn handle(
+            &self,
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> Result<Vec<Self::Event>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
+    /// Reacts to every event it is given, echoing the reason it received so the
+    /// test can prove the envelope reached `react` intact.
+    struct FreezeNotifier;
+
+    impl Policy for FreezeNotifier {
+        type Event = AccountEvent;
+
+        fn name(&self) -> &str {
+            "freeze_notifier"
+        }
+
+        fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+            let AccountEvent::Frozen { reason } = &event.data;
+            vec![Dispatch::to::<Account>(
+                AccountUrn(event.stream_id.clone()),
+                reason.clone(),
+            )]
+        }
+    }
+
+    /// A policy over an unrelated event type; the router must never call `react`.
+    struct ShippingNotifier;
+
+    impl Policy for ShippingNotifier {
+        type Event = ShippingEvent;
+
+        fn name(&self) -> &str {
+            "shipping_notifier"
+        }
+
+        fn react(&self, _event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+            panic!("react must not be called for a non-matching payload");
+        }
+    }
+
+    fn raw_frozen() -> PersistedEvent<serde_json::Value> {
+        PersistedEvent {
+            id: Uuid::new_v4(),
+            data: json!({ "Frozen": { "reason": "fraud-review" } }),
+            stream_id: UrnBuilder::new("account", "42").build().unwrap(),
+            r#type: "Frozen".to_string(),
+            version: 7,
+            created: Utc::now(),
+            metadata: Metadata::from_json(json!({ "correlation": "c-1" })),
+            aggregate_version: None,
+        }
+    }
+
+    /// A payload of the policy's own event type reaches `react`, with the
+    /// envelope (identity, position, metadata) carried across the erasure intact.
+    #[test]
+    fn reacts_to_a_matching_payload_preserving_the_envelope() {
+        let raw = raw_frozen();
+
+        let dispatches = FreezeNotifier.react_erased(&raw);
+
+        assert_eq!(
+            dispatches.len(),
+            1,
+            "matching payload must produce one command"
+        );
+        assert_eq!(dispatches[0].target(), TypeId::of::<Account>());
+
+        // The command was built from the deserialized payload and the borrowed
+        // envelope's stream id, so both survived the erasure.
+        let (id, command) = dispatches[0]
+            .payload
+            .downcast_ref::<(AccountUrn, String)>()
+            .expect("dispatch must carry the aggregate's (id, command) pair");
+        assert_eq!(id.0, raw.stream_id);
+        assert_eq!(command, "fraud-review");
+    }
+
+    /// A payload that isn't this policy's event type is skipped: no reaction, and
+    /// `react` is never called.
+    #[test]
+    fn skips_a_non_matching_payload() {
+        let raw = raw_frozen();
+
+        let dispatches = ShippingNotifier.react_erased(&raw);
+
+        assert!(
+            dispatches.is_empty(),
+            "a non-matching payload must produce no reaction"
+        );
     }
 }
