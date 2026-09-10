@@ -352,7 +352,9 @@ impl PostgresEventStoreBuilder {
     /// Replay is chunked: the history is paged through
     /// [`projection_flush_size`](Self::projection_flush_size) events at a time, all inside
     /// the one transaction, so what a rebuild holds scales with the chunk rather than with
-    /// the log.
+    /// the log. That transaction runs at `REPEATABLE READ`, so every page reads the one
+    /// snapshot the build started from; an append committed mid-rebuild is not replayed
+    /// into the view and belongs to whoever reads the store next.
     pub async fn build(self) -> Result<PostgresEventStore, replay::Error> {
         // The same tunable that bounds an append's flush bounds a rebuild's replay: both
         // are "events held before they are handed to `handle`", and a deployment that has
@@ -360,6 +362,17 @@ impl PostgresEventStoreBuilder {
         let chunk_size = resolve_projection_flush_size(self.projection_flush_size);
 
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+
+        // Pin one snapshot for the whole build. A chunked replay reads the history over
+        // many statements, and the default READ COMMITTED gives each statement a fresh
+        // snapshot — so an append committed mid-rebuild would be folded into the replay of
+        // a history it was never part of, or skipped if its key sorts behind the cursor.
+        // REPEATABLE READ makes every page read the snapshot the replay started from.
+        // Postgres requires this before the transaction's first query.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
 
         let mut registered: Vec<RegisteredProjection> = Vec::with_capacity(self.projections.len());
 
@@ -476,9 +489,10 @@ impl PostgresEventStoreBuilder {
     ///
     /// Peak retention is O(chunk), not O(history): each chunk is loaded, handed over and
     /// dropped before the next is read. The replay stays inside the caller's transaction,
-    /// so it reads one snapshot and rolls back as a unit — that is why the chunks are
-    /// paged with a keyset cursor rather than streamed from a second connection, which
-    /// would leave the transaction and read a different snapshot.
+    /// which `build` has pinned to `REPEATABLE READ`, so every page reads one snapshot and
+    /// the whole rebuild rolls back as a unit — that is why the chunks are paged with a
+    /// keyset cursor rather than streamed from a second connection, which would leave the
+    /// transaction and read a different snapshot.
     async fn replay_history(
         tx: &mut sqlx::PgConnection,
         projection: &mut dyn ErasedInlineProjection<Exec = sqlx::PgConnection>,

@@ -345,6 +345,99 @@ async fn replay_keeps_events_that_share_created_and_version_postgres_test() {
     );
 }
 
+/// A projection that appends — and commits — a new event from a **separate** connection
+/// the first time it is handed a chunk, i.e. between two pages of the replay.
+struct AppendsBetweenPagesProjection {
+    pool: PgPool,
+    log: CallLog,
+    appended: bool,
+}
+
+impl InlineProjection for AppendsBetweenPagesProjection {
+    type Exec = sqlx::PgConnection;
+    type Event = LedgerEvent;
+
+    fn name(&self) -> &str {
+        "rebuild_appends_between_pages_projection"
+    }
+
+    fn version(&self) -> i32 {
+        1
+    }
+
+    async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        _conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> Result<(), replay::Error> {
+        let batch = events
+            .iter()
+            .map(|e| match &e.data {
+                LedgerEvent::Added { amount } => *amount,
+            })
+            .collect();
+        self.log.batches.lock().unwrap().push(batch);
+
+        if !self.appended {
+            self.appended = true;
+            // Committed on its own connection, so it is visible to any later snapshot.
+            seed_history(&self.pool, "interloper", 1).await;
+        }
+
+        Ok(())
+    }
+}
+
+/// A replay must read one snapshot, not one per page. The rebuild transaction is the
+/// unit of atomicity, but on its own that only bounds what it *writes* — under the
+/// default READ COMMITTED isolation every page query takes a fresh snapshot, so an
+/// append committed mid-rebuild would be picked up by a later page and folded into a
+/// replay of history it was never part of.
+#[tokio::test]
+async fn replay_does_not_see_events_committed_between_pages_postgres_test() {
+    const HISTORY: usize = 20;
+    const FLUSH: usize = 5;
+
+    let (pool, _container) = start_postgres().await;
+    seed_history(&pool, "rebuild-snapshot-1", HISTORY).await;
+
+    let log = CallLog::default();
+    let _store = replay_persistence::PostgresEventStore::builder(pool.clone())
+        .projection_flush_size(FLUSH)
+        .register(AppendsBetweenPagesProjection {
+            pool: pool.clone(),
+            log: log.clone(),
+            appended: false,
+        })
+        .build()
+        .await
+        .expect("build store");
+
+    // The interloper is appended after the replay starts, so its `created` sorts past
+    // every page's cursor: a per-statement snapshot would hand it to the last page.
+    assert_eq!(
+        log.all_amounts(),
+        (0..HISTORY).map(|i| i as f64).collect::<Vec<_>>(),
+        "the replay must see the history its transaction started with, and nothing else"
+    );
+
+    // It is still in the log, for whoever reads the store next.
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(&pool)
+        .await
+        .expect("counting events must succeed");
+
+    assert_eq!(
+        stored,
+        HISTORY as i64 + 1,
+        "the concurrent append itself must have committed"
+    );
+}
+
 /// A projection that writes each replayed event to its own table and then fails, once
 /// it has seen more than `fail_after` events — i.e. part-way through a later chunk.
 struct FailsPartWayProjection {
