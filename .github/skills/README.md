@@ -29,6 +29,7 @@ These skills read their per-repo configuration from `docs/agents/`:
 - `docs/agents/issue-tracker.md` — issues live on `funkode-io/replay`
 - `docs/agents/triage-labels.md` — the triage label vocabulary
 - `docs/agents/domain.md` — `CONTEXT.md` and `docs/adr/` layout
+- `docs/agents/release.md` — version policy, publish order and the pre-flight gate
 
 ## Updating
 
