@@ -32,6 +32,7 @@ use urn::{Urn, UrnBuilder};
 
 mod common;
 use common::alloc::{allocated_bytes, CountingAllocator};
+use common::report::report;
 
 /// Every test binary registers its own global allocator; the counting itself is
 /// shared (`tests/common/alloc.rs`).
@@ -215,6 +216,13 @@ fn routing_through_many_inline_projections_allocates_about_one_payload() {
     let overhead = with_inline_projections.saturating_sub(baseline);
     let budget = payload / 10;
 
+    report(
+        "inline_projection_routing",
+        "overhead_over_baseline",
+        overhead as i128,
+        budget as i128,
+        "bytes",
+    );
     assert!(
         overhead < budget,
         "routing {BATCH} events ({payload} B of payload) through {INLINE_PROJECTIONS} inline \

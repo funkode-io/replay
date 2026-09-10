@@ -21,6 +21,7 @@ use replay_persistence::PersistedEvent;
 
 mod common;
 use common::alloc::{allocated_bytes, CountingAllocator};
+use common::report::report;
 
 /// Every test binary registers its own global allocator; the counting itself is
 /// shared (`tests/common/alloc.rs`).
@@ -145,6 +146,13 @@ async fn reading_a_batch_of_events_allocates_once_per_payload() {
     // 1× the payload, not 2×: a deep copy of the decoded document (the old
     // `data_raw.clone()`) would push this to ~200%.
     let percent_of_payload = read_bytes * 100 / payload_bytes;
+    report(
+        "read_path_batch",
+        "allocated_over_payload",
+        percent_of_payload as i128,
+        150,
+        "percent",
+    );
     assert!(
         percent_of_payload < 150,
         "reading {EVENTS} events allocated {read_bytes} bytes, {percent_of_payload}% of the \
