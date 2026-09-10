@@ -231,9 +231,9 @@ async fn append_smaller_than_the_chunk_arrives_in_one_call_postgres_test() {
     assert_eq!(log.batch_sizes(), vec![3]);
 }
 
-/// An inline projection that writes every event to its own table, then fails once it
-/// has seen `fail_after`
-/// events — i.e. part-way through a later chunk, after earlier chunks have written.
+/// An inline projection that writes every event to its own table, then fails on the
+/// first event *after* the `fail_after`-th — i.e. part-way through a later chunk, after
+/// earlier chunks have written.
 struct FailsPartWayProjection {
     seen: usize,
     fail_after: usize,
@@ -335,10 +335,10 @@ async fn failure_in_a_later_chunk_rolls_back_earlier_chunks_postgres_test() {
     // The point of the test: chunks 1 and 2 committed writes to the transaction
     // before chunk 3 failed. Without chunking there is only ever one call and the
     // assertions below hold vacuously.
+    let calls_made = *calls.lock().unwrap();
     assert!(
-        *calls.lock().unwrap() >= 2,
-        "the failure must land after earlier chunks had already written, got {} call(s)",
-        calls.lock().unwrap()
+        calls_made >= 2,
+        "the failure must land after earlier chunks had already written, got {calls_made} call(s)"
     );
 
     let projection_rows: i64 =

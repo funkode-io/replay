@@ -33,6 +33,9 @@ thread_local! {
 /// ```
 pub struct CountingAllocator;
 
+/// Records a successful allocation. Called only after the underlying allocator has
+/// returned a non-null pointer, so a failed allocation never skews the counters.
+///
 /// Const-initialized `Cell` with no destructor, so recording from inside `alloc`
 /// neither allocates nor recurses.
 fn record(bytes: usize) {
@@ -56,8 +59,11 @@ fn release(bytes: usize) {
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        record(layout.size());
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            record(layout.size());
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -66,17 +72,25 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if new_size >= layout.size() {
-            record(new_size - layout.size());
-        } else {
-            release(layout.size() - new_size);
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        // A failed `realloc` leaves the original block untouched, so the counters must
+        // not move either.
+        if !new_ptr.is_null() {
+            if new_size >= layout.size() {
+                record(new_size - layout.size());
+            } else {
+                release(layout.size() - new_size);
+            }
         }
-        unsafe { System.realloc(ptr, layout, new_size) }
+        new_ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        record(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            record(layout.size());
+        }
+        ptr
     }
 }
 
