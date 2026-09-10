@@ -100,3 +100,8 @@ The default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`,
 
 Single-context: one `CONTEXT.md` and one `docs/adr/` at the repo root, shared by all
 workspace crates. See `docs/agents/domain.md`.
+
+### Releases
+
+The upstream slug, the version policy, the four `Cargo.toml`s carrying the version, the
+ordered `cargo publish` set and the pre-flight gate. See `docs/agents/release.md`.
