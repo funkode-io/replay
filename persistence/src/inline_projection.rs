@@ -71,6 +71,16 @@ pub trait InlineProjection: Send + Sync {
     /// failed to deserialize into [`Event`](Self::Event) are filtered out before this is
     /// called) and is never empty. Writes go through `conn`, which is the store's active
     /// transaction, so they commit atomically with the appended events.
+    ///
+    /// **A single append may arrive as several calls.** The store bounds how many events
+    /// it holds before flushing them here, so an append larger than that bound is
+    /// delivered in order across ⌈size / flush⌉ calls — all on the same transaction,
+    /// committing or rolling back together. Do not assume a call carries an append in its
+    /// entirety: state that must span an append belongs in the projection's own fields or
+    /// its view, not in a local of one `handle` call. The events delivered, and their
+    /// order, are otherwise unchanged. See `PostgresEventStoreBuilder::projection_flush_size`
+    /// and ADR-0011. (The history replayed on first registration or version drift is still
+    /// delivered in one call.)
     fn handle(
         &mut self,
         conn: &mut Self::Exec,
