@@ -1,13 +1,9 @@
 -- Indexes supporting inline-projection rebuild (replay) and the general event query API.
 --
 -- Both `PostgresEventStore::stream_events` and the projection drift-rebuild replay
--- (`PostgresEventStoreBuilder::replay_history`) read events with:
+-- (`load_events_for_replay`) read events with:
 --
 --   SELECT ... FROM events WHERE <filter> ORDER BY created, version ASC
---
--- The rebuild replay pages through that order with a keyset cursor, adding `id` as a
--- tie-break: `WHERE (created, version, id) > (...) ORDER BY created, version, id LIMIT N`.
--- This index is the leading prefix of that key, so it still seeks each page directly.
 --
 -- 1. events(created, version)
 --    Supports the ORDER BY for replays that scan a broad slice of history
