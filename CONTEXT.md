@@ -43,6 +43,16 @@ effects when it processes an event, it cannot be safely rebuilt by replaying
 history the way a versioned [Projection] can. (Planned; not yet implemented.)
 _Avoid_: reactor, saga, process manager, automation, trigger, reaction.
 
+### Policy feed
+
+The slice of the event log one [Policy] reads on a poll: every `global_position`
+past its cursor, up to its read batch size, **before** its `stream_filter` is
+applied. Contiguity is decided on those unfiltered positions; an excluded position
+advances the cursor and fires nothing, like a compaction snapshot
+([ADR-0012](docs/adr/0012-policy-feed-contiguity-on-unfiltered-positions.md)). A
+`stream_filter` decides what a Policy *reacts to*, never how far it *gets*.
+_Avoid_: subscription, stream, queue, backlog.
+
 ### Causation
 
 The link from the event that triggered a [Policy] to the command and resulting
@@ -170,6 +180,7 @@ would need to honour the WASM dual-cfg pattern.
 
 [Aggregate]: #aggregate
 [Policy]: #policy
+[Policy feed]: #policy-feed
 [Dead letter]: #dead-letter
 [Retry]: #retry
 [Discard]: #discard

@@ -35,7 +35,9 @@ const REVIEWED: &[Reviewed] = &[
         file: "src/policy_runner.rs",
         function: "read_feed",
         justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
-                        (default 100). Bounded by the tunable, not by the feed.",
+                        (default 100). Bounded by the tunable, not by the feed — nor by \
+                        the policy's stream filter, which now selects what is delivered \
+                        from the window rather than what is read (ADR-0012).",
     },
     Reviewed {
         file: "src/policy_runner.rs",

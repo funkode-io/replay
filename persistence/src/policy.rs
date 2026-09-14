@@ -107,6 +107,10 @@ pub trait Policy: Send + Sync {
 
     /// Narrows the feed to the streams this policy cares about. Defaults to the
     /// whole log.
+    ///
+    /// Decides what the policy reacts to, not how far its cursor gets: excluded
+    /// positions still advance it (ADR-0012), so a selective filter spends its read
+    /// batch on positions rather than on matches.
     fn stream_filter(&self) -> StreamFilter {
         StreamFilter::all()
     }
