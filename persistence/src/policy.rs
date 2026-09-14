@@ -108,12 +108,9 @@ pub trait Policy: Send + Sync {
     /// Narrows the feed to the streams this policy cares about. Defaults to the
     /// whole log.
     ///
-    /// The filter decides what the policy **reacts to**, not how far its cursor
-    /// gets: the runner walks every position past the cursor and skips the ones
-    /// this filter excludes, exactly as it skips a compaction snapshot. A highly
-    /// selective filter therefore spends its read batch on positions rather than
-    /// on matches, and may take several polls to reach its next event — see
-    /// ADR-0012.
+    /// Decides what the policy reacts to, not how far its cursor gets: excluded
+    /// positions still advance it (ADR-0012), so a selective filter spends its read
+    /// batch on positions rather than on matches.
     fn stream_filter(&self) -> StreamFilter {
         StreamFilter::all()
     }

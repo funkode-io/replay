@@ -2288,17 +2288,17 @@ struct ChargeFeeWithCausationPolicy {
     fee: f64,
 }
 
-/// Same reaction as [`ChargeFeeWithCausationPolicy`], but replaying from the
-/// beginning of the log through a filter narrower than `all()` — the shape that
-/// used to wedge a policy on its very first poll (funkode-io/replay#166).
+/// Same reaction as [`ChargeFeeWithCausationPolicy`], from the beginning of the log
+/// through a filter narrower than `all()` — the shape that used to wedge a policy on
+/// its first poll (funkode-io/replay#166).
 struct WatchedAccountFeePolicy {
     watched: BankAccountUrn,
     target: IdempotentFeeAccountUrn,
     fee: f64,
 }
 
-/// A policy filtering on a column that is NULL for every live event: read as a
-/// `WHERE` predicate that is "no match", but read as a value it is SQL NULL.
+/// A policy filtering on a column that is NULL for every live event: as a `WHERE`
+/// predicate that is "no match", as a value it is NULL.
 struct ArchivedOnlyPolicy;
 
 impl replay_persistence::Policy for WithdrawFeePolicy {
@@ -2617,13 +2617,12 @@ async fn withdraw_fee_policy_drain_postgres_test() {
     assert_eq!(cursor_after, 2);
 }
 
-/// A policy whose `stream_filter` is narrower than `all()` must receive every
-/// event it asked for, even when the log interleaves them with events it did not.
+/// A `stream_filter` narrower than `all()` must still receive every event it asked
+/// for when the log interleaves them with events it did not.
 ///
-/// The feed used to apply the filter in SQL and then check the *filtered* rows for
-/// contiguity, so the first event on a non-matching stream was indistinguishable
-/// from a hole in the log and the policy stopped in front of it — on its first poll,
-/// permanently, with no error and no log line (funkode-io/replay#166).
+/// The feed used to check the *filtered* rows for contiguity, so the first event on a
+/// non-matching stream was indistinguishable from a hole and the policy stopped in
+/// front of it, silently (funkode-io/replay#166).
 #[tokio::test]
 async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
     let container = postgres::Postgres::default().start().await.unwrap();
@@ -2646,8 +2645,8 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
     let ignored = BankAccountUrn::new("filtered-ignored-1").unwrap();
     let target = IdempotentFeeAccountUrn::new("filtered-fees-1").unwrap();
 
-    // Position 1: an event on a stream the filter excludes — under the old feed
-    // this alone was enough to wedge the policy before it ever reacted.
+    // Position 1: an event on a stream the filter excludes — enough, on its own, to
+    // wedge the policy under the old feed.
     cqrs.execute::<IdempotentFeeAccount>(
         &target,
         replay::Metadata::default(),
@@ -2658,8 +2657,7 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
     .await
     .unwrap();
 
-    // Positions 2..5: the watched account's deposits interleaved with another
-    // account's, so matching and non-matching events alternate in global order.
+    // Positions 2..5: matching and non-matching deposits, interleaved.
     for (account, amount) in [
         (&ignored, 10.0),
         (&watched, 20.0),
@@ -2701,9 +2699,7 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
         .unwrap();
     assert_eq!(fees.balance, 90.0, "two fees of 5.0 must have been charged");
 
-    // The cursor advanced past the non-matching events too: it sits at the last
-    // position read (5), not at the last position delivered (5 happens to be a
-    // watched deposit, so read on: the second drain proves the rest).
+    // The cursor walked over the non-matching events too.
     let cursor: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
         .bind("watched_account_fee_policy")
         .fetch_one(&pg_pool)
@@ -2711,9 +2707,9 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
         .expect("cursor row must exist after drain");
     assert_eq!(cursor, 5);
 
-    // The two fee events the reactions appended (positions 6 and 7) are on a
-    // stream the filter excludes: the second drain fires nothing and still walks
-    // the cursor over them, so the policy is not parked in front of its own output.
+    // The fee events the reactions appended (6 and 7) are on an excluded stream: the
+    // second drain fires nothing and still walks past them, so the policy is not
+    // parked in front of its own output.
     let head: i64 = sqlx::query_scalar("SELECT MAX(global_position) FROM events")
         .fetch_one(&pg_pool)
         .await
@@ -2731,10 +2727,9 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
     assert_eq!(cursor_after, head);
 }
 
-/// A filter is a `WHERE` predicate, where SQL NULL and FALSE both mean "no match".
-/// The feed reads it as a value instead, and a value can be NULL — `aggregate_version
-/// = 1` is NULL for every live event. Collapsing that to "no match" is the feed's
-/// job; getting it wrong fails the read rather than skipping the row.
+/// The feed reads the filter as a value, and a value can be NULL — `aggregate_version
+/// = 1` is NULL for every live event. Collapsing that to "no match" is the feed's job;
+/// getting it wrong fails the read rather than skipping the row.
 #[tokio::test]
 async fn policy_filter_that_is_null_per_row_skips_and_advances_postgres_test() {
     let container = postgres::Postgres::default().start().await.unwrap();

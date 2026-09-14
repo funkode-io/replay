@@ -1166,19 +1166,12 @@ async fn load_event_by_id(
 
 /// Read the window of positions past `cursor` the policy may advance over.
 ///
-/// The window is read **unfiltered** — every `global_position > cursor`, up to
-/// `limit` of them — because contiguity is a property of the global position
-/// stream, not of the rows a policy asked for. `filter` is evaluated per row as
-/// `matches_filter` and decides only whether the event is delivered; a row it
-/// excludes still advances the cursor, exactly like a synthetic compaction
-/// snapshot (`compacted_snapshot = TRUE`, ADR-0004). Filtering the window itself
-/// would make the first non-matching event indistinguishable from a hole and wedge
-/// every policy whose filter is narrower than `all()`.
-///
-/// How far the cursor may then advance is [`feed_from_window`]'s decision: the
-/// window is truncated at the first hole, because BIGSERIAL positions are assigned
-/// at INSERT and become visible at COMMIT, so a higher position can appear before a
-/// lower one fills in.
+/// Unfiltered — every `global_position > cursor`, up to `limit` — because contiguity
+/// belongs to the position stream, not to the rows the policy asked for (ADR-0012).
+/// `filter` is evaluated per row as `matches_filter` and decides delivery only; an
+/// excluded row advances the cursor like a compaction snapshot
+/// (`compacted_snapshot = TRUE`, ADR-0004). [`feed_from_window`] then truncates the
+/// window at the first hole.
 async fn read_feed(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
@@ -1189,8 +1182,7 @@ async fn read_feed(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
          global_position, compacted_snapshot, COALESCE((",
     );
-    // A filter is a WHERE predicate, where SQL NULL and FALSE both mean "no
-    // match"; read as a value it must be collapsed to FALSE explicitly.
+    // As a predicate NULL means no match; read as a value it must be collapsed.
     PostgresEventStore::add_filters(&mut qb, filter);
     qb.push("), FALSE) AS matches_filter FROM events WHERE global_position > ");
     qb.push_bind(cursor);
@@ -1205,9 +1197,7 @@ async fn read_feed(
         let is_snapshot: bool = row.get("compacted_snapshot");
         let matches_filter: bool = row.get("matches_filter");
 
-        // Only rows that are actually delivered are parsed into events. The row
-        // bytes of a skipped position still cross the wire — the window is read
-        // with one query, so its cost is the batch, matching or not.
+        // Only delivered rows are parsed; a skipped row's bytes are still fetched.
         let delivered = if is_snapshot || !matches_filter {
             None
         } else {

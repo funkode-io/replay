@@ -2172,12 +2172,11 @@ Two batch sizes control throughput vs checkpoint frequency:
 
 The runner enforces `read_batch_size ≥ checkpoint_batch_size`.
 
-`read_batch_size` counts **positions in the log**, not events your policy matches.
-A `stream_filter` selects what the policy reacts to; the cursor still walks past
-everything else (see [ADR-0012](docs/adr/0012-policy-feed-contiguity-on-unfiltered-positions.md)),
-so a highly selective policy over a busy log may need several drains to reach its
-next event. Raise `read_batch_size` if that latency matters — it is what bounds the
-memory a drain uses.
+`read_batch_size` counts positions in the log, not matches: a `stream_filter` decides
+what a policy reacts to, the cursor still walks past everything else
+([ADR-0012](docs/adr/0012-policy-feed-contiguity-on-unfiltered-positions.md)). A
+selective policy over a busy log may need several drains to reach its next event;
+raise `read_batch_size` if that latency matters.
 
 ### Failure handling
 

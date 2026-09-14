@@ -47,13 +47,10 @@ _Avoid_: reactor, saga, process manager, automation, trigger, reaction.
 
 The slice of the event log one [Policy] reads on a poll: every `global_position`
 past its cursor, up to its read batch size, **before** its `stream_filter` is
-applied. Contiguity — how far the cursor may advance — is decided on the feed's
-unfiltered positions, because a position that was never written is a hole worth
-waiting for while a position the Policy simply did not ask for is not. A position
-the filter excludes, like a compaction snapshot, advances the cursor and fires
-nothing
-([ADR-0012](docs/adr/0012-policy-feed-contiguity-on-unfiltered-positions.md)).
-So a `stream_filter` decides what a Policy *reacts to*, never how far it *gets*.
+applied. Contiguity is decided on those unfiltered positions; an excluded position
+advances the cursor and fires nothing, like a compaction snapshot
+([ADR-0012](docs/adr/0012-policy-feed-contiguity-on-unfiltered-positions.md)). A
+`stream_filter` decides what a Policy *reacts to*, never how far it *gets*.
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation
