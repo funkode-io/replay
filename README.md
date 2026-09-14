@@ -2334,7 +2334,7 @@ hidden behind a "still catching up" label:
 
 | Condition | When | Meaning |
 |-----------|------|---------|
-| `Blocked` | `missing_position` is set | The feed stops at a position that does not exist; the policy has zero throughput and will not recover on its own. |
+| `Blocked` | `missing_position` is set | The feed stops at a position that does not exist; the policy has zero throughput while that stays true. |
 | `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
 | `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
 | `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
@@ -2345,8 +2345,10 @@ hidden behind a "still catching up" label:
 `Blocked` is a point-in-time observation, not a proof that the hole is permanent:
 because `global_position` is assigned at INSERT and becomes visible at COMMIT, an
 append in flight leaves a momentary gap, so a poll taken during it can read as
-`Blocked` and clear by itself on the next one. Alert on the condition persisting
-across polls, not on a single read.
+`Blocked` and clear by itself on the next one. A position burned by an aborted
+append, on the other hand, never appears and the policy stays blocked until an
+operator intervenes. The two are indistinguishable from a single read, so alert
+on the condition persisting across polls.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only

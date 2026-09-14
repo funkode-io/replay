@@ -102,11 +102,15 @@ _Avoid_: state, policy state, health check.
 
 A [Policy] whose cursor is parked immediately in front of a `global_position`
 that does not exist while a later one does. The feed is read as a gap-free
-prefix, so it stops at the hole: the Policy reacts to nothing and, unlike a
-Policy that is merely behind, will never catch up on its own. Distinct from
-_lagging_ (a backlog that is draining) and from a `Degraded` status raised by a
-[Dead letter] (individual reactions parked while the Policy still advances) —
-blocked means zero throughput, which is why [Policy status] ranks it above both.
+prefix, so it stops at the hole and the Policy reacts to nothing for as long as
+the position stays missing. Blocked is what an observer can *see*; whether it
+ever clears depends on the hole: a position burned by an aborted append can
+never be filled, so the Policy stays blocked until an operator moves its cursor,
+while a position still in flight looks identical and resolves itself on commit.
+Distinct from _lagging_ (a backlog that is draining) and from a `Degraded`
+status raised by a [Dead letter] (individual reactions parked while the Policy
+still advances) — blocked means zero throughput, which is why [Policy status]
+ranks it above both.
 _Avoid_: stuck, wedged, hung, stalled.
 
 ### Scoped URN

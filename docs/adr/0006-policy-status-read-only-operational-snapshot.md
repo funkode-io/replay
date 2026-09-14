@@ -79,8 +79,10 @@ operational tables the runner already maintains.
   parked failure is never hidden behind a benign "still catching up" label. Lag is
   expected and self-healing; a dead letter means an event was skipped and needs a
   human. `Blocked` sits above `Degraded` because it is a *throughput* statement,
-  not a *failure count*: a blocked policy processes nothing at all and will not
-  recover on its own, while a degraded one is still draining its feed. Reporting a
+  not a *failure count*: a blocked policy processes nothing at all while the hole
+  is there — and if the hole is a burned position, nothing but an operator will
+  clear it — whereas a degraded one is still draining its feed (the consequences
+  below qualify what a single `Blocked` read does and does not prove). Reporting a
   blocked policy as `Degraded` (or worse, `Working`) is how the outage above stayed
   invisible. `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`,
   `"Working"`, `"Degraded"`, `"Blocked"`) so JSON/UI consumers can match on it.

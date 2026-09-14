@@ -21,17 +21,18 @@ use sqlx::{Pool, Postgres};
 ///
 /// Precedence (highest wins):
 ///
-/// | Condition  | When                                               |
-/// |------------|----------------------------------------------------|
-/// | `Blocked`  | the position right after the cursor does not exist  |
-/// | `Degraded` | `dead_letter_count > 0`                            |
-/// | `Working`  | `dead_letter_count == 0`, `lag > 0`                |
-/// | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`               |
+/// | Condition  | When                                                     |
+/// |------------|----------------------------------------------------------|
+/// | `Blocked`  | the position after the cursor is absent, a later one exists |
+/// | `Degraded` | `dead_letter_count > 0`                                  |
+/// | `Working`  | `dead_letter_count == 0`, `lag > 0`                      |
+/// | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`                     |
 ///
 /// A policy that is *both* behind and has dead letters resolves to `Degraded`
 /// so that parked failures are never hidden behind a progress label. A policy
 /// parked in front of a hole resolves to `Blocked` whatever else is true of it:
-/// it has no throughput at all, which outranks some-reactions-parked.
+/// it has no throughput at all, which outranks some-reactions-parked. An empty
+/// tail is not a hole — a drained policy is `CaughtUp`, never `Blocked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyCondition {
     /// No dead letters and no lag: fully healthy and up to date.
@@ -42,8 +43,11 @@ pub enum PolicyCondition {
     Degraded,
     /// The cursor is parked immediately in front of a `global_position` that
     /// does not exist, while a later position does. The feed stops at the hole,
-    /// so the policy processes nothing and cannot recover on its own; needs
-    /// operator attention.
+    /// so the policy processes nothing for as long as the position stays
+    /// missing. A position burned by an aborted append never appears, and such
+    /// a policy never recovers on its own; a position still in flight is
+    /// indistinguishable at read time and clears when it commits, so alert on
+    /// this condition persisting across polls rather than on one read.
     Blocked,
 }
 
@@ -95,7 +99,7 @@ pub struct PolicyStatus {
     pub position: i64,
     /// Current global head (`MAX(global_position)` on the events table).
     pub head: i64,
-    /// Number of events the policy has yet to process (`head - position`).
+    /// Positions the policy has yet to process (`head - position`).
     ///
     /// Counts positions, not events: a burned or deleted position inflates it.
     pub lag: i64,
