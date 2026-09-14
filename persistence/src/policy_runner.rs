@@ -25,7 +25,8 @@ use tokio::task::JoinHandle;
 use replay::{Aggregate, Metadata};
 
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
-use crate::policy_feed::{feed_from_window, WindowPosition};
+use crate::policy_blocked::{probe_blocked, resolve_blocked_warn_after, BlockedWatch};
+use crate::policy_feed::{feed_from_window, Feed, Gap, WindowPosition};
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
 /// Erased, services-bound execution path for one aggregate type.
@@ -209,6 +210,7 @@ impl PolicyRunnerBuilder {
             policies: self.policies,
             executors: self.executors,
             notifications: self.notifications,
+            blocked: Arc::new(BlockedWatch::new(resolve_blocked_warn_after())),
         }
     }
 }
@@ -253,6 +255,9 @@ pub struct PolicyRunner {
     policies: Vec<Arc<dyn ErasedPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
+    /// Rate gate for the blocked-policy warning, shared by every drain path so a
+    /// blocked Policy is reported at the same bounded rate however it is driven.
+    blocked: Arc<BlockedWatch>,
 }
 
 /// Handle for background policy tasks spawned by [`PolicyRunner::start_polling`].
@@ -769,6 +774,7 @@ impl PolicyRunner {
             let cqrs = self.cqrs.clone();
             let pool = self.pool.clone();
             let executors = self.executors.clone();
+            let blocked = Arc::clone(&self.blocked);
             let mut policy_shutdown_rx = shutdown_rx.clone();
             let name = policy.name().to_string();
             let mut leader_rx = leadership_rx
@@ -832,6 +838,7 @@ impl PolicyRunner {
                             &executors,
                             policy.as_ref(),
                             &mut cursor,
+                            &blocked,
                             max_depth,
                         )
                         .await
@@ -909,6 +916,7 @@ impl PolicyRunner {
             &self.executors,
             policy,
             &mut cursor,
+            &self.blocked,
             max_depth,
         )
         .await
@@ -932,14 +940,29 @@ async fn drain_policy_once(
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     policy: &dyn ErasedPolicy,
     cursor: &mut PolicyCursor,
+    blocked: &BlockedWatch,
     max_depth: u32,
 ) -> Result<usize, replay::Error> {
     let name = policy.name().to_string();
     let checkpoint_size = resolve_checkpoint_batch_size(policy);
     let read_batch = resolve_read_batch_size(policy, checkpoint_size);
-    let feed = read_feed(pool, policy.stream_filter(), cursor.position, read_batch).await?;
+    let Feed { positions, gap } =
+        read_feed(pool, policy.stream_filter(), cursor.position, read_batch).await?;
 
-    if feed.is_empty() {
+    if let Some(Gap { expected, found }) = gap {
+        // The one fact the blocked deployment in funkode-io/replay#164 never had.
+        // Cheap enough to emit on every poll, so it is the trace an operator turns
+        // on rather than a signal that has to survive a rate limit.
+        tracing::debug!(
+            policy = %name,
+            cursor = cursor.position,
+            expected,
+            found,
+            "policy feed stops at a gap in global_position"
+        );
+    }
+
+    if positions.is_empty() {
         // Nothing to process: the policy is idle, or parked in front of a gap
         // that will never fill. Both are the states an operator corrects by hand
         // with an UPDATE on `policy_cursors`, and both are the only moments when
@@ -951,16 +974,33 @@ async fn drain_policy_once(
                 position = cursor.position,
                 "persisted cursor was moved externally; adopting it"
             );
+            // The cursor moved, so whatever gap was just read belongs to the old
+            // position: the policy is not blocked where it was.
+            blocked.cleared(&name);
+            return Ok(0);
+        }
+
+        match gap {
+            // Parked in front of a hole. An append still in flight looks exactly
+            // like this and clears in milliseconds, so the escalation is gated on
+            // how long the cursor has actually been parked.
+            Some(gap) => report_blocked(pool, &name, cursor.position, gap, blocked).await?,
+            // Caught up with nothing past the cursor: a healthy idle policy, and
+            // it stays silent.
+            None => blocked.cleared(&name),
         }
         return Ok(0);
     }
+
+    // The policy is advancing, so it is not blocked any more.
+    blocked.cleared(&name);
 
     let mut executed = 0;
     let mut events_since_checkpoint = 0u32;
     for WindowPosition {
         global_position,
         delivered,
-    } in feed
+    } in positions
     {
         if let Some(raw) = delivered {
             let depth = event_causation_depth(&raw);
@@ -1019,6 +1059,58 @@ async fn drain_policy_once(
     }
 
     Ok(executed)
+}
+
+/// Report a policy that has been parked in front of a hole long enough for the hole
+/// to be permanent rather than an append still landing.
+///
+/// The wait itself is by design (ADR-0003 skip-safety): a `global_position` is
+/// assigned at `INSERT` and becomes visible at `COMMIT`, so a missing one is
+/// normally an append about to land. What is not by design is waiting forever —
+/// `nextval` is non-transactional, so an aborted append burns its positions
+/// permanently and nothing will ever fill them (funkode-io/replay#164).
+///
+/// Two gates keep this from becoming noise: the Policy must have been parked longer
+/// than [`BlockedWatch::interval`], and the record repeats at most once per
+/// interval. The probe that answers the first question runs once per poll while a
+/// Policy is parked in front of a hole — two index lookups, for a Policy that by
+/// definition has nothing else to do.
+async fn report_blocked(
+    pool: &Pool<Postgres>,
+    name: &str,
+    cursor: i64,
+    gap: Gap,
+    blocked: &BlockedWatch,
+) -> Result<(), replay::Error> {
+    let now = std::time::Instant::now();
+    if !blocked.due(name, now) {
+        return Ok(());
+    }
+
+    let Some(parked) = probe_blocked(pool, name).await? else {
+        return Ok(());
+    };
+
+    if parked.elapsed < blocked.interval() {
+        // Young enough to be an append still in flight, which is what the feed is
+        // supposed to wait for.
+        return Ok(());
+    }
+
+    tracing::warn!(
+        policy = %name,
+        cursor,
+        head = parked.head,
+        missing_position = gap.expected,
+        next_position = gap.found,
+        blocked_for_secs = parked.elapsed.as_secs(),
+        "policy is blocked: its feed stops at a global_position that does not exist. \
+         If the position was burned by an aborted append it will never appear, and the \
+         cursor must be moved past it (funkode-io/replay#164)"
+    );
+    blocked.reported(name, now);
+
+    Ok(())
 }
 
 /// Report a checkpoint that lost to a cursor moved outside this process. The
@@ -1203,13 +1295,13 @@ async fn load_event_by_id(
 /// `filter` is evaluated per row as `matches_filter` and decides delivery only; an
 /// excluded row advances the cursor like a compaction snapshot
 /// (`compacted_snapshot = TRUE`, ADR-0004). [`feed_from_window`] then truncates the
-/// window at the first hole.
+/// window at the first hole, and names the hole it truncated at.
 async fn read_feed(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
     cursor: i64,
     limit: u32,
-) -> Result<Vec<WindowPosition<PersistedEvent<Value>>>, replay::Error> {
+) -> Result<Feed<PersistedEvent<Value>>, replay::Error> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
          global_position, compacted_snapshot, COALESCE((",

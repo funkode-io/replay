@@ -127,7 +127,10 @@ while a later one does, so its feed yields nothing and it reacts to nothing.
 Distinct from _lagging_ (a backlog that is draining) and from `Degraded`
 (reactions parked while the Policy still advances): blocked means zero
 throughput. Whether it clears is not observable from one reading
-([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)).
+([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)). A
+blocked Policy is also visible without being asked: the runner traces the stop at
+`debug` and escalates to `warn` once the cursor has been parked longer than an
+in-flight append could explain.
 _Avoid_: stuck, wedged, hung, stalled.
 
 ### Scoped URN

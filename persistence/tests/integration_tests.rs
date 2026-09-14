@@ -3307,7 +3307,10 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
         "expected the running daemon to honour the corrected cursor without a restart"
     );
 
-    // And the correction is never rolled back by the stale in-memory value.
+    // And the correction is never rolled back by the stale in-memory value, which
+    // is `burned - 1`: the property is that the stored position never falls behind
+    // the operator's write, not that the drain has already checkpointed past it
+    // (that is a race with the poll, and the balance above already proves it drains).
     for _ in 0..10 {
         let stored: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
             .bind("withdraw_fee_policy_start_at_beginning")
@@ -3315,7 +3318,7 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
             .await
             .unwrap();
         assert!(
-            stored > burned,
+            stored >= burned,
             "stored cursor {stored} fell back behind the operator's correction {burned}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

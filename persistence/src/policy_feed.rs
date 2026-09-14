@@ -1,5 +1,5 @@
-//! How far a Policy's cursor may advance over the positions read past it, and which
-//! of them are delivered.
+//! How far a Policy's cursor may advance over the positions read past it, which
+//! of them are delivered, and the hole that stopped it.
 //!
 //! Contiguity is decided on the unfiltered `global_position` stream: a position the
 //! Policy's filter excludes advances the cursor and fires nothing, like a compaction
@@ -32,32 +32,67 @@ impl<E> WindowPosition<E> {
     }
 }
 
-/// The prefix of `window` the cursor may advance over.
+/// The hole a feed stopped at: the position expected next, and the one found instead.
+///
+/// Carried out of the decision rather than dropped inside it, because "the feed stops
+/// here" is the one fact an operator of a blocked Policy never had
+/// (funkode-io/replay#164).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gap {
+    /// The position the cursor would have advanced to next.
+    pub(crate) expected: i64,
+    /// The lowest position past `expected` that actually exists.
+    pub(crate) found: i64,
+}
+
+/// How far the cursor may advance this poll, and why it stops there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Feed<E> {
+    /// The prefix of the window the cursor may advance over, in position order.
+    pub(crate) positions: Vec<WindowPosition<E>>,
+    /// Set when the window ended at a hole rather than at its own end.
+    pub(crate) gap: Option<Gap>,
+}
+
+/// The prefix of `window` the cursor may advance over, and the hole that ends it.
 ///
 /// `window` is every position past `cursor` that was read, ascending, with
 /// filtered-out ones present as `delivered: None`. Truncated at the first hole: a
-/// missing position may be an append still in flight (ADR-0003 skip-safety).
-pub(crate) fn feed_from_window<E>(
-    cursor: i64,
-    window: impl IntoIterator<Item = WindowPosition<E>>,
-) -> Vec<WindowPosition<E>> {
-    window
-        .into_iter()
+/// missing position may be an append still in flight (ADR-0003 skip-safety). The
+/// window is truncated in place, so deciding costs no allocation.
+pub(crate) fn feed_from_window<E>(cursor: i64, mut window: Vec<WindowPosition<E>>) -> Feed<E> {
+    let gap = window
+        .iter()
         .zip(cursor + 1..)
-        .take_while(|(position, expected)| position.global_position == *expected)
-        .map(|(position, _)| position)
-        .collect()
+        .find(|(position, expected)| position.global_position != *expected)
+        .map(|(position, expected)| Gap {
+            expected,
+            found: position.global_position,
+        });
+
+    if let Some(gap) = gap {
+        // Everything from `expected` on is past the hole: unreachable this poll.
+        window.truncate((gap.expected - cursor - 1) as usize);
+    }
+
+    Feed {
+        positions: window,
+        gap,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{feed_from_window, WindowPosition};
+    use super::{feed_from_window, Gap, WindowPosition};
 
     #[test]
     fn an_empty_window_advances_nothing() {
         let window: Vec<WindowPosition<&str>> = Vec::new();
 
-        assert_eq!(feed_from_window(7, window), Vec::new());
+        let feed = feed_from_window(7, window);
+
+        assert_eq!(feed.positions, Vec::new());
+        assert_eq!(feed.gap, None);
     }
 
     #[test]
@@ -67,7 +102,10 @@ mod tests {
             WindowPosition::delivered(9, "b"),
         ];
 
-        assert_eq!(feed_from_window(7, window.clone()), window);
+        let feed = feed_from_window(7, window.clone());
+
+        assert_eq!(feed.positions, window);
+        assert_eq!(feed.gap, None, "a window that simply ran out is not a gap");
     }
 
     /// The bug this module exists for: a filter that excludes position 8 must not
@@ -83,10 +121,14 @@ mod tests {
 
         let feed = feed_from_window(7, window.clone());
 
-        assert_eq!(feed, window);
-        assert_eq!(feed.last().map(|p| p.global_position), Some(11));
+        assert_eq!(feed.positions, window);
+        assert_eq!(feed.gap, None);
+        assert_eq!(feed.positions.last().map(|p| p.global_position), Some(11));
         assert_eq!(
-            feed.iter().filter_map(|p| p.delivered).collect::<Vec<_>>(),
+            feed.positions
+                .iter()
+                .filter_map(|p| p.delivered)
+                .collect::<Vec<_>>(),
             vec!["b", "d"]
         );
     }
@@ -100,9 +142,16 @@ mod tests {
             WindowPosition::delivered(11, "d"),
         ];
 
+        let feed = feed_from_window(7, window);
+
+        assert_eq!(feed.positions, vec![WindowPosition::delivered(8, "a")]);
         assert_eq!(
-            feed_from_window(7, window),
-            vec![WindowPosition::delivered(8, "a")]
+            feed.gap,
+            Some(Gap {
+                expected: 9,
+                found: 10
+            }),
+            "the hole the feed stopped at is what an operator needs named"
         );
     }
 
@@ -113,7 +162,17 @@ mod tests {
             WindowPosition::delivered(10, "c"),
         ];
 
-        assert_eq!(feed_from_window(7, window), Vec::new());
+        let feed = feed_from_window(7, window);
+
+        assert_eq!(feed.positions, Vec::new());
+        assert_eq!(
+            feed.gap,
+            Some(Gap {
+                expected: 8,
+                found: 9
+            }),
+            "an empty feed with a gap is a blocked Policy; without one it is idle"
+        );
     }
 
     /// Filtered-out positions are read, so they are never themselves holes.
@@ -125,9 +184,35 @@ mod tests {
             WindowPosition::delivered(11, "d"),
         ];
 
+        let feed = feed_from_window(7, window);
+
         assert_eq!(
-            feed_from_window(7, window),
+            feed.positions,
             vec![WindowPosition::skipped(8), WindowPosition::skipped(9)]
+        );
+        assert_eq!(
+            feed.gap,
+            Some(Gap {
+                expected: 10,
+                found: 11
+            })
+        );
+    }
+
+    /// A multi-position hole reports its first missing position, which is the one
+    /// the cursor is parked in front of.
+    #[test]
+    fn a_wide_hole_reports_its_first_missing_position() {
+        let window = vec![WindowPosition::delivered(20, "t")];
+
+        let feed = feed_from_window(7, window);
+
+        assert_eq!(
+            feed.gap,
+            Some(Gap {
+                expected: 8,
+                found: 20
+            })
         );
     }
 
@@ -137,6 +222,6 @@ mod tests {
         let window: Vec<WindowPosition<&str>> =
             (1..=100).map(WindowPosition::<&str>::skipped).collect();
 
-        assert_eq!(feed_from_window(0, window).len(), 100);
+        assert_eq!(feed_from_window(0, window).positions.len(), 100);
     }
 }

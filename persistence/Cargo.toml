@@ -44,5 +44,8 @@ moka = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# `no-env-filter` so a test binary captures the *library's* records: the default
+# filter is scoped to the crate the test lives in, which is never this one.
+tracing-test = { workspace = true, features = ["no-env-filter"] }
 tokio-test = { workspace = true }
 testcontainers-modules = { workspace = true }
