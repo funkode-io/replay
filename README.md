@@ -2295,9 +2295,12 @@ for s in &statuses {
 }
 
 // React to anything needing attention.
-let degraded: Vec<_> = statuses
+let needs_attention: Vec<_> = statuses
     .iter()
-    .filter(|s| s.condition == PolicyCondition::Degraded)
+    .filter(|s| matches!(
+        s.condition,
+        PolicyCondition::Degraded | PolicyCondition::Blocked,
+    ))
     .collect();
 ```
 
@@ -2308,7 +2311,9 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `name` | Stable policy name (the cursor key). |
 | `position` | Last processed `global_position`. |
 | `head` | Current global head (`MAX(global_position)`). |
-| `lag` | Events still to process (`head - position`). |
+| `lag` | Positions still to process (`head - position`). |
+| `next_position` | Lowest `global_position` past the cursor that actually exists; `None` when nothing is left. |
+| `missing_position` | The hole the cursor is parked on (`position + 1`) when that position does not exist but a later one does; otherwise `None`. |
 | `last_checkpoint_at` | When the cursor last advanced (staleness signal). |
 | `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
@@ -2323,17 +2328,25 @@ position in `1..=H` is present, e.g. to freeze a version at publish time — use
 events with `global_position <= H` then observes the same set of events on every
 later read.
 
-`condition` is derived with a strict precedence — **dead letters outrank lag** —
-so a parked failure is never hidden behind a "still catching up" label:
+`condition` is derived with a strict precedence — **a hole outranks dead letters,
+dead letters outrank lag** — so neither a wedged policy nor a parked failure is
+hidden behind a "still catching up" label:
 
 | Condition | When | Meaning |
 |-----------|------|---------|
+| `Blocked` | `missing_position` is set | The feed stops at a position that does not exist; the policy has zero throughput and will not recover on its own. |
 | `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
 | `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
 | `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
 
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
-`"Degraded"`) for JSON/UI consumers.
+`"Degraded"`, `"Blocked"`) for JSON/UI consumers.
+
+`Blocked` is a point-in-time observation, not a proof that the hole is permanent:
+because `global_position` is assigned at INSERT and becomes visible at COMMIT, an
+append in flight leaves a momentary gap, so a poll taken during it can read as
+`Blocked` and clear by itself on the next one. Alert on the condition persisting
+across polls, not on a single read.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only

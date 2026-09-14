@@ -94,8 +94,20 @@ state (an [Aggregate]'s rebuilt-from-stream state) and **not** a [Projection]
 (it derives no read model from the event log; it reports on a Policy's runtime).
 _Observing_ a Policy's status (read-only) is a separate concern from
 _controlling_ a Policy (acting on its failures by [Retry] or [Discard] of a
-[Dead letter]).
+[Dead letter]). A status distinguishes a healthy idle Policy from a
+[Blocked policy] without anyone reading the log by hand.
 _Avoid_: state, policy state, health check.
+
+### Blocked policy
+
+A [Policy] whose cursor is parked immediately in front of a `global_position`
+that does not exist while a later one does. The feed is read as a gap-free
+prefix, so it stops at the hole: the Policy reacts to nothing and, unlike a
+Policy that is merely behind, will never catch up on its own. Distinct from
+_lagging_ (a backlog that is draining) and from a `Degraded` status raised by a
+[Dead letter] (individual reactions parked while the Policy still advances) —
+blocked means zero throughput, which is why [Policy status] ranks it above both.
+_Avoid_: stuck, wedged, hung, stalled.
 
 ### Scoped URN
 
@@ -151,6 +163,7 @@ would need to honour the WASM dual-cfg pattern.
 [Discard]: #discard
 [Rebuild]: #rebuild
 [Policy status]: #policy-status
+[Blocked policy]: #blocked-policy
 [Query]: #query
 [Scoped URN]: #scoped-urn
 [Live projection]: #live-projection

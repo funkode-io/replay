@@ -5581,6 +5581,14 @@ async fn policy_status_caught_up_postgres_test() {
         "lag == 0 must yield CaughtUp"
     );
     assert_eq!(s.head, s.position, "head and position must be equal");
+    assert_eq!(
+        s.next_position, None,
+        "nothing exists past the cursor of a drained policy"
+    );
+    assert_eq!(
+        s.missing_position, None,
+        "an empty tail is not a hole: a drained policy is not blocked"
+    );
 }
 
 /// A behind policy has `lag > 0` and condition `Working`.
@@ -5642,6 +5650,123 @@ async fn policy_status_working_behind_postgres_test() {
         "lag > 0 must yield Working"
     );
     assert_eq!(s.lag, s.head - s.position);
+    assert_eq!(
+        s.next_position,
+        Some(s.position + 1),
+        "the feed continues at the very next position"
+    );
+    assert_eq!(
+        s.missing_position, None,
+        "a policy merely behind the head has no hole in front of it"
+    );
+}
+
+/// A policy parked in front of a `global_position` that does not exist is
+/// `Blocked`, and `Blocked` outranks `Degraded`.
+///
+/// Setup reproduces the incident behind funkode-io/replay#164 exactly: append
+/// one event, burn a sequence value (`nextval` is non-transactional, so an
+/// aborted append leaves a permanent hole), then append again. The second event
+/// lands two positions past the first. A cursor on the first event therefore
+/// sits in front of a position that can never exist.
+#[tokio::test]
+async fn policy_status_blocked_on_missing_position_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("status-blocked-1").unwrap();
+
+    let deposit = |amount: f64| {
+        cqrs.execute::<BankAccount>(
+            &account,
+            replay::Metadata::default(),
+            BankAccountCommand::Deposit {
+                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                amount,
+            },
+            &(),
+            None,
+        )
+    };
+
+    deposit(10.0).await.unwrap();
+
+    // The position the policy will be parked on.
+    let parked_at: i64 = sqlx::query_scalar("SELECT MAX(global_position) FROM events")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("head query must succeed");
+
+    // Burn the next sequence value the way an aborted append does: the position
+    // is consumed and never returned, so no row can ever carry it.
+    sqlx::query("SELECT nextval('events_global_position_seq')")
+        .execute(&pg_pool)
+        .await
+        .expect("burning a sequence value must succeed");
+
+    deposit(20.0).await.unwrap();
+
+    sqlx::query("INSERT INTO policy_cursors (name, position, updated_at) VALUES ('blocked_policy', $1, now())")
+        .bind(parked_at)
+        .execute(&pg_pool)
+        .await
+        .expect("cursor insert must succeed");
+
+    let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
+    let statuses = status_store.list().await.expect("list must succeed");
+
+    assert_eq!(statuses.len(), 1, "one policy must appear");
+    let s = &statuses[0];
+    assert_eq!(s.position, parked_at);
+    assert_eq!(
+        s.missing_position,
+        Some(parked_at + 1),
+        "the burned position is the hole the policy is parked on"
+    );
+    assert_eq!(
+        s.next_position,
+        Some(parked_at + 2),
+        "the next event that actually exists is one beyond the hole"
+    );
+    assert_eq!(
+        s.condition,
+        replay_persistence::PolicyCondition::Blocked,
+        "a policy parked in front of a missing position must be Blocked"
+    );
+
+    // Blocked outranks Degraded: zero throughput is worse news than a parked
+    // reaction, so a dead letter must not relabel the policy.
+    sqlx::query(
+        "INSERT INTO policy_dead_letters \
+             (policy_name, global_position, event_id, error_kind, error_message) \
+         VALUES ('blocked_policy', $1, $2, 'Permanent', 'boom')",
+    )
+    .bind(parked_at)
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pg_pool)
+    .await
+    .expect("dead-letter insert must succeed");
+
+    let statuses = status_store.list().await.expect("list must succeed");
+    let s = &statuses[0];
+    assert_eq!(s.dead_letter_count, 1);
+    assert_eq!(
+        s.condition,
+        replay_persistence::PolicyCondition::Blocked,
+        "Blocked must take precedence over Degraded"
+    );
 }
 
 /// Multiple policies are all returned from a single `list()` call.
