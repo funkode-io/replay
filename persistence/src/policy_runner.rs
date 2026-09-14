@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use replay::{Aggregate, Metadata};
 
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
+use crate::policy_feed::{feed_from_window, WindowPosition};
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
 /// Erased, services-bound execution path for one aggregate type.
@@ -939,8 +940,12 @@ async fn drain_policy_once(
 
     let mut executed = 0;
     let mut events_since_checkpoint = 0u32;
-    for (global_position, maybe_raw) in feed {
-        if let Some(raw) = maybe_raw {
+    for WindowPosition {
+        global_position,
+        delivered,
+    } in feed
+    {
+        if let Some(raw) = delivered {
             let depth = event_causation_depth(&raw);
             if depth >= max_depth {
                 // Circuit breaker: the event's causation chain is too deep.
@@ -1159,53 +1164,62 @@ async fn load_event_by_id(
     }
 }
 
-/// Read the contiguous, gap-free prefix of events with `global_position >
-/// cursor` matching `filter`, in global order.
+/// Read the window of positions past `cursor` the policy may advance over.
 ///
-/// BIGSERIAL positions are assigned at INSERT but become visible at COMMIT,
-/// so a higher position can appear before a lower one fills in. Stopping at
-/// the first gap guarantees we never skip an event that is still in flight.
+/// The window is read **unfiltered** — every `global_position > cursor`, up to
+/// `limit` of them — because contiguity is a property of the global position
+/// stream, not of the rows a policy asked for. `filter` is evaluated per row as
+/// `matches_filter` and decides only whether the event is delivered; a row it
+/// excludes still advances the cursor, exactly like a synthetic compaction
+/// snapshot (`compacted_snapshot = TRUE`, ADR-0004). Filtering the window itself
+/// would make the first non-matching event indistinguishable from a hole and wedge
+/// every policy whose filter is narrower than `all()`.
 ///
-/// Each entry is `(global_position, maybe_event)`.  When `maybe_event` is
-/// `None` the row is a synthetic compaction snapshot (`compacted_snapshot =
-/// TRUE`): the cursor must still advance past it, but no reaction is fired.
+/// How far the cursor may then advance is [`feed_from_window`]'s decision: the
+/// window is truncated at the first hole, because BIGSERIAL positions are assigned
+/// at INSERT and become visible at COMMIT, so a higher position can appear before a
+/// lower one fills in.
 async fn read_feed(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
     cursor: i64,
     limit: u32,
-) -> Result<Vec<(i64, Option<PersistedEvent<Value>>)>, replay::Error> {
+) -> Result<Vec<WindowPosition<PersistedEvent<Value>>>, replay::Error> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-         global_position, compacted_snapshot FROM events WHERE global_position > ",
+         global_position, compacted_snapshot, COALESCE((",
     );
-    qb.push_bind(cursor);
-    qb.push(" AND ");
+    // A filter is a WHERE predicate, where SQL NULL and FALSE both mean "no
+    // match"; read as a value it must be collapsed to FALSE explicitly.
     PostgresEventStore::add_filters(&mut qb, filter);
+    qb.push("), FALSE) AS matches_filter FROM events WHERE global_position > ");
+    qb.push_bind(cursor);
     qb.push(" ORDER BY global_position ASC LIMIT ");
     qb.push_bind(limit as i64);
 
     let rows = qb.build().fetch_all(pool).await.map_err(crate::db_error)?;
 
-    let mut feed = Vec::with_capacity(rows.len());
-    for (expected, row) in (cursor + 1..).zip(rows) {
+    let mut window = Vec::with_capacity(rows.len());
+    for row in rows {
         let global_position: i64 = row.get("global_position");
-        if global_position != expected {
-            // Gap: stop here and let the hole fill on a later poll.
-            break;
-        }
-
         let is_snapshot: bool = row.get("compacted_snapshot");
-        if is_snapshot {
-            // Synthetic row: advance the cursor past it, but deliver nothing.
-            feed.push((global_position, None));
+        let matches_filter: bool = row.get("matches_filter");
+
+        // Only rows that are actually delivered are parsed: a position the policy
+        // skips costs its `global_position`, not its payload.
+        let delivered = if is_snapshot || !matches_filter {
+            None
         } else {
-            let event = PersistedEvent::<Value>::try_from(row)?;
-            feed.push((global_position, Some(event)));
-        }
+            Some(PersistedEvent::<Value>::try_from(row)?)
+        };
+
+        window.push(WindowPosition {
+            global_position,
+            delivered,
+        });
     }
 
-    Ok(feed)
+    Ok(feed_from_window(cursor, window))
 }
 
 async fn execute_dispatch(
