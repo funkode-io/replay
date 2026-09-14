@@ -26,6 +26,7 @@ use super::Event;
 /// let scoped: BankAccountUrn = account.at(&branch)?;   // urn:bank-account:acct-1@branch:london
 /// let branch: BranchUrn      = scoped.extract_scope()?;
 /// let account: BankAccountUrn = scoped.unscoped()?;
+/// let slug: &str             = scoped.to_slug();        // "acct-1", borrowed
 ///
 /// // nesting: one `at` per level, one `extract_scope` per level back
 /// let deep: BankAccountUrn = account.at(&branch.at(&region)?)?;
@@ -166,6 +167,9 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
     /// urn:product:sku123@catalog:that                →  urn:product:sku123
     /// urn:watchlist:main@user:0x78@wallet-type:evm   →  urn:watchlist:main
     /// ```
+    ///
+    /// Rebuilds and revalidates the URN, so it allocates. Reach for
+    /// [`Self::to_slug`] when the NSS is all that is wanted.
     #[track_caller]
     fn unscoped(&self) -> crate::Result<Self> {
         let current_urn: Urn = self.clone().into();
@@ -205,10 +209,43 @@ pub trait ScopedUrn: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::D
             Ok(s) => Ok(s),
         }
     }
+
+    /// The base's NSS — the identity slug — borrowed, without rebuilding anything.
+    ///
+    /// ```text
+    /// urn:attribute:heel-height@catalog:autumn        →  "heel-height"
+    /// urn:watchlist:main@user:0x78@wallet-type:evm    →  "main"
+    /// urn:attribute:heel-height                       →  "heel-height"
+    /// ```
+    ///
+    /// [`Self::unscoped`] without the URN. Same boundary — the first `@`, so a nested
+    /// scope goes whole — but it hands back a slice of the NSS that is already there
+    /// instead of cloning, rebuilding and revalidating a typed URN. That is the whole
+    /// point: a caller who wants the slug rather than the base pays five allocations
+    /// for `unscoped().nss().to_string()` and none for this, which is why they were
+    /// splitting on `@` by hand instead (see ADR-0010's note on consumers outside the
+    /// workspace).
+    ///
+    /// An unscoped URN answers with its own NSS rather than failing — the one place
+    /// this parts company with `unscoped`. It is what lets a caller hold either form:
+    /// a bare `urn:attribute:color` and a catalog-scoped one both answer `color`,
+    /// with no `unwrap_or` at the call site.
+    ///
+    /// The `AsRef<Urn>` bound sits on the method, not the trait, so this is a pure
+    /// addition — `#[derive(Urn)]` and `define_aggregate!` both generate that impl.
+    fn to_slug(&self) -> &str
+    where
+        Self: AsRef<Urn>,
+    {
+        // First '@': `at` keeps one out of the base, so everything from there is scope.
+        let nss = self.as_ref().nss();
+        nss.split_once('@').map_or(nss, |(base, _scope)| base)
+    }
 }
 
 /// Blanket impl: every type with `Into<Urn> + TryFrom<Urn> + Clone` gets
-/// `at`, `extract_scope` and `unscoped` for free.
+/// `at`, `extract_scope` and `unscoped` for free, and `to_slug` too once it
+/// also implements `AsRef<Urn>`.
 impl<T> ScopedUrn for T where T: Sized + Clone + Into<Urn> + TryFrom<Urn, Error: std::fmt::Debug> {}
 
 /// A trait for types that have a stream identifier.
@@ -289,6 +326,19 @@ pub trait WithId: Sized {
     fn unscoped(&self) -> crate::Result<Self> {
         let unscoped_id = self.get_id().unscoped()?;
         Ok(Self::with_id(unscoped_id))
+    }
+
+    /// [`ScopedUrn::to_slug`] on this stream's id.
+    ///
+    /// ```rust,ignore
+    /// // urn:product:sku123@catalog:that  →  "sku123"
+    /// let slug: &str = scoped_product.to_slug();
+    /// ```
+    fn to_slug(&self) -> &str
+    where
+        Self::StreamId: AsRef<Urn>,
+    {
+        self.get_id().to_slug()
     }
 }
 
@@ -533,6 +583,12 @@ mod tests {
                     urn.nid()
                 ))
             }
+        }
+    }
+
+    impl AsRef<Urn> for ProductUrn {
+        fn as_ref(&self) -> &Urn {
+            &self.0
         }
     }
 
@@ -848,6 +904,57 @@ mod tests {
         let scoped = ProductUrn(Urn::from_str("urn:product:sku123@catalog:that").unwrap());
         let unscoped: Urn = scoped.unscoped().unwrap().into();
         assert_eq!(unscoped.to_string(), "urn:product:sku123");
+    }
+
+    #[test]
+    fn test_to_slug_returns_the_base_nss() {
+        let product = ProductStream::with_string_id("urn:product:sku123@catalog:that").unwrap();
+        assert_eq!(product.to_slug(), "sku123");
+    }
+
+    #[test]
+    fn test_to_slug_drops_a_nested_scope_whole() {
+        // The scope starts at the first '@' (ADR-0010), so both levels go, not just the outer one.
+        let watchlist =
+            ProductUrn(Urn::from_str("urn:product:main@user:0x78@wallet-type:evm").unwrap());
+        assert_eq!(watchlist.to_slug(), "main");
+    }
+
+    #[test]
+    fn test_to_slug_of_an_unscoped_urn_is_its_own_nss() {
+        // Unlike `unscoped`, this does not fail: a caller holding either form gets one answer.
+        let product = ProductUrn(Urn::from_str("urn:product:sku123").unwrap());
+        assert_eq!(product.to_slug(), "sku123");
+    }
+
+    #[test]
+    fn test_to_slug_preserves_a_nss_containing_colons() {
+        // The NSS before '@' may hold anything a URN allows, colons included — same guarantee
+        // `unscoped` makes.
+        let product = ProductUrn(Urn::from_str("urn:product:eu:sku:123@catalog:that").unwrap());
+        assert_eq!(product.to_slug(), "eu:sku:123");
+    }
+
+    #[test]
+    fn test_to_slug_agrees_with_unscoped_wherever_unscoped_succeeds() {
+        // The two must name the same boundary. Asserting it here is what stops the cheap path
+        // from drifting away from the authoritative one.
+        for spelling in [
+            "urn:product:sku123@catalog:that",
+            "urn:product:main@user:0x78@wallet-type:evm",
+            "urn:product:eu:sku:123@catalog:that",
+        ] {
+            let scoped = ProductUrn(Urn::from_str(spelling).unwrap());
+            let unscoped: Urn = scoped.unscoped().unwrap().into();
+
+            assert_eq!(scoped.to_slug(), unscoped.nss(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn test_to_slug_on_a_stream_delegates_to_its_id() {
+        let product = ProductStream::with_string_id("urn:product:sku123@catalog:that").unwrap();
+        assert_eq!(product.to_slug(), product.get_id().to_slug());
     }
 
     #[test]
