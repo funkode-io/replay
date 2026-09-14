@@ -291,6 +291,106 @@ impl replay::Aggregate for IdempotentFeeAccount {
     }
 }
 
+/// Position an operator "moves the cursor to" in the mid-batch test below.
+const CURSOR_NUDGE_TARGET: i64 = 10_000;
+
+/// Cursor key shared by the fixture policy and the aggregate that moves it.
+const CURSOR_NUDGE_POLICY: &str = "cursor_nudge_policy";
+
+define_aggregate! {
+    CursorNudgeBox {
+        namespace: "cursor-nudge-box",
+        state: {
+            notes: i64,
+        },
+        commands: {
+            Note { at: i64 },
+        },
+        events: {
+            Noted { at: i64 },
+        }
+    }
+}
+
+impl replay::EventStream for CursorNudgeBox {
+    type Event = CursorNudgeBoxEvent;
+
+    fn stream_type() -> String {
+        "CursorNudgeBox".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            CursorNudgeBoxEvent::Noted { .. } => self.notes += 1,
+        }
+    }
+}
+
+/// An aggregate that moves the policy's stored cursor while the policy that
+/// dispatched to it is still mid-batch — the one deterministic way to stage the
+/// race an operator creates by running `UPDATE policy_cursors` against a busy
+/// leader.
+impl replay::Aggregate for CursorNudgeBox {
+    type Command = CursorNudgeBoxCommand;
+    type Error = replay::Error;
+    type Services = sqlx::Pool<sqlx::Postgres>;
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            CursorNudgeBoxCommand::Note { at } => {
+                sqlx::query(
+                    "UPDATE policy_cursors SET position = $1, updated_at = now() WHERE name = $2",
+                )
+                .bind(CURSOR_NUDGE_TARGET)
+                .bind(CURSOR_NUDGE_POLICY)
+                .execute(services)
+                .await
+                .map_err(|error| replay::Error::internal(error.to_string()))?;
+
+                Ok(vec![CursorNudgeBoxEvent::Noted { at }])
+            }
+        }
+    }
+}
+
+struct CursorNudgePolicy {
+    target: CursorNudgeBoxUrn,
+}
+
+impl replay_persistence::Policy for CursorNudgePolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        CURSOR_NUDGE_POLICY
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    /// Checkpoint after every event, so the first reaction is followed
+    /// immediately by the cursor write whose outcome the test is about.
+    fn checkpoint_batch_size(&self) -> Option<u32> {
+        Some(1)
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        match &event.data {
+            BankAccountEvent::Deposited { .. } => {
+                vec![replay_persistence::Dispatch::to::<CursorNudgeBox>(
+                    self.target.clone(),
+                    CursorNudgeBoxCommand::Note { at: event.version },
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 struct BankAccountStatement {
     bank_account: BankAccountUrn,
     from: chrono::NaiveDate,
@@ -2849,6 +2949,218 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
     );
 
     daemon.shutdown().await;
+}
+
+/// Issue #168: an operator must be able to move a stuck cursor on a *running*
+/// leader. Recreates the #164 incident exactly — a burned `global_position`
+/// leaves a hole that never fills, so the policy parks in front of it forever —
+/// and then applies the recovery that needed every replica scaled to zero:
+/// a plain `UPDATE policy_cursors`. The daemon keeps running and leading
+/// throughout.
+#[tokio::test]
+async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("cursor-move-1").unwrap();
+
+    let runner = std::sync::Arc::new(
+        replay_persistence::PolicyRunner::builder(cqrs.clone())
+            .register_services::<BankAccount>(())
+            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            .build(),
+    );
+    let daemon = runner
+        .clone()
+        .start_polling(std::time::Duration::from_millis(50));
+
+    let deposit = |day: u32| {
+        let cqrs = cqrs.clone();
+        let account = account.clone();
+        async move {
+            cqrs.execute::<BankAccount>(
+                &account,
+                replay::Metadata::default(),
+                BankAccountCommand::Deposit {
+                    effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
+                    amount: 100.0,
+                },
+                &(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    };
+
+    let balance = || {
+        let cqrs = cqrs.clone();
+        let account = account.clone();
+        async move {
+            cqrs.fetch_aggregate::<BankAccount>(&account)
+                .await
+                .unwrap()
+                .balance
+        }
+    };
+
+    // Wait until the daemon has charged the fee for the first deposit: 100 - 5.
+    deposit(1).await;
+    let mut settled = false;
+    for _ in 0..100 {
+        if (balance().await - 95.0).abs() < f64::EPSILON {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(settled, "expected the daemon to charge the first fee");
+
+    // Burn a global position the way an aborted append does: `nextval` is not
+    // transactional, so this value is gone from `events` permanently.
+    let burned: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
+        .fetch_one(&pg_pool)
+        .await
+        .unwrap();
+
+    // The next deposit lands behind the hole, so the policy is now wedged: the
+    // fee for it never fires, however long we wait.
+    deposit(2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        (balance().await - 195.0).abs() < f64::EPSILON,
+        "expected the policy to be wedged in front of the permanent gap"
+    );
+
+    // The operator's recovery, against the live deployment.
+    let moved = sqlx::query(
+        "UPDATE policy_cursors SET position = $1, updated_at = now() \
+         WHERE name = $2 AND position < $1",
+    )
+    .bind(burned)
+    .bind("withdraw_fee_policy_start_at_beginning")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(moved.rows_affected(), 1, "operator update must hit one row");
+
+    // Honoured by the running leader: the stranded deposit is charged.
+    let mut recovered = false;
+    for _ in 0..100 {
+        if (balance().await - 190.0).abs() < f64::EPSILON {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        recovered,
+        "expected the running daemon to honour the corrected cursor without a restart"
+    );
+
+    // And the correction is never rolled back by the stale in-memory value.
+    for _ in 0..10 {
+        let stored: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
+            .bind("withdraw_fee_policy_start_at_beginning")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+        assert!(
+            stored > burned,
+            "stored cursor {stored} fell back behind the operator's correction {burned}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    daemon.shutdown().await;
+}
+
+/// Issue #168, second criterion: the in-memory cursor must never write a stale
+/// position over a newer persisted one. Stages the race deterministically — the
+/// policy's first reaction moves the stored cursor far ahead while the drain is
+/// still mid-batch — and asserts the runner yields to the stored value instead
+/// of checkpointing its own.
+#[tokio::test]
+async fn policy_checkpoint_yields_to_a_concurrent_cursor_move_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("cursor-nudge-1").unwrap();
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<CursorNudgeBox>(pg_pool.clone())
+        .register_policy(CursorNudgePolicy {
+            target: CursorNudgeBoxUrn::new("cursor-nudge-box-1").unwrap(),
+        })
+        .build();
+
+    for day in 1..=3 {
+        cqrs.execute::<BankAccount>(
+            &account,
+            replay::Metadata::default(),
+            BankAccountCommand::Deposit {
+                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
+                amount: 100.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // The first reaction moves the stored cursor; the drain must stop there
+    // rather than checkpoint the position it was holding.
+    assert_eq!(
+        runner.drain().await.unwrap(),
+        1,
+        "drain must abandon the batch as soon as the stored cursor moves under it"
+    );
+
+    let stored: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
+        .bind(CURSOR_NUDGE_POLICY)
+        .fetch_one(&pg_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored, CURSOR_NUDGE_TARGET,
+        "the runner's in-memory position overwrote the newer persisted one"
+    );
+
+    // The next drain resumes from the moved cursor: nothing is left behind it,
+    // and the correction still stands.
+    assert_eq!(runner.drain().await.unwrap(), 0);
+    let stored_after: i64 =
+        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
+            .bind(CURSOR_NUDGE_POLICY)
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_after, CURSOR_NUDGE_TARGET);
 }
 
 #[tokio::test]

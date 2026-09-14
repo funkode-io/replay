@@ -2107,6 +2107,31 @@ executed but before the cursor is saved will re-deliver the triggering event.
 Correctness therefore depends on **idempotent command handling** keyed by
 causation identity in the target aggregate.
 
+### Moving a cursor on a running system
+
+The `policy_cursors` row is an **operator-writable control surface**, not private
+runner state: you can reposition a policy against a live deployment with plain
+SQL, without restarting a process or dropping leadership.
+
+```sql
+-- skip a position that can never be delivered, or rewind to re-deliver events
+UPDATE policy_cursors SET position = 264786, updated_at = now()
+WHERE name = 'price_fanout';
+```
+
+The leader picks the new position up **the next time its feed comes back empty**
+— within one poll `interval` for an idle or stuck policy, and after it has caught
+up for a busy one. A policy with work to do pays nothing for this: the re-read
+happens only when there is nothing to process.
+
+Cursor writes are a compare-and-set against the value the runner last read, so a
+checkpoint can never reinstate a position that predates your update; a runner
+that loses the race adopts your position and abandons the rest of its batch.
+Moving forward skips the events in between (they are never delivered); moving
+backward re-delivers them, which is safe under the same idempotency contract that
+covers crash re-delivery. See
+[ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md).
+
 ### Advisory-lock leader election
 
 Each policy task acquires a **Postgres session-scoped advisory lock** (keyed on

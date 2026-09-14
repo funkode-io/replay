@@ -802,7 +802,8 @@ impl PolicyRunner {
                     tracing::info!(policy = %name, "running as leader");
 
                     // Initialize cursor from the stored checkpoint (or bootstrap).
-                    let mut cursor = match load_cursor(&pool, &name, policy.start_at()).await {
+                    let mut cursor = match PolicyCursor::load(&pool, &name, policy.start_at()).await
+                    {
                         Ok(cursor) => cursor,
                         Err(error) => {
                             tracing::error!(
@@ -899,7 +900,7 @@ impl PolicyRunner {
 
     async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
         let name = policy.name().to_string();
-        let mut cursor = load_cursor(&self.pool, &name, policy.start_at()).await?;
+        let mut cursor = PolicyCursor::load(&self.pool, &name, policy.start_at()).await?;
         let max_depth = resolve_max_depth(policy);
         drain_policy_once(
             &self.cqrs,
@@ -929,13 +930,29 @@ async fn drain_policy_once(
     pool: &Pool<Postgres>,
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     policy: &dyn ErasedPolicy,
-    cursor: &mut i64,
+    cursor: &mut PolicyCursor,
     max_depth: u32,
 ) -> Result<usize, replay::Error> {
     let name = policy.name().to_string();
     let checkpoint_size = resolve_checkpoint_batch_size(policy);
     let read_batch = resolve_read_batch_size(policy, checkpoint_size);
-    let feed = read_feed(pool, policy.stream_filter(), *cursor, read_batch).await?;
+    let feed = read_feed(pool, policy.stream_filter(), cursor.position, read_batch).await?;
+
+    if feed.is_empty() {
+        // Nothing to process: the policy is idle, or parked in front of a gap
+        // that will never fill. Both are the states an operator corrects by hand
+        // with an UPDATE on `policy_cursors`, and both are the only moments when
+        // a re-read costs nothing, so this is where a *running* leader picks the
+        // correction up — no restart, no leadership change.
+        if cursor.refresh(pool, &name).await? {
+            tracing::info!(
+                policy = %name,
+                position = cursor.position,
+                "persisted cursor was moved externally; adopting it"
+            );
+        }
+        return Ok(0);
+    }
 
     let mut executed = 0;
     let mut events_since_checkpoint = 0u32;
@@ -973,7 +990,7 @@ async fn drain_policy_once(
             }
         }
         // Always track in-memory position.
-        *cursor = global_position;
+        cursor.position = global_position;
         events_since_checkpoint += 1;
 
         // Write the persistent cursor every `checkpoint_size` events so that
@@ -981,17 +998,32 @@ async fn drain_policy_once(
         // than the full drain batch (skip-safety: the cursor only advances
         // past events whose reactions are already durably committed).
         if events_since_checkpoint >= checkpoint_size {
-            save_cursor(pool, &name, global_position).await?;
+            if cursor.checkpoint(pool, &name).await? == Checkpoint::Superseded {
+                log_superseded(&name, cursor);
+                return Ok(executed);
+            }
             events_since_checkpoint = 0;
         }
     }
 
     // Final checkpoint: flush any events processed since the last periodic save.
-    if events_since_checkpoint > 0 {
-        save_cursor(pool, &name, *cursor).await?;
+    if events_since_checkpoint > 0
+        && cursor.checkpoint(pool, &name).await? == Checkpoint::Superseded
+    {
+        log_superseded(&name, cursor);
     }
 
     Ok(executed)
+}
+
+/// Report a checkpoint that lost to a cursor moved outside this process. The
+/// batch stops here; the cursor already holds the stored position.
+fn log_superseded(name: &str, cursor: &PolicyCursor) {
+    tracing::info!(
+        policy = %name,
+        position = cursor.position,
+        "persisted cursor was moved externally mid-batch; abandoning this batch at the stored position"
+    );
 }
 
 /// Execute all reactions for one event, applying the resilience policy:
@@ -1243,41 +1275,152 @@ async fn execute_dispatch(
         .await
 }
 
-async fn load_cursor(
-    pool: &Pool<Postgres>,
-    name: &str,
-    start_at: StartAt,
-) -> Result<i64, replay::Error> {
-    let position =
-        sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind(name)
-            .fetch_optional(pool)
-            .await
-            .map_err(crate::db_error)?;
+/// A policy's position in the global feed, paired with the value this process
+/// believes is stored in `policy_cursors`.
+///
+/// The stored value is not this process's private state: an operator moves a
+/// stuck policy by updating the row directly (that is how the permanent-gap
+/// incident in funkode-io/replay#164 was recovered). So the in-memory position
+/// is treated as a *lease* on the stored one:
+///
+/// - [`refresh`](Self::refresh) re-reads the row and adopts whatever it finds.
+///   The drain calls it when the feed comes back empty — an idle or wedged
+///   policy — which is where the correction can land for free.
+/// - [`checkpoint`](Self::checkpoint) is a compare-and-set against `persisted`,
+///   so a write derived from a position that predates the operator's update
+///   fails instead of silently reinstating it.
+struct PolicyCursor {
+    /// Last position handed to the policy in this process.
+    position: i64,
+    /// The value this process last observed in `policy_cursors`.
+    persisted: i64,
+}
 
-    if let Some(position) = position {
-        return Ok(position);
+/// Outcome of a [`PolicyCursor::checkpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checkpoint {
+    /// The stored position now matches the in-memory one.
+    Written,
+    /// Someone else moved the row since this process last read it. The write was
+    /// refused and the cursor has adopted the stored position instead.
+    Superseded,
+}
+
+impl PolicyCursor {
+    /// Load the stored checkpoint, bootstrapping the row from `start_at` the
+    /// first time a policy runs.
+    async fn load(
+        pool: &Pool<Postgres>,
+        name: &str,
+        start_at: StartAt,
+    ) -> Result<Self, replay::Error> {
+        if let Some(position) = read_position(pool, name).await? {
+            return Ok(Self {
+                position,
+                persisted: position,
+            });
+        }
+
+        let bootstrap_position = bootstrap_position(pool, start_at).await?;
+        let mut cursor = Self {
+            position: bootstrap_position,
+            persisted: bootstrap_position,
+        };
+
+        // `refresh` does the rest: it creates the row if it is still missing and
+        // adopts the stored value, which is a concurrent runner's bootstrap when
+        // that runner won the insert.
+        cursor.refresh(pool, name).await?;
+        Ok(cursor)
     }
 
-    let bootstrap_position = bootstrap_position(pool, start_at).await?;
+    /// Re-read the stored position and adopt it, returning `true` when it moved
+    /// the in-memory position (i.e. something outside this process wrote it).
+    ///
+    /// A deleted row is recreated at the in-memory position: dropping the row is
+    /// not a documented way to rewind a policy, and recreating it keeps the
+    /// policy from silently replaying its whole history. The recreate can lose
+    /// to a concurrent writer, so it re-reads and adopts the winner rather than
+    /// assuming its own value took.
+    async fn refresh(&mut self, pool: &Pool<Postgres>, name: &str) -> Result<bool, replay::Error> {
+        let persisted = match read_position(pool, name).await? {
+            Some(persisted) => persisted,
+            None => {
+                insert_position(pool, name, self.position).await?;
+                read_position(pool, name).await?.ok_or_else(|| {
+                    replay::Error::not_found("policy cursor row vanished immediately after insert")
+                        .with_operation("policy_cursor_refresh")
+                        .with_context("policy", name)
+                })?
+            }
+        };
+
+        self.persisted = persisted;
+        if persisted == self.position {
+            return Ok(false);
+        }
+
+        self.position = persisted;
+        Ok(true)
+    }
+
+    /// Persist the in-memory position, but only if the stored one is still the
+    /// value this process last saw.
+    ///
+    /// On [`Checkpoint::Superseded`] the cursor has already adopted the stored
+    /// position, so the caller must stop draining from its own: everything after
+    /// it belongs to the operator's correction, not to this batch.
+    async fn checkpoint(
+        &mut self,
+        pool: &Pool<Postgres>,
+        name: &str,
+    ) -> Result<Checkpoint, replay::Error> {
+        let updated = sqlx::query(
+            "UPDATE policy_cursors SET position = $2, updated_at = now() \
+             WHERE name = $1 AND position = $3",
+        )
+        .bind(name)
+        .bind(self.position)
+        .bind(self.persisted)
+        .execute(pool)
+        .await
+        .map_err(crate::db_error)?;
+
+        if updated.rows_affected() > 0 {
+            self.persisted = self.position;
+            return Ok(Checkpoint::Written);
+        }
+
+        self.refresh(pool, name).await?;
+        Ok(Checkpoint::Superseded)
+    }
+}
+
+/// Read a policy's stored position, or `None` when it has no row yet.
+async fn read_position(pool: &Pool<Postgres>, name: &str) -> Result<Option<i64>, replay::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(crate::db_error)
+}
+
+/// Create a policy's cursor row, leaving an existing one untouched.
+async fn insert_position(
+    pool: &Pool<Postgres>,
+    name: &str,
+    position: i64,
+) -> Result<(), replay::Error> {
     sqlx::query(
         "INSERT INTO policy_cursors (name, position, updated_at) VALUES ($1, $2, now()) \
          ON CONFLICT (name) DO NOTHING",
     )
     .bind(name)
-    .bind(bootstrap_position)
+    .bind(position)
     .execute(pool)
     .await
     .map_err(crate::db_error)?;
-
-    let persisted =
-        sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind(name)
-            .fetch_one(pool)
-            .await
-            .map_err(crate::db_error)?;
-
-    Ok(persisted)
+    Ok(())
 }
 
 async fn bootstrap_position(
@@ -1295,23 +1438,6 @@ async fn bootstrap_position(
             Ok(head.unwrap_or_default())
         }
     }
-}
-
-async fn save_cursor(
-    pool: &Pool<Postgres>,
-    name: &str,
-    position: i64,
-) -> Result<(), replay::Error> {
-    sqlx::query(
-        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ($1, $2, now()) \
-         ON CONFLICT (name) DO UPDATE SET position = EXCLUDED.position, updated_at = now()",
-    )
-    .bind(name)
-    .bind(position)
-    .execute(pool)
-    .await
-    .map_err(crate::db_error)?;
-    Ok(())
 }
 
 /// Typed representation of the `causation` block stamped in event metadata by
