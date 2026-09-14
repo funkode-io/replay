@@ -2293,6 +2293,10 @@ struct WatchedAccountFeePolicy {
     fee: f64,
 }
 
+/// A policy filtering on a column that is NULL for every live event: read as a
+/// `WHERE` predicate that is "no match", but read as a value it is SQL NULL.
+struct ArchivedOnlyPolicy;
+
 impl replay_persistence::Policy for WithdrawFeePolicy {
     type Event = BankAccountEvent;
 
@@ -2418,6 +2422,26 @@ impl replay_persistence::Policy for ChargeFeeWithCausationPolicy {
 /// Pure `react` unit test — no database. Asserts the policy returns exactly one
 /// dispatch, targeting the `BankAccount` aggregate, on a deposit, and nothing on
 /// other events.
+impl replay_persistence::Policy for ArchivedOnlyPolicy {
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "archived_only_policy"
+    }
+
+    fn stream_filter(&self) -> replay_persistence::StreamFilter {
+        replay_persistence::StreamFilter::with_aggregate_version(Some(1))
+    }
+
+    fn start_at(&self) -> replay_persistence::StartAt {
+        replay_persistence::StartAt::Beginning
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        panic!("no live event matches aggregate_version = 1, but {event:?} was delivered");
+    }
+}
+
 #[test]
 fn withdraw_fee_policy_react_is_pure() {
     use std::any::TypeId;
@@ -2701,6 +2725,64 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
             .await
             .expect("cursor row must exist after second drain");
     assert_eq!(cursor_after, head);
+}
+
+/// A filter is a `WHERE` predicate, where SQL NULL and FALSE both mean "no match".
+/// The feed reads it as a value instead, and a value can be NULL — `aggregate_version
+/// = 1` is NULL for every live event. Collapsing that to "no match" is the feed's
+/// job; getting it wrong fails the read rather than skipping the row.
+#[tokio::test]
+async fn policy_filter_that_is_null_per_row_skips_and_advances_postgres_test() {
+    let container = postgres::Postgres::default().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    let account = BankAccountUrn::new("null-filter-1").unwrap();
+
+    for amount in [10.0, 20.0] {
+        cqrs.execute::<BankAccount>(
+            &account,
+            replay::Metadata::default(),
+            BankAccountCommand::Deposit {
+                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                amount,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(ArchivedOnlyPolicy)
+        .build();
+
+    assert_eq!(
+        runner.drain().await.expect("drain must succeed"),
+        0,
+        "no live event matches the filter"
+    );
+
+    let cursor: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
+        .bind("archived_only_policy")
+        .fetch_one(&pg_pool)
+        .await
+        .expect("cursor row must exist after drain");
+    assert_eq!(cursor, 2, "the cursor walks past every position it read");
 }
 
 #[tokio::test]
