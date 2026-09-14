@@ -5581,14 +5581,8 @@ async fn policy_status_caught_up_postgres_test() {
         "lag == 0 must yield CaughtUp"
     );
     assert_eq!(s.head, s.position, "head and position must be equal");
-    assert_eq!(
-        s.next_position, None,
-        "nothing exists past the cursor of a drained policy"
-    );
-    assert_eq!(
-        s.missing_position, None,
-        "an empty tail is not a hole: a drained policy is not blocked"
-    );
+    assert_eq!(s.next_position, None, "nothing exists past the cursor");
+    assert_eq!(s.missing_position, None, "an empty tail is not a hole");
 }
 
 /// A behind policy has `lag > 0` and condition `Working`.
@@ -5655,20 +5649,15 @@ async fn policy_status_working_behind_postgres_test() {
         Some(s.position + 1),
         "the feed continues at the very next position"
     );
-    assert_eq!(
-        s.missing_position, None,
-        "a policy merely behind the head has no hole in front of it"
-    );
+    assert_eq!(s.missing_position, None, "no hole in front of the cursor");
 }
 
-/// A policy parked in front of a `global_position` that does not exist is
-/// `Blocked`, and `Blocked` outranks `Degraded`.
+/// A policy in front of a `global_position` that does not exist is `Blocked`,
+/// and `Blocked` outranks `Degraded`.
 ///
-/// Setup reproduces the incident behind funkode-io/replay#164 exactly: append
-/// one event, burn a sequence value (`nextval` is non-transactional, so an
-/// aborted append leaves a permanent hole), then append again. The second event
-/// lands two positions past the first. A cursor on the first event therefore
-/// sits in front of a position that can never exist.
+/// Setup reproduces funkode-io/replay#164: append one event, burn a sequence
+/// value (`nextval` is non-transactional, so an aborted append leaves a
+/// permanent hole), then append again two positions past the first.
 #[tokio::test]
 async fn policy_status_blocked_on_missing_position_postgres_test() {
     let container = postgres::Postgres::default().start().await.unwrap();
@@ -5703,14 +5692,13 @@ async fn policy_status_blocked_on_missing_position_postgres_test() {
 
     deposit(10.0).await.unwrap();
 
-    // The position the policy will be parked on.
+    // The position the policy will sit in front of.
     let parked_at: i64 = sqlx::query_scalar("SELECT MAX(global_position) FROM events")
         .fetch_one(&pg_pool)
         .await
         .expect("head query must succeed");
 
-    // Burn the next sequence value the way an aborted append does: the position
-    // is consumed and never returned, so no row can ever carry it.
+    // Burn the next sequence value the way an aborted append does.
     sqlx::query("SELECT nextval('events_global_position_seq')")
         .execute(&pg_pool)
         .await
@@ -5733,21 +5721,20 @@ async fn policy_status_blocked_on_missing_position_postgres_test() {
     assert_eq!(
         s.missing_position,
         Some(parked_at + 1),
-        "the burned position is the hole the policy is parked on"
+        "the burned position is the hole"
     );
     assert_eq!(
         s.next_position,
         Some(parked_at + 2),
-        "the next event that actually exists is one beyond the hole"
+        "the next event that exists is one beyond the hole"
     );
     assert_eq!(
         s.condition,
         replay_persistence::PolicyCondition::Blocked,
-        "a policy parked in front of a missing position must be Blocked"
+        "a policy in front of a missing position must be Blocked"
     );
 
-    // Blocked outranks Degraded: zero throughput is worse news than a parked
-    // reaction, so a dead letter must not relabel the policy.
+    // Blocked outranks Degraded.
     sqlx::query(
         "INSERT INTO policy_dead_letters \
              (policy_name, global_position, event_id, error_kind, error_message) \

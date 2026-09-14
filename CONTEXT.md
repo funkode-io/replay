@@ -94,23 +94,17 @@ state (an [Aggregate]'s rebuilt-from-stream state) and **not** a [Projection]
 (it derives no read model from the event log; it reports on a Policy's runtime).
 _Observing_ a Policy's status (read-only) is a separate concern from
 _controlling_ a Policy (acting on its failures by [Retry] or [Discard] of a
-[Dead letter]). A status distinguishes a healthy idle Policy from a
-[Blocked policy] without anyone reading the log by hand.
+[Dead letter]). It also tells a healthy idle Policy from a [Blocked policy].
 _Avoid_: state, policy state, health check.
 
 ### Blocked policy
 
-A [Policy] whose cursor is parked immediately in front of a `global_position`
-that does not exist while a later one does. The feed is read as a gap-free
-prefix, so it stops at the hole and the Policy reacts to nothing for as long as
-the position stays missing. Blocked is what an observer can *see*; whether it
-ever clears depends on the hole: a position burned by an aborted append can
-never be filled, so the Policy stays blocked until an operator moves its cursor,
-while a position still in flight looks identical and resolves itself on commit.
-Distinct from _lagging_ (a backlog that is draining) and from a `Degraded`
-status raised by a [Dead letter] (individual reactions parked while the Policy
-still advances) — blocked means zero throughput, which is why [Policy status]
-ranks it above both.
+A [Policy] whose cursor sits in front of a `global_position` that does not exist
+while a later one does, so its feed yields nothing and it reacts to nothing.
+Distinct from _lagging_ (a backlog that is draining) and from `Degraded`
+(reactions parked while the Policy still advances): blocked means zero
+throughput. Whether it clears is not observable from one reading
+([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)).
 _Avoid_: stuck, wedged, hung, stalled.
 
 ### Scoped URN

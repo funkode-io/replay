@@ -2312,8 +2312,8 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `position` | Last processed `global_position`. |
 | `head` | Current global head (`MAX(global_position)`). |
 | `lag` | Positions still to process (`head - position`). |
-| `next_position` | Lowest `global_position` past the cursor that actually exists; `None` when nothing is left. |
-| `missing_position` | The hole the cursor is parked on (`position + 1`) when that position does not exist but a later one does; otherwise `None`. |
+| `next_position` | Lowest `global_position` past the cursor that exists; `None` when nothing is left. |
+| `missing_position` | `position + 1` when that position is absent but a later one exists; otherwise `None`. |
 | `last_checkpoint_at` | When the cursor last advanced (staleness signal). |
 | `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
@@ -2329,12 +2329,11 @@ events with `global_position <= H` then observes the same set of events on every
 later read.
 
 `condition` is derived with a strict precedence — **a hole outranks dead letters,
-dead letters outrank lag** — so neither a blocked policy nor a parked failure is
-hidden behind a "still catching up" label:
+dead letters outrank lag**:
 
 | Condition | When | Meaning |
 |-----------|------|---------|
-| `Blocked` | `missing_position` is set | The feed stops at a position that does not exist; the policy has zero throughput while that stays true. |
+| `Blocked` | `missing_position` is set | The feed stops at a position that does not exist; zero throughput. |
 | `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
 | `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
 | `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
@@ -2342,13 +2341,8 @@ hidden behind a "still catching up" label:
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
 `"Degraded"`, `"Blocked"`) for JSON/UI consumers.
 
-`Blocked` is a point-in-time observation, not a proof that the hole is permanent:
-because `global_position` is assigned at INSERT and becomes visible at COMMIT, an
-append in flight leaves a momentary gap, so a poll taken during it can read as
-`Blocked` and clear by itself on the next one. A position burned by an aborted
-append, on the other hand, never appears and the policy stays blocked until an
-operator intervenes. The two are indistinguishable from a single read, so alert
-on the condition persisting across polls.
+An append in flight is indistinguishable from a permanent hole, so a single
+`Blocked` read may clear on the next poll. Alert on it persisting.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only

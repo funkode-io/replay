@@ -4,7 +4,7 @@
 //! writes (`policy_cursors`, `events`, and `policy_dead_letters`) and returns
 //! one [`PolicyStatus`] per known policy — a lightweight health/lag signal for
 //! monitoring, including whether a policy is parked in front of a
-//! `global_position` that does not exist and so cannot make progress.
+//! `global_position` that does not exist.
 //!
 //! This is **not** a Projection: it reads operational tables, not the event
 //! log, and does not use the [`crate::Query`] / [`crate::InlineProjection`]
@@ -21,18 +21,15 @@ use sqlx::{Pool, Postgres};
 ///
 /// Precedence (highest wins):
 ///
-/// | Condition  | When                                                     |
-/// |------------|----------------------------------------------------------|
+/// | Condition  | When                                                        |
+/// |------------|-------------------------------------------------------------|
 /// | `Blocked`  | the position after the cursor is absent, a later one exists |
-/// | `Degraded` | `dead_letter_count > 0`                                  |
-/// | `Working`  | `dead_letter_count == 0`, `lag > 0`                      |
-/// | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`                     |
+/// | `Degraded` | `dead_letter_count > 0`                                     |
+/// | `Working`  | `dead_letter_count == 0`, `lag > 0`                         |
+/// | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`                        |
 ///
-/// A policy that is *both* behind and has dead letters resolves to `Degraded`
-/// so that parked failures are never hidden behind a progress label. A policy
-/// parked in front of a hole resolves to `Blocked` whatever else is true of it:
-/// it has no throughput at all, which outranks some-reactions-parked. An empty
-/// tail is not a hole — a drained policy is `CaughtUp`, never `Blocked`.
+/// A policy that is *both* behind and has dead letters resolves to `Degraded`.
+/// An empty tail is not a hole: a drained policy is `CaughtUp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyCondition {
     /// No dead letters and no lag: fully healthy and up to date.
@@ -41,13 +38,9 @@ pub enum PolicyCondition {
     Working,
     /// At least one dead-letter row exists; needs operator attention.
     Degraded,
-    /// The cursor is parked immediately in front of a `global_position` that
-    /// does not exist, while a later position does. The feed stops at the hole,
-    /// so the policy processes nothing for as long as the position stays
-    /// missing. A position burned by an aborted append never appears, and such
-    /// a policy never recovers on its own; a position still in flight is
-    /// indistinguishable at read time and clears when it commits, so alert on
-    /// this condition persisting across polls rather than on one read.
+    /// The cursor sits in front of a `global_position` that does not exist
+    /// while a later one does, so the feed yields nothing. An append in flight
+    /// looks the same and clears on a later poll; a burned position does not.
     Blocked,
 }
 
@@ -63,12 +56,8 @@ impl PolicyCondition {
     }
 
     /// Derive the condition from the raw `lag`, `dead_letter_count` and
-    /// `missing_position` fields.
-    ///
-    /// A hole in front of the cursor (`missing_position.is_some()`) takes
-    /// precedence over everything, then dead letters over lag: a policy that is
-    /// behind, dead-lettered *and* parked on a hole resolves to
-    /// [`PolicyCondition::Blocked`].
+    /// `missing_position` fields, highest precedence first: a hole, then dead
+    /// letters, then lag.
     pub fn from_fields(lag: i64, dead_letter_count: i64, missing_position: Option<i64>) -> Self {
         if missing_position.is_some() {
             PolicyCondition::Blocked
@@ -103,15 +92,12 @@ pub struct PolicyStatus {
     ///
     /// Counts positions, not events: a burned or deleted position inflates it.
     pub lag: i64,
-    /// The lowest `global_position` greater than `position` that actually
-    /// exists, or `None` when nothing past the cursor is in the log.
+    /// The lowest `global_position` greater than `position` that exists, or
+    /// `None` when nothing past the cursor is in the log.
     pub next_position: Option<i64>,
-    /// `Some(position + 1)` when the position immediately after the cursor does
-    /// not exist while a later one does — the hole the policy is parked on.
-    /// `None` when the feed continues contiguously (or has nothing left).
-    ///
-    /// A hole may span several positions; this reports the first, which is the
-    /// one the feed stops at.
+    /// `Some(position + 1)` when that position does not exist while a later one
+    /// does — the hole the feed stops at. A multi-position hole reports its
+    /// first position.
     pub missing_position: Option<i64>,
     /// When the cursor was last advanced (staleness signal).
     pub last_checkpoint_at: DateTime<Utc>,
@@ -126,11 +112,8 @@ pub struct PolicyStatus {
     pub condition: PolicyCondition,
 }
 
-/// The hole a cursor is parked on, if any: set only when the position right
+/// The hole a cursor sits in front of, if any: set only when the position right
 /// after `position` is absent *and* some later position exists.
-///
-/// A cursor with nothing past it is caught up, not blocked — that is an empty
-/// tail, not evidence of a hole.
 fn missing_position(position: i64, next_position: Option<i64>) -> Option<i64> {
     match next_position {
         Some(next) if next > position + 1 => Some(position + 1),
@@ -163,10 +146,9 @@ impl PolicyStatusStore {
     /// `policy_cursors`, `MAX(global_position)` on `events`, a per-policy
     /// `MIN(global_position) > cursor` probe, and a per-policy `LATERAL`
     /// aggregate over `policy_dead_letters`.  The dead-letter lateral is
-    /// filtered by `pc.name`, so it uses the `(policy_name, created_at)` index
-    /// instead of aggregating the whole table; the `MIN`/`MAX` on `events` are
-    /// index probes on `idx_events_global_position`.  The event log is never
-    /// scanned.
+    /// filtered by `pc.name`, so it uses the `(policy_name, created_at)` index;
+    /// the `MIN`/`MAX` on `events` are probes on `idx_events_global_position`.
+    /// The event log is never scanned.
     pub async fn list(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
         let rows = sqlx::query(
             r#"
@@ -305,7 +287,7 @@ mod tests {
         assert_eq!(degraded.condition.as_str(), "Degraded");
         assert_eq!(degraded.condition.to_string(), "Degraded");
 
-        // parked in front of a hole: blocked, ahead of both of the above
+        // in front of a hole: blocked, ahead of both of the above
         let blocked = PolicyStatus {
             name: "blocked_policy".to_string(),
             position: 7,
@@ -345,8 +327,7 @@ mod tests {
             PolicyCondition::from_fields(10, 2, None),
             PolicyCondition::Degraded
         );
-        // A hole in front of the cursor outranks everything: the policy has zero
-        // throughput, so "catching up" and "some events parked" both understate it.
+        // A hole in front of the cursor outranks everything.
         assert_eq!(
             PolicyCondition::from_fields(5, 0, Some(7)),
             PolicyCondition::Blocked
@@ -363,11 +344,11 @@ mod tests {
     fn missing_position_is_the_hole_in_front_of_the_cursor() {
         // Next event is the very next position: no hole.
         assert_eq!(missing_position(5, Some(6)), None);
-        // Next event is further out: the policy is parked on position 6.
+        // Next event is further out: the hole is position 6.
         assert_eq!(missing_position(5, Some(9)), Some(6));
         // Nothing past the cursor at all: caught up, not blocked.
         assert_eq!(missing_position(5, None), None);
-        // A cursor at 0 with the log starting at 1 is the bootstrap case, not a hole.
+        // A cursor at 0 with the log starting at 1 is the bootstrap case.
         assert_eq!(missing_position(0, Some(1)), None);
     }
 
