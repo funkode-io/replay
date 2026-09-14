@@ -23,6 +23,7 @@ mod global_position;
 
 mod common;
 use common::postgres_image::postgres_container;
+use common::wait::wait_for_count;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -3322,25 +3323,14 @@ async fn policy_single_active_runner_via_advisory_lock_postgres_test() {
     // appending anything. `load_cursor` inserts the cursor row at bootstrap, so
     // the row's presence proves the elected leader captured `Now` ahead of the
     // deposits and cannot initialize after them and legitimately skip them.
-    // A fixed sleep here is a race: how long election takes depends on the
-    // server, and losing it makes the leader skip the very events under test.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let ready = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM policy_cursors WHERE name = 'single_runner_policy'",
-        )
-        .fetch_one(&pg_pool)
-        .await
-        .expect("cursor count query must succeed");
-        if ready == 1 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no policy cursor was initialized before timeout: nobody became leader"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_count(
+        &pg_pool,
+        "SELECT COUNT(*) FROM policy_cursors WHERE name = 'single_runner_policy'",
+        1,
+        Duration::from_secs(15),
+        "a leader to be elected and bootstrap its cursor",
+    )
+    .await;
 
     cqrs.execute::<BankAccount>(
         &account,
@@ -3551,23 +3541,14 @@ async fn policy_bounded_connection_footprint_many_policies_postgres_test() {
     // appending the trigger. `load_cursor` inserts the cursor row at bootstrap,
     // so the presence of all rows proves every worker captured `Now` ahead of the
     // trigger and cannot initialize after it and legitimately skip it.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let ready = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM policy_cursors WHERE name LIKE 'footprint_policy_%'",
-        )
-        .fetch_one(&pg_pool)
-        .await
-        .expect("cursor count query must succeed");
-        if ready == POLICY_COUNT as i64 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "only {ready}/{POLICY_COUNT} policy cursors initialized before timeout"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_count(
+        &pg_pool,
+        "SELECT COUNT(*) FROM policy_cursors WHERE name LIKE 'footprint_policy_%'",
+        POLICY_COUNT as i64,
+        Duration::from_secs(15),
+        "every policy to bootstrap its cursor",
+    )
+    .await;
 
     // ── Append one deposit to the shared trigger account ──────────────────────
     let trigger = BankAccountUrn::new("footprint-trigger").unwrap();
@@ -3587,22 +3568,14 @@ async fn policy_bounded_connection_footprint_many_policies_postgres_test() {
     // Poll until every policy has drained the trigger event rather than relying
     // on a fixed delay; a constrained pool serializes the transient drains and a
     // slow or contended host can take a while.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let withdrawn = loop {
-        let count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE type = 'Withdrawn'")
-                .fetch_one(&pg_pool)
-                .await
-                .expect("count query must succeed");
-        if count >= POLICY_COUNT as i64 {
-            break count;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "only {count}/{POLICY_COUNT} policies processed the trigger deposit before timeout"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let withdrawn = wait_for_count(
+        &pg_pool,
+        "SELECT COUNT(*) FROM events WHERE type = 'Withdrawn'",
+        POLICY_COUNT as i64,
+        Duration::from_secs(20),
+        "every policy to process the trigger deposit",
+    )
+    .await;
 
     assert_eq!(
         withdrawn, POLICY_COUNT as i64,
