@@ -17,6 +17,9 @@ use urn::Urn;
 use replay_macros::define_aggregate;
 use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
+mod common;
+use common::postgres_image::postgres_container;
+
 const POSTGRES_PORT: u16 = 5432;
 
 define_aggregate! {
@@ -66,7 +69,7 @@ async fn start_postgres() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres::Postgres::default().start().await.unwrap();
+    let container = postgres_container().start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)

@@ -12,6 +12,23 @@ You can chose you implement just `Stream` (state will be built from events) or `
 
 > Important to note `Streams` never fails as the are built from events that happened in the past (so there are no side effects, error handling, etc.). All of these concerns are managed in the aggregate.
 
+## Requirements
+
+`es-replay-persistence` requires **PostgreSQL 13 or later**.
+
+13 is the floor because it is the oldest release providing the transaction-snapshot
+functions (`pg_current_snapshot`, `pg_snapshot_xmin`, `pg_snapshot_xmax`). Without them
+the policy feed cannot tell an append that is still in flight from a sequence value that
+was burned by an aborted transaction and can therefore never appear — and a single burned
+position then stops every policy indefinitely
+([#164](https://github.com/funkode-io/replay/issues/164)).
+
+The integration suite is verified against a PostgreSQL release that is still receiving
+upstream fixes; the pinned image tag lives in `persistence/tests/common/postgres_image.rs`.
+
+The core `es-replay` crate has no database requirement at all, and is the half that runs
+on WASM.
+
 ## Example
 
 Let's model a small banking domain with two aggregate roots:
