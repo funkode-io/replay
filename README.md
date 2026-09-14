@@ -2337,9 +2337,12 @@ for s in &statuses {
 }
 
 // React to anything needing attention.
-let degraded: Vec<_> = statuses
+let needs_attention: Vec<_> = statuses
     .iter()
-    .filter(|s| s.condition == PolicyCondition::Degraded)
+    .filter(|s| matches!(
+        s.condition,
+        PolicyCondition::Degraded | PolicyCondition::Blocked,
+    ))
     .collect();
 ```
 
@@ -2350,7 +2353,9 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `name` | Stable policy name (the cursor key). |
 | `position` | Last processed `global_position`. |
 | `head` | Current global head (`MAX(global_position)`). |
-| `lag` | Events still to process (`head - position`). |
+| `lag` | Positions still to process (`head - position`). |
+| `next_position` | Lowest `global_position` past the cursor that exists; `None` when nothing is left. |
+| `missing_position` | `position + 1` when that position is absent but a later one exists; otherwise `None`. |
 | `last_checkpoint_at` | When the cursor last advanced (staleness signal). |
 | `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
@@ -2365,17 +2370,21 @@ position in `1..=H` is present, e.g. to freeze a version at publish time — use
 events with `global_position <= H` then observes the same set of events on every
 later read.
 
-`condition` is derived with a strict precedence — **dead letters outrank lag** —
-so a parked failure is never hidden behind a "still catching up" label:
+`condition` is derived with a strict precedence — **a hole outranks dead letters,
+dead letters outrank lag**:
 
 | Condition | When | Meaning |
 |-----------|------|---------|
+| `Blocked` | `missing_position` is set | The feed stops at a position that does not exist; zero throughput. |
 | `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
 | `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
 | `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
 
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
-`"Degraded"`) for JSON/UI consumers.
+`"Degraded"`, `"Blocked"`) for JSON/UI consumers.
+
+An append in flight is indistinguishable from a permanent hole, so a single
+`Blocked` read may clear on the next poll. Alert on it persisting.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only

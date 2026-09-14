@@ -25,10 +25,13 @@ operational tables the runner already maintains.
   **single** SQL query over
   [`policy_cursors`](../../persistence/tests/migrations/0008_policy_cursors.sql)
   (per-policy stored position + `updated_at`), `MAX(global_position)` on `events`
-  (the global head), and a per-policy aggregate over
+  (the global head), `MIN(global_position) > cursor` on `events` (the next
+  position that actually exists), and a per-policy aggregate over
   [`policy_dead_letters`](../../persistence/tests/migrations/0010_policy_dead_letters.sql)
-  (`COUNT(*)` + `MAX(created_at)`). The event log is never scanned — status is
-  O(policies), not O(events), so it stays cheap to poll on a dashboard interval.
+  (`COUNT(*)` + `MAX(created_at)`). The event log is never scanned: both `events`
+  reads are `MIN`/`MAX` probes on `idx_events_global_position`, O(log events)
+  each. The dead-letter aggregate still walks one policy's index entries, so
+  status scales with dead letters, not with the log.
 
 - **Extend the existing read model; do not fork a parallel one.** Status lives in
   [`PolicyStatusStore`](../../persistence/src/policy_status.rs) and is read via
@@ -39,25 +42,42 @@ operational tables the runner already maintains.
 
 - **A status is a derived health label plus the raw numbers behind it.**
   `PolicyStatus` carries `name`, `position`, `head`, `lag` (`head - position`),
-  `last_checkpoint_at`, `dead_letter_count`, `last_dead_letter_at`, and a derived
-  `condition`. The raw fields are always present so a consumer can render its own
-  view; `condition` is the at-a-glance summary.
+  `next_position`, `missing_position`, `last_checkpoint_at`, `dead_letter_count`,
+  `last_dead_letter_at`, and a derived `condition`. The raw fields are always
+  present so a consumer can render its own view; `condition` is the at-a-glance
+  summary.
 
-- **`PolicyCondition` precedence: dead letters outrank lag.** The condition is
-  derived by `PolicyCondition::from_fields(lag, dead_letter_count)` with a strict
-  precedence (highest wins):
+- **Report the next position that exists, and the hole in front of the cursor.**
+  `lag` counts positions, so it cannot tell a policy draining a backlog from one
+  parked in front of a `global_position` that will never exist —
+  [#164](https://github.com/funkode-io/replay/issues/164), where one burned
+  `BIGSERIAL` value stopped 19 policies for three days and was diagnosed with
+  hand-written SQL. `next_position` is `MIN(global_position) > position`, `None`
+  on an empty tail; `missing_position` is `Some(position + 1)` when
+  `next_position > position + 1`, else `None`. A multi-position hole reports its
+  first position, the one the feed stops at. An empty tail is not a hole: a
+  drained policy is `CaughtUp`.
 
-  | Condition  | When                                  |
-  |------------|---------------------------------------|
-  | `Degraded` | `dead_letter_count > 0`               |
-  | `Working`  | `dead_letter_count == 0`, `lag > 0`   |
-  | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`  |
+- **`PolicyCondition` precedence: a hole outranks dead letters, dead letters
+  outrank lag.** The condition is derived by
+  `PolicyCondition::from_fields(lag, dead_letter_count, missing_position)` with a
+  strict precedence (highest wins):
+
+  | Condition  | When                                       |
+  |------------|--------------------------------------------|
+  | `Blocked`  | `missing_position.is_some()`               |
+  | `Degraded` | `dead_letter_count > 0`                    |
+  | `Working`  | `dead_letter_count == 0`, `lag > 0`        |
+  | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`       |
 
   A policy that is **both** behind and dead-lettered resolves to `Degraded`, so a
   parked failure is never hidden behind a benign "still catching up" label. Lag is
   expected and self-healing; a dead letter means an event was skipped and needs a
-  human. `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`,
-  `"Working"`, `"Degraded"`) so JSON/UI consumers can match on it.
+  human. `Blocked` outranks `Degraded` because it is a throughput statement rather
+  than a failure count: a blocked policy processes nothing, a degraded one is
+  still draining. `condition` has a stable `as_str()` / `Display` form
+  (`"CaughtUp"`, `"Working"`, `"Degraded"`, `"Blocked"`) so JSON/UI consumers can
+  match on it.
 
 - **Only policies that have run appear.** Status is keyed off `policy_cursors`
   rows. A policy that has been registered but has never started (no cursor row)
@@ -76,13 +96,23 @@ operational tables the runner already maintains.
   and a just-written dead letter appears on the next read. This is correct for a
   monitoring signal and avoids taking any lock on the runner's hot path.
 
+- `Blocked` is an **observation, not a permanence proof**. `global_position` is
+  assigned at INSERT and visible at COMMIT, so an append in flight looks like a
+  hole and clears on a later poll; a burned position never does, and the two are
+  identical from one read. Alert on the condition persisting across polls.
+  Deciding a hole can never fill, and advancing the cursor past it, needs
+  transaction-snapshot evidence on the runner side —
+  [#164](https://github.com/funkode-io/replay/issues/164). This ADR still covers
+  observing only: `Blocked` names the condition, it does not clear it.
+
 - This ADR covers **observing** only. **Controlling** a policy — explicitly
   retrying or discarding a dead letter, or rewinding a cursor — is a separate
   capability deliberately deferred to its own decision, so the read path carries no
   mutation surface.
 
 - The condition precedence and the dead-letter / lag interaction are covered by a
-  unit test (the `from_fields` precedence table) and Docker-gated Postgres
-  integration tests (caught-up, behind, multiple policies, never-run-absent, and a
-  degraded-with-dead-letters case proving `Degraded` beats `Working`), which double
-  as the executable specification of these contracts.
+  unit test (the `from_fields` precedence table, and the `missing_position`
+  derivation) and Docker-gated Postgres integration tests (caught-up, behind,
+  multiple policies, never-run-absent, `Degraded` over `Working`, and a burned
+  sequence value proving `Blocked` over `Degraded`), which double as the
+  executable specification of these contracts.
