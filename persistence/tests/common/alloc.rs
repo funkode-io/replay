@@ -5,6 +5,11 @@
 //! Both come from one counting allocator; only the `#[global_allocator]` registration
 //! has to stay in each test binary, since a binary can register exactly one and it must
 //! be its own.
+//!
+//! `allow(dead_code)` module-wide: every test binary that says `mod common;` compiles
+//! this whole module but uses only the measurement it needs — and the binaries that
+//! only want a Postgres container use none of it at all.
+#![allow(dead_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -95,10 +100,6 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 /// Runs `f` and returns the bytes it allocated on this thread.
-///
-/// `allow(dead_code)`: each test binary includes the whole module but uses only the
-/// measurement it needs.
-#[allow(dead_code)]
 pub fn allocated_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = ALLOCATED.with(Cell::get);
     let value = f();
@@ -110,14 +111,12 @@ pub fn allocated_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
 ///
 /// Separate from the measurement because the code under test may be an `async` block,
 /// which cannot be wrapped in a closure the way [`allocated_bytes`] wraps one.
-#[allow(dead_code)]
 pub fn reset_peak() {
     LIVE.with(|live| live.set(0));
     PEAK.with(|peak| peak.set(0));
 }
 
 /// The most bytes held live on this thread at any one moment since [`reset_peak`].
-#[allow(dead_code)]
 pub fn peak_live_bytes() -> isize {
     PEAK.with(Cell::get)
 }

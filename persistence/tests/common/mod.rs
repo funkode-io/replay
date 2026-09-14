@@ -4,4 +4,5 @@
 //! `mod common;` rather than as a test binary of its own.
 
 pub mod alloc;
+pub mod postgres_image;
 pub mod report;
