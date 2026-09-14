@@ -2419,9 +2419,6 @@ impl replay_persistence::Policy for ChargeFeeWithCausationPolicy {
     }
 }
 
-/// Pure `react` unit test — no database. Asserts the policy returns exactly one
-/// dispatch, targeting the `BankAccount` aggregate, on a deposit, and nothing on
-/// other events.
 impl replay_persistence::Policy for ArchivedOnlyPolicy {
     type Event = BankAccountEvent;
 
@@ -2442,6 +2439,9 @@ impl replay_persistence::Policy for ArchivedOnlyPolicy {
     }
 }
 
+/// Pure `react` unit test — no database. Asserts the policy returns exactly one
+/// dispatch, targeting the `BankAccount` aggregate, on a deposit, and nothing on
+/// other events.
 #[test]
 fn withdraw_fee_policy_react_is_pure() {
     use std::any::TypeId;

@@ -39,10 +39,19 @@ holes (funkode-io/replay#164) is to be added.
   reacts to*. Two policies with different filters walk the log at the same rate.
 - The read batch is spent on positions, not on matches: a Policy with a highly
   selective filter reads a batch of mostly-skipped positions per poll and may need
-  several polls to reach its next event. Memory stays bounded by the batch — a
-  filter cannot make the window grow — and only rows that are actually delivered are
-  parsed into events, so a skipped position costs its `global_position`, not its
-  payload.
+  several polls to reach its next event. Memory stays bounded by the batch — a filter
+  cannot make the window grow — but the bound is now the same for every Policy: a
+  selective one pays for a batch of rows it will not react to, where the old (broken)
+  filtered query paid only for its matches. Only delivered rows are parsed into
+  events; the row bytes behind a skipped position are still fetched, because one
+  query reads the window.
+- Projecting the payload columns only for matching rows, or reading positions and
+  matching rows as two queries, would recover that and would also let the position
+  window be larger than the row batch. Both are deliberately not done here: the
+  bounded read was never the incident, and a second query brings a second snapshot
+  (a concurrent compaction can change whether a row matches between the two). If a
+  selective Policy's catch-up rate ever becomes the problem, that is the change to
+  make, with a measurement behind it.
 - The filter now runs in the SELECT list, where SQL's three-valued logic is visible:
   a predicate that yields NULL (for example `aggregate_version = 3` on a live row)
   must be read as "no match", so it is collapsed with `COALESCE(…, FALSE)`. As a

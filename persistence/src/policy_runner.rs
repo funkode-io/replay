@@ -1205,8 +1205,9 @@ async fn read_feed(
         let is_snapshot: bool = row.get("compacted_snapshot");
         let matches_filter: bool = row.get("matches_filter");
 
-        // Only rows that are actually delivered are parsed: a position the policy
-        // skips costs its `global_position`, not its payload.
+        // Only rows that are actually delivered are parsed into events. The row
+        // bytes of a skipped position still cross the wire — the window is read
+        // with one query, so its cost is the batch, matching or not.
         let delivered = if is_snapshot || !matches_filter {
             None
         } else {
