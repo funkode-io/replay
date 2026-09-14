@@ -290,6 +290,9 @@ impl replay::Aggregate for IdempotentFeeAccount {
 /// Position an operator "moves the cursor to" in the mid-batch test below.
 const CURSOR_NUDGE_TARGET: i64 = 10_000;
 
+/// Cursor key shared by the fixture policy and the aggregate that moves it.
+const CURSOR_NUDGE_POLICY: &str = "cursor_nudge_policy";
+
 define_aggregate! {
     CursorNudgeBox {
         namespace: "cursor-nudge-box",
@@ -339,7 +342,7 @@ impl replay::Aggregate for CursorNudgeBox {
                     "UPDATE policy_cursors SET position = $1, updated_at = now() WHERE name = $2",
                 )
                 .bind(CURSOR_NUDGE_TARGET)
-                .bind("cursor_nudge_policy")
+                .bind(CURSOR_NUDGE_POLICY)
                 .execute(services)
                 .await
                 .map_err(|error| replay::Error::internal(error.to_string()))?;
@@ -358,7 +361,7 @@ impl replay_persistence::Policy for CursorNudgePolicy {
     type Event = BankAccountEvent;
 
     fn name(&self) -> &str {
-        "cursor_nudge_policy"
+        CURSOR_NUDGE_POLICY
     }
 
     fn start_at(&self) -> replay_persistence::StartAt {
@@ -3135,7 +3138,7 @@ async fn policy_checkpoint_yields_to_a_concurrent_cursor_move_postgres_test() {
     );
 
     let stored: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-        .bind("cursor_nudge_policy")
+        .bind(CURSOR_NUDGE_POLICY)
         .fetch_one(&pg_pool)
         .await
         .unwrap();
@@ -3149,7 +3152,7 @@ async fn policy_checkpoint_yields_to_a_concurrent_cursor_move_postgres_test() {
     assert_eq!(runner.drain().await.unwrap(), 0);
     let stored_after: i64 =
         sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind("cursor_nudge_policy")
+            .bind(CURSOR_NUDGE_POLICY)
             .fetch_one(&pg_pool)
             .await
             .unwrap();

@@ -999,11 +999,7 @@ async fn drain_policy_once(
         // past events whose reactions are already durably committed).
         if events_since_checkpoint >= checkpoint_size {
             if cursor.checkpoint(pool, &name).await? == Checkpoint::Superseded {
-                tracing::info!(
-                    policy = %name,
-                    position = cursor.position,
-                    "persisted cursor was moved externally mid-batch; abandoning it and adopting the stored position"
-                );
+                log_superseded(&name, cursor);
                 return Ok(executed);
             }
             events_since_checkpoint = 0;
@@ -1014,14 +1010,20 @@ async fn drain_policy_once(
     if events_since_checkpoint > 0
         && cursor.checkpoint(pool, &name).await? == Checkpoint::Superseded
     {
-        tracing::info!(
-            policy = %name,
-            position = cursor.position,
-            "persisted cursor was moved externally mid-batch; abandoning it and adopting the stored position"
-        );
+        log_superseded(&name, cursor);
     }
 
     Ok(executed)
+}
+
+/// Report a checkpoint that lost to a cursor moved outside this process. The
+/// batch stops here; the cursor already holds the stored position.
+fn log_superseded(name: &str, cursor: &PolicyCursor) {
+    tracing::info!(
+        policy = %name,
+        position = cursor.position,
+        "persisted cursor was moved externally mid-batch; abandoning this batch at the stored position"
+    );
 }
 
 /// Execute all reactions for one event, applying the resilience policy:
