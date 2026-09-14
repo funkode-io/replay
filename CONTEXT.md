@@ -102,10 +102,11 @@ _Avoid_: state, policy state, health check.
 A stream identifier carrying its owner as a suffix:
 `urn:bank-account:acct-1@branch:london`. The embedded URN is the **scope**, the
 part before the `@` the **base**. Composed with `at`, taken apart with
-`extract_scope` (the scope) and `unscoped` (the base). Scopes nest —
-`urn:watchlist:main@user:0x78@wallet-type:evm` — and `extract_scope` peels one
-level at a time. `at` refuses to scope an already-scoped URN, which is what makes
-the left-most `@` the outermost scope
+`extract_scope` (the scope), `unscoped` (the base) and `to_slug` (the base's NSS,
+borrowed, for a caller who wants the identity rather than a typed URN). Scopes
+nest — `urn:watchlist:main@user:0x78@wallet-type:evm` — and `extract_scope` peels
+one level at a time. `at` refuses to scope an already-scoped URN, which is what
+makes the left-most `@` the outermost scope
 ([ADR-0010](docs/adr/0010-nested-scoped-urns-parse-at-the-first-at-sign.md)). It
 is an identity, not a [Query]: the event store treats the whole string as an
 opaque stream id.

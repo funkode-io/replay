@@ -1133,7 +1133,7 @@ assert_eq!(active_products.len(), 2);
 
 When two streams are related (e.g., a bank account belonging to a branch), you can embed that
 relationship directly in the URN using `ScopedUrn::at`, recover it with
-`ScopedUrn::extract_scope`, and drop it again with `ScopedUrn::unscoped`.
+`ScopedUrn::extract_scope`, and drop it again with `ScopedUrn::unscoped` or `ScopedUrn::to_slug`.
 
 The resulting URN uses the format `urn:<nid>:<nss>@<scope_nid>:<scope_nss>`.
 
@@ -1214,11 +1214,38 @@ let region: RegionUrn = branch.extract_scope::<RegionUrn>()?;     // urn:region:
 
 // unscoped drops the whole scope
 let base: BankAccountUrn = account.unscoped()?;                   // urn:bank-account:acct-1
+
+// to_slug drops it too, but hands back the NSS borrowed instead of a rebuilt URN
+let slug: &str = account.to_slug();                               // "acct-1"
 ```
 
 Re-scoping an already-scoped URN is refused — call `unscoped()` first. That guard is what
 makes the left-most `@` the outermost scope
 ([ADR-0010](docs/adr/0010-nested-scoped-urns-parse-at-the-first-at-sign.md)).
+
+#### `unscoped` or `to_slug`
+
+Both drop the scope at the same boundary — the first `@` — and differ in what they hand back:
+
+| | returns | scoped input | unscoped input | allocates |
+| --- | --- | --- | --- | --- |
+| `unscoped()` | `Result<Self>` — the base as a typed URN | the base | `Err` (nothing to drop) | yes: clones, rebuilds, revalidates |
+| `to_slug()` | `&str` — the base's NSS | the base's NSS | its own NSS | **no** — a slice of the NSS already there |
+
+Take `unscoped` when you need the base as a URN to pass on or re-scope. Take `to_slug` when you
+need the identity as text — a database key, a display label, a lookup in a map — which is the
+common case and the one where rebuilding a URN is pure overhead. `to_slug` is infallible on
+purpose: a caller that may hold either a scoped or a bare URN gets one answer from both, with no
+`unwrap_or` at the call site.
+
+```rust
+let bare: AttributeUrn = AttributeUrn::new("color")?;
+let scoped: AttributeUrn = bare.clone().at(&catalog)?;
+
+assert_eq!(bare.to_slug(), "color");     // no scope to drop
+assert_eq!(scoped.to_slug(), "color");   // scope dropped
+assert!(bare.unscoped().is_err());       // whereas unscoped insists on one
+```
 
 ### Prelude
 
@@ -1232,7 +1259,7 @@ use replay::prelude::*;
 
 | Export | Purpose |
 | --- | --- |
-| `ScopedUrn` | `at`, `extract_scope` and `unscoped` on URN types |
+| `ScopedUrn` | `at`, `extract_scope`, `unscoped` and `to_slug` on URN types |
 | `WithId` | `with_id`, `get_id`, `with_string_id` on aggregate structs |
 | `EventStream` | `apply`, `stream_type` |
 | `Aggregate` | `handle` |
