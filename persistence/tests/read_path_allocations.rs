@@ -21,6 +21,7 @@ use replay_persistence::PersistedEvent;
 
 mod common;
 use common::alloc::{allocated_bytes, CountingAllocator};
+use common::postgres_image::postgres_container;
 use common::report::report;
 
 /// Every test binary registers its own global allocator; the counting itself is
@@ -51,7 +52,7 @@ fn fat_event(version: i64) -> Value {
 }
 
 async fn start_postgres() -> (ContainerAsync<postgres::Postgres>, PgPool) {
-    let container = postgres::Postgres::default().start().await.unwrap();
+    let container = postgres_container().start().await.unwrap();
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
