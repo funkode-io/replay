@@ -2329,7 +2329,7 @@ events with `global_position <= H` then observes the same set of events on every
 later read.
 
 `condition` is derived with a strict precedence — **a hole outranks dead letters,
-dead letters outrank lag** — so neither a wedged policy nor a parked failure is
+dead letters outrank lag** — so neither a blocked policy nor a parked failure is
 hidden behind a "still catching up" label:
 
 | Condition | When | Meaning |

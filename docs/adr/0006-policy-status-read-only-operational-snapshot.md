@@ -81,7 +81,7 @@ operational tables the runner already maintains.
   human. `Blocked` sits above `Degraded` because it is a *throughput* statement,
   not a *failure count*: a blocked policy processes nothing at all and will not
   recover on its own, while a degraded one is still draining its feed. Reporting a
-  wedged policy as `Degraded` (or worse, `Working`) is how the outage above stayed
+  blocked policy as `Degraded` (or worse, `Working`) is how the outage above stayed
   invisible. `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`,
   `"Working"`, `"Degraded"`, `"Blocked"`) so JSON/UI consumers can match on it.
 

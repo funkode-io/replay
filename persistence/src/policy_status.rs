@@ -303,7 +303,7 @@ mod tests {
 
         // parked in front of a hole: blocked, ahead of both of the above
         let blocked = PolicyStatus {
-            name: "wedged_policy".to_string(),
+            name: "blocked_policy".to_string(),
             position: 7,
             head: 10,
             lag: 3,
