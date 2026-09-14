@@ -94,7 +94,7 @@ row directly while the system runs. The third controlling action alongside
 one parked reaction, skipping events when it moves forward and re-delivering
 them when it moves backward. The running leader adopts the new position when its
 feed is empty, and never writes a position that predates the move
-([ADR-0011](docs/adr/0011-policy-cursor-is-an-operator-writable-control-surface.md)).
+([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
 _Avoid_: reset, seek, rewind (as a name for the act; a rewind is one direction of
 it).
 

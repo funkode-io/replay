@@ -1322,20 +1322,16 @@ impl PolicyCursor {
         }
 
         let bootstrap_position = bootstrap_position(pool, start_at).await?;
-        insert_position(pool, name, bootstrap_position).await?;
+        let mut cursor = Self {
+            position: bootstrap_position,
+            persisted: bootstrap_position,
+        };
 
-        // Re-read rather than trusting the insert: a concurrent runner may have
-        // won the `ON CONFLICT DO NOTHING`, and its value is the stored one.
-        let persisted = read_position(pool, name).await?.ok_or_else(|| {
-            replay::Error::not_found("policy cursor row vanished immediately after bootstrap")
-                .with_operation("policy_cursor_load")
-                .with_context("policy", name)
-        })?;
-
-        Ok(Self {
-            position: persisted,
-            persisted,
-        })
+        // `refresh` does the rest: it creates the row if it is still missing and
+        // adopts the stored value, which is a concurrent runner's bootstrap when
+        // that runner won the insert.
+        cursor.refresh(pool, name).await?;
+        Ok(cursor)
     }
 
     /// Re-read the stored position and adopt it, returning `true` when it moved
@@ -1343,12 +1339,20 @@ impl PolicyCursor {
     ///
     /// A deleted row is recreated at the in-memory position: dropping the row is
     /// not a documented way to rewind a policy, and recreating it keeps the
-    /// policy from silently replaying its whole history.
+    /// policy from silently replaying its whole history. The recreate can lose
+    /// to a concurrent writer, so it re-reads and adopts the winner rather than
+    /// assuming its own value took.
     async fn refresh(&mut self, pool: &Pool<Postgres>, name: &str) -> Result<bool, replay::Error> {
-        let Some(persisted) = read_position(pool, name).await? else {
-            insert_position(pool, name, self.position).await?;
-            self.persisted = self.position;
-            return Ok(false);
+        let persisted = match read_position(pool, name).await? {
+            Some(persisted) => persisted,
+            None => {
+                insert_position(pool, name, self.position).await?;
+                read_position(pool, name).await?.ok_or_else(|| {
+                    replay::Error::not_found("policy cursor row vanished immediately after insert")
+                        .with_operation("policy_cursor_refresh")
+                        .with_context("policy", name)
+                })?
+            }
         };
 
         self.persisted = persisted;

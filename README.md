@@ -2113,7 +2113,7 @@ that loses the race adopts your position and abandons the rest of its batch.
 Moving forward skips the events in between (they are never delivered); moving
 backward re-delivers them, which is safe under the same idempotency contract that
 covers crash re-delivery. See
-[ADR-0011](docs/adr/0011-policy-cursor-is-an-operator-writable-control-surface.md).
+[ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md).
 
 ### Advisory-lock leader election
 

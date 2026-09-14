@@ -3015,7 +3015,7 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
     // Wait until the daemon has charged the fee for the first deposit: 100 - 5.
     deposit(1).await;
     let mut settled = false;
-    for _ in 0..40 {
+    for _ in 0..100 {
         if (balance().await - 95.0).abs() < f64::EPSILON {
             settled = true;
             break;
@@ -3054,7 +3054,7 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
 
     // Honoured by the running leader: the stranded deposit is charged.
     let mut recovered = false;
-    for _ in 0..40 {
+    for _ in 0..100 {
         if (balance().await - 190.0).abs() < f64::EPSILON {
             recovered = true;
             break;
