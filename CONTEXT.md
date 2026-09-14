@@ -85,6 +85,19 @@ the controlling actions over a Policy's failures that [Policy status] only
 observes.
 _Avoid_: dismiss, drop, ignore.
 
+### Cursor move
+
+The _controlling_ act of an operator repositioning a [Policy]'s stored cursor —
+the `policy_cursors` row that records how far it has processed — by writing the
+row directly while the system runs. The third controlling action alongside
+[Retry] and [Discard], and the coarsest: it moves the Policy itself rather than
+one parked reaction, skipping events when it moves forward and re-delivering
+them when it moves backward. The running leader adopts the new position when its
+feed is empty, and never writes a position that predates the move
+([ADR-0011](docs/adr/0011-policy-cursor-is-an-operator-writable-control-surface.md)).
+_Avoid_: reset, seek, rewind (as a name for the act; a rewind is one direction of
+it).
+
 ### Policy status
 
 A point-in-time, read-only snapshot of a [Policy]'s operational progress and
@@ -149,6 +162,7 @@ would need to honour the WASM dual-cfg pattern.
 [Dead letter]: #dead-letter
 [Retry]: #retry
 [Discard]: #discard
+[Cursor move]: #cursor-move
 [Rebuild]: #rebuild
 [Policy status]: #policy-status
 [Query]: #query
