@@ -11,9 +11,9 @@
 //! later slices that build on this substrate.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,7 @@ pub struct PolicyRunnerBuilder {
     policies: Vec<Arc<dyn ErasedPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
+    supervision: WorkerSupervision,
 }
 
 impl PolicyRunnerBuilder {
@@ -161,6 +162,14 @@ impl PolicyRunnerBuilder {
     /// deterministic testing without a NOTIFY wakeup.
     pub fn without_notifications(mut self) -> Self {
         self.notifications = false;
+        self
+    }
+
+    /// Replace the default [`WorkerSupervision`]: how long the runner waits
+    /// before restarting a worker that died outside its reaction, and how many
+    /// such restarts it allows within a window before giving up on it.
+    pub fn with_worker_supervision(mut self, supervision: WorkerSupervision) -> Self {
+        self.supervision = supervision;
         self
     }
 
@@ -210,6 +219,7 @@ impl PolicyRunnerBuilder {
             policies: self.policies,
             executors: self.executors,
             notifications: self.notifications,
+            supervision: self.supervision,
             blocked: Arc::new(BlockedWatch::new(resolve_blocked_warn_after())),
         }
     }
@@ -255,6 +265,7 @@ pub struct PolicyRunner {
     policies: Vec<Arc<dyn ErasedPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
+    supervision: WorkerSupervision,
     /// Rate gate for the blocked-policy warning, shared by every drain path so a
     /// blocked Policy is reported at the same bounded rate however it is driven.
     blocked: Arc<BlockedWatch>,
@@ -264,6 +275,7 @@ pub struct PolicyRunner {
 pub struct PolicyRunnerDaemon {
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    stopped: StoppedWorkers,
 }
 
 impl PolicyRunnerDaemon {
@@ -272,6 +284,204 @@ impl PolicyRunnerDaemon {
         let _ = self.shutdown_tx.send(true);
         for task in self.tasks {
             let _ = task.await;
+        }
+    }
+
+    /// The workers the runner has given up on, in the order they stopped.
+    ///
+    /// A worker that dies outside its reaction is restarted (see
+    /// [`WorkerSupervision`]); one that dies more often than its budget allows
+    /// is not, and is named here. An empty list is the healthy case, which is
+    /// what makes a non-empty one worth alerting on: nothing is reacting for the
+    /// policies it names, and nothing in this process will start them again.
+    ///
+    /// This is the seam the escalation hook (funkode-io/replay#186) replaces.
+    /// Until it lands, exhausting the budget stops the worker rather than ending
+    /// the process, and the advisory lock that elects the leader is held by the
+    /// process rather than by the worker — so a standby replica takes the policy
+    /// over only once a consumer reads this and ends the process itself.
+    pub fn stopped_workers(&self) -> Vec<StoppedWorker> {
+        self.stopped.snapshot()
+    }
+}
+
+// ── Worker supervision ───────────────────────────────────────────────────────
+
+/// How the runner supervises a worker that dies for a reason the per-event path
+/// cannot contain — a panic in the drain loop, in cursor I/O, in the feed read.
+///
+/// Such a death kills the worker task, and an unsupervised worker is simply gone
+/// until somebody notices the work stopped. The runner restarts it instead,
+/// which is safe because a restarted worker resumes from the last durable
+/// checkpoint and re-delivers at most a checkpoint's worth of events —
+/// at-least-once is the contract reactions are already written against.
+///
+/// Restarting is bounded twice over, because "restarting forever" must never be
+/// mistaken for "running":
+///
+/// - each attempt waits [`initial_backoff`](Self::initial_backoff), doubled per
+///   restart already spent in the window and capped at
+///   [`max_backoff`](Self::max_backoff), so a worker failing against a
+///   struggling database does not spin against it;
+/// - at most [`max_restarts`](Self::max_restarts) restarts are allowed within
+///   [`restart_window`](Self::restart_window); past that the worker stays down
+///   and is named by [`PolicyRunnerDaemon::stopped_workers`].
+///
+/// The budget is per worker, and so is everything a restart touches: it re-reads
+/// one policy's cursor and no other's, and leadership is unaffected because the
+/// advisory locks live on the process's shared lock-manager session rather than
+/// on the worker task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerSupervision {
+    max_restarts: u32,
+    window: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl Default for WorkerSupervision {
+    /// Five restarts a minute, backing off from 100 ms to at most 30 s.
+    ///
+    /// Chosen so a transient fault — a failover, a dropped connection — is
+    /// ridden out without a human, while a worker dying from a defect stops
+    /// within about a minute instead of hiding behind a restart loop.
+    fn default() -> Self {
+        Self {
+            max_restarts: 5,
+            window: Duration::from_secs(60),
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+impl WorkerSupervision {
+    /// How many restarts are allowed within [`restart_window`](Self::restart_window).
+    ///
+    /// `0` disables restarting: the first death stops the worker for good.
+    pub fn max_restarts(mut self, max_restarts: u32) -> Self {
+        self.max_restarts = max_restarts;
+        self
+    }
+
+    /// The sliding window the restart budget is counted over. A restart older
+    /// than this stops counting against it, so a worker that dies once a day is
+    /// restarted every day.
+    pub fn restart_window(mut self, window: Duration) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// How long the runner waits before the first restart in a window; each
+    /// further restart in the same window doubles it.
+    pub fn initial_backoff(mut self, initial_backoff: Duration) -> Self {
+        self.initial_backoff = initial_backoff;
+        self
+    }
+
+    /// The ceiling the doubling backoff stops at.
+    pub fn max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Backoff before the `restarts`-th restart of the current window (1-based).
+    fn backoff_for(&self, restarts: u32) -> Duration {
+        let doublings = restarts.saturating_sub(1).min(31);
+        self.initial_backoff
+            .saturating_mul(1u32 << doublings)
+            .min(self.max_backoff)
+    }
+}
+
+/// A worker the runner has given up on: it died more often than its
+/// [`WorkerSupervision`] budget allows, so it was not restarted again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedWorker {
+    /// The policy whose worker stopped. Nothing is reacting to its feed.
+    pub policy: String,
+    /// How many times it was restarted before the budget ran out.
+    pub restarts: u32,
+}
+
+/// The stopped workers, shared by the supervisors that record one and the
+/// [`PolicyRunnerDaemon`] a consumer reads them from.
+///
+/// Bounded by the number of registered policies: a supervisor records exactly
+/// one entry, and then it is done.
+#[derive(Clone, Default)]
+struct StoppedWorkers(Arc<Mutex<Vec<StoppedWorker>>>);
+
+impl StoppedWorkers {
+    fn record(&self, policy: &str, restarts: u32) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(StoppedWorker {
+                policy: policy.to_string(),
+                restarts,
+            });
+    }
+
+    fn snapshot(&self) -> Vec<StoppedWorker> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// What the supervisor does about a worker that just died.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartDecision {
+    /// Restart after `backoff`; this is restart number `restarts` in the window.
+    Restart { backoff: Duration, restarts: u32 },
+    /// The budget is spent: `restarts` restarts already happened in this window
+    /// and the worker stays down.
+    Exhausted { restarts: u32 },
+}
+
+/// One worker's restart budget: the restarts it has spent inside the current
+/// window.
+///
+/// Bounded by `max_restarts` entries — the budget is declared exhausted rather
+/// than recording one past it — and entries are dropped as they age out of the
+/// window.
+struct RestartBudget {
+    supervision: WorkerSupervision,
+    spent: VecDeque<Instant>,
+}
+
+impl RestartBudget {
+    fn new(supervision: WorkerSupervision) -> Self {
+        Self {
+            supervision,
+            spent: VecDeque::new(),
+        }
+    }
+
+    /// Charge a death that happened at `now` to the budget.
+    fn record_death(&mut self, now: Instant) -> RestartDecision {
+        while self
+            .spent
+            .front()
+            .is_some_and(|spent| now.duration_since(*spent) >= self.supervision.window)
+        {
+            self.spent.pop_front();
+        }
+
+        let already_spent = self.spent.len() as u32;
+        if already_spent >= self.supervision.max_restarts {
+            return RestartDecision::Exhausted {
+                restarts: already_spent,
+            };
+        }
+
+        self.spent.push_back(now);
+        let restarts = already_spent + 1;
+        RestartDecision::Restart {
+            backoff: self.supervision.backoff_for(restarts),
+            restarts,
         }
     }
 }
@@ -286,6 +496,7 @@ impl PolicyRunner {
             policies: Vec::new(),
             executors: HashMap::new(),
             notifications: true,
+            supervision: WorkerSupervision::default(),
         }
     }
 
@@ -768,142 +979,44 @@ impl PolicyRunner {
             }));
         }
 
-        // ── Per-policy worker tasks ───────────────────────────────────────────
+        // ── Per-policy supervised workers ─────────────────────────────────────
+        // Every policy gets a supervisor that owns its worker task and restarts
+        // it when it dies for a reason the per-event path cannot contain. The
+        // supervisors are independent of one another, and none of them holds a
+        // lock: a restart re-reads one policy's cursor and leaves every other
+        // policy — and this process's leadership — untouched.
+        let stopped = StoppedWorkers::default();
         for policy in &self.policies {
-            let policy = Arc::clone(policy);
-            let cqrs = self.cqrs.clone();
-            let pool = self.pool.clone();
-            let executors = self.executors.clone();
-            let blocked = Arc::clone(&self.blocked);
-            let mut policy_shutdown_rx = shutdown_rx.clone();
             let name = policy.name().to_string();
-            let mut leader_rx = leadership_rx
+            let leader_rx = leadership_rx
                 .remove(&name)
                 .expect("every policy has a leadership channel");
-            let mut wake_rx = wake_tx.as_ref().map(broadcast::Sender::subscribe);
 
-            tasks.push(tokio::spawn(async move {
-                let max_depth = resolve_max_depth(policy.as_ref());
+            let worker = PolicyWorker {
+                policy: Arc::clone(policy),
+                cqrs: self.cqrs.clone(),
+                pool: self.pool.clone(),
+                executors: self.executors.clone(),
+                blocked: Arc::clone(&self.blocked),
+                shutdown_rx: shutdown_rx.clone(),
+                leader_rx,
+                wake_tx: wake_tx.clone(),
+                interval,
+                name,
+            };
 
-                'lifetime: loop {
-                    if *policy_shutdown_rx.borrow() {
-                        return;
-                    }
-
-                    // Wait until the shared lock manager elects this worker leader.
-                    while !*leader_rx.borrow() {
-                        tokio::select! {
-                            changed = policy_shutdown_rx.changed() => {
-                                if changed.is_err() || *policy_shutdown_rx.borrow() {
-                                    return;
-                                }
-                            }
-                            changed = leader_rx.changed() => {
-                                if changed.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-
-                    tracing::info!(policy = %name, "running as leader");
-
-                    // Initialize cursor from the stored checkpoint (or bootstrap).
-                    let mut cursor = match PolicyCursor::load(&pool, &name, policy.start_at()).await
-                    {
-                        Ok(cursor) => cursor,
-                        Err(error) => {
-                            tracing::error!(
-                                policy = %name,
-                                error = %error,
-                                "leader failed to initialize cursor; retrying"
-                            );
-                            tokio::select! {
-                                _ = policy_shutdown_rx.changed() => return,
-                                _ = tokio::time::sleep(interval) => {}
-                            }
-                            continue 'lifetime;
-                        }
-                    };
-
-                    // Leadership polling loop.
-                    loop {
-                        if *policy_shutdown_rx.borrow() || !*leader_rx.borrow() {
-                            break;
-                        }
-
-                        match drain_policy_once(
-                            &cqrs,
-                            &pool,
-                            &executors,
-                            policy.as_ref(),
-                            &mut cursor,
-                            &blocked,
-                            max_depth,
-                        )
-                        .await
-                        {
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::error!(
-                                    policy = %name,
-                                    error = %error,
-                                    "policy polling iteration failed"
-                                );
-                            }
-                        }
-
-                        // Wait for the next wakeup: NOTIFY broadcast (if enabled),
-                        // poll timeout, leadership change, or shutdown — whichever
-                        // fires first.
-                        if let Some(ref mut wake) = wake_rx {
-                            tokio::select! {
-                                changed = policy_shutdown_rx.changed() => {
-                                    if changed.is_err() || *policy_shutdown_rx.borrow() {
-                                        break;
-                                    }
-                                }
-                                changed = leader_rx.changed() => {
-                                    if changed.is_err() {
-                                        break;
-                                    }
-                                }
-                                _ = tokio::time::sleep(interval) => {}
-                                res = wake.recv() => {
-                                    // Ok or Lagged both mean "drain now"; Closed
-                                    // means the listener stopped, fall back to polling.
-                                    if let Err(broadcast::error::RecvError::Closed) = res {
-                                        wake_rx = None;
-                                    }
-                                }
-                            }
-                        } else {
-                            tokio::select! {
-                                changed = policy_shutdown_rx.changed() => {
-                                    if changed.is_err() || *policy_shutdown_rx.borrow() {
-                                        break;
-                                    }
-                                }
-                                changed = leader_rx.changed() => {
-                                    if changed.is_err() {
-                                        break;
-                                    }
-                                }
-                                _ = tokio::time::sleep(interval) => {}
-                            }
-                        }
-                    }
-
-                    if *policy_shutdown_rx.borrow() {
-                        return;
-                    }
-                    // Lost leadership without shutdown: loop back and wait to be
-                    // re-elected before draining again.
-                }
-            }));
+            tasks.push(tokio::spawn(supervise_policy_worker(
+                worker,
+                self.supervision,
+                stopped.clone(),
+            )));
         }
 
-        PolicyRunnerDaemon { shutdown_tx, tasks }
+        PolicyRunnerDaemon {
+            shutdown_tx,
+            tasks,
+            stopped,
+        }
     }
 
     async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
@@ -921,6 +1034,244 @@ impl PolicyRunner {
         )
         .await
     }
+}
+
+/// Everything one policy's worker needs to run, cloned afresh on each restart.
+///
+/// A worker is a task that can die, so its inputs are held here rather than
+/// captured in a closure: the supervisor keeps this and spawns a new task from a
+/// clone of it, which is what makes a restart possible at all.
+#[derive(Clone)]
+struct PolicyWorker {
+    policy: Arc<dyn ErasedPolicy>,
+    cqrs: Cqrs<PostgresEventStore>,
+    pool: Pool<Postgres>,
+    executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    blocked: Arc<BlockedWatch>,
+    shutdown_rx: watch::Receiver<bool>,
+    leader_rx: watch::Receiver<bool>,
+    /// Kept as the sender so each attempt subscribes its own receiver; a
+    /// restarted worker misses the wakeups it was dead for, which costs latency
+    /// and nothing else (polling is the correctness baseline).
+    wake_tx: Option<broadcast::Sender<()>>,
+    interval: Duration,
+    name: String,
+}
+
+impl PolicyWorker {
+    /// Drive one policy until shutdown: wait to be elected, load the cursor,
+    /// drain until leadership or the process ends.
+    ///
+    /// Returning is the *clean* exit. Anything else — a panic in the drain loop,
+    /// in cursor I/O, in the feed read — unwinds this task and is the
+    /// supervisor's business.
+    async fn run(self) {
+        let PolicyWorker {
+            policy,
+            cqrs,
+            pool,
+            executors,
+            blocked,
+            mut shutdown_rx,
+            mut leader_rx,
+            wake_tx,
+            interval,
+            name,
+        } = self;
+        let mut wake_rx = wake_tx.as_ref().map(broadcast::Sender::subscribe);
+
+        let max_depth = resolve_max_depth(policy.as_ref());
+
+        'lifetime: loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+
+            // Wait until the shared lock manager elects this worker leader.
+            while !*leader_rx.borrow() {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                    changed = leader_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            tracing::info!(policy = %name, "running as leader");
+
+            // Initialize cursor from the stored checkpoint (or bootstrap).
+            let mut cursor = match PolicyCursor::load(&pool, &name, policy.start_at()).await {
+                Ok(cursor) => cursor,
+                Err(error) => {
+                    tracing::error!(
+                        policy = %name,
+                        error = %error,
+                        "leader failed to initialize cursor; retrying"
+                    );
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return,
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                    continue 'lifetime;
+                }
+            };
+
+            // Leadership polling loop.
+            loop {
+                if *shutdown_rx.borrow() || !*leader_rx.borrow() {
+                    break;
+                }
+
+                match drain_policy_once(
+                    &cqrs,
+                    &pool,
+                    &executors,
+                    policy.as_ref(),
+                    &mut cursor,
+                    &blocked,
+                    max_depth,
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            policy = %name,
+                            error = %error,
+                            "policy polling iteration failed"
+                        );
+                    }
+                }
+
+                // Wait for the next wakeup: NOTIFY broadcast (if enabled),
+                // poll timeout, leadership change, or shutdown — whichever
+                // fires first.
+                if let Some(ref mut wake) = wake_rx {
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        changed = leader_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(interval) => {}
+                        res = wake.recv() => {
+                            // Ok or Lagged both mean "drain now"; Closed
+                            // means the listener stopped, fall back to polling.
+                            if let Err(broadcast::error::RecvError::Closed) = res {
+                                wake_rx = None;
+                            }
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        changed = leader_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                }
+            }
+
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            // Lost leadership without shutdown: loop back and wait to be
+            // re-elected before draining again.
+        }
+    }
+}
+
+/// Own one policy's worker task and restart it when it dies.
+///
+/// The worker returning is a clean stop and ends supervision with it; a panic is
+/// charged to `supervision`'s [`RestartBudget`], which either grants a restart
+/// after a backoff or declares the worker stopped. Exhaustion is recorded in
+/// `stopped` so it is an outcome a consumer can read
+/// ([`PolicyRunnerDaemon::stopped_workers`]) rather than a silence.
+async fn supervise_policy_worker(
+    worker: PolicyWorker,
+    supervision: WorkerSupervision,
+    stopped: StoppedWorkers,
+) {
+    let name = worker.name.clone();
+    let mut shutdown_rx = worker.shutdown_rx.clone();
+    let mut budget = RestartBudget::new(supervision);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
+        let cause = match tokio::spawn(worker.clone().run()).await {
+            // The worker stopped on its own terms: shutdown, or a channel it
+            // depends on closing. Nothing to supervise.
+            Ok(()) => return,
+            // Aborted from outside (a runtime shutting down): not a fault, and
+            // respawning into a dying runtime helps nobody.
+            Err(error) if error.is_cancelled() => return,
+            Err(error) => panic_cause(error),
+        };
+
+        match budget.record_death(Instant::now()) {
+            RestartDecision::Restart { backoff, restarts } => {
+                tracing::warn!(
+                    policy = %name,
+                    restarts,
+                    window_secs = supervision.window.as_secs(),
+                    backoff_ms = backoff.as_millis() as u64,
+                    cause = %cause,
+                    "policy worker died outside its reaction; restarting after backoff"
+                );
+                tokio::select! {
+                    _ = shutdown_rx.changed() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+            }
+            RestartDecision::Exhausted { restarts } => {
+                tracing::error!(
+                    policy = %name,
+                    restarts,
+                    window_secs = supervision.window.as_secs(),
+                    cause = %cause,
+                    "policy worker exhausted its restart budget; it is stopped and \
+                     nothing is reacting for this policy"
+                );
+                stopped.record(&name, restarts);
+                return;
+            }
+        }
+    }
+}
+
+/// Read a dead task's panic message, so a restart says what killed the worker
+/// rather than only that something did.
+fn panic_cause(error: tokio::task::JoinError) -> String {
+    let payload = error.into_panic();
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "panic carrying a payload of an unrecognised type".to_string()
 }
 
 /// Maximum number of times a retryable dispatch error is retried before the
@@ -1747,5 +2098,143 @@ mod tests {
         assert!(err
             .to_string()
             .contains("policy dispatch metadata contains a key that collides"));
+    }
+}
+
+#[cfg(test)]
+mod restart_budget_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{RestartBudget, RestartDecision, WorkerSupervision};
+
+    /// Three restarts a minute, 100 ms doubling to a 400 ms ceiling.
+    fn supervision() -> WorkerSupervision {
+        WorkerSupervision::default()
+            .max_restarts(3)
+            .restart_window(Duration::from_secs(60))
+            .initial_backoff(Duration::from_millis(100))
+            .max_backoff(Duration::from_millis(400))
+    }
+
+    fn restart(decision: RestartDecision) -> (Duration, u32) {
+        match decision {
+            RestartDecision::Restart { backoff, restarts } => (backoff, restarts),
+            RestartDecision::Exhausted { restarts } => {
+                panic!("expected a restart, got exhaustion after {restarts}")
+            }
+        }
+    }
+
+    /// A worker failing against a struggling database must not spin: each
+    /// restart in the window waits twice as long as the one before it.
+    #[test]
+    fn each_restart_in_a_window_waits_twice_as_long() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision());
+
+        assert_eq!(
+            restart(budget.record_death(now)),
+            (Duration::from_millis(100), 1)
+        );
+        assert_eq!(
+            restart(budget.record_death(now + Duration::from_millis(1))),
+            (Duration::from_millis(200), 2)
+        );
+        assert_eq!(
+            restart(budget.record_death(now + Duration::from_millis(2))),
+            (Duration::from_millis(400), 3)
+        );
+    }
+
+    /// The doubling stops at the configured ceiling rather than growing until a
+    /// restart is indistinguishable from never happening.
+    #[test]
+    fn the_backoff_stops_doubling_at_the_ceiling() {
+        let supervision = supervision().max_restarts(10);
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision);
+
+        let backoffs: Vec<Duration> = (0..6)
+            .map(|nth| restart(budget.record_death(now + Duration::from_millis(nth))).0)
+            .collect();
+
+        assert_eq!(
+            backoffs,
+            vec![
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(400),
+                Duration::from_millis(400),
+                Duration::from_millis(400),
+            ]
+        );
+    }
+
+    /// "Restarting forever" must never pass for "running": once the window's
+    /// restarts are spent the worker stays down.
+    #[test]
+    fn a_fourth_death_inside_the_window_exhausts_a_budget_of_three() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision());
+
+        for nth in 0..3 {
+            restart(budget.record_death(now + Duration::from_millis(nth)));
+        }
+
+        assert_eq!(
+            budget.record_death(now + Duration::from_secs(59)),
+            RestartDecision::Exhausted { restarts: 3 }
+        );
+    }
+
+    /// The budget is a window, not a lifetime total: a worker that dies once a
+    /// day is restarted every day.
+    #[test]
+    fn a_death_past_the_window_restarts_with_a_fresh_budget() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision());
+
+        for nth in 0..3 {
+            restart(budget.record_death(now + Duration::from_millis(nth)));
+        }
+
+        // Far enough out that every earlier restart has aged out of the window.
+        let later = now + Duration::from_secs(61);
+        assert_eq!(
+            restart(budget.record_death(later)),
+            (Duration::from_millis(100), 1),
+            "the first restart of a new window backs off from the start again"
+        );
+    }
+
+    /// A budget of zero is how a consumer says "never restart this": the first
+    /// death is terminal, and nothing waits for a backoff that will not be used.
+    #[test]
+    fn a_budget_of_zero_makes_the_first_death_terminal() {
+        let mut budget = RestartBudget::new(supervision().max_restarts(0));
+
+        assert_eq!(
+            budget.record_death(Instant::now()),
+            RestartDecision::Exhausted { restarts: 0 }
+        );
+    }
+
+    /// The bookkeeping is bounded by the budget, not by how long the process has
+    /// been up or by how often the worker has died in it.
+    #[test]
+    fn the_recorded_deaths_never_outgrow_the_budget() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision());
+
+        for nth in 0..1_000 {
+            let _ = budget.record_death(now + Duration::from_millis(nth));
+        }
+
+        assert!(
+            budget.spent.len() <= 3,
+            "the window holds at most the budget, got {}",
+            budget.spent.len()
+        );
     }
 }

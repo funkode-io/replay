@@ -19,6 +19,8 @@
 //!   as the events they wrote, each carrying the causation the runner stamps.
 //! - [`PolicyDaemonHarness::cursor`] — the policy's persisted position.
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
+//! - [`PolicyDaemonHarness::stopped_workers`] — the workers the runner gave up
+//!   on, which is what an operator reads off the daemon in their own service.
 //!
 //! Tasks, channels and in-process state are deliberately absent.
 //!
@@ -56,7 +58,7 @@ use super::postgres_image::{postgres_container, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PostgresEventStore,
+    Cqrs, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PostgresEventStore, StoppedWorker,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -92,6 +94,7 @@ define_aggregate! {
             Ping { tag: String },
             Echo { tag: String },
             Refuse { reason: String },
+            Explode { message: String },
         },
         events: {
             Pinged { tag: String },
@@ -137,6 +140,10 @@ impl replay::Aggregate for Probe {
                 "probe refuses: {reason}"
             ))
             .with_operation("Refuse")),
+            // A command that kills whatever task runs it, so a test can drive a
+            // worker's death the way production meets one: a panic outside the
+            // reaction, with no error value to return.
+            ProbeCommand::Explode { message } => panic!("{message}"),
         }
     }
 }
@@ -306,6 +313,13 @@ impl PolicyDaemonHarness {
     /// Every command the policy has dispatched so far, in the order the events
     /// they wrote landed.
     pub async fn dispatches(&self) -> Vec<DispatchedCommand> {
+        self.dispatches_for(&self.policy_name).await
+    }
+
+    /// The same, for any policy registered through this harness — a test that
+    /// registers a second one (to prove one policy's trouble leaves the other
+    /// alone) observes it here.
+    pub async fn dispatches_for(&self, policy: &str) -> Vec<DispatchedCommand> {
         let rows = sqlx::query(
             "SELECT id, global_position, stream_id, type, \
                     (metadata->'causation'->>'global_position')::bigint AS caused_by_position, \
@@ -314,7 +328,7 @@ impl PolicyDaemonHarness {
              WHERE metadata->'causation'->>'policy' = $1 \
              ORDER BY global_position ASC LIMIT $2",
         )
-        .bind(&self.policy_name)
+        .bind(policy)
         .bind(OBSERVATION_LIMIT)
         .fetch_all(&self.pool)
         .await
@@ -333,11 +347,25 @@ impl PolicyDaemonHarness {
 
     /// The policy's persisted cursor, or `None` before it has one.
     pub async fn cursor(&self) -> Option<i64> {
+        self.cursor_for(&self.policy_name).await
+    }
+
+    /// The same, for any policy registered through this harness.
+    pub async fn cursor_for(&self, policy: &str) -> Option<i64> {
         sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind(&self.policy_name)
+            .bind(policy)
             .fetch_optional(&self.pool)
             .await
             .expect("cursor observation must be readable")
+    }
+
+    /// The workers the runner has given up on — what an operator sees when a
+    /// policy has stopped for good rather than merely paused.
+    pub fn stopped_workers(&self) -> Vec<StoppedWorker> {
+        self.daemon
+            .as_ref()
+            .expect("the daemon is only taken by shutdown")
+            .stopped_workers()
     }
 
     /// The policy's dead letters — the reactions it parked — oldest first.
@@ -366,15 +394,36 @@ impl PolicyDaemonHarness {
     /// Wait until the policy has dispatched a command caused by the event at
     /// `position`, and return it.
     pub async fn await_dispatch_caused_by(&self, position: i64) -> DispatchedCommand {
+        self.await_dispatch_caused_by_for(&self.policy_name, position)
+            .await
+    }
+
+    /// The same, for any policy registered through this harness.
+    pub async fn await_dispatch_caused_by_for(
+        &self,
+        policy: &str,
+        position: i64,
+    ) -> DispatchedCommand {
         self.observe(
-            &format!("a dispatch caused by the event at position {position}"),
+            &format!("a dispatch by {policy} caused by the event at position {position}"),
             || async {
-                self.dispatches()
+                self.dispatches_for(policy)
                     .await
                     .into_iter()
                     .find(|d| d.caused_by_position == position)
             },
         )
+        .await
+    }
+
+    /// Wait until the runner has given up on `policy`'s worker, and return what
+    /// it recorded about it.
+    pub async fn await_stopped_worker(&self, policy: &str) -> StoppedWorker {
+        self.observe(&format!("{policy}'s worker to stop for good"), || async {
+            self.stopped_workers()
+                .into_iter()
+                .find(|stopped| stopped.policy == policy)
+        })
         .await
     }
 

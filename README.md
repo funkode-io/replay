@@ -2240,6 +2240,62 @@ When a dispatch fails the runner classifies the error and responds accordingly:
 | **Retryable** | `Unavailable`, `RateLimited`, `Conflict` | Exponential back-off, up to `MAX_DISPATCH_RETRIES` (3) attempts. |
 | **Permanent** | All other errors, or retries exhausted | Write to `policy_dead_letters`, advance cursor. The policy keeps running. |
 
+#### Restarting a worker that dies
+
+That table covers a dispatch that *returns* an error. A worker can also die
+outright — a panic in the drain loop, in cursor I/O, in the feed read — which
+kills its task and, unsupervised, would leave the policy not running until
+somebody noticed the work had stopped.
+
+The runner restarts such a worker. It is safe because a restarted worker resumes
+from its last durable checkpoint and re-delivers at most a checkpoint's worth of
+events, which is the at-least-once contract reactions are already written
+against. Restarting is bounded by a budget, so "restarting forever" is never
+mistaken for "running":
+
+```rust,ignore
+use std::time::Duration;
+use replay_persistence::WorkerSupervision;
+
+let runner = PolicyRunnerBuilder::new(cqrs, pool)
+    .register_policy(my_policy)
+    .with_worker_supervision(
+        WorkerSupervision::default()   // 5 restarts a minute, 100 ms → 30 s
+            .max_restarts(10)          // 0 disables restarting entirely
+            .restart_window(Duration::from_secs(300))
+            .initial_backoff(Duration::from_millis(250))
+            .max_backoff(Duration::from_secs(60)),
+    )
+    .build();
+```
+
+Each restart waits `initial_backoff` doubled per restart already spent in the
+window, capped at `max_backoff`, and logs at `warn` naming the policy, the cause
+and how many restarts the window has seen. Restarts are per worker: one policy's
+restart re-reads that policy's cursor only, and leadership is untouched because
+the advisory locks live on the process's shared lock-manager session rather than
+on the worker task.
+
+A worker that spends its budget is **stopped**, logged at `error`, and named by
+`daemon.stopped_workers()`:
+
+```rust,ignore
+for stopped in daemon.stopped_workers() {
+    // Nothing is reacting for `stopped.policy`, and nothing in this process
+    // will start it again.
+    tracing::error!(policy = %stopped.policy, restarts = stopped.restarts, "policy is down");
+}
+```
+
+An empty list is the healthy case. A non-empty one is worth alerting on, and
+worth acting on: because leadership is held by the *process*, a standby replica
+takes the policy over only once this process exits, so a service that wants
+failover should end itself when it reads a stopped worker.
+
+Two deaths the runner does **not** contain: a panic inside a task the reaction
+spawns itself (it unwinds in its own task, outside both boundaries) and an OOM
+kill (the kernel ends the process; no supervision layer can catch that).
+
 #### `policy_dead_letters` table
 
 ```sql

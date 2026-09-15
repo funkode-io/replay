@@ -140,8 +140,8 @@ The set of background workers that drive every [Policy] in a process — one
 worker per Policy, each owning that Policy's durable cursor, sharing the
 process's listener and lock-manager connections
 ([ADR-0008](docs/adr/0008-policy-runner-shared-connection-leadership.md)). The
-Policy is what reacts; the runner is what makes it run, restarts it and reports
-on it.
+Policy is what reacts; the runner is what makes it run, restarts it within its
+[Restart budget] and reports on it.
 _Avoid_: policy engine, subscriber, dispatcher, scheduler, worker pool.
 
 ### Leader
@@ -161,6 +161,20 @@ deliberately idle — it is not a stopped worker and not a lagging one — and
 may become [Leader]: when the lock for that Policy is released every Standby
 competes for it and one of them wins it.
 _Avoid_: secondary, passive replica, follower, spare.
+
+### Restart budget
+
+How many times the [Policy runner] may restart one worker within a sliding
+window, and how long it waits between attempts — the bound that keeps "restarting
+forever" from passing for "running". A restart is cheap and safe because the
+worker resumes from its last durable checkpoint and re-delivers at most a
+checkpoint's worth of events, which the at-least-once contract already covers; it
+is therefore the answer to a worker that *dies*, never to a reaction that *fails*
+(that is a [Dead letter]). A worker that spends its budget is stopped rather than
+restarted again, and is named by the daemon so the stop is an observation rather
+than a silence. The budget is per worker: spending one leaves every other
+Policy's worker, cursor and the process's leadership untouched.
+_Avoid_: retry policy, circuit breaker, restart limit, backoff policy.
 
 ### Liveness
 
@@ -265,6 +279,7 @@ it:
 [Policy runner]: #policy-runner
 [Leader]: #leader
 [Standby]: #standby
+[Restart budget]: #restart-budget
 [Liveness]: #liveness
 [Progress]: #progress
 [Caught up]: #caught-up
