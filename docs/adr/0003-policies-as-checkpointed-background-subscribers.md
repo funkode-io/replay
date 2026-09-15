@@ -30,7 +30,10 @@ effects**. Therefore a **projection version bump ⇒ reset + replay**, but a
   committed by a concurrent append can never be skipped. We rejected an append-time
   serializing lock (kills bulk-load write throughput) and a naive `created`/per-
   stream `version` cursor (not a total order; skips and double-counts under clock
-  skew and concurrency).
+  skew and concurrency). *Amended by
+  [ADR-0015](0015-policy-crosses-a-position-no-transaction-can-fill.md): this
+  assumed every hole eventually fills, and a position burned by an aborted append
+  never does.*
 - **Delivery is at-least-once.** We do not chase exactly-once delivery (high cost,
   illusory across crash boundaries). Correctness comes from **idempotent aggregate
   commands** (at-least-once + idempotent consumer = effectively-once). The dedup key

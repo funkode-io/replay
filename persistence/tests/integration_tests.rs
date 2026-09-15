@@ -3189,11 +3189,14 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
 }
 
 /// Issue #168: an operator must be able to move a stuck cursor on a *running*
-/// leader. Recreates the #164 incident exactly — a burned `global_position`
-/// leaves a hole that never fills, so the policy parks in front of it forever —
-/// and then applies the recovery that needed every replica scaled to zero:
-/// a plain `UPDATE policy_cursors`. The daemon keeps running and leading
-/// throughout.
+/// leader. Recreates the #164 incident — a hole in `global_position` that the feed
+/// parks in front of — and then applies the recovery that needed every replica
+/// scaled to zero: a plain `UPDATE policy_cursors`. The daemon keeps running and
+/// leading throughout.
+///
+/// The hole is held open by a transaction that never commits, because that is the
+/// kind the runner is right to wait at: a position no transaction holds is crossed
+/// on its own since #170, and would never reach the operator.
 #[tokio::test]
 async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_test() {
     let container = postgres::Postgres::default().start().await.unwrap();
@@ -3265,10 +3268,11 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
     }
     assert!(settled, "expected the daemon to charge the first fee");
 
-    // Burn a global position the way an aborted append does: `nextval` is not
-    // transactional, so this value is gone from `events` permanently.
+    // Take a global position and keep it: to every other session this is an append
+    // in flight, so the feed must wait at the hole it leaves.
+    let mut holder = pg_pool.begin().await.unwrap();
     let burned: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
-        .fetch_one(&pg_pool)
+        .fetch_one(&mut *holder)
         .await
         .unwrap();
 
@@ -3278,7 +3282,7 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(
         (balance().await - 195.0).abs() < f64::EPSILON,
-        "expected the policy to be wedged in front of the permanent gap"
+        "expected the policy to be wedged in front of the gap"
     );
 
     // The operator's recovery, against the live deployment.
@@ -3324,6 +3328,7 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    holder.rollback().await.unwrap();
     daemon.shutdown().await;
 }
 
