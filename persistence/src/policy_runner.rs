@@ -286,6 +286,14 @@ impl StoppedPolicies {
         }
     }
 
+    /// Note that `policy` is parked in front of `gap` without judging it: the poll
+    /// that first sees a hole may still have work in front of it, and the hole is no
+    /// younger for that.
+    fn sighted(&self, policy: &str, gap: Gap) {
+        self.blocked
+            .sighted(policy, gap.expected, std::time::Instant::now());
+    }
+
     /// Forget everything known about where `policy` was stopped: it is no longer
     /// parked there, so the next hole is a fresh wait and a fresh question.
     fn forget(&self, policy: &str) {
@@ -1022,11 +1030,14 @@ async fn drain_policy_once(
         // A truncated window: the policy advances over the prefix now and parks at
         // the hole. The hole is as old as this poll even though this poll had work,
         // so the clock starts here rather than on the first empty poll.
+        //
+        // Whether the hole can ever fill is asked on the *next* poll, once the
+        // prefix has been delivered and the feed comes back empty: the answer costs
+        // a query, and a poll with work in front of it has somewhere better to be.
+        // The delay is one poll, and the positions are no less burned for it.
         Some(gap) => {
             trace_gap(&name, gap);
-            stopped
-                .blocked
-                .sighted(&name, gap.expected, std::time::Instant::now());
+            stopped.sighted(&name, gap);
         }
         // Advancing with nothing in the way.
         None => stopped.forget(&name),
