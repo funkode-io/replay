@@ -49,7 +49,7 @@ The slice of the event log one [Policy] reads on a poll: every `global_position`
 past its cursor, up to its read batch size, **before** its `stream_filter` is
 applied. Contiguity is decided on those unfiltered positions; an excluded position
 advances the cursor and fires nothing, like a compaction snapshot
-([ADR-0012](docs/adr/0012-policy-feed-contiguity-on-unfiltered-positions.md)). A
+([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
 `stream_filter` decides what a Policy *reacts to*, never how far it *gets*.
 _Avoid_: subscription, stream, queue, backlog.
 

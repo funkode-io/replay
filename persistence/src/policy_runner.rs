@@ -1294,7 +1294,7 @@ async fn load_event_by_id(
 /// Read the window of positions past `cursor` the policy may advance over.
 ///
 /// Unfiltered — every `global_position > cursor`, up to `limit` — because contiguity
-/// belongs to the position stream, not to the rows the policy asked for (ADR-0012).
+/// belongs to the position stream, not to the rows the policy asked for (ADR-0013).
 /// `filter` is evaluated per row as `matches_filter` and decides delivery only; an
 /// excluded row advances the cursor like a compaction snapshot
 /// (`compacted_snapshot = TRUE`, ADR-0004). [`feed_from_window`] then truncates the
