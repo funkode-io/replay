@@ -50,7 +50,9 @@ past its cursor, up to its read batch size, **before** its `stream_filter` is
 applied. Contiguity is decided on those unfiltered positions; an excluded position
 advances the cursor and fires nothing, like a compaction snapshot
 ([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
-`stream_filter` decides what a Policy *reacts to*, never how far it *gets*.
+`stream_filter` decides what a Policy *reacts to*, never how far it *gets*. The
+feed stops at a position it has not read, which may be an append still in flight —
+unless it is a [Burned position], which it crosses.
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation
@@ -131,8 +133,22 @@ throughput. Whether it clears is not observable from one reading
 ([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)). A
 blocked Policy is also visible without being asked: the runner traces the stop at
 `debug` and escalates to `warn` once the cursor has been parked longer than an
-in-flight append could explain.
+in-flight append could explain. Since the runner crosses a [Burned position] on
+its own, a Policy that stays blocked is one waiting on an append that really is in
+flight.
 _Avoid_: stuck, wedged, hung, stalled.
+
+### Burned position
+
+A `global_position` taken from the sequence by a transaction that then aborted.
+`nextval` is not transactional, so the value is never returned to the sequence and
+no event can ever carry it: the hole it leaves in the [Policy feed] is permanent,
+unlike the one an append still in flight leaves. The two are told apart exactly,
+by whether any running transaction still holds the position, and a Policy crosses
+a burned one by itself, naming it in a `warn`
+([ADR-0015](docs/adr/0015-policy-crosses-a-position-no-transaction-can-fill.md)).
+_Avoid_: gap, hole (as a name for the permanent kind), lost position, skipped
+position.
 
 ### Policy runner
 
@@ -262,6 +278,7 @@ it:
 [Rebuild]: #rebuild
 [Policy status]: #policy-status
 [Blocked policy]: #blocked-policy
+[Burned position]: #burned-position
 [Policy runner]: #policy-runner
 [Leader]: #leader
 [Standby]: #standby
