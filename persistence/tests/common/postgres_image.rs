@@ -19,6 +19,9 @@ use testcontainers_modules::testcontainers::{ContainerRequest, ImageExt};
 /// Image tag pinning the PostgreSQL release the suite runs against.
 pub const POSTGRES_TAG: &str = "17-alpine";
 
+/// The port the server listens on inside the container.
+pub const POSTGRES_PORT: u16 = 5432;
+
 /// A container request for the suite's PostgreSQL server.
 pub fn postgres_container() -> ContainerRequest<postgres::Postgres> {
     postgres::Postgres::default().with_tag(POSTGRES_TAG)
