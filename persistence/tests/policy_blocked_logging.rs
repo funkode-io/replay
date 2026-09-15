@@ -343,6 +343,55 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
         vec![head, head],
         "both policies must have drained the event stranded behind the hole"
     );
+
+    // ── Stopping mid-window ───────────────────────────────────────────────────
+    // A window with work in it *and* a hole behind that work: the policy advances
+    // over the prefix and parks at the hole, so the trace must name where it parks,
+    // not where the poll started.
+    let traces_before = AtomicUsize::new(0);
+    logs_assert(|lines| {
+        traces_before.store(gap_traces(lines).len(), Ordering::SeqCst);
+        Ok(())
+    });
+
+    add(2.0).await;
+    let burned_again: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
+        .fetch_one(&pool)
+        .await
+        .expect("burning a sequence value must succeed");
+    add(3.0).await;
+
+    runner.drain().await.expect("drain must succeed");
+
+    let parks_at = burned_again - 1;
+    logs_assert(|lines| {
+        for trace in gap_traces(lines)
+            .into_iter()
+            .skip(traces_before.load(Ordering::SeqCst))
+        {
+            for field in [
+                &format!("cursor={parks_at}"),
+                &format!("expected={burned_again}"),
+                &format!("found={}", burned_again + 1),
+            ] {
+                if !trace.contains(field) {
+                    return Err(format!("the trace lacks {field}: {trace}"));
+                }
+            }
+        }
+        Ok(())
+    });
+
+    let positions: Vec<i64> =
+        sqlx::query_scalar("SELECT position FROM policy_cursors ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .expect("reading the cursors must succeed");
+    assert_eq!(
+        positions,
+        vec![parks_at, parks_at],
+        "the traced cursor must be the one the policies actually parked at"
+    );
 }
 
 /// A daemon keeps its cursor in memory across polls, so an operator's correction is

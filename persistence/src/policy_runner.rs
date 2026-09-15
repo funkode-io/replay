@@ -970,8 +970,8 @@ async fn drain_policy_once(
         match gap {
             // Parked in front of a hole, and the cursor is where the read left it.
             Some(gap) => {
-                trace_gap(&name, cursor.position, gap);
-                report_blocked(pool, &name, cursor.position, gap, blocked).await?;
+                trace_gap(&name, gap);
+                report_blocked(pool, &name, gap, blocked).await?;
             }
             // Caught up: a healthy idle policy, and it stays silent.
             None => blocked.cleared(&name),
@@ -979,9 +979,10 @@ async fn drain_policy_once(
         return Ok(0);
     }
 
-    // A truncated window: the policy advances now and stops at the hole next poll.
+    // A truncated window: the policy advances over the prefix now and parks at the
+    // hole, so the trace names the position it parks at, not the one it started from.
     if let Some(gap) = gap {
-        trace_gap(&name, cursor.position, gap);
+        trace_gap(&name, gap);
     }
 
     // The policy is advancing, so it is not blocked any more.
@@ -1055,10 +1056,14 @@ async fn drain_policy_once(
 
 /// Trace the stop: the one fact the blocked deployment in funkode-io/replay#164
 /// never had. Cheap enough to emit on every poll, so it needs no rate limit.
-fn trace_gap(name: &str, cursor: i64, gap: Gap) {
+///
+/// `cursor` is where this poll *leaves* the cursor, which is the position before the
+/// hole — not where the poll started. The two differ when a window is truncated:
+/// the policy advances over the prefix first and parks at the hole afterwards.
+fn trace_gap(name: &str, gap: Gap) {
     tracing::debug!(
         policy = %name,
-        cursor,
+        cursor = gap.expected - 1,
         expected = gap.expected,
         found = gap.found,
         "policy feed stops at a gap in global_position"
@@ -1078,7 +1083,6 @@ fn trace_gap(name: &str, cursor: i64, gap: Gap) {
 async fn report_blocked(
     pool: &Pool<Postgres>,
     name: &str,
-    cursor: i64,
     gap: Gap,
     blocked: &BlockedWatch,
 ) -> Result<(), replay::Error> {
@@ -1092,7 +1096,8 @@ async fn report_blocked(
 
     tracing::warn!(
         policy = %name,
-        cursor,
+        // The feed was empty, so the cursor is parked immediately before the hole.
+        cursor = gap.expected - 1,
         head = parked.head,
         missing_position = gap.expected,
         next_position = gap.found,
