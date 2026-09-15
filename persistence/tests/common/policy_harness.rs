@@ -75,6 +75,11 @@ const OBSERVE_RECHECK: Duration = Duration::from_millis(20);
 /// the lot into memory would violate the crate's bounded-memory rule.
 const OBSERVATION_LIMIT: i64 = 1_000;
 
+/// Metadata key carrying the marker that identifies an event appended by
+/// [`PolicyDaemonHarness::ping`]. Only the harness writes it, so an event
+/// carrying a given marker is the one a given `ping` call wrote.
+const PING_MARKER_KEY: &str = "harness_ping";
+
 // ── The aggregate every harness test drives ──────────────────────────────────
 
 define_aggregate! {
@@ -259,13 +264,19 @@ impl PolicyDaemonHarness {
     }
 
     /// Append a `Pinged` event for the policy to react to.
+    ///
+    /// The daemon is already running, so by the time the append returns the
+    /// policy may have reacted — possibly into this very stream. The event is
+    /// therefore identified by a marker minted here and stamped in its metadata,
+    /// not by "the newest row on the stream", which a reaction can win.
     pub async fn ping(&self, stream: &str, tag: &str) -> AppendedEvent {
         let id = ProbeUrn::new(stream).expect("stream name must be a valid URN NSS");
+        let marker = Uuid::new_v4();
 
         self.cqrs
             .execute::<Probe>(
                 &id,
-                replay::Metadata::default(),
+                replay::Metadata::new(serde_json::json!({ PING_MARKER_KEY: marker })),
                 ProbeCommand::Ping {
                     tag: tag.to_string(),
                 },
@@ -276,14 +287,13 @@ impl PolicyDaemonHarness {
             .expect("append must succeed");
 
         let stream_id = id.to_urn().to_string();
-        let row = sqlx::query(
-            "SELECT id, global_position FROM events \
-             WHERE stream_id = $1 ORDER BY global_position DESC LIMIT 1",
-        )
-        .bind(&stream_id)
-        .fetch_one(&self.pool)
-        .await
-        .expect("the appended event must be readable");
+        let row =
+            sqlx::query("SELECT id, global_position FROM events WHERE metadata->>($1::text) = $2")
+                .bind(PING_MARKER_KEY)
+                .bind(marker.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .expect("the appended event must be readable");
 
         AppendedEvent {
             event_id: row.get("id"),
@@ -390,6 +400,10 @@ impl PolicyDaemonHarness {
     /// Re-read `observation` until it holds, or fail with everything this
     /// harness can see about the policy.
     ///
+    /// The deadline bounds the *observation*, not just the gaps between reads:
+    /// each attempt runs under whatever time is left, so a query that never
+    /// comes back fails as a timeout here rather than hanging the test.
+    ///
     /// Generic on purpose: a test with a question this harness does not answer
     /// directly can still ask it without inventing its own timeout, its own
     /// recheck interval, and its own diagnosis on failure.
@@ -403,18 +417,26 @@ impl PolicyDaemonHarness {
     {
         let deadline = Instant::now() + OBSERVE_TIMEOUT;
         loop {
-            if let Some(observed) = observation().await {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if let Ok(Some(observed)) = tokio::time::timeout(remaining, observation()).await {
                 return observed;
             }
             if Instant::now() >= deadline {
-                panic!(
-                    "timed out after {:?} waiting for {what}\n  policy:     {}\n  cursor:     {:?}\n  dispatched: {:#?}\n  parked:     {:#?}",
-                    OBSERVE_TIMEOUT,
-                    self.policy_name,
-                    self.cursor().await,
-                    self.dispatches().await,
-                    self.parked().await,
-                );
+                // Past the deadline the diagnosis is what the test is for, so it
+                // gets its own budget rather than the exhausted one.
+                let diagnosis = tokio::time::timeout(OBSERVE_TIMEOUT, async {
+                    format!(
+                        "  policy:     {}\n  cursor:     {:?}\n  dispatched: {:#?}\n  parked:     {:#?}",
+                        self.policy_name,
+                        self.cursor().await,
+                        self.dispatches().await,
+                        self.parked().await,
+                    )
+                })
+                .await
+                .unwrap_or_else(|_| "  (the database stopped answering too)".to_string());
+
+                panic!("timed out after {OBSERVE_TIMEOUT:?} waiting for {what}\n{diagnosis}");
             }
             tokio::time::sleep(OBSERVE_RECHECK).await;
         }

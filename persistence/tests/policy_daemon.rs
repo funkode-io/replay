@@ -97,3 +97,36 @@ async fn a_permanently_failing_reaction_is_parked_and_the_daemon_carries_on_post
 
     harness.shutdown().await;
 }
+
+/// A policy may dispatch back into the stream it just read — the shape that
+/// makes "the newest event on the stream" a useless way to identify the one a
+/// test appended, since the reaction can land first. The harness must still
+/// hand back the ping, and the causation must still point at it.
+#[tokio::test]
+async fn a_reaction_into_the_same_stream_does_not_confuse_the_trigger_postgres_test() {
+    let harness = PolicyDaemonHarness::start("same_stream", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, |event| {
+            match &event.data {
+                // Echo back into the stream the ping arrived on.
+                ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+                    ProbeUrn::parse(&event.stream_id).unwrap(),
+                    ProbeCommand::Echo { tag: tag.clone() },
+                )],
+                _ => vec![],
+            }
+        })
+    })
+    .await;
+
+    let ping = harness.ping("subject-1", "hello").await;
+
+    let dispatched = harness.await_dispatch_caused_by(ping.global_position).await;
+    assert_eq!(dispatched.stream_id, ping.stream_id);
+    assert_eq!(dispatched.caused_by_event_id, ping.event_id);
+    assert!(
+        dispatched.global_position > ping.global_position,
+        "the reaction must land after the event it reacted to"
+    );
+
+    harness.shutdown().await;
+}
