@@ -166,14 +166,17 @@ _Avoid_: secondary, passive replica, follower, spare.
 
 How many times the [Policy runner] may restart one worker within a sliding
 window, and how long it waits between attempts — the bound that keeps "restarting
-forever" from passing for "running". A restart is cheap and safe because the
-worker resumes from its last durable checkpoint and re-delivers at most a
-checkpoint's worth of events, which the at-least-once contract already covers; it
-is therefore the answer to a worker that *dies*, never to a reaction that *fails*
-(that is a [Dead letter]). A worker that spends its budget is stopped rather than
-restarted again, and is named by the daemon so the stop is an observation rather
-than a silence. The budget is per worker: spending one leaves every other
-Policy's worker, cursor and the process's leadership untouched.
+forever" from passing for "running"
+([ADR-0014](docs/adr/0014-dead-policy-worker-restarted-on-a-budget.md)). A restart
+is cheap and safe because the worker resumes from its last durable checkpoint and
+re-delivers at most a checkpoint's worth of events, which the at-least-once
+contract already covers; it is therefore the answer to a worker that *dies*, never
+to a reaction that *fails* (that is a [Dead letter]). A worker that spends its
+budget is stopped rather than restarted again, and is named by the daemon so the
+stop is an observation rather than a silence. The budget is per worker: spending
+one leaves every other Policy's worker, cursor and the process's leadership
+untouched.
+_Avoid_: retry policy, circuit breaker, restart limit, backoff policy.
 _Avoid_: retry policy, circuit breaker, restart limit, backoff policy.
 
 ### Liveness

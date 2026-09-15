@@ -2292,6 +2292,15 @@ worth acting on: because leadership is held by the *process*, a standby replica
 takes the policy over only once this process exits, so a service that wants
 failover should end itself when it reads a stopped worker.
 
+The two shared tasks — the lock manager that holds every policy's advisory lock
+and the NOTIFY listener — are supervised on the same budget. They own no policy,
+so they are not listed as stopped workers; they are reported through their
+consequences. A lock manager that spends its budget takes every policy's
+leadership with it, and each of those workers reports itself stopped in turn, so
+`stopped_workers()` names the policies that are down rather than the plumbing
+that took them down. A listener that gives up costs latency only: workers fall
+back to the poll interval, which is the correctness baseline.
+
 Two deaths the runner does **not** contain: a panic inside a task the reaction
 spawns itself (it unwinds in its own task, outside both boundaries) and an OOM
 kill (the kernel ends the process; no supervision layer can catch that).

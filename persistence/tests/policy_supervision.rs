@@ -5,7 +5,16 @@
 //! raised while the worker prepares its read of the feed, and a panic raised
 //! from the command a reaction dispatched. Both unwind the worker task, which is
 //! exactly how a panic in the lock manager, the listener or cursor I/O would end
-//! it, and none of them is a panic inside `react` (that boundary is #183).
+//! it, and neither is a panic inside `react` — that boundary is #183.
+//!
+//! The second fault does sit on the per-event path even though it is not in
+//! `react`: it panics inside the aggregate's command handler. That is deliberate,
+//! because it is the only way to kill a worker *after* one of an event's commands
+//! has committed and *before* its cursor is durable, which is what "resumes from
+//! the last checkpoint" is about. If #183 extends containment from the reaction
+//! to the whole per-event path, that test must be re-pointed at another fault —
+//! and it will say so by failing, which is the point of it being written this
+//! way.
 //!
 //! Every assertion is something an operator could make: the policy reacted
 //! again, the cursor moved, the daemon names a worker it gave up on. The only
