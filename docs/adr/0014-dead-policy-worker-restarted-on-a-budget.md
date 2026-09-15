@@ -62,6 +62,16 @@ Each worker now runs under a supervisor that restarts it, bounded by a
   help a worker that can never be elected again, so it is recorded as stopped
   immediately instead of burning a budget to reach the same place.
 
+- **The lock manager's pinned connection is ended, not returned, when it lets go
+  of it.** Postgres releases a session advisory lock only when the session ends,
+  and sqlx returns a dropped pool connection to the idle queue with its session
+  state intact. A manager that panicked would therefore leave every Policy it led
+  locked by an idle connection nobody is using — unleadable here and in every
+  replica, and invisible, because a worker waiting to be elected looks exactly
+  like a healthy [Standby](../../CONTEXT.md#standby). The connection is closed on
+  drop, so the unwind path releases the locks and a restart recovers rather than
+  wedges.
+
 ## Consequences
 
 - A panic outside the reaction costs re-delivery and a `warn`, not a stopped

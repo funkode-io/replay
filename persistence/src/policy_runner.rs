@@ -966,6 +966,48 @@ async fn run_notify_listener(
     }
 }
 
+/// The lock manager's pinned connection, ended rather than returned when the
+/// manager lets go of it.
+///
+/// Postgres releases a session advisory lock only when the *session* ends, and a
+/// pooled connection outlives the task that borrowed it: sqlx pings a dropped
+/// connection and puts it back in the idle queue with its session state intact,
+/// locks and all. A lock manager that panicked would therefore leave every
+/// Policy it led locked by an idle connection nobody is using — unleadable by
+/// this process *and* by every standby replica, and invisible, because a worker
+/// waiting to be elected looks exactly like a standby that is meant to be
+/// waiting. Ending the session is what makes a restart recover rather than
+/// wedge, so it must happen even on the unwind path, which is why it is a `Drop`
+/// and not a line of code at the end of the task.
+struct PinnedSession(sqlx::pool::PoolConnection<Postgres>);
+
+impl PinnedSession {
+    fn pin(connection: sqlx::pool::PoolConnection<Postgres>) -> Self {
+        Self(connection)
+    }
+}
+
+impl Drop for PinnedSession {
+    fn drop(&mut self) {
+        // Takes effect when the connection itself drops, immediately after this.
+        self.0.close_on_drop();
+    }
+}
+
+impl std::ops::Deref for PinnedSession {
+    type Target = sqlx::PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PinnedSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Hold every policy's advisory lock on one pinned connection and publish who
 /// leads what.
 ///
@@ -1011,14 +1053,14 @@ async fn run_lock_manager(
 
         // (Re)acquire the single pinned connection. All of this
         // instance's advisory locks live on this one session; when it
-        // drops they are all released together, so on reconnect we
+        // ends they are all released together, so on reconnect we
         // recompete for every key from scratch.
         let mut lock_conn = loop {
             if *shutdown_rx.borrow() {
                 return Stop::Shutdown;
             }
             match pool.acquire().await {
-                Ok(conn) => break conn,
+                Ok(conn) => break PinnedSession::pin(conn),
                 Err(error) => {
                     tracing::error!(
                         error = %error,
