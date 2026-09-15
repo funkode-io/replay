@@ -19,13 +19,13 @@ use replay_persistence::{Dispatch, StartAt, PANIC_ERROR_KIND};
 use tracing_test::traced_test;
 
 /// Tag whose reaction panics. Any other tag echoes.
-const POISON: &str = "panic";
+const PANICS: &str = "panic";
 
 /// The panic's message, so the parked row can be asserted to carry it.
 const PANIC_MESSAGE: &str = "reaction exploded on a malformed payload";
 
-/// A Policy that panics on `POISON` and echoes everything else, counting how
-/// many times it was asked to react to a poison event.
+/// A Policy that panics on `PANICS` and echoes everything else, counting how
+/// many times it was asked to react to an event that makes it panic.
 ///
 /// The count is the only way to see "never retried" from outside: a retry would
 /// call `react` again before parking anything.
@@ -39,7 +39,7 @@ fn panicking_policy(
         let reactions = Arc::clone(&reactions);
         builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, move |event| {
             match &event.data {
-                ProbeEvent::Pinged { tag } if tag == POISON => {
+                ProbeEvent::Pinged { tag } if tag == PANICS => {
                     reactions.fetch_add(1, Ordering::SeqCst);
                     panic!("{PANIC_MESSAGE}");
                 }
@@ -63,11 +63,11 @@ async fn a_panicking_reaction_is_parked_and_the_policy_keeps_reacting_postgres_t
     let harness =
         PolicyDaemonHarness::start("panics", panicking_policy(Arc::clone(&reactions))).await;
 
-    let poison = harness.ping("subject-1", POISON).await;
+    let panicked = harness.ping("subject-1", PANICS).await;
 
     let parked = harness.await_dead_letters(1).await;
-    assert_eq!(parked[0].global_position, poison.global_position);
-    assert_eq!(parked[0].event_id, poison.event_id);
+    assert_eq!(parked[0].global_position, panicked.global_position);
+    assert_eq!(parked[0].event_id, panicked.event_id);
     assert_eq!(
         parked[0].error_kind, PANIC_ERROR_KIND,
         "a panic must be told apart from a returned error, got {:?}",
@@ -92,9 +92,11 @@ async fn a_panicking_reaction_is_parked_and_the_policy_keeps_reacting_postgres_t
     let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
     assert_eq!(dispatched.event_type, "Echoed");
 
-    let cursor = harness.await_cursor_at_least(poison.global_position).await;
+    let cursor = harness
+        .await_cursor_at_least(panicked.global_position)
+        .await;
     assert!(
-        cursor >= poison.global_position,
+        cursor >= panicked.global_position,
         "cursor {cursor} must have advanced past the event that panicked"
     );
     assert_eq!(
@@ -116,7 +118,7 @@ async fn a_panicking_reaction_is_parked_and_the_policy_keeps_reacting_postgres_t
             .copied()
             .filter(|line| line.contains("policy reaction panicked"))
             .collect();
-        let position = format!("global_position={}", poison.global_position);
+        let position = format!("global_position={}", panicked.global_position);
         match parked.as_slice() {
             [line]
                 if line.contains("ERROR")
@@ -144,9 +146,11 @@ async fn a_restart_does_not_redeliver_the_panicking_event_postgres_test() {
     let mut harness =
         PolicyDaemonHarness::start("panic_restart", panicking_policy(Arc::clone(&reactions))).await;
 
-    let poison = harness.ping("subject-1", POISON).await;
+    let panicked = harness.ping("subject-1", PANICS).await;
     harness.await_dead_letters(1).await;
-    harness.await_cursor_at_least(poison.global_position).await;
+    harness
+        .await_cursor_at_least(panicked.global_position)
+        .await;
 
     harness.restart().await;
 
@@ -163,6 +167,45 @@ async fn a_restart_does_not_redeliver_the_panicking_event_postgres_test() {
         harness.dead_letters().await.len(),
         1,
         "a restart must not park a second dead letter for the same event"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The containment reaches the operator's own controls: retrying a row parked
+/// for a panic replays the reaction that panicked, and that panic must not
+/// unwind the retry call — it re-parks the row in place and the bulk run
+/// reports it as still failing.
+#[tokio::test]
+async fn retrying_a_parked_panic_re_parks_it_rather_than_unwinding_the_retry_postgres_test() {
+    let reactions = Arc::new(AtomicUsize::new(0));
+    let harness =
+        PolicyDaemonHarness::start("panic_retry", panicking_policy(Arc::clone(&reactions))).await;
+
+    let panicked = harness.ping("subject-1", PANICS).await;
+    harness.await_dead_letters(1).await;
+
+    let summary = harness.retry_parked().await;
+    assert_eq!(summary.resolved, 0, "a panicking reaction cannot resolve");
+    assert_eq!(
+        summary.still_failing, 1,
+        "the row that panicked again must be reported as still failing"
+    );
+
+    assert_eq!(
+        reactions.load(Ordering::SeqCst),
+        2,
+        "the retry must have replayed the reaction exactly once"
+    );
+
+    let parked = harness.dead_letters().await;
+    assert_eq!(parked.len(), 1, "a retry must never insert a second row");
+    assert_eq!(parked[0].global_position, panicked.global_position);
+    assert_eq!(parked[0].error_kind, PANIC_ERROR_KIND);
+    assert!(
+        parked[0].error_message.contains(PANIC_MESSAGE),
+        "the re-parked row must carry the panic it raised again, got {:?}",
+        parked[0].error_message
     );
 
     harness.shutdown().await;

@@ -21,8 +21,8 @@ catch. We make the delivery of one event the containment boundary.
   `catch_unwind`, one level outside `execute_event_reactions` so it wraps the
   retry loop as well as the reaction. Containing at the worker instead — letting
   the task die and restarting it — would re-deliver the same event to the same
-  reaction and panic again, spending the worker's restart budget on a poison
-  event that will never succeed. Restarting a worker is a separate concern, for
+  reaction and panic again, spending the worker's restart budget on one bad event
+  that will never succeed. Restarting a worker is a separate concern, for
   failures that are *about* the worker.
 
 - **A panic is permanent on first occurrence and is never retried.** Re-running a
@@ -55,9 +55,9 @@ catch. We make the delivery of one event the containment boundary.
   leaves the one a dispatched command's handler raises, on the same worker task,
   through the same await. The per-event boundary covers both for the same catch.
 
-- **Treating a panic as retryable.** It costs three back-offs per poison event
-  and reaches the same dead letter, delaying the Policy for a failure that is
-  deterministic by construction.
+- **Treating a panic as retryable.** It costs three back-offs per panicking
+  reaction and reaches the same dead letter, delaying the Policy for a failure
+  that is deterministic by construction.
 
 - **Storing the panic under `ErrorKind::Internal`.** It reads as "a returned
   internal error" and is indistinguishable, in the table an operator queries,

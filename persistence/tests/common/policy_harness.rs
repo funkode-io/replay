@@ -20,11 +20,13 @@
 //! - [`PolicyDaemonHarness::cursor`] — the policy's persisted position.
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
 //!
-//! And one thing an operator can *do*:
+//! And two things an operator can *do*:
 //!
 //! - [`PolicyDaemonHarness::restart`] — stop the daemon and start an identical
 //!   one against the same database, so a test can ask what survived in memory
 //!   (nothing) and what survived in the tables (everything that matters).
+//! - [`PolicyDaemonHarness::retry_parked`] — the bulk retry of everything the
+//!   policy parked, run out of band while the daemon keeps polling.
 //!
 //! Tasks, channels and in-process state are deliberately absent.
 //!
@@ -63,7 +65,8 @@ use super::postgres_image::{postgres_container, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PostgresEventStore,
+    Cqrs, DeadLetterRetrySummary, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon,
+    PostgresEventStore,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -282,6 +285,26 @@ impl PolicyDaemonHarness {
             self.configure.as_ref(),
             &self.policy_name,
         ));
+    }
+
+    /// Retry every dead letter this policy has parked, oldest-first — the
+    /// operator's bulk recovery.
+    ///
+    /// Runs on a runner built exactly like the daemon's but never started: a
+    /// retry takes no advisory lock and never touches the cursor, so it is the
+    /// out-of-band call an operator makes against a system that is still
+    /// running, which is how it is made here.
+    pub async fn retry_parked(&self) -> DeadLetterRetrySummary {
+        let runner = (self.configure)(
+            PolicyRunner::builder(self.cqrs.clone()).register_services::<Probe>(()),
+            &self.policy_name,
+        )
+        .build();
+
+        runner
+            .retry_policy_dead_letters(&self.policy_name)
+            .await
+            .expect("a bulk retry must return a summary rather than fail")
     }
 
     /// The name the policy under test was registered under.

@@ -1165,8 +1165,8 @@ fn log_superseded(name: &str, cursor: &PolicyCursor) {
 /// one failure it cannot see. A reaction is arbitrary user code called on the
 /// worker's own task, so a panic in it unwinds the worker: the policy would stop
 /// reacting for the rest of the process's life, silently. Catching here — at the
-/// event rather than at the worker — is what stops one poison event from
-/// consuming a worker's restart budget.
+/// event rather than at the worker — is what stops one bad event from consuming
+/// a worker's restart budget.
 ///
 /// A panic is classified **permanent on first occurrence** and parked
 /// immediately, never retried: re-running a reaction that panicked
