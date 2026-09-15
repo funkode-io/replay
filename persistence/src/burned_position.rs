@@ -26,6 +26,11 @@
 //! The lock appears with the transaction's first statement and is released only
 //! after its commit is published, which is what makes the ordering in
 //! [`verdict`](BurnedPositions::verdict) safe.
+//!
+//! That is a claim about Postgres, so it is tested rather than asserted:
+//! `a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test` drives
+//! the snapshot rule to a false verdict about a position a running append is holding.
+//! Read it before replacing the oracle here with a cheaper-looking one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -454,3 +454,149 @@ async fn a_transaction_holding_a_position_without_an_xid_is_waited_for_postgres_
         )),
     });
 }
+
+/// The rule this fix rejects, executed, so nobody reinstates it by accident.
+///
+/// The obvious way to decide permanence is a transaction-snapshot watermark: record
+/// `pg_snapshot_xmax(pg_current_snapshot())` when the hole is first seen, and treat
+/// the hole as permanent once `pg_snapshot_xmin(pg_current_snapshot())` has reached
+/// it, on the reasoning that every transaction in flight at the first reading has
+/// then ended. It is wrong, and this test makes it be wrong on demand.
+///
+/// A snapshot's `xmax` is one past the newest *completed* transaction, and its list
+/// of in-flight transactions only reaches that far. An append that is running while
+/// nothing newer has completed therefore sits above the watermark and is in no list
+/// at all: the reading says "nothing was in flight" about a transaction that is
+/// holding the very position in question. One later commit is enough to carry `xmin`
+/// to the watermark and complete the false proof.
+///
+/// The consequence is the reason the feed waits at holes in the first place. The
+/// burned-position fix trades a loud, recoverable outage for a quiet one only if it
+/// gets this wrong: skipping a position that later commits delivers that event to
+/// nobody, ever, with every health signal green.
+///
+/// If this test ever fails, Postgres has changed what a snapshot reports and the
+/// rejected design deserves a fresh look. Until then, it is the evidence for
+/// ADR-0015's choice of the sequence's lock holders as the oracle.
+#[tokio::test]
+#[traced_test]
+async fn a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Beginning, |_| vec![])
+        .build();
+
+    let add = |stream: &'static str, amount: f64| {
+        let cqrs = cqrs.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &LedgerUrn::new(stream).unwrap(),
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    let snapshot_bounds = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint, \
+                 pg_snapshot_xmax(pg_current_snapshot())::text::bigint",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("reading the snapshot must succeed")
+        }
+    };
+
+    add("snapshot-main", 10.0).await;
+    add("snapshot-held", 5.0).await;
+    drain_until(&runner, &pool, 2, 4).await;
+
+    // An append in flight, holding the position it took. It has written a row, so it
+    // has a transaction id and is exactly the case a snapshot is supposed to cover.
+    let mut in_flight = pool.begin().await.expect("beginning must succeed");
+    let held = clone_event_into(&mut in_flight, 2).await;
+    let holder_xid: i64 = sqlx::query_scalar("SELECT pg_current_xact_id()::text::bigint")
+        .fetch_one(&mut *in_flight)
+        .await
+        .expect("the holder has a transaction id");
+
+    // What the rejected rule would record on the poll that first sees the hole.
+    let (_, watermark) = snapshot_bounds().await;
+    assert!(
+        watermark <= holder_xid,
+        "the watermark is one past the newest completed transaction, so a running \
+         one at or above it is in no in-flight list: watermark {watermark}, holder \
+         {holder_xid}"
+    );
+
+    // One ordinary append commits behind the hole. This is what makes the hole
+    // visible to the feed at all \u2014 and, incidentally, completes the false proof.
+    add("snapshot-main", 1.0).await;
+
+    // Polled rather than read once: any unrelated transaction that happens to be
+    // running holds `xmin` below the watermark until it ends, which delays the false
+    // verdict without making it any less false.
+    let mut ended_by_the_rejected_rule = false;
+    for _ in 0..40 {
+        if snapshot_bounds().await.0 >= watermark {
+            ended_by_the_rejected_rule = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        ended_by_the_rejected_rule,
+        "the rejected rule must reach its verdict here; if it no longer does, the \
+         reasoning in ADR-0015 needs revisiting rather than this assertion relaxing"
+    );
+
+    // And it is a false verdict: the position is still missing, and the transaction
+    // that can still write it is still running.
+    let still_missing: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM events WHERE global_position = $1)")
+            .bind(held)
+            .fetch_one(&pool)
+            .await
+            .expect("checking the position must succeed");
+    let still_holds_the_sequence: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'relation' \
+         AND relation = pg_get_serial_sequence('events', 'global_position')::regclass)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reading the locks must succeed");
+    assert!(
+        still_missing && still_holds_the_sequence,
+        "the rejected rule called a position permanent while the append holding it \
+         was still running"
+    );
+
+    // The runner, asked the right question, waits.
+    for _ in 0..5 {
+        runner.drain().await.expect("drain must succeed");
+    }
+    assert_eq!(
+        stored_cursor(&pool, AUDIT).await,
+        held - 1,
+        "the position is not burned and must not be crossed"
+    );
+    logs_assert(|lines| match skip_warnings(lines).len() {
+        0 => Ok(()),
+        n => Err(format!(
+            "the snapshot's false verdict must not reach the cursor, got {n} skips"
+        )),
+    });
+
+    // The event the rejected rule would have lost.
+    in_flight.commit().await.expect("committing must succeed");
+    drain_until(&runner, &pool, held + 1, 5).await;
+}

@@ -62,6 +62,13 @@ Either one lets an `xmin`/`xmax` watermark call a hole permanent while the appen
 that fills it is still running. The lock has neither problem: it exists from the
 transaction's first statement, whatever the transaction has written.
 
+The rejected rule is not only argued against here, it is executed:
+`a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test` stages a
+running append, records the watermark that rule would record, and shows the rule
+reaching its verdict while the append is still holding the position. If Postgres ever
+changes what a snapshot reports, that test fails and this decision deserves a fresh
+look — which is the only circumstance in which it should be revisited.
+
 ## Consequences
 
 - **No schema change, no cursor-format change, no migration.** The candidate set is
