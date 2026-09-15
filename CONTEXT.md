@@ -117,7 +117,8 @@ state (an [Aggregate]'s rebuilt-from-stream state) and **not** a [Projection]
 (it derives no read model from the event log; it reports on a Policy's runtime).
 _Observing_ a Policy's status (read-only) is a separate concern from
 _controlling_ a Policy (acting on its failures by [Retry] or [Discard] of a
-[Dead letter]). It also tells a healthy idle Policy from a [Blocked policy].
+[Dead letter]). It reports the [Progress] axis only and says nothing about
+[Liveness]. It also tells a healthy idle Policy from a [Blocked policy].
 _Avoid_: state, policy state, health check.
 
 ### Blocked policy
@@ -126,9 +127,64 @@ A [Policy] whose cursor sits in front of a `global_position` that does not exist
 while a later one does, so its feed yields nothing and it reacts to nothing.
 Distinct from _lagging_ (a backlog that is draining) and from `Degraded`
 (reactions parked while the Policy still advances): blocked means zero
-throughput. Whether it clears is not observable from one reading
+throughput. It is a [Progress] verdict: a blocked Policy's worker is usually
+perfectly live. Whether it clears is not observable from one reading
 ([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)).
 _Avoid_: stuck, wedged, hung, stalled.
+
+### Policy runner
+
+The set of background workers that drive every [Policy] in a process — one
+worker per Policy, each owning that Policy's durable cursor, sharing the
+process's listener and lock-manager connections
+([ADR-0008](docs/adr/0008-policy-runner-shared-connection-leadership.md)). The
+Policy is what reacts; the runner is what makes it run, restarts it and reports
+on it.
+_Avoid_: policy engine, subscriber, dispatcher, scheduler, worker pool.
+
+### Leader
+
+The single worker, across every replica, that currently drives a given [Policy]
+and holds its advisory lock. Leadership is held per Policy, not per process: one
+replica is routinely Leader for some Policies and [Standby] for others, and
+leadership moves only when the lock is released.
+_Avoid_: primary, master, owner, active node.
+
+### Standby
+
+A worker that exists for a [Policy] another replica leads, holds no lock and
+therefore processes nothing. A Standby is healthy and deliberately idle — it is
+not a stopped worker and not a lagging one — and becomes [Leader] when the
+current Leader releases the lock.
+_Avoid_: secondary, passive replica, follower, spare.
+
+### Liveness
+
+The axis reporting whether a [Policy]'s worker exists and is running — leading,
+standing by, restarting, stopped or unknown. Only the process running the
+[Policy runner] knows it, so it is published from memory and never derived from
+the operational tables. Independent of [Progress] in both directions: a
+[Standby] is live and advances nothing, and a [Leader] can be live while its
+Policy is a [Blocked policy].
+_Avoid_: uptime, availability, aliveness, worker status.
+
+### Progress
+
+The axis reporting how far a [Policy] has advanced through its feed and whether
+its reactions are completing — the axis [Policy status] observes, on which
+[Blocked policy] and [Caught up] are verdicts. Derived from the operational
+tables alone, so any replica can read it, including one whose worker is a
+[Standby]. Independent of [Liveness].
+_Avoid_: advancement, catch-up rate, freshness.
+
+### Caught up
+
+The transition of a [Policy] from a backlog to zero lag: the moment its cursor
+reaches the end of its feed, announced once with how many events it took and how
+long. It is not a terminal state: a Policy that remains at zero lag is simply
+idle, and the next appended event returns it to working. Nothing is caught up
+for a stretch of time — only at the instant it arrives.
+_Avoid_: up to date, in sync, complete, finished.
 
 ### Scoped URN
 
@@ -178,6 +234,19 @@ reaction itself) is portable, but its runtime is an irreducibly server-side
 background process. A future [Async projection] aimed at client/edge targets
 would need to honour the WASM dual-cfg pattern.
 
+## Non-guarantees
+
+What the [Policy runner] does not promise, stated here so no consumer builds on
+it:
+
+- **A panic inside a task the reaction spawns itself is not contained.** The
+  runner's containment boundaries are the per-event dispatch and the worker; a
+  task the reaction hands to a runtime or a blocking pool unwinds in its own
+  task, outside both, and neither parks a [Dead letter] nor restarts anything.
+- **An OOM kill is not containable in-process.** The kernel ends the process; no
+  supervision layer can catch it. The only defences are bounding what a reaction
+  loads and bounding how long a dispatch may run.
+
 [Aggregate]: #aggregate
 [Policy]: #policy
 [Policy feed]: #policy-feed
@@ -188,6 +257,12 @@ would need to honour the WASM dual-cfg pattern.
 [Rebuild]: #rebuild
 [Policy status]: #policy-status
 [Blocked policy]: #blocked-policy
+[Policy runner]: #policy-runner
+[Leader]: #leader
+[Standby]: #standby
+[Liveness]: #liveness
+[Progress]: #progress
+[Caught up]: #caught-up
 [Query]: #query
 [Scoped URN]: #scoped-urn
 [Live projection]: #live-projection
