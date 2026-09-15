@@ -308,7 +308,12 @@ impl PolicyRunner {
     /// cursor — one event at a time, advancing only after that event's commands
     /// have committed (at-least-once delivery; reactions must be idempotent).
     ///
-    /// Returns the total number of dispatches executed across all policies.
+    /// Returns how many dispatches **committed** across all policies — a progress
+    /// signal, not an audit. A delivery that fails does not contribute its
+    /// partial work: a permanent failure counts only the dispatches that
+    /// committed before it, an exhausted retry budget counts nothing for that
+    /// event, and a contained panic likewise counts nothing. The cursor, not this
+    /// number, is what records what was processed.
     pub async fn drain(&self) -> Result<usize, replay::Error> {
         let mut total = 0;
         for policy in &self.policies {
