@@ -46,7 +46,7 @@ async fn a_registered_policy_reacts_to_an_appended_event_postgres_test() {
         "cursor {cursor} must have advanced past the event it reacted to"
     );
     assert!(
-        harness.parked().await.is_empty(),
+        harness.dead_letters().await.is_empty(),
         "a reaction that succeeded must park nothing"
     );
 
@@ -80,7 +80,7 @@ async fn a_permanently_failing_reaction_is_parked_and_the_daemon_carries_on_post
 
     let poison = harness.ping("subject-1", "poison").await;
 
-    let parked = harness.await_parked(1).await;
+    let parked = harness.await_dead_letters(1).await;
     assert_eq!(parked[0].global_position, poison.global_position);
     assert_eq!(parked[0].event_id, poison.event_id);
     assert!(
@@ -93,7 +93,11 @@ async fn a_permanently_failing_reaction_is_parked_and_the_daemon_carries_on_post
     let next = harness.ping("subject-2", "hello").await;
     let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
     assert_eq!(dispatched.event_type, "Echoed");
-    assert_eq!(harness.parked().await.len(), 1, "no second parked row");
+    assert_eq!(
+        harness.dead_letters().await.len(),
+        1,
+        "no second parked row"
+    );
 
     harness.shutdown().await;
 }

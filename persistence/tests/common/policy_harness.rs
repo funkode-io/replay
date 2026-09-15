@@ -18,7 +18,7 @@
 //! - [`PolicyDaemonHarness::dispatches`] — the commands the policy issued, seen
 //!   as the events they wrote, each carrying the causation the runner stamps.
 //! - [`PolicyDaemonHarness::cursor`] — the policy's persisted position.
-//! - [`PolicyDaemonHarness::parked`] — its dead-lettered dispatches.
+//! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
 //!
 //! Tasks, channels and in-process state are deliberately absent.
 //!
@@ -170,9 +170,10 @@ pub struct DispatchedCommand {
     pub caused_by_event_id: Uuid,
 }
 
-/// A dispatch the runner gave up on and parked.
+/// A reaction the runner gave up on and parked — the glossary's
+/// [Dead letter], as an operator reads it out of `policy_dead_letters`.
 #[derive(Debug, Clone)]
-pub struct ParkedDispatch {
+pub struct DeadLetter {
     pub global_position: i64,
     pub event_id: Uuid,
     pub error_kind: String,
@@ -339,8 +340,8 @@ impl PolicyDaemonHarness {
             .expect("cursor observation must be readable")
     }
 
-    /// The policy's parked dispatches, oldest first.
-    pub async fn parked(&self) -> Vec<ParkedDispatch> {
+    /// The policy's dead letters — the reactions it parked — oldest first.
+    pub async fn dead_letters(&self) -> Vec<DeadLetter> {
         let rows = sqlx::query(
             "SELECT global_position, event_id, error_kind, error_message \
              FROM policy_dead_letters WHERE policy_name = $1 \
@@ -353,7 +354,7 @@ impl PolicyDaemonHarness {
         .expect("parked observation must be readable");
 
         rows.into_iter()
-            .map(|row| ParkedDispatch {
+            .map(|row| DeadLetter {
                 global_position: row.get("global_position"),
                 event_id: row.get("event_id"),
                 error_kind: row.get("error_kind"),
@@ -387,11 +388,11 @@ impl PolicyDaemonHarness {
         .await
     }
 
-    /// Wait until the policy has parked at least `count` dispatches, and return
-    /// them all.
-    pub async fn await_parked(&self, count: usize) -> Vec<ParkedDispatch> {
-        self.observe(&format!("{count} parked dispatch(es)"), || async {
-            let parked = self.parked().await;
+    /// Wait until the policy has parked at least `count` reactions, and return
+    /// every dead letter it has.
+    pub async fn await_dead_letters(&self, count: usize) -> Vec<DeadLetter> {
+        self.observe(&format!("{count} parked reaction(s)"), || async {
+            let parked = self.dead_letters().await;
             (parked.len() >= count).then_some(parked)
         })
         .await
@@ -430,7 +431,7 @@ impl PolicyDaemonHarness {
                         self.policy_name,
                         self.cursor().await,
                         self.dispatches().await,
-                        self.parked().await,
+                        self.dead_letters().await,
                     )
                 })
                 .await

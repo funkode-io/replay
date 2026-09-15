@@ -18,8 +18,8 @@ that does this lives in `persistence/tests/common/policy_harness.rs`.
 
 - **The observation set is what an operator can see, and only that**: the
   commands a policy dispatched (read from `events` via the causation metadata the
-  runner stamps, not recorded in-process), its persisted cursor, and its parked
-  dispatches. Task handles, channels and internal counters are not exposed, so a
+  runner stamps, not recorded in-process), its persisted cursor, and its dead
+  letters. Task handles, channels and internal counters are not exposed, so a
   test cannot accidentally assert on a mechanism instead of a behaviour — which
   is the failure mode that made the existing policy tests unable to see any of
   this.
