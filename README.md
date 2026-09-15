@@ -2239,6 +2239,13 @@ When a dispatch fails the runner classifies the error and responds accordingly:
 | **Business-rule violation** | `ErrorKind::BusinessRuleViolation` | Advance cursor immediately — the event is correct, the domain logic rejected the command. No retry, no dead-letter. |
 | **Retryable** | `Unavailable`, `RateLimited`, `Conflict` | Exponential back-off, up to `MAX_DISPATCH_RETRIES` (3) attempts. |
 | **Permanent** | All other errors, or retries exhausted | Write to `policy_dead_letters`, advance cursor. The policy keeps running. |
+| **Panic** | The reaction (or a command it dispatched) panicked | Write to `policy_dead_letters` with `error_kind = 'Panic'` and the panic's message, log at `error`, advance cursor. Never retried — a reaction that panicked panics again ([ADR-0013](docs/adr/0013-panicking-reaction-parked-as-a-permanent-failure.md)). |
+
+The panic boundary is the delivery of **one event**, so the worker survives and
+the Policy reacts to every later event. Two panics are outside it: one inside a
+task the reaction **spawns itself** (it unwinds in its own task, and nothing
+parks a dead letter for it), and any panic in a binary built with
+`panic = "abort"`, where the process ends before a catch can run.
 
 #### `policy_dead_letters` table
 
@@ -2248,7 +2255,7 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
     policy_name      TEXT        NOT NULL,   -- stable policy name / cursor key
     global_position  BIGINT      NOT NULL,   -- position of the triggering event
     event_id         UUID        NOT NULL,   -- UUID of the triggering event
-    error_kind       TEXT        NOT NULL,   -- e.g. "Permanent", "Conflict"
+    error_kind       TEXT        NOT NULL,   -- ErrorKind text, or "Panic"
     error_message    TEXT        NOT NULL,   -- human-readable detail for triage
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -2268,6 +2275,9 @@ LIMIT  20;
 
 -- Look up the original event for manual replay
 SELECT * FROM events WHERE id = '<event_id from dead letter>';
+
+-- Reactions that panicked: defects in the reaction, not refused commands
+SELECT * FROM policy_dead_letters WHERE error_kind = 'Panic';
 ```
 
 #### Retrying and discarding dead letters
@@ -2277,7 +2287,7 @@ band. None take an advisory lock or move the policy cursor:
 
 | Method | Reaction | Outcome |
 |--------|----------|---------|
-| `retry_dead_letter(id)` | Re-runs the policy's reaction against **current** aggregate state through the same `Cqrs` path the live drain uses. | `Resolved` (succeeded, or now declined with a `BusinessRuleViolation`), `StillFailing` (re-parked in place with the fresh error), or `NotFound`. |
+| `retry_dead_letter(id)` | Re-runs the policy's reaction against **current** aggregate state through the same `Cqrs` path the live drain uses. | `Resolved` (succeeded, or now declined with a `BusinessRuleViolation`), `StillFailing` (re-parked in place with the fresh error, or with the panic it raised again), or `NotFound`. |
 | `discard_dead_letter(id)` | None — pure bookkeeping: no `react`, no command, no new event. | `Discarded` or `NotFound`. |
 | `retry_policy_dead_letters(name)` | Bulk: applies `retry_dead_letter` to every parked row for the policy, **oldest-first**. | `DeadLetterRetrySummary { resolved, still_failing }`. |
 
