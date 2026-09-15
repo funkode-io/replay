@@ -12,10 +12,12 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Pool, Postgres, QueryBuilder, Row};
@@ -85,6 +87,16 @@ where
 /// Policy tasks LISTEN on this channel; `PostgresEventStore::store_events`
 /// fires a NOTIFY on it after every successful commit.
 pub const REPLAY_NOTIFY_CHANNEL: &str = "replay_events";
+
+/// The `error_kind` written to `policy_dead_letters` when a reaction **panicked**
+/// rather than returning an error.
+///
+/// The two demand different responses, so they are not merged into one kind: a
+/// returned error is usually data (the reaction worked, the command was refused
+/// or the dependency was down), a panic is usually a defect in the reaction
+/// itself. Distinct from every [`replay::ErrorKind`] rendering, so
+/// `WHERE error_kind = 'Panic'` finds exactly the reactions that blew up.
+pub const PANIC_ERROR_KIND: &str = "Panic";
 
 // ── Closure-based policy adapter ─────────────────────────────────────────────
 
@@ -296,7 +308,12 @@ impl PolicyRunner {
     /// cursor — one event at a time, advancing only after that event's commands
     /// have committed (at-least-once delivery; reactions must be idempotent).
     ///
-    /// Returns the total number of dispatches executed across all policies.
+    /// Returns how many dispatches **committed** across all policies — a progress
+    /// signal, not an audit. A delivery that fails does not contribute its
+    /// partial work: a permanent failure counts only the dispatches that
+    /// committed before it, an exhausted retry budget counts nothing for that
+    /// event, and a contained panic likewise counts nothing. The cursor, not this
+    /// number, is what records what was processed.
     pub async fn drain(&self) -> Result<usize, replay::Error> {
         let mut total = 0;
         for policy in &self.policies {
@@ -320,6 +337,10 @@ impl PolicyRunner {
     /// - the reaction fails permanently again → the existing row is **updated
     ///   in place** with the fresh error ([`DeadLetterRetry::StillFailing`]);
     ///   no second row is ever inserted.
+    /// - the reaction **panics** → same treatment as a permanent failure, with
+    ///   the row updated to [`PANIC_ERROR_KIND`] and the panic's message. The
+    ///   panic never reaches the caller, so a bulk retry continues with the
+    ///   next row.
     ///
     /// Re-execution safety comes from the causation guard (the command carries
     /// the triggering event's id) plus the optimistic-concurrency check in
@@ -372,38 +393,64 @@ impl PolicyRunner {
         // executor is an operator misconfiguration (a clear error to the caller),
         // distinct from a dispatch that executes but fails permanently (which
         // re-parks the row in place).
-        let mut failure: Option<replay::Error> = None;
-        for dispatch in policy.react_erased(&raw) {
-            if !self.executors.contains_key(&dispatch.target()) {
-                return Err(replay::Error::invalid_input(
-                    "no services registered for the aggregate targeted by a policy dispatch",
-                )
-                .with_operation("retry_dead_letter")
-                .with_context("policy", &policy_name)
-                .with_context("aggregate", dispatch.aggregate_name()));
-            }
+        //
+        // The reaction runs behind the same catch as the live drain: a row parked
+        // for a panic replays the reaction that panicked, and unwinding here would
+        // take the operator's call with it — and, in a bulk retry, every row after
+        // this one.
+        let attempt = AssertUnwindSafe(async {
+            let mut failure: Option<replay::Error> = None;
+            for dispatch in policy.react_erased(&raw) {
+                if !self.executors.contains_key(&dispatch.target()) {
+                    return Err(replay::Error::invalid_input(
+                        "no services registered for the aggregate targeted by a policy dispatch",
+                    )
+                    .with_operation("retry_dead_letter")
+                    .with_context("policy", &policy_name)
+                    .with_context("aggregate", dispatch.aggregate_name()));
+                }
 
-            match execute_dispatch(
-                &self.cqrs,
-                &self.executors,
-                &policy_name,
-                global_position,
-                &raw,
-                dispatch,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation => {
-                    // Stale reaction: the aggregate now declines it. Clean
-                    // resolution — fall through to archive the row.
-                }
-                Err(e) => {
-                    failure = Some(e);
-                    break;
+                match execute_dispatch(
+                    &self.cqrs,
+                    &self.executors,
+                    &policy_name,
+                    global_position,
+                    &raw,
+                    dispatch,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation => {
+                        // Stale reaction: the aggregate now declines it. Clean
+                        // resolution — fall through to archive the row.
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
                 }
             }
-        }
+            Ok(failure)
+        })
+        .catch_unwind()
+        .await;
+
+        let failure = match attempt {
+            Ok(result) => result?,
+            Err(payload) => {
+                let message = panic_message(&*payload);
+                tracing::error!(
+                    policy          = %policy_name,
+                    dead_letter_id  = id,
+                    global_position,
+                    panic           = %message,
+                    "retried policy reaction panicked; the dead letter stays parked"
+                );
+                update_dead_letter(&self.pool, id, PANIC_ERROR_KIND, &message).await?;
+                return Ok(DeadLetterRetry::StillFailing);
+            }
+        };
 
         match failure {
             None => {
@@ -417,17 +464,13 @@ impl PolicyRunner {
                 }
             }
             Some(error) => {
-                sqlx::query(
-                    "UPDATE policy_dead_letters \
-                     SET error_kind = $2, error_message = $3 \
-                     WHERE id = $1",
+                update_dead_letter(
+                    &self.pool,
+                    id,
+                    &error.kind().to_string(),
+                    &error.to_string(),
                 )
-                .bind(id)
-                .bind(error.kind().to_string())
-                .bind(error.to_string())
-                .execute(&self.pool)
-                .await
-                .map_err(crate::db_error)?;
+                .await?;
                 Ok(DeadLetterRetry::StillFailing)
             }
         }
@@ -1017,17 +1060,11 @@ async fn drain_policy_once(
                 );
             } else {
                 // Real event within depth budget: deliver to the policy with
-                // the full resilience policy (BRV advance, retry, dead-letter).
-                executed += execute_event_reactions(
-                    cqrs,
-                    pool,
-                    executors,
-                    policy,
-                    &name,
-                    global_position,
-                    &raw,
-                )
-                .await?;
+                // the full resilience policy (BRV advance, retry, dead-letter),
+                // and with a panic in the reaction contained to this event.
+                executed +=
+                    react_to_event(cqrs, pool, executors, policy, &name, global_position, &raw)
+                        .await?;
             }
         }
         // Always track in-memory position.
@@ -1126,6 +1163,92 @@ fn log_superseded(name: &str, cursor: &PolicyCursor) {
     );
 }
 
+/// Deliver one event to a policy — the runner's **per-event containment
+/// boundary**.
+///
+/// [`execute_event_reactions`] absorbs every *returned* failure; this absorbs the
+/// one failure it cannot see. A reaction is arbitrary user code called on the
+/// worker's own task, so a panic in it unwinds the worker: the policy would stop
+/// reacting for the rest of the process's life, silently. Catching here — at the
+/// event rather than at the worker — is what stops one bad event from consuming
+/// a worker's restart budget.
+///
+/// A panic is classified **permanent on first occurrence** and parked
+/// immediately, never retried: re-running a reaction that panicked
+/// deterministically panics again. The parked row records
+/// [`PANIC_ERROR_KIND`] so an operator can tell a defect in the reaction from a
+/// command the domain refused.
+///
+/// **Not contained**: a panic inside a task the reaction spawns itself (or hands
+/// to a blocking pool). It unwinds in its own task, outside this boundary and
+/// outside the worker, so nothing parks a dead letter for it. Nor is anything
+/// contained in a binary built with `panic = "abort"`, where a panic ends the
+/// process before any catch runs.
+///
+/// [`AssertUnwindSafe`] is the honest claim here: what survives the catch is the
+/// database and the runner's own bookkeeping (both untouched by the unwind) plus
+/// the policy object itself, whose interior state — if it has any — is the
+/// reaction's own to keep consistent.
+async fn react_to_event(
+    cqrs: &Cqrs<PostgresEventStore>,
+    pool: &Pool<Postgres>,
+    executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    policy: &dyn ErasedPolicy,
+    policy_name: &str,
+    global_position: i64,
+    raw: &PersistedEvent<Value>,
+) -> Result<usize, replay::Error> {
+    let reactions = execute_event_reactions(
+        cqrs,
+        pool,
+        executors,
+        policy,
+        policy_name,
+        global_position,
+        raw,
+    );
+
+    match AssertUnwindSafe(reactions).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = panic_message(&*payload);
+            tracing::error!(
+                policy          = %policy_name,
+                event_id        = %raw.id,
+                stream_id       = %raw.stream_id,
+                global_position,
+                panic           = %message,
+                "policy reaction panicked; writing dead-letter and advancing cursor"
+            );
+            write_dead_letter(
+                pool,
+                policy_name,
+                global_position,
+                raw,
+                PANIC_ERROR_KIND,
+                &message,
+            )
+            .await?;
+            Ok(0)
+        }
+    }
+}
+
+/// Read the message out of a caught panic's payload.
+///
+/// `panic!` carries a `&'static str` when its argument is a literal and a
+/// `String` when it is formatted; anything else reached `panic_any` and has no
+/// message to report.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "reaction panicked with a payload that is neither &str nor String".to_string()
+    }
+}
+
 /// Execute all reactions for one event, applying the resilience policy:
 ///
 /// | Outcome                             | Action                                |
@@ -1136,7 +1259,9 @@ fn log_superseded(name: &str, cursor: &PolicyCursor) {
 /// | Permanent or retries exhausted      | write `policy_dead_letters`, advance  |
 ///
 /// The function always returns `Ok`; failures are absorbed here so the caller's
-/// cursor always advances (a circuit-breaker, never a poison pill).
+/// cursor always advances (a circuit-breaker, never a poison pill). A reaction
+/// that *panics* is absorbed one level out, in [`react_to_event`], which is the
+/// only failure this function cannot observe.
 ///
 /// **Re-react safety**: on retry the policy's `react` is called again for the
 /// same event.  Because `react` is a pure function and the at-least-once +
@@ -1194,7 +1319,15 @@ async fn execute_event_reactions(
                         error           = %e,
                         "policy dispatch failed permanently; writing dead-letter and advancing cursor"
                     );
-                    write_dead_letter(pool, policy_name, global_position, raw, &e).await?;
+                    write_dead_letter(
+                        pool,
+                        policy_name,
+                        global_position,
+                        raw,
+                        &e.kind().to_string(),
+                        &e.to_string(),
+                    )
+                    .await?;
                 }
             }
         }
@@ -1211,13 +1344,17 @@ async fn execute_event_reactions(
     Ok(0)
 }
 
-/// Write a dead-letter record for a dispatch that could not be executed.
+/// Write a dead-letter record for a reaction that could not be completed.
+///
+/// `error_kind` is the [`replay::ErrorKind`] of a returned error, or
+/// [`PANIC_ERROR_KIND`] when the reaction panicked.
 async fn write_dead_letter(
     pool: &Pool<Postgres>,
     policy_name: &str,
     global_position: i64,
     raw: &PersistedEvent<Value>,
-    error: &replay::Error,
+    error_kind: &str,
+    error_message: &str,
 ) -> Result<(), replay::Error> {
     sqlx::query(
         "INSERT INTO policy_dead_letters \
@@ -1227,8 +1364,30 @@ async fn write_dead_letter(
     .bind(policy_name)
     .bind(global_position)
     .bind(raw.id)
-    .bind(error.kind().to_string())
-    .bind(error.to_string())
+    .bind(error_kind)
+    .bind(error_message)
+    .execute(pool)
+    .await
+    .map_err(crate::db_error)?;
+    Ok(())
+}
+
+/// Update a parked dead letter in place with the failure a retry just produced,
+/// so a row that keeps failing is never duplicated.
+async fn update_dead_letter(
+    pool: &Pool<Postgres>,
+    id: i64,
+    error_kind: &str,
+    error_message: &str,
+) -> Result<(), replay::Error> {
+    sqlx::query(
+        "UPDATE policy_dead_letters \
+         SET error_kind = $2, error_message = $3 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error_kind)
+    .bind(error_message)
     .execute(pool)
     .await
     .map_err(crate::db_error)?;
@@ -1716,7 +1875,35 @@ mod tests {
     use replay::Metadata;
     use serde_json::json;
 
-    use super::merge_dispatch_metadata;
+    use super::{merge_dispatch_metadata, panic_message};
+
+    #[test]
+    fn reads_the_message_of_a_literal_panic() {
+        let payload = std::panic::catch_unwind(|| panic!("reaction exploded"))
+            .expect_err("must have panicked");
+
+        assert_eq!(panic_message(&*payload), "reaction exploded");
+    }
+
+    #[test]
+    fn reads_the_message_of_a_formatted_panic() {
+        let event = "evt-7";
+        let payload = std::panic::catch_unwind(|| panic!("reaction exploded on {event}"))
+            .expect_err("must have panicked");
+
+        assert_eq!(panic_message(&*payload), "reaction exploded on evt-7");
+    }
+
+    #[test]
+    fn reports_a_panic_payload_that_carries_no_message() {
+        let payload = std::panic::catch_unwind(|| std::panic::panic_any(42u8))
+            .expect_err("must have panicked");
+
+        assert_eq!(
+            panic_message(&*payload),
+            "reaction panicked with a payload that is neither &str nor String"
+        );
+    }
 
     #[test]
     fn merges_dispatch_metadata_without_collisions() {

@@ -20,6 +20,14 @@
 //! - [`PolicyDaemonHarness::cursor`] — the policy's persisted position.
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
 //!
+//! And two things an operator can *do*:
+//!
+//! - [`PolicyDaemonHarness::restart`] — stop the daemon and start an identical
+//!   one against the same database, so a test can ask what survived in memory
+//!   (nothing) and what survived in the tables (everything that matters).
+//! - [`PolicyDaemonHarness::retry_parked`] — the bulk retry of everything the
+//!   policy parked, run out of band while the daemon keeps polling.
+//!
 //! Tasks, channels and in-process state are deliberately absent.
 //!
 //! ## Waiting
@@ -44,6 +52,7 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sqlx::postgres::PgPoolOptions;
@@ -56,7 +65,8 @@ use super::postgres_image::{postgres_container, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PostgresEventStore,
+    Cqrs, DeadLetterRetrySummary, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon,
+    PostgresEventStore,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -92,6 +102,7 @@ define_aggregate! {
             Ping { tag: String },
             Echo { tag: String },
             Refuse { reason: String },
+            Explode { reason: String },
         },
         events: {
             Pinged { tag: String },
@@ -137,6 +148,11 @@ impl replay::Aggregate for Probe {
                 "probe refuses: {reason}"
             ))
             .with_operation("Refuse")),
+            // A command that panics *inside the handler*, so a test can drive a
+            // panic into the asynchronous half of the runner's per-event
+            // boundary — the one a panic in `react` never reaches, because it
+            // happens while awaiting the dispatch rather than before it.
+            ProbeCommand::Explode { reason } => panic!("probe exploded: {reason}"),
         }
     }
 }
@@ -192,8 +208,15 @@ pub struct PolicyDaemonHarness {
     pool: PgPool,
     cqrs: Cqrs<PostgresEventStore>,
     policy_name: String,
+    /// How the policy under test is registered. Kept so [`restart`](Self::restart)
+    /// can build the same daemon again against the same database.
+    configure: Arc<Configure>,
     daemon: Option<PolicyRunnerDaemon>,
 }
+
+/// Registers the policy under test on a fresh runner builder, under the name the
+/// harness minted for it.
+type Configure = dyn Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync;
 
 impl PolicyDaemonHarness {
     /// Start a database, register the policy `configure` builds, and begin
@@ -206,7 +229,7 @@ impl PolicyDaemonHarness {
     /// assertion.
     pub async fn start<F>(label: &str, configure: F) -> Self
     where
-        F: FnOnce(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder,
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
         let container = postgres_container()
             .start()
@@ -238,25 +261,56 @@ impl PolicyDaemonHarness {
 
         let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
         let policy_name = unique_policy_name(label);
+        let configure: Arc<Configure> = Arc::new(configure);
 
-        let runner = configure(
-            PolicyRunner::builder(cqrs.clone()).register_services::<Probe>(()),
-            &policy_name,
-        )
-        .build();
-
-        // The daemon's tasks own everything they need, so the runner itself is
-        // free to drop here: a test can only reach the daemon through this
-        // harness, which is the point.
-        let daemon = runner.start_polling(DAEMON_POLL_INTERVAL);
+        let daemon = spawn_daemon(&cqrs, configure.as_ref(), &policy_name);
 
         Self {
             _container: container,
             pool,
             cqrs,
             policy_name,
+            configure,
             daemon: Some(daemon),
         }
+    }
+
+    /// Stop the daemon and start an identically configured one against the same
+    /// database — the process restart an operator would perform, minus the
+    /// process.
+    ///
+    /// Everything in memory (cursor position, in-flight work) is discarded; only
+    /// what the first daemon made durable survives. That is what makes this the
+    /// way to ask whether an event is re-delivered after a restart.
+    pub async fn restart(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.shutdown().await;
+        }
+        self.daemon = Some(spawn_daemon(
+            &self.cqrs,
+            self.configure.as_ref(),
+            &self.policy_name,
+        ));
+    }
+
+    /// Retry every dead letter this policy has parked, oldest-first — the
+    /// operator's bulk recovery.
+    ///
+    /// Runs on a runner built exactly like the daemon's but never started: a
+    /// retry takes no advisory lock and never touches the cursor, so it is the
+    /// out-of-band call an operator makes against a system that is still
+    /// running, which is how it is made here.
+    pub async fn retry_parked(&self) -> DeadLetterRetrySummary {
+        let runner = (self.configure)(
+            PolicyRunner::builder(self.cqrs.clone()).register_services::<Probe>(()),
+            &self.policy_name,
+        )
+        .build();
+
+        runner
+            .retry_policy_dead_letters(&self.policy_name)
+            .await
+            .expect("a bulk retry must return a summary rather than fail")
     }
 
     /// The name the policy under test was registered under.
@@ -466,4 +520,22 @@ impl PolicyDaemonHarness {
 fn unique_policy_name(label: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!("harness_{label}_{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Build the configured runner and start it polling.
+///
+/// The daemon's tasks own everything they need, so the runner itself is free to
+/// drop here: a test can only reach the daemon through the harness, which is the
+/// point.
+fn spawn_daemon(
+    cqrs: &Cqrs<PostgresEventStore>,
+    configure: &Configure,
+    policy_name: &str,
+) -> PolicyRunnerDaemon {
+    configure(
+        PolicyRunner::builder(cqrs.clone()).register_services::<Probe>(()),
+        policy_name,
+    )
+    .build()
+    .start_polling(DAEMON_POLL_INTERVAL)
 }
