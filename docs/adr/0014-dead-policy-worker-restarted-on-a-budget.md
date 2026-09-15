@@ -79,6 +79,15 @@ Each worker now runs under a supervisor that restarts it, bounded by a
   it at the event and parking a [Dead letter](../../CONTEXT.md#dead-letter) is
   funkode-io/replay#183, and will make the two boundaries distinct so that a
   poison event cannot consume a restart budget.
+- **A dispatch that fails is never supervision's business.** A retryable error is
+  retried, anything else is parked and the cursor advances. Restarting on a
+  failed dispatch would re-deliver the same event forever, which is the loop the
+  dead-letter contract exists to prevent, so no test in this work asserts it.
+- **An election logs where it resumes from**, at `info`, once per election. It is
+  the only trace a process killed from outside leaves: an OOM-killed pod that
+  reprints the same `next_position` on every restart is being killed by one
+  event, while one whose position advances between restarts is leaking. Neither
+  is detectable in-process, so the log line is the whole defence.
 - Nothing is persisted: the budget and the stopped list are in-process state, so
   a restart of the process resets both and no schema change is involved.
 - `stopped_workers()` is a poll, not a notification. Turning it into something a

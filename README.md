@@ -2305,6 +2305,29 @@ Two deaths the runner does **not** contain: a panic inside a task the reaction
 spawns itself (it unwinds in its own task, outside both boundaries) and an OOM
 kill (the kernel ends the process; no supervision layer can catch that).
 
+#### Reading a process that died without saying so
+
+An OOM kill leaves no log line of its own — the process ends between two
+instructions. What it does leave is the last thing the runner said, so every
+time a worker is elected it logs at `info` where it is picking up:
+
+```text
+INFO policy worker is leading; resuming after its last checkpoint
+     policy=price_fanout resuming_after=264785 next_position=264786
+```
+
+Once per election, not per event, so an idle policy stays silent. In a crash
+loop the same `next_position` reappears on every restart, which names the event
+to look at:
+
+```sql
+SELECT * FROM events WHERE global_position = 264786;
+```
+
+A process killed by an *accumulating* leak instead shows the position advancing
+between restarts — it is making progress, just not surviving — which is the
+difference between "one event is killing us" and "we leak".
+
 #### `policy_dead_letters` table
 
 ```sql

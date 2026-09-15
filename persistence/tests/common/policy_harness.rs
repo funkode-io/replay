@@ -94,7 +94,6 @@ define_aggregate! {
             Ping { tag: String },
             Echo { tag: String },
             Refuse { reason: String },
-            Explode { message: String },
         },
         events: {
             Pinged { tag: String },
@@ -140,10 +139,6 @@ impl replay::Aggregate for Probe {
                 "probe refuses: {reason}"
             ))
             .with_operation("Refuse")),
-            // A command that kills whatever task runs it, so a test can drive a
-            // worker's death the way production meets one: a panic outside the
-            // reaction, with no error value to return.
-            ProbeCommand::Explode { message } => panic!("{message}"),
         }
     }
 }

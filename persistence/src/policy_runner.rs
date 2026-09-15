@@ -1253,6 +1253,22 @@ impl PolicyWorker {
                 }
             };
 
+            // Where this worker is picking up, said once per election rather
+            // than once per event. It is the only line a process that dies
+            // *outside* the runtime leaves behind: an OOM kill takes the process
+            // between two instructions, so nothing can be logged as it happens,
+            // and the last thing the runner said before going quiet is the
+            // position it was about to work from. A process killed by one poison
+            // event therefore prints the same `next_position` on every restart,
+            // which names the event to look at:
+            // `SELECT * FROM events WHERE global_position = <next_position>`.
+            tracing::info!(
+                policy = %name,
+                resuming_after = cursor.position,
+                next_position = cursor.position + 1,
+                "policy worker is leading; resuming after its last checkpoint"
+            );
+
             // Leadership polling loop.
             loop {
                 if *shutdown_rx.borrow() || !*leader_rx.borrow() {

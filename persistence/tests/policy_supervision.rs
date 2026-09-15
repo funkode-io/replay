@@ -1,20 +1,19 @@
 //! A worker that dies is restarted — supervision, driven against a real daemon
 //! and a real database (funkode-io/replay#185).
 //!
-//! The deaths here are the ones the per-event boundary cannot contain: a panic
-//! raised while the worker prepares its read of the feed, and a panic raised
-//! from the command a reaction dispatched. Both unwind the worker task, which is
-//! exactly how a panic in the lock manager, the listener or cursor I/O would end
-//! it, and neither is a panic inside `react` — that boundary is #183.
+//! The death injected here is one the per-event path cannot contain and cannot
+//! be blamed on any single event: a panic raised while the worker prepares its
+//! read of the feed. That is the shape of a panic in the lock manager, the
+//! listener or cursor I/O — the causes #185 names — and it is deliberately *not*
+//! a failure of a dispatch. A dispatch that fails is not supervision's business
+//! at all: a retryable error is retried, anything else is parked as a dead
+//! letter and the cursor advances, which is the contract that keeps one bad
+//! event from stopping a policy. A test that made a dispatch failure restart a
+//! worker would contradict it, so there is none here.
 //!
-//! The second fault does sit on the per-event path even though it is not in
-//! `react`: it panics inside the aggregate's command handler. That is deliberate,
-//! because it is the only way to kill a worker *after* one of an event's commands
-//! has committed and *before* its cursor is durable, which is what "resumes from
-//! the last checkpoint" is about. If #183 extends containment from the reaction
-//! to the whole per-event path, that test must be re-pointed at another fault —
-//! and it will say so by failing, which is the point of it being written this
-//! way.
+//! Resuming from the last durable checkpoint after a death is covered by
+//! `policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test` in
+//! `integration_tests.rs`, which is also what makes a pod restart safe.
 //!
 //! Every assertion is something an operator could make: the policy reacted
 //! again, the cursor moved, the daemon names a worker it gave up on. The only
@@ -22,7 +21,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,10 +43,13 @@ fn quick_supervision() -> WorkerSupervision {
 ///
 /// `stream_filter` is called by the worker as it prepares its read of the feed,
 /// before any event is delivered, so a panic there stands in for the panics this
-/// ticket is about: the lock manager, the listener, cursor I/O. The reaction
-/// itself is ordinary — it echoes every ping — so a restarted worker is visible
-/// by it reacting again.
-struct DiesBeforeReadingTheFeed {
+/// ticket is about: the lock manager, the listener, cursor I/O. It is nothing to
+/// do with the event that happens to be next, which is the distinction that
+/// keeps a restart from being a substitute for parking a dead letter.
+///
+/// The reaction itself is ordinary — it echoes every ping — so a worker that
+/// came back is visible by it reacting again.
+struct DiesOutsideTheReaction {
     name: String,
     /// How many more times the worker should die. Decremented as it dies, so a
     /// test can ask for exactly one death, or for more than the budget allows.
@@ -55,9 +57,13 @@ struct DiesBeforeReadingTheFeed {
     /// How many deaths actually happened, so a test can prove its fault fired
     /// rather than assume it.
     deaths: Arc<AtomicUsize>,
+    /// Hold the fault back until the policy has reacted to something, so a test
+    /// can tell what a restart lost from what the policy had never reached.
+    only_after_reacting: bool,
+    reacted: Arc<AtomicBool>,
 }
 
-impl Policy for DiesBeforeReadingTheFeed {
+impl Policy for DiesOutsideTheReaction {
     type Event = ProbeEvent;
 
     fn name(&self) -> &str {
@@ -69,6 +75,10 @@ impl Policy for DiesBeforeReadingTheFeed {
     }
 
     fn stream_filter(&self) -> StreamFilter {
+        if self.only_after_reacting && !self.reacted.load(Ordering::SeqCst) {
+            return StreamFilter::all();
+        }
+
         let staged = self
             .deaths_to_stage
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -85,6 +95,7 @@ impl Policy for DiesBeforeReadingTheFeed {
     }
 
     fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+        self.reacted.store(true, Ordering::SeqCst);
         echo(event)
     }
 }
@@ -102,7 +113,8 @@ fn echo(event: &PersistedEvent<ProbeEvent>) -> Vec<Dispatch> {
 }
 
 /// A worker that dies for a reason the per-event boundary cannot contain comes
-/// back on its own and carries on processing events.
+/// back on its own, and the events that arrived while it was away are reacted to
+/// rather than stepped over.
 #[tokio::test]
 async fn a_worker_that_dies_outside_the_reaction_is_restarted_postgres_test() {
     let deaths = Arc::new(AtomicUsize::new(0));
@@ -114,25 +126,51 @@ async fn a_worker_that_dies_outside_the_reaction_is_restarted_postgres_test() {
         PolicyDaemonHarness::start("restarts", move |builder, policy| {
             builder
                 .with_worker_supervision(quick_supervision())
-                .register_policy(DiesBeforeReadingTheFeed {
+                .register_policy(DiesOutsideTheReaction {
                     name: policy.to_string(),
                     deaths_to_stage: staged,
                     deaths,
+                    only_after_reacting: true,
+                    reacted: Arc::new(AtomicBool::new(false)),
                 })
         })
         .await
     };
 
-    let ping = harness.ping("subject-1", "hello").await;
+    // One event reacted to normally: the worker is alive and leading.
+    let before = harness.ping("subject-1", "before").await;
+    harness
+        .await_dispatch_caused_by(before.global_position)
+        .await;
 
-    let dispatched = harness.await_dispatch_caused_by(ping.global_position).await;
+    // The fault is now armed, and the worker dies on its next look at the feed.
+    harness
+        .observe("the worker to die", || async {
+            (deaths.load(Ordering::SeqCst) == 1).then_some(())
+        })
+        .await;
+
+    // Everything appended from here on is what a restart must not lose.
+    let during = harness.ping("subject-2", "during").await;
+    let after = harness.ping("subject-3", "after").await;
+
+    let dispatched = harness
+        .await_dispatch_caused_by(during.global_position)
+        .await;
     assert_eq!(dispatched.event_type, "Echoed");
-    harness.await_cursor_at_least(ping.global_position).await;
+    harness
+        .await_dispatch_caused_by(after.global_position)
+        .await;
+    let cursor = harness.await_cursor_at_least(after.global_position).await;
+    assert!(
+        cursor >= after.global_position,
+        "cursor {cursor} must have passed every event the restarted worker read"
+    );
 
-    assert_eq!(
-        deaths.load(Ordering::SeqCst),
-        1,
-        "the test's fault must have fired: without a death there is no restart to observe"
+    assert!(
+        harness.dead_letters().await.is_empty(),
+        "a worker death is a restart, not a parked reaction: {:?}",
+        harness.dead_letters().await
     );
     assert!(
         harness.stopped_workers().is_empty(),
@@ -157,10 +195,12 @@ async fn a_worker_that_exhausts_its_budget_stops_and_is_reported_postgres_test()
         PolicyDaemonHarness::start("exhausts", move |builder, policy| {
             builder
                 .with_worker_supervision(quick_supervision().max_restarts(2))
-                .register_policy(DiesBeforeReadingTheFeed {
+                .register_policy(DiesOutsideTheReaction {
                     name: policy.to_string(),
                     deaths_to_stage: staged,
                     deaths,
+                    only_after_reacting: false,
+                    reacted: Arc::new(AtomicBool::new(false)),
                 })
                 .register_policy_fn::<ProbeEvent, _>(neighbour_of(policy), StartAt::Beginning, echo)
         })
@@ -207,91 +247,6 @@ async fn a_worker_that_exhausts_its_budget_stops_and_is_reported_postgres_test()
         toll,
         "a stopped worker must not be restarted again"
     );
-
-    harness.shutdown().await;
-}
-
-/// A worker that dies after one of an event's commands has committed, but
-/// before its cursor is durable, resumes from the last checkpoint: the event it
-/// died on is delivered again rather than stepped over.
-#[tokio::test]
-async fn a_restarted_worker_resumes_from_its_checkpoint_and_skips_nothing_postgres_test() {
-    // The fault fires once: the second delivery of the same event must get
-    // through, or the worker would simply die again.
-    let explosions = Arc::new(AtomicUsize::new(1));
-
-    let harness = {
-        let explosions = Arc::clone(&explosions);
-        PolicyDaemonHarness::start("resumes", move |builder, policy| {
-            builder
-                .with_worker_supervision(quick_supervision())
-                .register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, move |event| {
-                    match &event.data {
-                        ProbeEvent::Pinged { tag } if tag == "boom" => {
-                            let mut dispatches = echo(event);
-                            let staged = explosions
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                                    left.checked_sub(1)
-                                })
-                                .is_ok();
-                            if staged {
-                                // Runs *after* the echo has committed, so the
-                                // worker dies mid-event with work already done
-                                // and nothing checkpointed.
-                                dispatches.push(Dispatch::to::<Probe>(
-                                    ProbeUrn::new("fuse").unwrap(),
-                                    ProbeCommand::Explode {
-                                        message: "the worker died handling a dispatched command"
-                                            .to_string(),
-                                    },
-                                ));
-                            }
-                            dispatches
-                        }
-                        _ => echo(event),
-                    }
-                })
-        })
-        .await
-    };
-
-    let boom = harness.ping("subject-1", "boom").await;
-
-    // Two echoes caused by the same event: one from before the death, one from
-    // the re-delivery a checkpoint-resumed worker performs. At-least-once is the
-    // contract; skipping the event would be the bug.
-    let echoes = harness
-        .observe(
-            "the event the worker died on to be delivered again",
-            || async {
-                let caused: Vec<_> = harness
-                    .dispatches()
-                    .await
-                    .into_iter()
-                    .filter(|d| d.caused_by_position == boom.global_position)
-                    .collect();
-                (caused.len() >= 2).then_some(caused)
-            },
-        )
-        .await;
-    assert!(echoes.iter().all(|d| d.event_type == "Echoed"));
-    assert_eq!(
-        explosions.load(Ordering::SeqCst),
-        0,
-        "the test's fault must have fired"
-    );
-
-    // And the policy is running normally afterwards: past the event that killed
-    // it, with the next one reacted to and nothing parked.
-    harness.await_cursor_at_least(boom.global_position).await;
-    let next = harness.ping("subject-2", "hello").await;
-    harness.await_dispatch_caused_by(next.global_position).await;
-    assert!(
-        harness.dead_letters().await.is_empty(),
-        "a worker death is a restart, not a parked reaction: {:?}",
-        harness.dead_letters().await
-    );
-    assert!(harness.stopped_workers().is_empty());
 
     harness.shutdown().await;
 }
