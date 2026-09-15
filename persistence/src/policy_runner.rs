@@ -949,19 +949,6 @@ async fn drain_policy_once(
     let Feed { positions, gap } =
         read_feed(pool, policy.stream_filter(), cursor.position, read_batch).await?;
 
-    if let Some(Gap { expected, found }) = gap {
-        // The one fact the blocked deployment in funkode-io/replay#164 never had.
-        // Cheap enough to emit on every poll, so it is the trace an operator turns
-        // on rather than a signal that has to survive a rate limit.
-        tracing::debug!(
-            policy = %name,
-            cursor = cursor.position,
-            expected,
-            found,
-            "policy feed stops at a gap in global_position"
-        );
-    }
-
     if positions.is_empty() {
         // Nothing to process: the policy is idle, or parked in front of a gap
         // that will never fill. Both are the states an operator corrects by hand
@@ -974,22 +961,27 @@ async fn drain_policy_once(
                 position = cursor.position,
                 "persisted cursor was moved externally; adopting it"
             );
-            // The cursor moved, so whatever gap was just read belongs to the old
-            // position: the policy is not blocked where it was.
+            // The gap was read from the position the operator has just replaced:
+            // reporting it would name a stop that no longer exists.
             blocked.cleared(&name);
             return Ok(0);
         }
 
         match gap {
-            // Parked in front of a hole. An append still in flight looks exactly
-            // like this and clears in milliseconds, so the escalation is gated on
-            // how long the cursor has actually been parked.
-            Some(gap) => report_blocked(pool, &name, cursor.position, gap, blocked).await?,
-            // Caught up with nothing past the cursor: a healthy idle policy, and
-            // it stays silent.
+            // Parked in front of a hole, and the cursor is where the read left it.
+            Some(gap) => {
+                trace_gap(&name, cursor.position, gap);
+                report_blocked(pool, &name, cursor.position, gap, blocked).await?;
+            }
+            // Caught up: a healthy idle policy, and it stays silent.
             None => blocked.cleared(&name),
         }
         return Ok(0);
+    }
+
+    // A truncated window: the policy advances now and stops at the hole next poll.
+    if let Some(gap) = gap {
+        trace_gap(&name, cursor.position, gap);
     }
 
     // The policy is advancing, so it is not blocked any more.
@@ -1061,20 +1053,28 @@ async fn drain_policy_once(
     Ok(executed)
 }
 
-/// Report a policy that has been parked in front of a hole long enough for the hole
-/// to be permanent rather than an append still landing.
+/// Trace the stop: the one fact the blocked deployment in funkode-io/replay#164
+/// never had. Cheap enough to emit on every poll, so it needs no rate limit.
+fn trace_gap(name: &str, cursor: i64, gap: Gap) {
+    tracing::debug!(
+        policy = %name,
+        cursor,
+        expected = gap.expected,
+        found = gap.found,
+        "policy feed stops at a gap in global_position"
+    );
+}
+
+/// Report a Policy parked in front of a hole long enough for the hole to be
+/// permanent rather than an append still landing.
 ///
-/// The wait itself is by design (ADR-0003 skip-safety): a `global_position` is
-/// assigned at `INSERT` and becomes visible at `COMMIT`, so a missing one is
-/// normally an append about to land. What is not by design is waiting forever —
-/// `nextval` is non-transactional, so an aborted append burns its positions
-/// permanently and nothing will ever fill them (funkode-io/replay#164).
+/// The wait is by design (ADR-0003 skip-safety): a `global_position` is assigned at
+/// `INSERT` and visible at `COMMIT`, so a missing one is normally about to land.
+/// Waiting forever is not — `nextval` is non-transactional, so an aborted append
+/// burns its positions and nothing will ever fill them (funkode-io/replay#164).
 ///
-/// Two gates keep this from becoming noise: the Policy must have been parked longer
-/// than [`BlockedWatch::interval`], and the record repeats at most once per
-/// interval. The probe that answers the first question runs once per poll while a
-/// Policy is parked in front of a hole — two index lookups, for a Policy that by
-/// definition has nothing else to do.
+/// [`BlockedWatch`] decides which poll reports; the probe then runs at most once
+/// per interval, to name the head and how long the cursor has been parked.
 async fn report_blocked(
     pool: &Pool<Postgres>,
     name: &str,
@@ -1082,20 +1082,13 @@ async fn report_blocked(
     gap: Gap,
     blocked: &BlockedWatch,
 ) -> Result<(), replay::Error> {
-    let now = std::time::Instant::now();
-    if !blocked.due(name, now) {
+    if !blocked.poll(name, gap.expected, std::time::Instant::now()) {
         return Ok(());
     }
 
     let Some(parked) = probe_blocked(pool, name).await? else {
         return Ok(());
     };
-
-    if parked.elapsed < blocked.interval() {
-        // Young enough to be an append still in flight, which is what the feed is
-        // supposed to wait for.
-        return Ok(());
-    }
 
     tracing::warn!(
         policy = %name,
@@ -1108,7 +1101,6 @@ async fn report_blocked(
          If the position was burned by an aborted append it will never appear, and the \
          cursor must be moved past it (funkode-io/replay#164)"
     );
-    blocked.reported(name, now);
 
     Ok(())
 }

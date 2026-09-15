@@ -2426,19 +2426,15 @@ has no `policy_cursors` row and is therefore absent from `list()`. The store onl
 
 ### What a blocked policy writes to the log
 
-`PolicyStatusStore` answers "is anything blocked?" only when someone asks. A policy
-that stops in front of a hole also **says so where the operator is already looking**
-— the log — because the incident behind
-[#164](https://github.com/funkode-io/replay/issues/164) was not the stop, it was that
-a healthy idle policy and a permanently blocked one produced byte-identical output:
-nothing.
-
-Two records, at two levels:
+`PolicyStatusStore` answers "is anything blocked?" only when asked. A policy that
+stops in front of a hole also says so in the log, because in
+[#164](https://github.com/funkode-io/replay/issues/164) a healthy idle policy and a
+permanently blocked one produced byte-identical output: nothing.
 
 | Level | When | Fields |
 |-------|------|--------|
 | `debug` | every poll whose feed stops at a hole | `policy`, `cursor`, `expected`, `found` |
-| `warn` | the policy has been parked longer than the escalation threshold | `policy`, `cursor`, `head`, `missing_position`, `next_position`, `blocked_for_secs` |
+| `warn` | the hole has persisted longer than the escalation threshold | `policy`, `cursor`, `head`, `missing_position`, `next_position`, `blocked_for_secs` |
 
 ```text
 DEBUG replay_persistence::policy_runner: policy feed stops at a gap in global_position
@@ -2449,15 +2445,18 @@ WARN  replay_persistence::policy_runner: policy is blocked: its feed stops at a
       next_position=264787 blocked_for_secs=259200
 ```
 
-The `warn` is what you alert on; `blocked_for_secs` is measured from
-`policy_cursors.updated_at`, so it survives restarts and leadership changes and keeps
-counting across them.
-
 | Setting | Env var | Default |
 |---------|---------|---------|
-| Time parked before the first `warn`, and the minimum spacing between repeats | `REPLAY_BLOCKED_WARN_AFTER_SECS` | `30` |
+| How long a hole must persist before the first `warn`, and the minimum spacing between repeats | `REPLAY_BLOCKED_WARN_AFTER_SECS` | `30` |
 
-One knob does both jobs: below the threshold a missing position is an append still
-committing, which the feed is designed to wait for; above it, the warning repeats no
-more than once per interval for as long as the policy stays blocked. A policy that is
-caught up and idle logs nothing at all.
+Alert on the `warn`. Two clocks meet in it, and they answer different questions:
+
+- **When to warn** is decided by how long *this hole* has been in front of the cursor,
+  measured in the running process. Below the threshold a missing position is an append
+  still committing, which the feed is designed to wait for, so a policy idle for an
+  hour that then waits on a commit stays silent.
+- **`blocked_for_secs`** is measured from `policy_cursors.updated_at` — the last time
+  the cursor advanced — so it survives restarts and leadership changes and reports the
+  age of the outage, not the age of the process.
+
+A caught-up idle policy logs nothing at all.
