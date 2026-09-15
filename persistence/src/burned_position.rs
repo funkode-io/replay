@@ -53,8 +53,7 @@ const MAX_HOLDERS: i64 = 1024;
 ///
 /// Virtual rather than real: a transaction has a virtual id from its first
 /// statement, but acquires an `xid` only when it first writes, and a transaction
-/// that has taken a sequence value and not yet inserted has none. Prepared
-/// transactions have no virtual id and are named by their `xid` instead.
+/// that has taken a sequence value and not yet inserted has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Holder(String);
 
@@ -76,17 +75,32 @@ impl From<&str> for Holder {
 /// Empty is the ordinary answer on a healthy system and the strongest one: nothing
 /// holds a sequence value, so nothing can fill the hole.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct Holders(Vec<Holder>);
+pub(crate) struct Holders {
+    ids: Vec<Holder>,
+    /// Whether any holder is a prepared transaction — one that has been written to
+    /// disk to await `COMMIT PREPARED`, and now outlives the session that created it.
+    ///
+    /// Such a holder cannot be tracked by identity. Postgres keeps its original
+    /// virtual id while the server runs, but re-issues it as `-1/<xid>` after a
+    /// restart, so a candidate recorded before one would look like a candidate that
+    /// had ended — while `COMMIT PREPARED` can still publish the missing event. The
+    /// verdict therefore refuses to decide at all while one is holding the sequence,
+    /// which needs no identity and covers any future re-identification too.
+    prepared: bool,
+}
 
 impl Holders {
     fn holds_any_of(&self, others: &Holders) -> bool {
-        others.0.iter().any(|holder| self.0.contains(holder))
+        others.ids.iter().any(|holder| self.ids.contains(holder))
     }
 }
 
 impl<H: Into<Holder>> FromIterator<H> for Holders {
     fn from_iter<I: IntoIterator<Item = H>>(ids: I) -> Self {
-        Self(ids.into_iter().map(Into::into).collect())
+        Self {
+            ids: ids.into_iter().map(Into::into).collect(),
+            prepared: false,
+        }
     }
 }
 
@@ -159,7 +173,7 @@ impl BurnedPositions {
             };
         }
 
-        if candidates.holders.holds_any_of(&holders) {
+        if holders.prepared || candidates.holders.holds_any_of(&holders) {
             Permanence::Fillable
         } else {
             Permanence::Permanent
@@ -228,7 +242,7 @@ pub(crate) async fn sequence_holders(
     let row = sqlx::query(
         "SELECT pg_get_serial_sequence('events', 'global_position') AS sequence_name, \
          (SELECT COALESCE(array_agg(held.holder), ARRAY[]::text[]) FROM ( \
-            SELECT COALESCE(l.virtualtransaction, l.transactionid::text) AS holder \
+            SELECT COALESCE(l.virtualtransaction, 'unidentified') AS holder \
             FROM pg_locks l \
             WHERE l.locktype = 'relation' \
               AND l.mode = 'RowExclusiveLock' \
@@ -237,7 +251,16 @@ pub(crate) async fn sequence_holders(
                                 WHERE d.datname = current_database()) \
               AND l.relation = pg_get_serial_sequence('events', 'global_position')::regclass \
             LIMIT $1 \
-         ) held) AS holders",
+         ) held) AS holders, \
+         EXISTS (SELECT 1 FROM pg_locks l \
+                 WHERE l.locktype = 'relation' \
+                   AND l.mode = 'RowExclusiveLock' \
+                   AND l.granted \
+                   AND l.pid IS NULL \
+                   AND l.database = (SELECT d.oid FROM pg_database d \
+                                     WHERE d.datname = current_database()) \
+                   AND l.relation = pg_get_serial_sequence('events', 'global_position')::regclass \
+         ) AS prepared",
     )
     // One over the cap, so a full page is recognisable as "too many" rather than
     // passing for a complete set of exactly `MAX_HOLDERS`.
@@ -259,7 +282,13 @@ pub(crate) async fn sequence_holders(
         return Ok(None);
     }
 
-    Ok(Some(holders.into_iter().collect()))
+    let mut holders: Holders = holders.into_iter().collect();
+    // A lock with no backend behind it belongs to a prepared transaction: it has
+    // been written to disk and awaits `COMMIT PREPARED`, so it can publish the
+    // missing event long after the session that created it has gone.
+    holders.prepared = row.get("prepared");
+
+    Ok(Some(holders))
 }
 
 /// Confirm `policy` is still parked at `cursor` and find where it resumes.
@@ -431,6 +460,32 @@ mod tests {
         assert_eq!(
             burned.verdict("never_ran", HOLE, Holders::default()),
             Permanence::Permanent
+        );
+    }
+
+    /// A prepared transaction outlives its session and keeps its hold on the
+    /// position until someone commits or rolls it back. Its identity is not stable
+    /// across a server restart, so it is answered by its presence rather than by
+    /// matching it against a recorded candidate.
+    #[test]
+    fn a_prepared_transaction_holding_the_sequence_settles_nothing() {
+        let burned = BurnedPositions::new();
+        let prepared = Holders {
+            prepared: true,
+            ..Holders::default()
+        };
+
+        assert_eq!(
+            burned.verdict(POLICY, HOLE, prepared.clone()),
+            Permanence::Fillable,
+            "an empty candidate list means nothing while a prepared holder exists"
+        );
+
+        burned.verdict(POLICY, HOLE, holders(&["4/731"]));
+        assert_eq!(
+            burned.verdict(POLICY, HOLE, prepared),
+            Permanence::Fillable,
+            "and neither does a recorded candidate that has since ended"
         );
     }
 

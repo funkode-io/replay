@@ -12,6 +12,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
+use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 use tracing_test::traced_test;
 
@@ -658,4 +659,128 @@ async fn a_long_lived_reader_of_the_sequence_does_not_hold_a_position_postgres_t
     });
 
     reader.rollback().await.expect("rollback must succeed");
+}
+
+/// A prepared transaction still holds the position it took, and is the one holder
+/// that cannot be tracked by identity: Postgres keeps its virtual id while the
+/// server runs and re-issues it as `-1/<xid>` after a restart, so a candidate
+/// recorded before a restart would look like one that had ended — while
+/// `COMMIT PREPARED` can still publish the missing event.
+///
+/// The runner therefore keys on the lock having no backend behind it rather than on
+/// who holds it, and this test pins that marker as much as the behaviour: if a
+/// future Postgres stops reporting a prepared holder with a null `pid`, the
+/// assertion below fails rather than the skip quietly losing an event.
+///
+/// Two-phase commit is off by default, so this test runs its own server with it on.
+#[tokio::test]
+#[traced_test]
+async fn a_prepared_transaction_holding_a_position_is_waited_for_postgres_test() {
+    let container = postgres_container()
+        .with_cmd(["postgres", "-c", "max_prepared_transactions=5"])
+        .start()
+        .await
+        .unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&format!(
+            "postgres://postgres:postgres@{host}:{port}/postgres"
+        ))
+        .await
+        .expect("Failed to connect to Postgres");
+    sqlx::migrate!("./tests/migrations")
+        .run(&pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let reacted = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&reacted);
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Beginning, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        })
+        .build();
+
+    let add = |stream: &'static str, amount: f64| {
+        let cqrs = cqrs.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &LedgerUrn::new(stream).unwrap(),
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    add("prepared-main", 10.0).await;
+    add("prepared-held", 5.0).await;
+    drain_until(&runner, &pool, 2, 4).await;
+    assert_eq!(reacted.load(Ordering::SeqCst), 2);
+
+    // An append that has written its event and been prepared: its session is gone,
+    // and only `COMMIT PREPARED` or `ROLLBACK PREPARED` decides its fate.
+    let mut in_flight = pool.begin().await.expect("beginning must succeed");
+    let held = clone_event_into(&mut in_flight, 2).await;
+    sqlx::query("PREPARE TRANSACTION 'held-append'")
+        .execute(&mut *in_flight)
+        .await
+        .expect("preparing the append must succeed");
+    drop(in_flight);
+
+    // What the runner keys on: a lock with no backend behind it.
+    let prepared_holders: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'relation' \
+         AND mode = 'RowExclusiveLock' AND granted AND pid IS NULL \
+         AND relation = pg_get_serial_sequence('events', 'global_position')::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reading the locks must succeed");
+    assert_eq!(
+        prepared_holders, 1,
+        "a prepared transaction must still hold the sequence, and report no backend"
+    );
+
+    // The event behind it lands, making the hole visible to the feed.
+    add("prepared-main", 1.0).await;
+
+    for _ in 0..5 {
+        runner.drain().await.expect("drain must succeed");
+    }
+
+    assert_eq!(
+        stored_cursor(&pool, AUDIT).await,
+        held - 1,
+        "a position a prepared transaction holds must never be crossed"
+    );
+    logs_assert(|lines| match skip_warnings(lines).len() {
+        0 => Ok(()),
+        n => Err(format!(
+            "nothing may be skipped while a prepared transaction holds it, got {n}"
+        )),
+    });
+
+    // It commits, long after its session is gone, exactly as the hazard describes.
+    sqlx::query("COMMIT PREPARED 'held-append'")
+        .execute(&pool)
+        .await
+        .expect("committing the prepared append must succeed");
+
+    drain_until(&runner, &pool, held + 1, 5).await;
+    assert_eq!(
+        reacted.load(Ordering::SeqCst),
+        4,
+        "the prepared event and the one behind it must both be delivered"
+    );
 }
