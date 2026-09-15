@@ -13,7 +13,8 @@
 //! holds `RowExclusiveLock` on the sequence until it ends, and `pg_locks` lists that
 //! lock to any role. So the transactions that could fill the hole are enumerable at
 //! the moment the hole is seen, and once none of them is still running the hole is
-//! permanent.
+//! permanent. Reading the sequence is a different lock and does not make a
+//! transaction a candidate, however long it runs.
 //!
 //! The lock is the oracle, not the transaction snapshot `pg_current_snapshot()`
 //! offers, for two reasons. A transaction acquires an `xid` only when it first
@@ -213,6 +214,14 @@ pub(crate) enum Resume {
 /// another database on a relation that happens to share the identifier counts as a
 /// candidate, and a long-lived transaction over there keeps a Policy waiting for an
 /// append that cannot exist.
+///
+/// Only *granted* `RowExclusiveLock` rows count. That is the mode `nextval` and
+/// `setval` take, and a transaction takes it even when it already holds a stronger
+/// lock on the same sequence, so nothing that has taken a value is missed. Reading a
+/// sequence takes `AccessShareLock` and holds it to the end of the transaction, and a
+/// request not yet granted belongs to a transaction that has not taken a value at
+/// all: counting either would let a long-lived reader keep a genuinely burned
+/// position blocked, which is the outage this exists to end.
 pub(crate) async fn sequence_holders(
     pool: &Pool<Postgres>,
 ) -> Result<Option<Holders>, replay::Error> {
@@ -222,6 +231,8 @@ pub(crate) async fn sequence_holders(
             SELECT COALESCE(l.virtualtransaction, l.transactionid::text) AS holder \
             FROM pg_locks l \
             WHERE l.locktype = 'relation' \
+              AND l.mode = 'RowExclusiveLock' \
+              AND l.granted \
               AND l.database = (SELECT d.oid FROM pg_database d \
                                 WHERE d.datname = current_database()) \
               AND l.relation = pg_get_serial_sequence('events', 'global_position')::regclass \

@@ -600,3 +600,62 @@ async fn a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test(
     in_flight.commit().await.expect("committing must succeed");
     drain_until(&runner, &pool, held + 1, 5).await;
 }
+
+/// Reading the sequence is not holding a position. A long-lived transaction that
+/// only looked at it — a monitoring query, or the operator's own diagnostic from the
+/// field report — keeps an `AccessShareLock` on it until it ends, and counting that
+/// as a candidate would keep a genuinely burned position blocked for as long as the
+/// reader lives: the outage this whole mechanism exists to end, re-entered through
+/// the mechanism itself.
+#[tokio::test]
+#[traced_test]
+async fn a_long_lived_reader_of_the_sequence_does_not_hold_a_position_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Beginning, |_| vec![])
+        .build();
+
+    let ledger = LedgerUrn::new("sequence-reader").unwrap();
+    let add = |amount: f64| {
+        let cqrs = cqrs.clone();
+        let ledger = ledger.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &ledger,
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    add(10.0).await;
+    drain_until(&runner, &pool, 1, 4).await;
+
+    // Open for the rest of the test, reading the sequence and nothing else.
+    let mut reader = pool.begin().await.expect("beginning must succeed");
+    let _: i64 = sqlx::query_scalar("SELECT last_value FROM events_global_position_seq")
+        .fetch_one(&mut *reader)
+        .await
+        .expect("reading the sequence must succeed");
+
+    let burned = burn_positions(&pool, 1).await;
+    add(1.0).await;
+
+    let polls = drain_until(&runner, &pool, burned + 1, 5).await;
+    assert!(
+        polls <= 3,
+        "a reader must not delay crossing a burned position, took {polls} polls"
+    );
+    logs_assert(|lines| match skip_warnings(lines).len() {
+        1 => Ok(()),
+        n => Err(format!("the burned position must be crossed once, got {n}")),
+    });
+
+    reader.rollback().await.expect("rollback must succeed");
+}
