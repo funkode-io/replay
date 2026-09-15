@@ -6,6 +6,7 @@ mod infrastructure;
 mod inline_projection;
 mod persisted_event;
 mod policy;
+mod policy_blocked;
 mod policy_feed;
 mod policy_runner;
 mod policy_status;

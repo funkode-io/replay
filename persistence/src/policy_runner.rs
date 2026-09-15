@@ -25,7 +25,8 @@ use tokio::task::JoinHandle;
 use replay::{Aggregate, Metadata};
 
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
-use crate::policy_feed::{feed_from_window, WindowPosition};
+use crate::policy_blocked::{probe_blocked, resolve_blocked_warn_after, BlockedWatch};
+use crate::policy_feed::{feed_from_window, Feed, Gap, WindowPosition};
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
 /// Erased, services-bound execution path for one aggregate type.
@@ -209,6 +210,7 @@ impl PolicyRunnerBuilder {
             policies: self.policies,
             executors: self.executors,
             notifications: self.notifications,
+            blocked: Arc::new(BlockedWatch::new(resolve_blocked_warn_after())),
         }
     }
 }
@@ -253,6 +255,9 @@ pub struct PolicyRunner {
     policies: Vec<Arc<dyn ErasedPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
+    /// Rate gate for the blocked-policy warning, shared by every drain path so a
+    /// blocked Policy is reported at the same bounded rate however it is driven.
+    blocked: Arc<BlockedWatch>,
 }
 
 /// Handle for background policy tasks spawned by [`PolicyRunner::start_polling`].
@@ -769,6 +774,7 @@ impl PolicyRunner {
             let cqrs = self.cqrs.clone();
             let pool = self.pool.clone();
             let executors = self.executors.clone();
+            let blocked = Arc::clone(&self.blocked);
             let mut policy_shutdown_rx = shutdown_rx.clone();
             let name = policy.name().to_string();
             let mut leader_rx = leadership_rx
@@ -832,6 +838,7 @@ impl PolicyRunner {
                             &executors,
                             policy.as_ref(),
                             &mut cursor,
+                            &blocked,
                             max_depth,
                         )
                         .await
@@ -909,6 +916,7 @@ impl PolicyRunner {
             &self.executors,
             policy,
             &mut cursor,
+            &self.blocked,
             max_depth,
         )
         .await
@@ -932,14 +940,16 @@ async fn drain_policy_once(
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     policy: &dyn ErasedPolicy,
     cursor: &mut PolicyCursor,
+    blocked: &BlockedWatch,
     max_depth: u32,
 ) -> Result<usize, replay::Error> {
     let name = policy.name().to_string();
     let checkpoint_size = resolve_checkpoint_batch_size(policy);
     let read_batch = resolve_read_batch_size(policy, checkpoint_size);
-    let feed = read_feed(pool, policy.stream_filter(), cursor.position, read_batch).await?;
+    let Feed { positions, gap } =
+        read_feed(pool, policy.stream_filter(), cursor.position, read_batch).await?;
 
-    if feed.is_empty() {
+    if positions.is_empty() {
         // Nothing to process: the policy is idle, or parked in front of a gap
         // that will never fill. Both are the states an operator corrects by hand
         // with an UPDATE on `policy_cursors`, and both are the only moments when
@@ -951,8 +961,34 @@ async fn drain_policy_once(
                 position = cursor.position,
                 "persisted cursor was moved externally; adopting it"
             );
+            // The gap was read from the position the operator has just replaced:
+            // reporting it would name a stop that no longer exists.
+            blocked.cleared(&name);
+            return Ok(0);
+        }
+
+        match gap {
+            // Parked in front of a hole, and the cursor is where the read left it.
+            Some(gap) => {
+                trace_gap(&name, gap);
+                report_blocked(pool, &name, gap, blocked).await?;
+            }
+            // Caught up: a healthy idle policy, and it stays silent.
+            None => blocked.cleared(&name),
         }
         return Ok(0);
+    }
+
+    match gap {
+        // A truncated window: the policy advances over the prefix now and parks at
+        // the hole. The hole is as old as this poll even though this poll had work,
+        // so the clock starts here rather than on the first empty poll.
+        Some(gap) => {
+            trace_gap(&name, gap);
+            blocked.sighted(&name, gap.expected, std::time::Instant::now());
+        }
+        // Advancing with nothing in the way.
+        None => blocked.cleared(&name),
     }
 
     let mut executed = 0;
@@ -960,7 +996,7 @@ async fn drain_policy_once(
     for WindowPosition {
         global_position,
         delivered,
-    } in feed
+    } in positions
     {
         if let Some(raw) = delivered {
             let depth = event_causation_depth(&raw);
@@ -1019,6 +1055,65 @@ async fn drain_policy_once(
     }
 
     Ok(executed)
+}
+
+/// Trace the stop: the one fact the blocked deployment in funkode-io/replay#164
+/// never had. Cheap enough to emit on every poll, so it needs no rate limit.
+///
+/// `cursor` is where the *feed* stops: the position before the hole, which is where
+/// the poll leaves the cursor when it gets that far. It is a property of the read,
+/// not of what the reactions then managed to do, so it is the same field whether the
+/// window was empty or was truncated after a prefix.
+fn trace_gap(name: &str, gap: Gap) {
+    tracing::debug!(
+        policy = %name,
+        cursor = gap.expected - 1,
+        expected = gap.expected,
+        found = gap.found,
+        "policy feed stops at a gap in global_position"
+    );
+}
+
+/// Report a Policy parked in front of a hole long enough for the hole to be
+/// permanent rather than an append still landing.
+///
+/// The wait is by design (ADR-0003 skip-safety): a `global_position` is assigned at
+/// `INSERT` and visible at `COMMIT`, so a missing one is normally about to land.
+/// Waiting forever is not — `nextval` is non-transactional, so an aborted append
+/// burns its positions and nothing will ever fill them (funkode-io/replay#164).
+///
+/// [`BlockedWatch`] decides which poll reports; the probe then runs at most once
+/// per interval, to name the head and how long the cursor has been parked.
+async fn report_blocked(
+    pool: &Pool<Postgres>,
+    name: &str,
+    gap: Gap,
+    blocked: &BlockedWatch,
+) -> Result<(), replay::Error> {
+    if !blocked.poll(name, gap.expected, std::time::Instant::now()) {
+        return Ok(());
+    }
+
+    // Confirms the hole is still there and the cursor still in front of it: the read
+    // that found it is a few statements old by now.
+    let Some(parked) = probe_blocked(pool, name, gap.expected - 1, gap.expected).await? else {
+        return Ok(());
+    };
+
+    tracing::warn!(
+        policy = %name,
+        // The feed was empty, so the cursor is parked immediately before the hole.
+        cursor = gap.expected - 1,
+        head = parked.head,
+        missing_position = gap.expected,
+        next_position = gap.found,
+        blocked_for_secs = parked.elapsed.as_secs(),
+        "policy is blocked: its feed stops at a global_position that does not exist. \
+         If the position was burned by an aborted append it will never appear, and the \
+         cursor must be moved past it (funkode-io/replay#164)"
+    );
+
+    Ok(())
 }
 
 /// Report a checkpoint that lost to a cursor moved outside this process. The
@@ -1203,13 +1298,13 @@ async fn load_event_by_id(
 /// `filter` is evaluated per row as `matches_filter` and decides delivery only; an
 /// excluded row advances the cursor like a compaction snapshot
 /// (`compacted_snapshot = TRUE`, ADR-0004). [`feed_from_window`] then truncates the
-/// window at the first hole.
+/// window at the first hole, and names the hole it truncated at.
 async fn read_feed(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
     cursor: i64,
     limit: u32,
-) -> Result<Vec<WindowPosition<PersistedEvent<Value>>>, replay::Error> {
+) -> Result<Feed<PersistedEvent<Value>>, replay::Error> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
          global_position, compacted_snapshot, COALESCE((",

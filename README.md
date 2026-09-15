@@ -2423,3 +2423,40 @@ Only policies that have actually run appear: a registered-but-never-started poli
 has no `policy_cursors` row and is therefore absent from `list()`. The store only
 *observes* — retrying or discarding a dead letter is a separate, deliberate action
 (see the triage queries above).
+
+### What a blocked policy writes to the log
+
+`PolicyStatusStore` answers "is anything blocked?" only when asked. A policy that
+stops in front of a hole also says so in the log, because in
+[#164](https://github.com/funkode-io/replay/issues/164) a healthy idle policy and a
+permanently blocked one produced byte-identical output: nothing.
+
+| Level | When | Fields |
+|-------|------|--------|
+| `debug` | every poll whose feed stops at a hole | `policy`, `cursor`, `expected`, `found` |
+| `warn` | the hole has persisted longer than the escalation threshold | `policy`, `cursor`, `head`, `missing_position`, `next_position`, `blocked_for_secs` |
+
+```text
+DEBUG replay_persistence::policy_runner: policy feed stops at a gap in global_position
+      policy=price_fanout cursor=264785 expected=264786 found=264787
+WARN  replay_persistence::policy_runner: policy is blocked: its feed stops at a
+      global_position that does not exist. …
+      policy=price_fanout cursor=264785 head=264956 missing_position=264786
+      next_position=264787 blocked_for_secs=259200
+```
+
+| Setting | Env var | Default |
+|---------|---------|---------|
+| How long a hole must persist before the first `warn`, and the minimum spacing between repeats | `REPLAY_BLOCKED_WARN_AFTER_SECS` | `30` |
+
+Alert on the `warn`. Two clocks meet in it, and they answer different questions:
+
+- **When to warn** is decided by how long *this hole* has been in front of the cursor,
+  measured in the running process. Below the threshold a missing position is an append
+  still committing, which the feed is designed to wait for, so a policy idle for an
+  hour that then waits on a commit stays silent.
+- **`blocked_for_secs`** is measured from `policy_cursors.updated_at` — the last time
+  the cursor advanced — so it survives restarts and leadership changes and reports the
+  age of the outage, not the age of the process.
+
+A caught-up idle policy logs nothing at all.
