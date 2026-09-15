@@ -155,7 +155,8 @@ _Avoid_: primary, master, owner, active node.
 A worker that exists for a [Policy] another replica leads, whose replica holds no
 lock for it and which therefore processes nothing. A Standby is healthy and
 deliberately idle — it is not a stopped worker and not a lagging one — and
-becomes [Leader] when the lock for that Policy is released.
+may become [Leader]: when the lock for that Policy is released every Standby
+competes for it and one of them wins it.
 _Avoid_: secondary, passive replica, follower, spare.
 
 ### Liveness
@@ -171,7 +172,7 @@ _Avoid_: uptime, availability, aliveness, worker status.
 
 The axis reporting how far a [Policy] has advanced through its feed and whether
 its reactions are completing — the axis [Policy status] observes, on which
-[Blocked policy] and [Caught up] are verdicts. Derived from the operational
+[Blocked policy] is a verdict and [Caught up] a transition. Derived from the operational
 tables alone, so any replica can read it, including one whose worker is a
 [Standby]. Independent of [Liveness] in both directions: a [Standby] is live and
 advances nothing, and the [Leader] of a [Blocked policy] is live and advances
