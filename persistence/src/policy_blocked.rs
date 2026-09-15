@@ -67,7 +67,8 @@ impl BlockedWatch {
     /// return whether this poll reports it.
     ///
     /// Decides and claims under one lock, so concurrent drains of the same Policy
-    /// cannot both report.
+    /// cannot both report. `now` is read before the lock, so two of them can arrive
+    /// out of order; ages saturate, and the older one then skips a poll.
     pub(crate) fn poll(&self, policy: &str, missing_position: i64, now: Instant) -> bool {
         let mut seen = self.lock();
         let is_new_hole = seen
@@ -85,12 +86,12 @@ impl BlockedWatch {
         }
         let sighting = seen.get_mut(policy).expect("present or just inserted");
 
-        if now.duration_since(sighting.first_seen) < self.interval {
+        if now.saturating_duration_since(sighting.first_seen) < self.interval {
             return false;
         }
         if sighting
             .reported
-            .is_some_and(|last| now.duration_since(last) < self.interval)
+            .is_some_and(|last| now.saturating_duration_since(last) < self.interval)
         {
             return false;
         }
@@ -243,6 +244,18 @@ mod tests {
         watch.cleared("never_ran");
 
         assert!(!watch.poll("never_ran", 42, Instant::now()));
+    }
+
+    /// Two drains can read the clock in one order and reach the lock in the other.
+    /// The older timestamp must cost a poll, not the drain.
+    #[test]
+    fn a_timestamp_that_arrives_out_of_order_is_harmless() {
+        let watch = BlockedWatch::new(INTERVAL);
+        let start = Instant::now();
+
+        assert!(!watch.poll("import_started", 42, start + INTERVAL));
+        assert!(!watch.poll("import_started", 42, start));
+        assert!(watch.poll("import_started", 42, start + INTERVAL + INTERVAL));
     }
 
     #[test]
