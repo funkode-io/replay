@@ -71,7 +71,7 @@ triggering event so a single bad event never wedges the Policy. A reaction that
 **panics** is one of these: the panic is contained at the event it was reacting
 to, parked on first occurrence without a retry, and recorded as kind `Panic` so
 an operator can tell a defect in the reaction from a command the domain refused
-([ADR-0014](docs/adr/0014-panicking-reaction-parked-as-a-permanent-failure.md)).
+([ADR-0016](docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md)).
 Dead letters are queryable so an operator can later inspect them and either
 [Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.
