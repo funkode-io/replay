@@ -127,8 +127,7 @@ A [Policy] whose cursor sits in front of a `global_position` that does not exist
 while a later one does, so its feed yields nothing and it reacts to nothing.
 Distinct from _lagging_ (a backlog that is draining) and from `Degraded`
 (reactions parked while the Policy still advances): blocked means zero
-throughput. It is a [Progress] verdict: a blocked Policy's worker is usually
-perfectly live. Whether it clears is not observable from one reading
+throughput. Whether it clears is not observable from one reading
 ([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)).
 _Avoid_: stuck, wedged, hung, stalled.
 
@@ -144,18 +143,19 @@ _Avoid_: policy engine, subscriber, dispatcher, scheduler, worker pool.
 
 ### Leader
 
-The single worker, across every replica, that currently drives a given [Policy]
-and holds its advisory lock. Leadership is held per Policy, not per process: one
-replica is routinely Leader for some Policies and [Standby] for others, and
-leadership moves only when the lock is released.
+The single worker, across every replica, that currently drives a given [Policy].
+Leadership is decided per Policy, not per process — the replica whose shared
+lock-manager session holds that Policy's advisory lock leads it
+([ADR-0008](docs/adr/0008-policy-runner-shared-connection-leadership.md)) — so
+one replica is routinely Leader for some Policies and [Standby] for others.
 _Avoid_: primary, master, owner, active node.
 
 ### Standby
 
-A worker that exists for a [Policy] another replica leads, holds no lock and
-therefore processes nothing. A Standby is healthy and deliberately idle — it is
-not a stopped worker and not a lagging one — and becomes [Leader] when the
-current Leader releases the lock.
+A worker that exists for a [Policy] another replica leads, whose replica holds no
+lock for it and which therefore processes nothing. A Standby is healthy and
+deliberately idle — it is not a stopped worker and not a lagging one — and
+becomes [Leader] when the lock for that Policy is released.
 _Avoid_: secondary, passive replica, follower, spare.
 
 ### Liveness
@@ -163,9 +163,8 @@ _Avoid_: secondary, passive replica, follower, spare.
 The axis reporting whether a [Policy]'s worker exists and is running — leading,
 standing by, restarting, stopped or unknown. Only the process running the
 [Policy runner] knows it, so it is published from memory and never derived from
-the operational tables. Independent of [Progress] in both directions: a
-[Standby] is live and advances nothing, and a [Leader] can be live while its
-Policy is a [Blocked policy].
+the operational tables. It implies nothing about [Progress], and nothing about
+it can be inferred from Progress.
 _Avoid_: uptime, availability, aliveness, worker status.
 
 ### Progress
@@ -174,7 +173,9 @@ The axis reporting how far a [Policy] has advanced through its feed and whether
 its reactions are completing — the axis [Policy status] observes, on which
 [Blocked policy] and [Caught up] are verdicts. Derived from the operational
 tables alone, so any replica can read it, including one whose worker is a
-[Standby]. Independent of [Liveness].
+[Standby]. Independent of [Liveness] in both directions: a [Standby] is live and
+advances nothing, and the [Leader] of a [Blocked policy] is live and advances
+nothing either.
 _Avoid_: advancement, catch-up rate, freshness.
 
 ### Caught up
@@ -240,12 +241,12 @@ What the [Policy runner] does not promise, stated here so no consumer builds on
 it:
 
 - **A panic inside a task the reaction spawns itself is not contained.** The
-  runner's containment boundaries are the per-event dispatch and the worker; a
+  runner's containment boundaries are the reaction to one event and the worker; a
   task the reaction hands to a runtime or a blocking pool unwinds in its own
   task, outside both, and neither parks a [Dead letter] nor restarts anything.
 - **An OOM kill is not containable in-process.** The kernel ends the process; no
   supervision layer can catch it. The only defences are bounding what a reaction
-  loads and bounding how long a dispatch may run.
+  loads and bounding how long it may run.
 
 [Aggregate]: #aggregate
 [Policy]: #policy
