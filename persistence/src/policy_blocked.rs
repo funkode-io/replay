@@ -42,6 +42,16 @@ struct Sighting {
     reported: Option<Instant>,
 }
 
+impl Sighting {
+    fn new(missing_position: i64, first_seen: Instant) -> Self {
+        Self {
+            missing_position,
+            first_seen,
+            reported: None,
+        }
+    }
+}
+
 /// Decides which polls of a blocked Policy get to write a record.
 ///
 /// Two conditions, both per Policy: the hole must have survived `interval` of
@@ -75,14 +85,7 @@ impl BlockedWatch {
             .get(policy)
             .is_none_or(|sighting| sighting.missing_position != missing_position);
         if is_new_hole {
-            seen.insert(
-                policy.to_owned(),
-                Sighting {
-                    missing_position,
-                    first_seen: now,
-                    reported: None,
-                },
-            );
+            seen.insert(policy.to_owned(), Sighting::new(missing_position, now));
         }
         let sighting = seen.get_mut(policy).expect("present or just inserted");
 
@@ -98,6 +101,19 @@ impl BlockedWatch {
 
         sighting.reported = Some(now);
         true
+    }
+
+    /// Record that `policy` is looking at `missing_position` without deciding
+    /// anything: the poll that first sees a hole may still have work in front of
+    /// it, and the hole is no younger for that.
+    pub(crate) fn sighted(&self, policy: &str, missing_position: i64, now: Instant) {
+        let mut seen = self.lock();
+        if seen
+            .get(policy)
+            .is_none_or(|sighting| sighting.missing_position != missing_position)
+        {
+            seen.insert(policy.to_owned(), Sighting::new(missing_position, now));
+        }
     }
 
     /// Forget `policy`: it has advanced, so its next hole is a new wait.
@@ -124,20 +140,31 @@ pub(crate) struct BlockedFor {
     pub(crate) elapsed: Duration,
 }
 
-/// Read the head and how long `policy`'s cursor has been parked.
+/// Read the head and how long `policy`'s cursor has been parked, if it is still
+/// parked where the feed left it.
 ///
-/// One row, two index probes; the event log is never scanned. `None` when the
-/// Policy has no cursor row, so it has never run and cannot be blocked.
+/// The row is only returned when the cursor is still at `cursor` and
+/// `missing_position` is still absent, so a hole that filled — or an operator who
+/// moved the cursor — between the read and this query silences the report instead of
+/// dating it from a state that no longer holds.
+///
+/// One row, three index probes; the event log is never scanned.
 pub(crate) async fn probe_blocked(
     pool: &Pool<Postgres>,
     policy: &str,
+    cursor: i64,
+    missing_position: i64,
 ) -> Result<Option<BlockedFor>, replay::Error> {
     let row = sqlx::query(
         "SELECT COALESCE((SELECT MAX(global_position) FROM events), 0) AS head, \
          GREATEST(EXTRACT(EPOCH FROM (now() - pc.updated_at)) * 1000, 0)::bigint AS parked_ms \
-         FROM policy_cursors pc WHERE pc.name = $1",
+         FROM policy_cursors pc \
+         WHERE pc.name = $1 AND pc.position = $2 \
+           AND NOT EXISTS (SELECT 1 FROM events WHERE global_position = $3)",
     )
     .bind(policy)
+    .bind(cursor)
+    .bind(missing_position)
     .fetch_optional(pool)
     .await
     .map_err(crate::db_error)?;
@@ -235,6 +262,40 @@ mod tests {
             42,
             start + Duration::from_secs(29) + INTERVAL
         ));
+    }
+
+    /// A poll that saw the hole while it still had work starts the clock: the hole
+    /// is no younger for the policy having been busy in front of it.
+    #[test]
+    fn a_sighting_starts_the_clock_without_reporting() {
+        let watch = BlockedWatch::new(INTERVAL);
+        let start = Instant::now();
+
+        watch.sighted("import_started", 42, start);
+
+        assert!(watch.poll("import_started", 42, start + INTERVAL));
+    }
+
+    #[test]
+    fn a_sighting_of_the_hole_already_seen_does_not_restart_the_clock() {
+        let watch = BlockedWatch::new(INTERVAL);
+        let start = Instant::now();
+
+        watch.sighted("import_started", 42, start);
+        watch.sighted("import_started", 42, start + INTERVAL);
+
+        assert!(watch.poll("import_started", 42, start + INTERVAL));
+    }
+
+    #[test]
+    fn a_sighting_of_a_different_hole_restarts_the_clock() {
+        let watch = BlockedWatch::new(INTERVAL);
+        let start = Instant::now();
+
+        watch.sighted("import_started", 42, start);
+        watch.sighted("import_started", 99, start + INTERVAL);
+
+        assert!(!watch.poll("import_started", 99, start + INTERVAL));
     }
 
     #[test]

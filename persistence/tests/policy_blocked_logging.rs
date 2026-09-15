@@ -365,10 +365,17 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
 
     let parks_at = burned_again - 1;
     logs_assert(|lines| {
-        for trace in gap_traces(lines)
+        let traces: Vec<&str> = gap_traces(lines)
             .into_iter()
             .skip(traces_before.load(Ordering::SeqCst))
-        {
+            .collect();
+        if traces.len() != 2 {
+            return Err(format!(
+                "both policies stop mid-window, so both trace it: got {}",
+                traces.len()
+            ));
+        }
+        for trace in traces {
             for field in [
                 &format!("cursor={parks_at}"),
                 &format!("expected={burned_again}"),

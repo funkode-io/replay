@@ -979,14 +979,17 @@ async fn drain_policy_once(
         return Ok(0);
     }
 
-    // A truncated window: the policy advances over the prefix now and parks at the
-    // hole, so the trace names the position it parks at, not the one it started from.
-    if let Some(gap) = gap {
-        trace_gap(&name, gap);
+    match gap {
+        // A truncated window: the policy advances over the prefix now and parks at
+        // the hole. The hole is as old as this poll even though this poll had work,
+        // so the clock starts here rather than on the first empty poll.
+        Some(gap) => {
+            trace_gap(&name, gap);
+            blocked.sighted(&name, gap.expected, std::time::Instant::now());
+        }
+        // Advancing with nothing in the way.
+        None => blocked.cleared(&name),
     }
-
-    // The policy is advancing, so it is not blocked any more.
-    blocked.cleared(&name);
 
     let mut executed = 0;
     let mut events_since_checkpoint = 0u32;
@@ -1057,9 +1060,10 @@ async fn drain_policy_once(
 /// Trace the stop: the one fact the blocked deployment in funkode-io/replay#164
 /// never had. Cheap enough to emit on every poll, so it needs no rate limit.
 ///
-/// `cursor` is where this poll *leaves* the cursor, which is the position before the
-/// hole — not where the poll started. The two differ when a window is truncated:
-/// the policy advances over the prefix first and parks at the hole afterwards.
+/// `cursor` is where the *feed* stops: the position before the hole, which is where
+/// the poll leaves the cursor when it gets that far. It is a property of the read,
+/// not of what the reactions then managed to do, so it is the same field whether the
+/// window was empty or was truncated after a prefix.
 fn trace_gap(name: &str, gap: Gap) {
     tracing::debug!(
         policy = %name,
@@ -1090,7 +1094,9 @@ async fn report_blocked(
         return Ok(());
     }
 
-    let Some(parked) = probe_blocked(pool, name).await? else {
+    // Confirms the hole is still there and the cursor still in front of it: the read
+    // that found it is a few statements old by now.
+    let Some(parked) = probe_blocked(pool, name, gap.expected - 1, gap.expected).await? else {
         return Ok(());
     };
 
