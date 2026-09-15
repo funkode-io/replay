@@ -102,6 +102,7 @@ define_aggregate! {
             Ping { tag: String },
             Echo { tag: String },
             Refuse { reason: String },
+            Explode { reason: String },
         },
         events: {
             Pinged { tag: String },
@@ -147,6 +148,11 @@ impl replay::Aggregate for Probe {
                 "probe refuses: {reason}"
             ))
             .with_operation("Refuse")),
+            // A command that panics *inside the handler*, so a test can drive a
+            // panic into the asynchronous half of the runner's per-event
+            // boundary — the one a panic in `react` never reaches, because it
+            // happens while awaiting the dispatch rather than before it.
+            ProbeCommand::Explode { reason } => panic!("probe exploded: {reason}"),
         }
     }
 }

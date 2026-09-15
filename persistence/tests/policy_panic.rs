@@ -24,6 +24,12 @@ const PANICS: &str = "panic";
 /// The panic's message, so the parked row can be asserted to carry it.
 const PANIC_MESSAGE: &str = "reaction exploded on a malformed payload";
 
+/// Tag whose reaction dispatches a command whose *handler* panics.
+const EXPLODES: &str = "explode";
+
+/// The reason that handler panics with.
+const HANDLER_PANIC_REASON: &str = "detonator armed";
+
 /// A Policy that panics on `PANICS` and echoes everything else, counting how
 /// many times it was asked to react to an event that makes it panic.
 ///
@@ -206,6 +212,72 @@ async fn retrying_a_parked_panic_re_parks_it_rather_than_unwinding_the_retry_pos
         parked[0].error_message.contains(PANIC_MESSAGE),
         "the re-parked row must carry the panic it raised again, got {:?}",
         parked[0].error_message
+    );
+
+    harness.shutdown().await;
+}
+
+/// The boundary is the *delivery* of an event, not just the call to `react`: a
+/// panic raised inside the command handler the reaction dispatched to — while
+/// the runner awaits it — is contained identically.
+///
+/// This is the asynchronous half of the catch. A panic in `react` unwinds
+/// before the first await; this one unwinds in the middle of one.
+#[tokio::test]
+async fn a_panic_inside_a_dispatched_command_handler_is_contained_too_postgres_test() {
+    let harness =
+        PolicyDaemonHarness::start("handler_panics", |builder, policy| {
+            builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, |event| {
+                match &event.data {
+                    ProbeEvent::Pinged { tag } if tag == EXPLODES => vec![Dispatch::to::<Probe>(
+                        ProbeUrn::new("detonator").unwrap(),
+                        ProbeCommand::Explode {
+                            reason: HANDLER_PANIC_REASON.to_string(),
+                        },
+                    )],
+                    ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+                        ProbeUrn::new(format!("{tag}-echo")).unwrap(),
+                        ProbeCommand::Echo { tag: tag.clone() },
+                    )],
+                    _ => vec![],
+                }
+            })
+        })
+        .await;
+
+    let exploded = harness.ping("subject-1", EXPLODES).await;
+
+    let parked = harness.await_dead_letters(1).await;
+    assert_eq!(parked[0].global_position, exploded.global_position);
+    assert_eq!(parked[0].event_id, exploded.event_id);
+    assert_eq!(
+        parked[0].error_kind, PANIC_ERROR_KIND,
+        "a handler that panicked is a panic, not a returned error"
+    );
+    assert!(
+        parked[0]
+            .error_message
+            .contains(&format!("probe exploded: {HANDLER_PANIC_REASON}")),
+        "parked row must carry the handler's panic message, got {:?}",
+        parked[0].error_message
+    );
+
+    // The worker survived the await it panicked in: the next event is reacted to.
+    let next = harness.ping("subject-2", "hello").await;
+    let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
+    assert_eq!(dispatched.event_type, "Echoed");
+
+    let cursor = harness
+        .await_cursor_at_least(exploded.global_position)
+        .await;
+    assert!(
+        cursor >= exploded.global_position,
+        "cursor {cursor} must have advanced past the event whose handler panicked"
+    );
+    assert_eq!(
+        harness.dead_letters().await.len(),
+        1,
+        "a handler panic is permanent on first occurrence, so it is parked once"
     );
 
     harness.shutdown().await;
