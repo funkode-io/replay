@@ -2440,7 +2440,7 @@ WARN  replay_persistence::policy_runner: policy feed skipped global_position val
       that can never appear: … policy=price_fanout cursor=264785
       skipped_from=264786 skipped_to=264786 skipped=1 next_position=264787
 WARN  replay_persistence::policy_runner: policy is blocked: its feed stops at a
-      global_position that does not exist. …
+      global_position that does not exist yet. A transaction still holds it …
       policy=price_fanout cursor=264785 head=264956 missing_position=264786
       next_position=264787 blocked_for_secs=259200
 ```

@@ -207,6 +207,12 @@ pub(crate) enum Resume {
 /// a renamed or non-default sequence is still the one probed. A column that owns no
 /// sequence is an error and not an empty answer, for the same reason: "nothing holds
 /// the sequence" is the verdict that unblocks a skip.
+///
+/// `pg_locks` is cluster-wide while a relation's identifier is only meaningful inside
+/// one database, so the rows are scoped to this one. Without that, a lock held in
+/// another database on a relation that happens to share the identifier counts as a
+/// candidate, and a long-lived transaction over there keeps a Policy waiting for an
+/// append that cannot exist.
 pub(crate) async fn sequence_holders(
     pool: &Pool<Postgres>,
 ) -> Result<Option<Holders>, replay::Error> {
@@ -216,6 +222,8 @@ pub(crate) async fn sequence_holders(
             SELECT COALESCE(l.virtualtransaction, l.transactionid::text) AS holder \
             FROM pg_locks l \
             WHERE l.locktype = 'relation' \
+              AND l.database = (SELECT d.oid FROM pg_database d \
+                                WHERE d.datname = current_database()) \
               AND l.relation = pg_get_serial_sequence('events', 'global_position')::regclass \
             LIMIT $1 \
          ) held) AS holders",

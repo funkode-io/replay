@@ -1166,21 +1166,25 @@ async fn skip_burned_positions(
         return Ok(false);
     };
 
-    tracing::warn!(
-        policy = %name,
-        cursor = cursor.position,
-        skipped_from = gap.expected,
-        skipped_to = next_position - 1,
-        skipped = next_position - gap.expected,
-        next_position,
-        "policy feed skipped global_position values that can never appear: no \
-         transaction still holds them, so they were burned by an append that \
-         aborted. Advancing past them (funkode-io/replay#164)"
-    );
-
+    // The record is written after the checkpoint, not before: a cursor moved by an
+    // operator between the read above and this write loses the compare-and-set, and
+    // this process then crossed nothing. A `warn` saying otherwise would send
+    // whoever reads it looking for a move that never happened.
+    let parked_at = cursor.position;
     cursor.position = next_position - 1;
-    if cursor.checkpoint(pool, name).await? == Checkpoint::Superseded {
-        log_superseded(name, cursor);
+    match cursor.checkpoint(pool, name).await? {
+        Checkpoint::Written => tracing::warn!(
+            policy = %name,
+            cursor = parked_at,
+            skipped_from = gap.expected,
+            skipped_to = next_position - 1,
+            skipped = next_position - gap.expected,
+            next_position,
+            "policy feed skipped global_position values that can never appear: no \
+             transaction still holds them, so they were burned by an append that \
+             aborted. Advancing past them (funkode-io/replay#164)"
+        ),
+        Checkpoint::Superseded => log_superseded(name, cursor),
     }
     stopped.forget(name);
 
@@ -1224,9 +1228,12 @@ async fn report_blocked(
         missing_position = gap.expected,
         next_position = gap.found,
         blocked_for_secs = parked.elapsed.as_secs(),
-        "policy is blocked: its feed stops at a global_position that does not exist. \
-         If the position was burned by an aborted append it will never appear, and the \
-         cursor must be moved past it (funkode-io/replay#164)"
+        "policy is blocked: its feed stops at a global_position that does not exist \
+         yet. A transaction still holds it, so this is an append that has not \
+         committed, or a cursor parked in front of a position that was never \
+         written. A position no transaction holds is crossed automatically \
+         (funkode-io/replay#170), so do not move the cursor past this one until the \
+         append it is waiting for is known to be gone"
     );
 
     Ok(())
