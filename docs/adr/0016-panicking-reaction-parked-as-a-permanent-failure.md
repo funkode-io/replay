@@ -68,6 +68,15 @@ catch. We make the delivery of one event the containment boundary.
 - A Policy survives a panicking reaction: it reacts to every later event, its
   cursor advances past the event that panicked, and a restart resumes past it
   rather than re-delivering it.
+- **A crash between parking and the next checkpoint parks the row again.** The
+  dead letter commits immediately, the cursor is written every
+  `checkpoint_batch_size` events, so a process that dies in between re-delivers
+  the event and a deterministic failure parks a second row. Accepted, not fixed,
+  and not specific to panics — it is at-least-once delivery (ADR-0003) showing
+  through on the path that was already there for returned permanent failures. A
+  dead letter is an extraordinary event an operator reads by hand; showing the
+  same one twice costs a moment's triage, while de-duplicating it costs a
+  uniqueness constraint over every parking path.
 - Two things remain uncontained, and both are stated in `CONTEXT.md`'s
   non-guarantees: a panic inside a task the reaction **spawns itself**, which
   unwinds in its own task outside this boundary, and any panic in a binary built
