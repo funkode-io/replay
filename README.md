@@ -16,15 +16,9 @@ You can chose you implement just `Stream` (state will be built from events) or `
 
 `es-replay-persistence` requires **PostgreSQL 13 or later**.
 
-13 is the floor because it is the oldest release providing the transaction-snapshot
-functions (`pg_current_snapshot`, `pg_snapshot_xmin`, `pg_snapshot_xmax`). Without them
-the policy feed cannot tell an append that is still in flight from a sequence value that
-was burned by an aborted transaction and can therefore never appear — and a single burned
-position then stops every policy indefinitely
-([#164](https://github.com/funkode-io/replay/issues/164)).
-
-The integration suite is verified against a PostgreSQL release that is still receiving
-upstream fixes; the pinned image tag lives in `persistence/tests/common/postgres_image.rs`.
+That is the oldest release the integration suite is willing to claim, not a feature
+floor; the suite itself is verified against a release still receiving upstream fixes,
+and the pinned image tag lives in `persistence/tests/common/postgres_image.rs`.
 
 The core `es-replay` crate has no database requirement at all, and is the half that runs
 on WASM.
@@ -2226,7 +2220,7 @@ The runner enforces `read_batch_size ≥ checkpoint_batch_size`.
 
 `read_batch_size` counts positions in the log, not matches: a `stream_filter` decides
 what a policy reacts to, the cursor still walks past everything else
-([ADR-0012](docs/adr/0012-policy-feed-contiguity-on-unfiltered-positions.md)). A
+([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
 selective policy over a busy log may need several drains to reach its next event;
 raise `read_batch_size` if that latency matters.
 
@@ -2426,8 +2420,10 @@ dead letters outrank lag**:
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
 `"Degraded"`, `"Blocked"`) for JSON/UI consumers.
 
-An append in flight is indistinguishable from a permanent hole, so a single
-`Blocked` read may clear on the next poll. Alert on it persisting.
+An append in flight is indistinguishable from a permanent hole *in a single reading*,
+so a `Blocked` reading may clear on the next poll — either because the append landed,
+or because the runner established that nothing can land there and crossed it (see
+below). Alert on it persisting.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only
@@ -2444,13 +2440,17 @@ permanently blocked one produced byte-identical output: nothing.
 | Level | When | Fields |
 |-------|------|--------|
 | `debug` | every poll whose feed stops at a hole | `policy`, `cursor`, `expected`, `found` |
+| `warn` | positions were crossed because no transaction can fill them | `policy`, `cursor`, `skipped_from`, `skipped_to`, `skipped`, `next_position` |
 | `warn` | the hole has persisted longer than the escalation threshold | `policy`, `cursor`, `head`, `missing_position`, `next_position`, `blocked_for_secs` |
 
 ```text
 DEBUG replay_persistence::policy_runner: policy feed stops at a gap in global_position
       policy=price_fanout cursor=264785 expected=264786 found=264787
+WARN  replay_persistence::policy_runner: policy feed skipped global_position values
+      that can never appear: … policy=price_fanout cursor=264785
+      skipped_from=264786 skipped_to=264786 skipped=1 next_position=264787
 WARN  replay_persistence::policy_runner: policy is blocked: its feed stops at a
-      global_position that does not exist. …
+      global_position that does not exist yet. A transaction still holds it …
       policy=price_fanout cursor=264785 head=264956 missing_position=264786
       next_position=264787 blocked_for_secs=259200
 ```
@@ -2470,3 +2470,20 @@ Alert on the `warn`. Two clocks meet in it, and they answer different questions:
   age of the outage, not the age of the process.
 
 A caught-up idle policy logs nothing at all.
+
+### Why a hole no longer stops a policy for good
+
+`nextval` is not transactional: a `global_position` taken by an append that then
+aborts is burned, and no event can ever carry it. The runner tells that apart from an
+append still committing exactly, with no timeout — only a transaction that has
+already taken the position can write it, and such a transaction holds a lock on the
+sequence until it ends. A hole whose holders have all ended, and which is still
+missing when re-read afterwards, is crossed: the runner logs the `warn` above and
+moves the cursor past the whole burned run in one step
+([ADR-0015](docs/adr/0015-policy-crosses-a-position-no-transaction-can-fill.md)).
+
+So the second `warn` — `policy is blocked` — now reports a wait that is still
+legitimate: a long-running append, or a cursor an operator parked in front of a
+position that does not exist yet. Moving a parked cursor by hand remains supported
+and is still the tool for those; it is no longer the only way out of a burned
+position.

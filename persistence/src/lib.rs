@@ -1,4 +1,5 @@
 mod aggregate_version;
+mod burned_position;
 mod cqrs;
 mod error;
 mod filters;

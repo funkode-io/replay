@@ -3,6 +3,12 @@
 //! The wait is the design; the silence was the bug. So this test asserts on the log
 //! itself rather than on the code that writes it, through the states an operator
 //! passes: caught up, just stopped, stopped too long, still stopped, corrected.
+//!
+//! The hole here is one an append could still fill — a transaction that has taken
+//! the position and not yet ended. That is the only kind that stops a Policy at all
+//! since funkode-io/replay#170: a position no running transaction holds can never
+//! appear, and the runner crosses it instead of reporting it forever (see
+//! `policy_burned_position.rs`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -98,6 +104,20 @@ async fn start_postgres() -> (
     (pool, container)
 }
 
+/// Take a `global_position` and keep it: an append in flight, as far as any other
+/// session can tell, and a hole the feed is right to wait at.
+///
+/// The transaction is returned so the caller keeps it open — dropping it ends the
+/// wait.
+async fn hold_position(pool: &PgPool) -> (sqlx::Transaction<'static, sqlx::Postgres>, i64) {
+    let mut holder = pool.begin().await.expect("beginning must succeed");
+    let position: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("taking a position must succeed");
+    (holder, position)
+}
+
 /// Lines the runner writes about a stopped feed, in the order it wrote them.
 fn gap_traces<'a>(lines: &[&'a str]) -> Vec<&'a str> {
     lines
@@ -181,12 +201,10 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
     );
 
     // ── Just stopped ──────────────────────────────────────────────────────────
-    // The #164 fault: `nextval` is not transactional, so a position consumed by an
-    // aborted append is gone for good and the next event lands behind the hole.
-    let burned: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
-        .fetch_one(&pool)
-        .await
-        .expect("burning a sequence value must succeed");
+    // An append holds a position and has not committed, so the next event lands
+    // behind the hole it leaves. The runner cannot know whether that append will
+    // commit, and waiting for it is the design.
+    let (_holder, burned) = hold_position(&pool).await;
     add(1.0).await;
 
     // One cursor has not advanced in ten minutes — healthy idleness, not a stop.
@@ -355,10 +373,7 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
     });
 
     add(2.0).await;
-    let burned_again: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
-        .fetch_one(&pool)
-        .await
-        .expect("burning a sequence value must succeed");
+    let (_second_holder, burned_again) = hold_position(&pool).await;
     add(3.0).await;
 
     runner.drain().await.expect("drain must succeed");
@@ -468,10 +483,7 @@ async fn a_correction_adopted_by_a_running_daemon_traces_no_stale_gap_postgres_t
     add(10.0).await;
     wait_for_position(1).await;
 
-    let burned: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
-        .fetch_one(&pool)
-        .await
-        .expect("burning a sequence value must succeed");
+    let (_holder, burned) = hold_position(&pool).await;
     add(1.0).await;
 
     // Wait for the daemon to trace the stop. Doubles as proof that this test can see
