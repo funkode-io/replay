@@ -2476,7 +2476,9 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 
 `head` is the raw `MAX(global_position)`. Because `global_position` is a
 `BIGSERIAL` assigned at INSERT but only made visible at COMMIT, a higher position
-can commit before a lower one, so the head can momentarily contain gaps. When you
+can commit before a lower one, so the head can momentarily contain gaps. A position
+that is present, though, names exactly one event: a unique index enforces it, so a
+cursor stepping position by position cannot step over an event. When you
 need a **stable cut** of the log — the largest position `H` such that every
 position in `1..=H` is present, e.g. to freeze a version at publish time — use
 `PostgresEventStore::contiguous_high_water_mark()` instead of `head`; replaying

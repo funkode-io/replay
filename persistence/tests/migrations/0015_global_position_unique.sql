@@ -1,0 +1,34 @@
+-- no-transaction
+-- Two events cannot share a `global_position`, and the database is what refuses the
+-- second one.
+--
+-- The policy feed advances its cursor one position at a time, so a position held by two
+-- events means one of them is stepped over and never delivered (funkode-io/replay#200).
+-- `BIGSERIAL` never promised otherwise: it is a column, a sequence and a default, and the
+-- 0007 index next to it was not unique. The invariant the feed rests on was held by habit.
+--
+-- Built `CONCURRENTLY` so appends keep working while it is added to a populated table,
+-- which is why the file opens with sqlx's `-- no-transaction` directive: a concurrent
+-- build cannot run inside a transaction block, and that includes the implicit one
+-- Postgres wraps around a multi-statement request. Hence one statement in this file, the
+-- duplicate check in 0014 and the superseded index dropped in 0016.
+--
+-- Deliberately not `IF NOT EXISTS`: a concurrent build that fails leaves an index behind
+-- that is present but invalid, and `IF NOT EXISTS` would step over it and report success,
+-- leaving the rule unenforced. Rerunning fails with "relation already exists" instead, and
+-- what to do then depends on which of two leftovers this is:
+--
+--   SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_events_global_position_unique'::regclass;
+--
+-- `false` — the build failed: `DROP INDEX CONCURRENTLY idx_events_global_position_unique`
+-- and rerun. `true` — the build succeeded and the process died before sqlx recorded the
+-- migration (it writes the `_sqlx_migrations` row in a second statement): the rule is
+-- already enforced, so record version 15 as applied rather than rebuilding a valid index
+-- over a live table.
+--
+-- A unique index, not a UNIQUE table constraint: the enforcement is identical, and
+-- promoting it (`ALTER TABLE … ADD CONSTRAINT … USING INDEX`) buys a catalog entry at the
+-- price of an ACCESS EXCLUSIVE lock on `events`, which is the lock the concurrent build
+-- exists to avoid.
+CREATE UNIQUE INDEX CONCURRENTLY idx_events_global_position_unique
+    ON events (global_position);
