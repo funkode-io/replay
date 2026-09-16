@@ -7,9 +7,4 @@
 -- reason the build is concurrent — a plain `DROP INDEX` takes an ACCESS EXCLUSIVE lock
 -- on `events` and appends queue behind whatever read is already scanning it — and so,
 -- like 0015, this file holds one statement outside a transaction block.
---
--- `idx_events_policy_feed` (0009) is left in place: it is partial on
--- `compacted_snapshot = FALSE`, and since ADR-0013 the feed reads positions unfiltered,
--- so nothing matches its predicate any more. Removing it is a separate question from this
--- one, on its own evidence.
 DROP INDEX CONCURRENTLY IF EXISTS idx_events_global_position;

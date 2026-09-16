@@ -183,8 +183,9 @@ async fn duplicate_positions_stop_the_migration_and_name_themselves_postgres_tes
     );
 }
 
-/// The index the unique one supersedes is gone, and the feed's read still reaches its
-/// rows through an index rather than a sequential scan and a sort.
+/// The index the unique one supersedes is gone, as is the partial index no query could
+/// ever use, and the feed's read still reaches its rows through an index rather than a
+/// sequential scan and a sort.
 #[tokio::test]
 async fn the_feed_read_still_scans_an_index_postgres_test() {
     let (_container, pool) = start_postgres().await;
@@ -194,6 +195,10 @@ async fn the_feed_read_still_scans_an_index_postgres_test() {
     assert!(
         !indexes.contains(&"idx_events_global_position".to_string()),
         "the non-unique index the unique one supersedes must be dropped: {indexes:?}"
+    );
+    assert!(
+        !indexes.contains(&"idx_events_policy_feed".to_string()),
+        "the partial index no feed query can match must be dropped: {indexes:?}"
     );
 
     let stream_id = "urn:acl:unique-3";
