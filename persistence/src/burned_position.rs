@@ -86,6 +86,16 @@ pub(crate) struct Holders {
     /// had ended — while `COMMIT PREPARED` can still publish the missing event. The
     /// verdict therefore refuses to decide at all while one is holding the sequence,
     /// which needs no identity and covers any future re-identification too.
+    ///
+    /// This is deliberately coarser than the candidate set, and the trade is
+    /// deliberate too: a prepared transaction that took a *later* position cannot
+    /// fill this hole, yet it stops the verdict all the same. Being coarse costs
+    /// little here, because such a transaction is holding a position ahead of the
+    /// hole and the feed parks in front of *that* the moment this one is crossed —
+    /// only the events in between are delayed, and only until an operator resolves a
+    /// prepared transaction that is a half-finished append in its own right. Being
+    /// precise would cost an identity that survives a restart, which is exactly what
+    /// a prepared transaction does not have.
     prepared: bool,
 }
 
@@ -487,6 +497,23 @@ mod tests {
             Permanence::Fillable,
             "and neither does a recorded candidate that has since ended"
         );
+    }
+
+    /// A prepared transaction holding the sequence stops the verdict even when it is
+    /// not one of this hole's candidates, because it cannot be told apart from one.
+    /// The cost is bounded: it holds a position ahead of the hole, so the feed would
+    /// park in front of that position anyway.
+    #[test]
+    fn a_prepared_holder_that_arrived_later_still_stops_the_verdict() {
+        let burned = BurnedPositions::new();
+        let prepared = Holders {
+            prepared: true,
+            ..Holders::default()
+        };
+
+        burned.verdict(POLICY, HOLE, Holders::default());
+
+        assert_eq!(burned.verdict(POLICY, HOLE, prepared), Permanence::Fillable);
     }
 
     /// The whole burned run is crossed at once: a hundred positions burned by one

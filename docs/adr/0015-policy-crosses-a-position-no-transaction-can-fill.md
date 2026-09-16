@@ -39,6 +39,18 @@ last burned position, and checkpoints. The whole burned run is crossed in one mo
 so an aborted batch that burned a hundred thousand positions costs one poll rather
 than a hundred thousand.
 
+**One holder escapes the candidate set, by necessity.** A prepared transaction
+outlives the session that created it, and Postgres re-issues its lock as `-1/<xid>`
+after a server restart, so a candidate recorded before that restart looks like one
+that has ended while `COMMIT PREPARED` can still publish the missing event. There is
+no identity to record that survives the transition, so the verdict refuses to settle
+while *any* prepared transaction holds the sequence — including one that took a later
+position and therefore cannot fill this hole. That over-waits by construction, and
+the over-wait is bounded: such a transaction holds a position ahead of the hole, so
+the feed parks in front of that position the moment this one is crossed. Only the
+events in between are delayed, and only until an operator resolves a prepared
+transaction that is a half-finished append in its own right.
+
 **The order of the two reads is the argument, not an implementation detail.** The
 lock is read first; only then is the position confirmed missing, in a snapshot taken
 afterwards. Postgres publishes a transaction's commit before releasing its locks, so
