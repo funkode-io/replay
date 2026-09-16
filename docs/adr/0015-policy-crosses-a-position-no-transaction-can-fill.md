@@ -83,6 +83,17 @@ look — which is the only circumstance in which it should be revisited.
 
 ## Consequences
 
+- **The prepared-transaction guard defends a case the library cannot reach on its
+  own.** The store owns every transaction it writes in, begins and commits it itself,
+  and never prepares one; nor does it accept an externally-managed transaction to
+  write into. So a prepared transaction can only come to hold a `global_position` if
+  something outside the library appends to `events` under a transaction manager that
+  uses two-phase commit — which is also outside every other guarantee made here. The
+  guard costs nothing when that never happens: two-phase commit is disabled by
+  default in PostgreSQL, and the check only counts prepared transactions holding the
+  events sequence specifically, so an unrelated one elsewhere in the database is not
+  seen. It is kept because the failure it prevents is a silently undelivered event,
+  and the alternative to keeping it is documenting a trap.
 - **No schema change, no cursor-format change, no migration.** The candidate set is
   per Policy and in memory, bounded by the number of transactions that can hold the
   sequence at once, which is bounded by the server's `max_connections`. A restart or
