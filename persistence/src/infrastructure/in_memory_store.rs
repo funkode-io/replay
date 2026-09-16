@@ -31,13 +31,16 @@ use replay::{Compactable, Event};
 /// path makes NO atomicity guarantee — the events are already stored when `handle` runs, and
 /// a failing `handle` does not roll them back. It exists purely to exercise projection
 /// routing and batch-handling logic in fast unit tests without a database.
+/// An appended event and the position it was appended at.
+type PositionedEvent = (u64, PersistedEvent<Value>);
+
 pub struct InMemoryEventStore {
     /// Events per stream, each paired with the position it was appended at. A `HashMap`
     /// has no order of its own, so a cross-stream read has nothing but this counter to
     /// put the streams back into append order — it is the in-memory analogue of
     /// `events.global_position`
     /// (`docs/adr/0018-every-event-read-is-ordered-by-global-position.md`).
-    events: RwLock<HashMap<Urn, Vec<(u64, PersistedEvent<Value>)>>>,
+    events: RwLock<HashMap<Urn, Vec<PositionedEvent>>>,
     /// The next append position. Taken under the same write lock that publishes the
     /// events, so positions and insertion order cannot disagree.
     next_position: RwLock<u64>,
@@ -291,8 +294,7 @@ impl EventStore for InMemoryEventStore {
             } else {
                 // Across streams the map hands them over in whatever order it likes, so
                 // the append positions are what puts them back in order.
-                let mut events: Vec<(u64, PersistedEvent<Value>)> =
-                    store.values().flatten().cloned().collect();
+                let mut events: Vec<PositionedEvent> = store.values().flatten().cloned().collect();
                 events.sort_unstable_by_key(|(position, _)| *position);
                 events.into_iter().map(|(_, e)| e).collect()
             };
