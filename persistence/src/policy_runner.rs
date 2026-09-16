@@ -2337,8 +2337,9 @@ impl PolicyCursor {
     /// and a position written alone is completed rather than refused.
     ///
     /// The completion is written back, so the row shows the point the Policy resumes
-    /// from rather than the half-instruction it was given. Losing that compare-and-set
-    /// means the row moved again; the next poll reads it and adopts that instead.
+    /// from rather than the half-instruction it was given — without disturbing
+    /// `updated_at`, since nothing was processed. Losing that compare-and-set means the
+    /// row moved again; the next poll reads it and adopts that instead.
     async fn adopt(
         &mut self,
         pool: &Pool<Postgres>,
@@ -2352,7 +2353,7 @@ impl PolicyCursor {
         };
 
         if self.point != self.persisted
-            && write_point(pool, name, self.persisted, self.point).await?
+            && complete_commit_txid(pool, name, self.persisted, self.point.commit_txid).await?
         {
             self.persisted = self.point;
         }
@@ -2439,6 +2440,34 @@ async fn write_point(
     .bind(name)
     .bind(to.position)
     .bind(to.commit_txid.to_string())
+    .bind(from.position)
+    .bind(from.commit_txid.to_string())
+    .execute(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(updated.rows_affected() > 0)
+}
+
+/// Fill in the transaction half of a row whose position stays where it is, under the
+/// same compare-and-set.
+///
+/// `updated_at` is deliberately left alone: it records when the cursor last *advanced*,
+/// and is what a Policy's `blocked_for_secs` ([`crate::policy_blocked`]) and its status's
+/// `last_checkpoint_at` ([`crate::PolicyStatus`]) are measured from. Completing a
+/// transaction half processes nothing, so touching it would erase a running outage.
+async fn complete_commit_txid(
+    pool: &Pool<Postgres>,
+    name: &str,
+    from: CursorPoint,
+    to: CommitStamp,
+) -> Result<bool, replay::Error> {
+    let updated = sqlx::query(
+        "UPDATE policy_cursors SET commit_txid = $2::xid8 \
+         WHERE name = $1 AND position = $3 AND commit_txid = $4::xid8",
+    )
+    .bind(name)
+    .bind(to.to_string())
     .bind(from.position)
     .bind(from.commit_txid.to_string())
     .execute(pool)
@@ -3309,6 +3338,16 @@ mod cursor_tests {
             .expect("the operator's move must succeed");
     }
 
+    /// When the cursor last advanced — the column `blocked_for_secs` and
+    /// `PolicyStatus::last_checkpoint_at` are read from.
+    async fn last_advanced(pool: &PgPool) -> chrono::DateTime<chrono::Utc> {
+        sqlx::query_scalar("SELECT updated_at FROM policy_cursors WHERE name = $1")
+            .bind(POLICY)
+            .fetch_one(pool)
+            .await
+            .expect("reading the cursor's timestamp must succeed")
+    }
+
     #[tokio::test]
     async fn a_checkpoint_records_the_transaction_the_policy_stopped_in_postgres_test() {
         let (pool, _container) = start_postgres().await;
@@ -3450,6 +3489,52 @@ mod cursor_tests {
                 commit_txid: events[1].commit_txid,
                 position: events[1].position + 10,
             }
+        );
+    }
+
+    /// Completing a transaction half is bookkeeping, not progress: a Policy that has
+    /// been parked for ten minutes still reads as parked for ten minutes afterwards.
+    ///
+    /// The case is a database upgraded through 0020 whose cursor sits on an event
+    /// appended after 0018: the row takes the sentinel, and the first leader to load it
+    /// derives the real id.
+    #[tokio::test]
+    async fn completing_the_transaction_half_reports_no_progress_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let events = append_events(&pool, 2).await;
+
+        sqlx::query(
+            "INSERT INTO policy_cursors (name, position, updated_at) \
+             VALUES ($1, $2, now() - interval '10 minutes')",
+        )
+        .bind(POLICY)
+        .bind(events[1].position)
+        .execute(&pool)
+        .await
+        .expect("staging the migrated cursor must succeed");
+        let parked_since = last_advanced(&pool).await;
+
+        let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Now)
+            .await
+            .expect("loading must succeed");
+
+        assert_eq!(
+            stored(&pool).await,
+            events[1],
+            "the load completed the transaction half from the log"
+        );
+        assert_eq!(
+            last_advanced(&pool).await,
+            parked_since,
+            "and reported no progress: nothing was processed"
+        );
+
+        // A checkpoint that does move the policy is progress, and says so.
+        cursor.advance_to(events[1].commit_txid, events[1].position + 1);
+        cursor.checkpoint(&pool, POLICY).await.unwrap();
+        assert!(
+            last_advanced(&pool).await > parked_since,
+            "a cursor that advanced reports when it did"
         );
     }
 
