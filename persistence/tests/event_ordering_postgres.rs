@@ -32,6 +32,9 @@ define_aggregate! {
         events: {
             Granted { member: String },
             Revoked { member: String },
+            // The compacted form of everything before the newest event — see the
+            // `Compactable` impl below.
+            MembersAt { members: Vec<String> },
         }
     }
 }
@@ -47,6 +50,7 @@ impl replay::EventStream for Acl {
         match event {
             AclEvent::Granted { member } => self.members.push(member),
             AclEvent::Revoked { member } => self.members.retain(|m| m != &member),
+            AclEvent::MembersAt { members } => self.members = members,
         }
     }
 }
@@ -179,31 +183,55 @@ async fn same_stream_replays_in_append_order_not_created_order_postgres_test() {
 }
 
 impl replay::Compactable for Acl {
-    /// Rewrites the live stream **reversed**. A realistic minimal ACL — one `Granted` per
-    /// surviving member — replays the same whatever order it is stored in, so it could
-    /// not tell a correctly written snapshot from a scrambled one. Reversing produces a
-    /// sequence that is both order-dependent and different from the live order, so the
-    /// test can compare what was stored against what this returned.
+    /// Compacts to a snapshot of everything but the newest event, followed by that event:
+    /// `[MembersAt{…}, tail]`. It reproduces the pre-compaction state and is a fixpoint,
+    /// as `Compactable` requires, and unlike the truly minimal ACL form — one `Granted`
+    /// per surviving member, which replays the same however it is stored — the snapshot
+    /// must precede the tail, so the order it is written in is observable.
     async fn compacted_events(
         &self,
         events: impl futures::TryStream<Ok = AclEvent, Error = replay::Error> + Send,
     ) -> replay::Result<replay::Compaction<AclEvent>> {
-        let mut events: Vec<AclEvent> = events.try_collect().await?;
-        events.reverse();
-        Ok(replay::Compaction::Rewrite(events))
+        // Holds the folded state and one event: the tail is only known to be the tail
+        // once the stream ends.
+        let (members, tail) = events
+            .try_fold(
+                (Vec::<String>::new(), None::<AclEvent>),
+                |(mut members, tail), event| async move {
+                    if let Some(previous) = tail {
+                        match previous {
+                            AclEvent::Granted { member } => members.push(member),
+                            AclEvent::Revoked { member } => members.retain(|m| m != &member),
+                            AclEvent::MembersAt { members: at } => members = at,
+                        }
+                    }
+                    Ok((members, Some(event)))
+                },
+            )
+            .await?;
+
+        match tail {
+            // Nothing to fold into a snapshot: one event is already the shortest stream
+            // that reproduces the state.
+            Some(_) if members.is_empty() => Ok(replay::Compaction::AlreadyCompacted),
+            Some(tail) => Ok(replay::Compaction::Rewrite(vec![
+                AclEvent::MembersAt { members },
+                tail,
+            ])),
+            None => Ok(replay::Compaction::AlreadyCompacted),
+        }
     }
 }
 
-/// `(type, member)` of each event of one stream generation, in `global_position` order —
-/// the order a read hands them over in.
+/// The events of one stream generation in `global_position` order — the order a read
+/// hands them over in.
 async fn events_in_position_order(
     pool: &PgPool,
     stream_key: &str,
     aggregate_version: Option<i32>,
-) -> Vec<(String, String)> {
-    sqlx::query_as::<_, (String, String)>(
-        "SELECT type, COALESCE(data->'Granted'->>'member', data->'Revoked'->>'member')
-           FROM events
+) -> Vec<AclEvent> {
+    sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT data FROM events
           WHERE stream_id = $1
             AND aggregate_version IS NOT DISTINCT FROM $2
           ORDER BY global_position",
@@ -213,6 +241,9 @@ async fn events_in_position_order(
     .fetch_all(pool)
     .await
     .expect("reading back the stream must succeed")
+    .into_iter()
+    .map(|data| serde_json::from_value(data).expect("a stored row must deserialize"))
+    .collect()
 }
 
 /// Compaction writes its snapshot rows itself, one INSERT per compacted event, and a read
@@ -240,6 +271,9 @@ async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postg
         AclCommand::Revoke {
             member: "alice".to_string(),
         },
+        AclCommand::Grant {
+            member: "carol".to_string(),
+        },
     ] {
         cqrs.execute::<Acl>(&stream_id, meta.clone(), command, &(), None)
             .await
@@ -247,19 +281,22 @@ async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postg
     }
 
     let acl = cqrs.fetch_aggregate::<Acl>(&stream_id).await.unwrap();
-    assert_eq!(acl.members, vec!["bob".to_string()]);
+    let before = vec!["bob".to_string(), "carol".to_string()];
+    assert_eq!(acl.members, before);
 
     let outcome = cqrs.compact(&acl, meta).await.expect("compaction succeeds");
     assert_eq!(outcome, CompactionOutcome::Compacted { archive_version: 1 });
 
-    let reversed = vec![
-        ("Revoked".to_string(), "alice".to_string()),
-        ("Granted".to_string(), "bob".to_string()),
-        ("Granted".to_string(), "alice".to_string()),
-    ];
     assert_eq!(
         events_in_position_order(&pool, &stream_key, None).await,
-        reversed,
+        vec![
+            AclEvent::MembersAt {
+                members: vec!["bob".to_string()]
+            },
+            AclEvent::Granted {
+                member: "carol".to_string()
+            },
+        ],
         "the snapshot rows must come back in the order `compacted_events` returned them"
     );
     assert_eq!(
@@ -267,9 +304,9 @@ async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postg
             .await
             .unwrap()
             .members,
-        vec!["bob".to_string(), "alice".to_string()],
-        "replaying that stored order must fold to what it says: the revoke lands first, \
-         so alice's later grant stands"
+        before,
+        "the compacted stream reproduces the pre-compaction state only while the snapshot \
+         is stored ahead of the tail it summarises"
     );
 
     let archived: Vec<_> = replay_persistence::PostgresEventStore::new(pool.clone())
@@ -279,7 +316,7 @@ async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postg
         .expect("reading the archived generation must succeed");
     assert_eq!(
         archived.len(),
-        3,
+        4,
         "archiving stamps the originals in place; they keep the positions they were \
          appended at"
     );
@@ -288,9 +325,28 @@ async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postg
         .await
         .expect("replaying the archived generation must succeed");
     assert_eq!(
-        original.members,
-        vec!["bob".to_string()],
+        original.members, before,
         "the archived generation still replays to the pre-compaction state"
+    );
+
+    // The fixture's half of the contract: compacting what compaction produced yields the
+    // same stream, so the assertions above pin the write order rather than a drift the
+    // rewrite introduced.
+    let compacted = cqrs.fetch_aggregate::<Acl>(&stream_id).await.unwrap();
+    cqrs.compact(&compacted, replay::Metadata::default())
+        .await
+        .expect("a second compaction succeeds");
+    assert_eq!(
+        events_in_position_order(&pool, &stream_key, None).await,
+        vec![
+            AclEvent::MembersAt {
+                members: vec!["bob".to_string()]
+            },
+            AclEvent::Granted {
+                member: "carol".to_string()
+            },
+        ],
+        "`compacted_events` must be a fixpoint"
     );
 }
 
