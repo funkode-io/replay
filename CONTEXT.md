@@ -72,6 +72,9 @@ triggering event so a single bad event never wedges the Policy. A reaction that
 to, parked on first occurrence without a retry, and recorded as kind `Panic` so
 an operator can tell a defect in the reaction from a command the domain refused
 ([ADR-0016](docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md)).
+A reaction the runner **abandoned on its [Dispatch timeout]** is another: retried
+like any transient failure and, once the retries are exhausted, recorded as kind
+`Timeout`.
 Dead letters are queryable so an operator can later inspect them and either
 [Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.
@@ -137,6 +140,17 @@ blocked Policy is also visible without being asked: the runner traces the stop a
 `debug` and escalates to `warn` once the cursor has been parked longer than an
 in-flight append could explain.
 _Avoid_: stuck, wedged, hung, stalled.
+
+### Dispatch timeout
+
+How long the [Policy runner] awaits one command a [Policy] dispatched before it
+abandons it — per Policy, defaulting to 30s
+([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It cuts
+a reaction that has *stopped* loose from its worker; it is not a latency budget,
+and a reaction that is merely slow raises it rather than being parked by it.
+Exceeding it is retryable, so a hang reaches the same [Dead letter] a dependency
+outage does, by the same back-off.
+_Avoid_: deadline, SLA, watchdog, timeout (unqualified).
 
 ### Policy runner
 
@@ -255,6 +269,11 @@ it:
 - **No panic is contained under `panic = "abort"`.** Containment is unwinding: a
   binary that aborts on panic ends the process before the runner's catch can park
   a [Dead letter].
+- **A [Dispatch timeout] cannot interrupt work the reaction moved onto another
+  task.** It bounds the future the runner awaits: dropping that future cancels
+  the command at its next suspension point, while a `tokio::spawn`, a blocking
+  pool or a request already in flight in a detached client keeps running,
+  unobserved, after the runner has stopped waiting for it.
 - **An OOM kill is not containable in-process.** The kernel ends the process; no
   supervision layer can catch it. The only defences are bounding what a reaction
   loads and bounding how long it may run.
@@ -263,6 +282,7 @@ it:
 [Policy]: #policy
 [Policy feed]: #policy-feed
 [Dead letter]: #dead-letter
+[Dispatch timeout]: #dispatch-timeout
 [Retry]: #retry
 [Discard]: #discard
 [Cursor move]: #cursor-move

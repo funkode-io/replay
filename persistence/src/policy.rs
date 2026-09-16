@@ -9,6 +9,7 @@
 //! WASM runner. The server-side execution lives in the runner (native only).
 
 use std::any::{Any, TypeId};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -160,6 +161,31 @@ pub trait Policy: Send + Sync {
         None
     }
 
+    /// How long the runner awaits one [`Dispatch`] of this policy before it
+    /// abandons it.
+    ///
+    /// Resolution order (most-specific-first):
+    ///   1. This per-policy override (when `Some`).
+    ///   2. Environment variable `REPLAY_DISPATCH_TIMEOUT_MS`.
+    ///   3. Built-in default (30s).
+    ///
+    /// Raise it for a reaction that is legitimately slow; a limit chosen for
+    /// fast reactions would park it as a failure.
+    ///
+    /// A dispatch that exceeds the limit is abandoned and treated as a
+    /// **retryable** failure: it is retried under the same back-off as an
+    /// `Unavailable` error and parked as a dead letter of kind `Timeout` once
+    /// the retries are exhausted.
+    ///
+    /// The bound is on **the future the runner awaits**. Dropping that future
+    /// cancels the command at its next suspension point; it cannot interrupt
+    /// work the reaction has moved onto another task (`tokio::spawn`, a
+    /// blocking pool, a request already in flight in a detached client), which
+    /// keeps running after the runner has stopped waiting for it.
+    fn dispatch_timeout(&self) -> Option<Duration> {
+        None
+    }
+
     /// Pure reaction: given an event, return the commands to dispatch.
     ///
     /// Invariant: because delivery is at-least-once, target aggregate command
@@ -190,6 +216,8 @@ pub(crate) trait ErasedPolicy: Send + Sync {
 
     fn checkpoint_batch_size_erased(&self) -> Option<u32>;
 
+    fn dispatch_timeout_erased(&self) -> Option<Duration>;
+
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch>;
 }
 
@@ -216,6 +244,10 @@ impl<P: Policy> ErasedPolicy for P {
 
     fn checkpoint_batch_size_erased(&self) -> Option<u32> {
         Policy::checkpoint_batch_size(self)
+    }
+
+    fn dispatch_timeout_erased(&self) -> Option<Duration> {
+        Policy::dispatch_timeout(self)
     }
 
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {

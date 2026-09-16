@@ -1,0 +1,239 @@
+//! A reaction that hangs is cut loose by the dispatch timeout.
+//!
+//! Nothing bounded the dispatch path in time: a command that never returned
+//! held its worker for the life of the process, with no error, no log line and
+//! no cursor movement — indistinguishable from a Policy with nothing to do.
+//! These tests assert the bound from where an operator stands: the Policy keeps
+//! reacting, its cursor keeps moving, and the reaction that hung is readable as
+//! a parked [Dead letter] that says it timed out.
+//!
+//! Every observation goes through `tests/common/policy_harness.rs`: a real
+//! daemon, a real database, no inspection of tasks or channels.
+
+mod common;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
+use replay_persistence::{
+    Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder, StartAt, TIMEOUT_ERROR_KIND,
+};
+use tracing_test::traced_test;
+
+/// Tag whose reaction dispatches a command that does not come back. Any other
+/// tag echoes.
+const HANGS: &str = "hang";
+
+/// How long the hung command sleeps: longer than any of these tests will run,
+/// so a test that passes proves the dispatch was abandoned rather than awaited.
+const HANG_FOR: Duration = Duration::from_secs(600);
+
+/// The timeout the Policy under test sets. Short enough that four attempts plus
+/// their back-offs fit comfortably inside the harness's observation budget.
+const DISPATCH_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// A Policy that dispatches a hung command for `HANGS` and an echo for anything
+/// else, counting how many times it was asked to react to the hanging event.
+///
+/// The count is how "retried under the existing backoff" is visible from
+/// outside: each retry calls `react` again before anything is parked.
+struct HangingPolicy {
+    name: String,
+    hang_for: Duration,
+    reactions: Arc<AtomicUsize>,
+}
+
+impl Policy for HangingPolicy {
+    type Event = ProbeEvent;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn start_at(&self) -> StartAt {
+        StartAt::Beginning
+    }
+
+    fn dispatch_timeout(&self) -> Option<Duration> {
+        Some(DISPATCH_TIMEOUT)
+    }
+
+    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+        match &event.data {
+            ProbeEvent::Pinged { tag } if tag == HANGS => {
+                self.reactions.fetch_add(1, Ordering::SeqCst);
+                vec![Dispatch::to::<Probe>(
+                    ProbeUrn::new("wedged").unwrap(),
+                    ProbeCommand::Hang {
+                        millis: self.hang_for.as_millis() as u64,
+                    },
+                )]
+            }
+            ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+                ProbeUrn::new(format!("{tag}-echo")).unwrap(),
+                ProbeCommand::Echo { tag: tag.clone() },
+            )],
+            _ => vec![],
+        }
+    }
+}
+
+/// Register a [`HangingPolicy`] whose hung command sleeps for `hang_for`.
+fn hanging_policy(
+    hang_for: Duration,
+    reactions: Arc<AtomicUsize>,
+) -> impl Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static {
+    move |builder, policy| {
+        builder.register_policy(HangingPolicy {
+            name: policy.to_string(),
+            hang_for,
+            reactions: Arc::clone(&reactions),
+        })
+    }
+}
+
+/// The whole of the watchdog in one run: the hung dispatch is abandoned and
+/// retried, parked once the retries are exhausted, recorded as a timeout rather
+/// than as a panic or a returned error, and the worker carries on.
+#[tokio::test]
+#[traced_test]
+async fn a_hung_dispatch_is_parked_as_a_timeout_and_the_policy_keeps_reacting_postgres_test() {
+    let reactions = Arc::new(AtomicUsize::new(0));
+    let harness =
+        PolicyDaemonHarness::start("hangs", hanging_policy(HANG_FOR, Arc::clone(&reactions))).await;
+
+    let hung = harness.ping("subject-1", HANGS).await;
+
+    let parked = harness.await_dead_letters(1).await;
+    assert_eq!(parked[0].global_position, hung.global_position);
+    assert_eq!(parked[0].event_id, hung.event_id);
+    assert_eq!(
+        parked[0].error_kind, TIMEOUT_ERROR_KIND,
+        "a timeout must be told apart from a panic and from a returned error, got {:?}",
+        parked[0].error_kind
+    );
+    assert!(
+        parked[0].error_message.contains("timeout"),
+        "the parked row must say the dispatch was abandoned on its timeout, got {:?}",
+        parked[0].error_message
+    );
+
+    // Retried, not parked on first occurrence: a hang may be a dependency that
+    // comes back, which is what the existing back-off is for.
+    assert!(
+        reactions.load(Ordering::SeqCst) > 1,
+        "a timed-out dispatch must be retried under the existing backoff, reacted {} time(s)",
+        reactions.load(Ordering::SeqCst)
+    );
+
+    // Still leading, still reading: the event after the hang is reacted to.
+    let next = harness.ping("subject-2", "hello").await;
+    let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
+    assert_eq!(dispatched.event_type, "Echoed");
+
+    let cursor = harness.await_cursor_at_least(hung.global_position).await;
+    assert!(
+        cursor >= hung.global_position,
+        "cursor {cursor} must have advanced past the event whose dispatch hung"
+    );
+    assert_eq!(
+        harness.dead_letters().await.len(),
+        1,
+        "exhausting the retries parks one dead letter, not one per attempt"
+    );
+
+    // A worker cut loose from a hung reaction says so, with the one number that
+    // is not inferable from the table: how long it waited.
+    logs_assert(|lines: &[&str]| {
+        let timed_out: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.contains("exceeded its dispatch timeout"))
+            .collect();
+        let position = format!("global_position={}", hung.global_position);
+        if timed_out.is_empty() {
+            return Err(
+                "expected at least one WARN naming the abandoned dispatch, got none".into(),
+            );
+        }
+        match timed_out.iter().find(|line| {
+            line.contains("WARN")
+                && line.contains(harness.policy_name())
+                && line.contains(&position)
+                && line.contains("elapsed_ms=")
+        }) {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "expected a WARN naming the policy, {position} and the elapsed time, got {timed_out:#?}"
+            )),
+        }
+    });
+
+    harness.shutdown().await;
+}
+
+/// A reaction that finishes inside its timeout is untouched by it: the command
+/// commits, nothing is parked, and the Policy advances as it always did.
+#[tokio::test]
+async fn a_dispatch_that_finishes_inside_its_timeout_is_unaffected_postgres_test() {
+    let reactions = Arc::new(AtomicUsize::new(0));
+    let slow_but_fine = DISPATCH_TIMEOUT / 5;
+    let harness = PolicyDaemonHarness::start(
+        "within_timeout",
+        hanging_policy(slow_but_fine, Arc::clone(&reactions)),
+    )
+    .await;
+
+    let slow = harness.ping("subject-1", HANGS).await;
+
+    let dispatched = harness.await_dispatch_caused_by(slow.global_position).await;
+    assert_eq!(
+        dispatched.event_type, "Echoed",
+        "the slow command must have committed its event"
+    );
+    assert_eq!(
+        reactions.load(Ordering::SeqCst),
+        1,
+        "a dispatch inside its timeout must not be retried"
+    );
+
+    harness.await_cursor_at_least(slow.global_position).await;
+    assert!(
+        harness.dead_letters().await.is_empty(),
+        "a dispatch that finished in time must park nothing"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The operator's own controls are bounded too: retrying a row parked for a
+/// timeout replays the reaction that hung, and that retry must come back rather
+/// than wedging the call — re-parking the row in place as a timeout.
+#[tokio::test]
+async fn retrying_a_parked_timeout_re_parks_it_rather_than_hanging_the_retry_postgres_test() {
+    let reactions = Arc::new(AtomicUsize::new(0));
+    let harness = PolicyDaemonHarness::start(
+        "timeout_retry",
+        hanging_policy(HANG_FOR, Arc::clone(&reactions)),
+    )
+    .await;
+
+    let hung = harness.ping("subject-1", HANGS).await;
+    harness.await_dead_letters(1).await;
+
+    let summary = harness.retry_parked().await;
+    assert_eq!(summary.resolved, 0, "a command that hangs cannot resolve");
+    assert_eq!(
+        summary.still_failing, 1,
+        "the row that timed out again must be reported as still failing"
+    );
+
+    let parked = harness.dead_letters().await;
+    assert_eq!(parked.len(), 1, "a retry must never insert a second row");
+    assert_eq!(parked[0].global_position, hung.global_position);
+    assert_eq!(parked[0].error_kind, TIMEOUT_ERROR_KIND);
+
+    harness.shutdown().await;
+}

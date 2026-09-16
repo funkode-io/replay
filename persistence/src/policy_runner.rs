@@ -14,7 +14,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -97,6 +97,16 @@ pub const REPLAY_NOTIFY_CHANNEL: &str = "replay_events";
 /// itself. Distinct from every [`replay::ErrorKind`] rendering, so
 /// `WHERE error_kind = 'Panic'` finds exactly the reactions that blew up.
 pub const PANIC_ERROR_KIND: &str = "Panic";
+
+/// The `error_kind` written to `policy_dead_letters` when a dispatch was
+/// **abandoned on its timeout** rather than returning an error.
+///
+/// A hang is not a refusal and not an outage the dependency reported: it is a
+/// reaction that never came back, and it is diagnosed by looking at what the
+/// command was waiting for. Distinct from every [`replay::ErrorKind`] rendering
+/// and from [`PANIC_ERROR_KIND`], so `WHERE error_kind = 'Timeout'` finds
+/// exactly the reactions that were cut loose.
+pub const TIMEOUT_ERROR_KIND: &str = "Timeout";
 
 // ── Closure-based policy adapter ─────────────────────────────────────────────
 
@@ -337,6 +347,11 @@ impl PolicyRunner {
     /// - the reaction fails permanently again → the existing row is **updated
     ///   in place** with the fresh error ([`DeadLetterRetry::StillFailing`]);
     ///   no second row is ever inserted.
+    /// - the reaction **hangs** → it is abandoned on the same dispatch timeout
+    ///   the live drain applies, so a bulk retry of parked hangs is bounded in
+    ///   time rather than wedging the operator's call. The row is updated to
+    ///   [`TIMEOUT_ERROR_KIND`] and reported `StillFailing`. Unlike the drain,
+    ///   a retry does not re-attempt: an operator retries.
     /// - the reaction **panics** → same treatment as a permanent failure, with
     ///   the row updated to [`PANIC_ERROR_KIND`] and the panic's message. The
     ///   panic never reaches the caller, so a bulk retry continues with the
@@ -399,7 +414,14 @@ impl PolicyRunner {
         // take the operator's call with it — and, in a bulk retry, every row after
         // this one.
         let attempt = AssertUnwindSafe(async {
-            let mut failure: Option<replay::Error> = None;
+            let delivery = Delivery {
+                cqrs: &self.cqrs,
+                pool: &self.pool,
+                executors: &self.executors,
+                policy_name: &policy_name,
+                dispatch_timeout: resolve_dispatch_timeout(policy.as_ref()),
+            };
+            let mut failure: Option<DispatchFailure> = None;
             for dispatch in policy.react_erased(&raw) {
                 if !self.executors.contains_key(&dispatch.target()) {
                     return Err(replay::Error::invalid_input(
@@ -410,18 +432,12 @@ impl PolicyRunner {
                     .with_context("aggregate", dispatch.aggregate_name()));
                 }
 
-                match execute_dispatch(
-                    &self.cqrs,
-                    &self.executors,
-                    &policy_name,
-                    global_position,
-                    &raw,
-                    dispatch,
-                )
-                .await
+                match delivery
+                    .execute_dispatch_within(global_position, &raw, dispatch)
+                    .await
                 {
                     Ok(()) => {}
-                    Err(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation => {
+                    Err(declined) if declined.declined() => {
                         // Stale reaction: the aggregate now declines it. Clean
                         // resolution — fall through to archive the row.
                     }
@@ -463,14 +479,9 @@ impl PolicyRunner {
                     Ok(DeadLetterRetry::NotFound)
                 }
             }
-            Some(error) => {
-                update_dead_letter(
-                    &self.pool,
-                    id,
-                    &error.kind().to_string(),
-                    &error.to_string(),
-                )
-                .await?;
+            Some(failure) => {
+                update_dead_letter(&self.pool, id, &failure.error_kind(), &failure.to_string())
+                    .await?;
                 Ok(DeadLetterRetry::StillFailing)
             }
         }
@@ -977,6 +988,57 @@ fn is_retryable(kind: replay::ErrorKind) -> bool {
     matches!(kind, Unavailable | RateLimited | Conflict)
 }
 
+/// A dispatch that did not complete, and why.
+///
+/// The two arms are the two ways a command fails to commit, and they are kept
+/// apart all the way to the parked row: a returned error carries a kind the
+/// aggregate chose, a timeout carries no error at all because nothing ever came
+/// back to produce one.
+enum DispatchFailure {
+    /// The command ran to completion and returned an error.
+    Returned(replay::Error),
+    /// The command was still running when `limit` expired, and was abandoned.
+    TimedOut { limit: Duration },
+}
+
+impl DispatchFailure {
+    /// The aggregate refused the command on a business rule: not a failure of
+    /// the runner's, and the cursor advances past it.
+    fn declined(&self) -> bool {
+        matches!(self, Self::Returned(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation)
+    }
+
+    /// A timeout is retryable by construction: the runner has no evidence the
+    /// command cannot succeed, only that it did not succeed in time.
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Returned(e) => is_retryable(e.kind()),
+            Self::TimedOut { .. } => true,
+        }
+    }
+
+    /// The `error_kind` this failure is parked under.
+    fn error_kind(&self) -> String {
+        match self {
+            Self::Returned(e) => e.kind().to_string(),
+            Self::TimedOut { .. } => TIMEOUT_ERROR_KIND.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Returned(e) => write!(f, "{e}"),
+            Self::TimedOut { limit } => write!(
+                f,
+                "policy dispatch abandoned after exceeding its {} ms timeout",
+                limit.as_millis()
+            ),
+        }
+    }
+}
+
 async fn drain_policy_once(
     cqrs: &Cqrs<PostgresEventStore>,
     pool: &Pool<Postgres>,
@@ -989,6 +1051,14 @@ async fn drain_policy_once(
     let name = policy.name().to_string();
     let checkpoint_size = resolve_checkpoint_batch_size(policy);
     let read_batch = resolve_read_batch_size(policy, checkpoint_size);
+    let dispatch_timeout = resolve_dispatch_timeout(policy);
+    let delivery = Delivery {
+        cqrs,
+        pool,
+        executors,
+        policy_name: &name,
+        dispatch_timeout,
+    };
     let Feed { positions, gap } =
         read_feed(pool, policy.stream_filter(), cursor.position, read_batch).await?;
 
@@ -1062,9 +1132,9 @@ async fn drain_policy_once(
                 // Real event within depth budget: deliver to the policy with
                 // the full resilience policy (BRV advance, retry, dead-letter),
                 // and with a panic in the reaction contained to this event.
-                executed +=
-                    react_to_event(cqrs, pool, executors, policy, &name, global_position, &raw)
-                        .await?;
+                executed += delivery
+                    .react_to_event(policy, global_position, &raw)
+                    .await?;
             }
         }
         // Always track in-memory position.
@@ -1163,73 +1233,237 @@ fn log_superseded(name: &str, cursor: &PolicyCursor) {
     );
 }
 
-/// Deliver one event to a policy — the runner's **per-event containment
-/// boundary**.
+/// The runner's machinery for delivering events to **one** policy, for as long
+/// as its settings hold: the execution path, the tables, and the time each
+/// dispatch is allowed.
 ///
-/// [`execute_event_reactions`] absorbs every *returned* failure; this absorbs the
-/// one failure it cannot see. A reaction is arbitrary user code called on the
-/// worker's own task, so a panic in it unwinds the worker: the policy would stop
-/// reacting for the rest of the process's life, silently. Catching here — at the
-/// event rather than at the worker — is what stops one bad event from consuming
-/// a worker's restart budget.
-///
-/// A panic is classified **permanent on first occurrence** and parked
-/// immediately, never retried: re-running a reaction that panicked
-/// deterministically panics again. The parked row records
-/// [`PANIC_ERROR_KIND`] so an operator can tell a defect in the reaction from a
-/// command the domain refused.
-///
-/// **Not contained**: a panic inside a task the reaction spawns itself (or hands
-/// to a blocking pool). It unwinds in its own task, outside this boundary and
-/// outside the worker, so nothing parks a dead letter for it. Nor is anything
-/// contained in a binary built with `panic = "abort"`, where a panic ends the
-/// process before any catch runs.
-///
-/// [`AssertUnwindSafe`] is the honest claim here: what survives the catch is the
-/// database and the runner's own bookkeeping (both untouched by the unwind) plus
-/// the policy object itself, whose interior state — if it has any — is the
-/// reaction's own to keep consistent.
-async fn react_to_event(
-    cqrs: &Cqrs<PostgresEventStore>,
-    pool: &Pool<Postgres>,
-    executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
-    policy: &dyn ErasedPolicy,
-    policy_name: &str,
-    global_position: i64,
-    raw: &PersistedEvent<Value>,
-) -> Result<usize, replay::Error> {
-    let reactions = execute_event_reactions(
-        cqrs,
-        pool,
-        executors,
-        policy,
-        policy_name,
-        global_position,
-        raw,
-    );
+/// Held together because the per-event path threads all of it unchanged through
+/// three layers (containment → retry → one dispatch), and because it is exactly
+/// what an out-of-band [`PolicyRunner::retry_dead_letter`] must reproduce for a
+/// parked row to be re-run the way the drain ran it.
+struct Delivery<'a> {
+    cqrs: &'a Cqrs<PostgresEventStore>,
+    pool: &'a Pool<Postgres>,
+    executors: &'a HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    policy_name: &'a str,
+    /// How long one dispatch may run before it is abandoned
+    /// ([`resolve_dispatch_timeout`]).
+    dispatch_timeout: Duration,
+}
 
-    match AssertUnwindSafe(reactions).catch_unwind().await {
-        Ok(result) => result,
-        Err(payload) => {
-            let message = panic_message(&*payload);
-            tracing::error!(
-                policy          = %policy_name,
-                event_id        = %raw.id,
-                stream_id       = %raw.stream_id,
-                global_position,
-                panic           = %message,
-                "policy reaction panicked; writing dead-letter and advancing cursor"
-            );
-            write_dead_letter(
-                pool,
+impl Delivery<'_> {
+    /// Deliver one event to a policy — the runner's **per-event containment
+    /// boundary**.
+    ///
+    /// [`Self::execute_event_reactions`] absorbs every *returned* failure; this
+    /// absorbs the one failure it cannot see. A reaction is arbitrary user code
+    /// called on the worker's own task, so a panic in it unwinds the worker: the
+    /// policy would stop reacting for the rest of the process's life, silently.
+    /// Catching here — at the event rather than at the worker — is what stops one
+    /// bad event from consuming a worker's restart budget.
+    ///
+    /// A panic is classified **permanent on first occurrence** and parked
+    /// immediately, never retried: re-running a reaction that panicked
+    /// deterministically panics again. The parked row records
+    /// [`PANIC_ERROR_KIND`] so an operator can tell a defect in the reaction from
+    /// a command the domain refused.
+    ///
+    /// **Not contained**: a panic inside a task the reaction spawns itself (or
+    /// hands to a blocking pool). It unwinds in its own task, outside this
+    /// boundary and outside the worker, so nothing parks a dead letter for it.
+    /// Nor is anything contained in a binary built with `panic = "abort"`, where
+    /// a panic ends the process before any catch runs.
+    ///
+    /// [`AssertUnwindSafe`] is the honest claim here: what survives the catch is
+    /// the database and the runner's own bookkeeping (both untouched by the
+    /// unwind) plus the policy object itself, whose interior state — if it has
+    /// any — is the reaction's own to keep consistent.
+    async fn react_to_event(
+        &self,
+        policy: &dyn ErasedPolicy,
+        global_position: i64,
+        raw: &PersistedEvent<Value>,
+    ) -> Result<usize, replay::Error> {
+        let policy_name = self.policy_name;
+        let reactions = self.execute_event_reactions(policy, global_position, raw);
+
+        match AssertUnwindSafe(reactions).catch_unwind().await {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = panic_message(&*payload);
+                tracing::error!(
+                    policy          = %policy_name,
+                    event_id        = %raw.id,
+                    stream_id       = %raw.stream_id,
+                    global_position,
+                    panic           = %message,
+                    "policy reaction panicked; writing dead-letter and advancing cursor"
+                );
+                write_dead_letter(
+                    self.pool,
+                    policy_name,
+                    global_position,
+                    raw,
+                    PANIC_ERROR_KIND,
+                    &message,
+                )
+                .await?;
+                Ok(0)
+            }
+        }
+    }
+
+    /// Execute all reactions for one event, applying the resilience policy:
+    ///
+    /// | Outcome                             | Action                                |
+    /// |-------------------------------------|---------------------------------------|
+    /// | `Ok`                                | count as executed, continue           |
+    /// | `BusinessRuleViolation`             | log + advance (aggregate said no)     |
+    /// | Retryable (`Unavailable`, `Conflict`, `RateLimited`, or a timeout) within retry budget | back-off + retry |
+    /// | Permanent or retries exhausted      | write `policy_dead_letters`, advance  |
+    ///
+    /// The function always returns `Ok`; failures are absorbed here so the caller's
+    /// cursor always advances (a circuit-breaker, never a poison pill). A reaction
+    /// that *panics* is absorbed one level out, in [`Self::react_to_event`], which
+    /// is the only failure this function cannot observe.
+    ///
+    /// Each dispatch is awaited for at most [`Delivery::dispatch_timeout`], so an
+    /// attempt is bounded in time as well as in failures; a whole event therefore
+    /// takes at most one timeout per dispatch per attempt, plus the back-offs.
+    ///
+    /// **Re-react safety**: on retry the policy's `react` is called again for the
+    /// same event.  Because `react` is a pure function and the at-least-once +
+    /// causation-guard contract already guarantees idempotency, re-executing an
+    /// earlier dispatch that already succeeded is safe.
+    async fn execute_event_reactions(
+        &self,
+        policy: &dyn ErasedPolicy,
+        global_position: i64,
+        raw: &PersistedEvent<Value>,
+    ) -> Result<usize, replay::Error> {
+        let policy_name = self.policy_name;
+        for attempt in 0..=MAX_DISPATCH_RETRIES {
+            let dispatches = policy.react_erased(raw);
+            let mut executed = 0usize;
+            let mut need_retry = false;
+
+            for dispatch in dispatches {
+                match self
+                    .execute_dispatch_within(global_position, raw, dispatch)
+                    .await
+                {
+                    Ok(()) => {
+                        executed += 1;
+                    }
+                    Err(failure) if failure.declined() => {
+                        tracing::info!(
+                            policy          = %policy_name,
+                            event_id        = %raw.id,
+                            global_position,
+                            error           = %failure,
+                            "policy dispatch declined by aggregate business rule; advancing cursor"
+                        );
+                    }
+                    Err(failure) if failure.retryable() && attempt < MAX_DISPATCH_RETRIES => {
+                        tracing::warn!(
+                            policy          = %policy_name,
+                            event_id        = %raw.id,
+                            global_position,
+                            attempt,
+                            error           = %failure,
+                            "policy dispatch failed with retryable error; backing off before retry"
+                        );
+                        need_retry = true;
+                        break; // skip remaining dispatches for this attempt
+                    }
+                    Err(failure) => {
+                        // Permanent error, or retryable (including a timeout) but
+                        // retries exhausted.
+                        tracing::error!(
+                            policy          = %policy_name,
+                            event_id        = %raw.id,
+                            global_position,
+                            attempt,
+                            error           = %failure,
+                            "policy dispatch failed permanently; writing dead-letter and advancing cursor"
+                        );
+                        write_dead_letter(
+                            self.pool,
+                            policy_name,
+                            global_position,
+                            raw,
+                            &failure.error_kind(),
+                            &failure.to_string(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            if !need_retry {
+                return Ok(executed);
+            }
+
+            // Exponential back-off: 100 ms, 200 ms, 400 ms, …
+            let backoff = Duration::from_millis(100 * (1u64 << attempt.min(5)));
+            tokio::time::sleep(backoff).await;
+        }
+
+        Ok(0)
+    }
+
+    /// Execute one dispatch, bounded in time.
+    ///
+    /// The watchdog on the dispatch path: a command that does not come back holds
+    /// the worker and nothing else — no error, no log line, no cursor movement, so
+    /// a frozen pipeline looks exactly like an idle one. Dropping the future when
+    /// `limit` expires turns that into an ordinary retryable failure the runner
+    /// already knows how to retry, exhaust and park.
+    ///
+    /// What is bounded is **the future this runner awaits**. Dropping it cancels
+    /// the command at its next suspension point; work the reaction has moved onto
+    /// another task keeps running, unobserved, after the runner stops waiting.
+    async fn execute_dispatch_within(
+        &self,
+        global_position: i64,
+        raw: &PersistedEvent<Value>,
+        dispatch: Dispatch,
+    ) -> Result<(), DispatchFailure> {
+        let policy_name = self.policy_name;
+        let limit = self.dispatch_timeout;
+        // Read before the dispatch is moved into the call; on a timeout it is the
+        // only thing that names what the worker was waiting for.
+        let aggregate = dispatch.aggregate_name();
+        let started = Instant::now();
+
+        match tokio::time::timeout(
+            limit,
+            execute_dispatch(
+                self.cqrs,
+                self.executors,
                 policy_name,
                 global_position,
                 raw,
-                PANIC_ERROR_KIND,
-                &message,
-            )
-            .await?;
-            Ok(0)
+                dispatch,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(DispatchFailure::Returned(error)),
+            Err(_) => {
+                tracing::warn!(
+                    policy          = %policy_name,
+                    event_id        = %raw.id,
+                    stream_id       = %raw.stream_id,
+                    global_position,
+                    aggregate,
+                    timeout_ms      = limit.as_millis(),
+                    elapsed_ms      = started.elapsed().as_millis(),
+                    "policy dispatch exceeded its dispatch timeout; abandoning it"
+                );
+                Err(DispatchFailure::TimedOut { limit })
+            }
         }
     }
 }
@@ -1247,101 +1481,6 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
     } else {
         "reaction panicked with a payload that is neither &str nor String".to_string()
     }
-}
-
-/// Execute all reactions for one event, applying the resilience policy:
-///
-/// | Outcome                             | Action                                |
-/// |-------------------------------------|---------------------------------------|
-/// | `Ok`                                | count as executed, continue           |
-/// | `BusinessRuleViolation`             | log + advance (aggregate said no)     |
-/// | Retryable (`Unavailable`, `Conflict`, `RateLimited`) within retry budget | back-off + retry |
-/// | Permanent or retries exhausted      | write `policy_dead_letters`, advance  |
-///
-/// The function always returns `Ok`; failures are absorbed here so the caller's
-/// cursor always advances (a circuit-breaker, never a poison pill). A reaction
-/// that *panics* is absorbed one level out, in [`react_to_event`], which is the
-/// only failure this function cannot observe.
-///
-/// **Re-react safety**: on retry the policy's `react` is called again for the
-/// same event.  Because `react` is a pure function and the at-least-once +
-/// causation-guard contract already guarantees idempotency, re-executing an
-/// earlier dispatch that already succeeded is safe.
-async fn execute_event_reactions(
-    cqrs: &Cqrs<PostgresEventStore>,
-    pool: &Pool<Postgres>,
-    executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
-    policy: &dyn ErasedPolicy,
-    policy_name: &str,
-    global_position: i64,
-    raw: &PersistedEvent<Value>,
-) -> Result<usize, replay::Error> {
-    for attempt in 0..=MAX_DISPATCH_RETRIES {
-        let dispatches = policy.react_erased(raw);
-        let mut executed = 0usize;
-        let mut need_retry = false;
-
-        for dispatch in dispatches {
-            match execute_dispatch(cqrs, executors, policy_name, global_position, raw, dispatch)
-                .await
-            {
-                Ok(()) => {
-                    executed += 1;
-                }
-                Err(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation => {
-                    tracing::info!(
-                        policy          = %policy_name,
-                        event_id        = %raw.id,
-                        global_position,
-                        error           = %e,
-                        "policy dispatch declined by aggregate business rule; advancing cursor"
-                    );
-                }
-                Err(e) if is_retryable(e.kind()) && attempt < MAX_DISPATCH_RETRIES => {
-                    tracing::warn!(
-                        policy          = %policy_name,
-                        event_id        = %raw.id,
-                        global_position,
-                        attempt,
-                        error           = %e,
-                        "policy dispatch failed with retryable error; backing off before retry"
-                    );
-                    need_retry = true;
-                    break; // skip remaining dispatches for this attempt
-                }
-                Err(e) => {
-                    // Permanent error, or retryable but retries exhausted.
-                    tracing::error!(
-                        policy          = %policy_name,
-                        event_id        = %raw.id,
-                        global_position,
-                        attempt,
-                        error           = %e,
-                        "policy dispatch failed permanently; writing dead-letter and advancing cursor"
-                    );
-                    write_dead_letter(
-                        pool,
-                        policy_name,
-                        global_position,
-                        raw,
-                        &e.kind().to_string(),
-                        &e.to_string(),
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        if !need_retry {
-            return Ok(executed);
-        }
-
-        // Exponential back-off: 100 ms, 200 ms, 400 ms, …
-        let backoff = Duration::from_millis(100 * (1u64 << attempt.min(5)));
-        tokio::time::sleep(backoff).await;
-    }
-
-    Ok(0)
 }
 
 /// Write a dead-letter record for a reaction that could not be completed.
@@ -1776,6 +1915,18 @@ const READ_BATCH_SIZE_ENV_VAR: &str = "REPLAY_READ_BATCH_SIZE";
 /// Environment variable that overrides the checkpoint-batch default.
 const CHECKPOINT_BATCH_SIZE_ENV_VAR: &str = "REPLAY_CHECKPOINT_BATCH_SIZE";
 
+/// Built-in default for how long one dispatch may run before it is abandoned.
+///
+/// Generous on purpose: it exists to cut loose a reaction that has *stopped*,
+/// not to enforce a latency budget, so it must not park a reaction that is
+/// merely slow. A reaction with a legitimately longer ceiling raises it with
+/// [`Policy::dispatch_timeout`].
+const DEFAULT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment variable that overrides the dispatch-timeout default, in
+/// milliseconds.
+const DISPATCH_TIMEOUT_ENV_VAR: &str = "REPLAY_DISPATCH_TIMEOUT_MS";
+
 /// Resolve the effective causation depth limit for a policy.
 ///
 /// Precedence (most-specific wins):
@@ -1830,6 +1981,29 @@ fn resolve_read_batch_size(policy: &dyn ErasedPolicy, checkpoint_size: u32) -> u
     raw.max(checkpoint_size)
 }
 
+/// Resolve the effective dispatch timeout (how long one dispatch may run).
+///
+/// Precedence: per-policy override → `REPLAY_DISPATCH_TIMEOUT_MS` env var →
+/// default 30s. `0` and unparseable values fall back to the default rather than
+/// abandoning every dispatch the moment it starts.
+fn resolve_dispatch_timeout(policy: &dyn ErasedPolicy) -> Duration {
+    dispatch_timeout_or_default(policy.dispatch_timeout_erased())
+}
+
+/// The precedence itself, over the override a policy declared.
+fn dispatch_timeout_or_default(declared: Option<Duration>) -> Duration {
+    if let Some(timeout) = declared {
+        if !timeout.is_zero() {
+            return timeout;
+        }
+    }
+    std::env::var(DISPATCH_TIMEOUT_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(DEFAULT_DISPATCH_TIMEOUT, Duration::from_millis)
+}
+
 fn merge_dispatch_metadata(
     causation: Metadata,
     dispatch: Option<Metadata>,
@@ -1872,10 +2046,72 @@ fn merge_no_collisions(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use replay::Metadata;
     use serde_json::json;
 
-    use super::{merge_dispatch_metadata, panic_message};
+    use super::{
+        dispatch_timeout_or_default, merge_dispatch_metadata, panic_message, DispatchFailure,
+        DEFAULT_DISPATCH_TIMEOUT, DISPATCH_TIMEOUT_ENV_VAR, TIMEOUT_ERROR_KIND,
+    };
+
+    #[test]
+    fn a_policy_that_declares_a_timeout_gets_it() {
+        let declared = Duration::from_millis(250);
+
+        assert_eq!(dispatch_timeout_or_default(Some(declared)), declared);
+    }
+
+    /// A zero timeout would abandon every dispatch the moment it started, so it
+    /// is read as "unset" rather than obeyed.
+    #[test]
+    fn a_zero_timeout_is_not_a_timeout() {
+        // Process-global, and tests share the process: only assert the default
+        // when nothing has set it.
+        if std::env::var(DISPATCH_TIMEOUT_ENV_VAR).is_err() {
+            assert_eq!(
+                dispatch_timeout_or_default(Some(Duration::ZERO)),
+                DEFAULT_DISPATCH_TIMEOUT
+            );
+            assert_eq!(dispatch_timeout_or_default(None), DEFAULT_DISPATCH_TIMEOUT);
+        }
+    }
+
+    /// A timeout is parked under its own kind, and says what it exceeded: the
+    /// hung command returned nothing to describe itself with.
+    #[test]
+    fn a_timed_out_dispatch_parks_as_a_timeout() {
+        let failure = DispatchFailure::TimedOut {
+            limit: Duration::from_millis(1_500),
+        };
+
+        assert_eq!(failure.error_kind(), TIMEOUT_ERROR_KIND);
+        assert!(failure.retryable(), "a hang may still be a passing outage");
+        assert!(!failure.declined());
+        assert!(
+            failure.to_string().contains("1500 ms"),
+            "the parked message must name the limit it blew, got {failure}"
+        );
+    }
+
+    /// The classification a returned error carries is untouched by the watchdog.
+    #[test]
+    fn a_returned_error_keeps_its_own_kind() {
+        let declined = DispatchFailure::Returned(replay::Error::business_rule_violation(
+            "the account is frozen",
+        ));
+        let transient = DispatchFailure::Returned(replay::Error::unavailable("the ledger is down"));
+        let permanent = DispatchFailure::Returned(replay::Error::invalid_input("no such account"));
+
+        assert!(declined.declined());
+        assert!(transient.retryable());
+        assert!(!permanent.retryable());
+        assert_eq!(
+            permanent.error_kind(),
+            replay::ErrorKind::InvalidInput.to_string()
+        );
+    }
 
     #[test]
     fn reads_the_message_of_a_literal_panic() {
