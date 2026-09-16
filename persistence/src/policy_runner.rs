@@ -12,6 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -142,6 +143,7 @@ pub struct PolicyRunnerBuilder {
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
     supervision: WorkerSupervision,
+    escalate: EscalationHook,
 }
 
 impl PolicyRunnerBuilder {
@@ -185,6 +187,37 @@ impl PolicyRunnerBuilder {
     /// such restarts it allows within a window before giving up on it.
     pub fn with_worker_supervision(mut self, supervision: WorkerSupervision) -> Self {
         self.supervision = supervision;
+        self
+    }
+
+    /// Replace what happens when a worker is down for good: it died more often
+    /// than its [`WorkerSupervision`] budget allows, or the lock manager that
+    /// elects it has stopped ([`EscalationReason`]).
+    ///
+    /// The hook is called once per Policy, on the supervisor's task, after the
+    /// stop has been recorded in [`PolicyRunnerDaemon::stopped_workers`]. It runs
+    /// in place of the default, which **exits the process** with
+    /// [`ESCALATION_EXIT_CODE`].
+    ///
+    /// **A hook that returns leaves the Policy stopped fleet-wide.** Leadership
+    /// is held by this process's lock-manager session rather than by the worker
+    /// task, so the advisory lock stays held, no standby replica takes the Policy
+    /// over, and nothing reacts for it until the process ends. Overriding the
+    /// default therefore means taking on the ending: fail a liveness probe, drain
+    /// and exit, page someone — something must, or the Policy is down until a
+    /// human notices.
+    ///
+    /// ```rust,ignore
+    /// runner_builder.on_escalation(|escalation| {
+    ///     tracing::error!(policy = %escalation.policy, "policy is down: {}", escalation.reason);
+    ///     liveness_probe.fail();          // Kubernetes restarts the pod, which exits it
+    /// })
+    /// ```
+    pub fn on_escalation<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&Escalation) + Send + Sync + 'static,
+    {
+        self.escalate = Arc::new(hook);
         self
     }
 
@@ -235,6 +268,7 @@ impl PolicyRunnerBuilder {
             executors: self.executors,
             notifications: self.notifications,
             supervision: self.supervision,
+            escalate: self.escalate,
             stopped: StoppedPolicies::new(),
         }
     }
@@ -281,6 +315,8 @@ pub struct PolicyRunner {
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
     supervision: WorkerSupervision,
+    /// What the consumer does about a worker this runner has given up on.
+    escalate: EscalationHook,
     /// What this process remembers about the Policies that are stopped, shared by
     /// every drain path so a stop is judged the same way however it is driven.
     stopped: StoppedPolicies,
@@ -348,10 +384,11 @@ impl PolicyRunnerDaemon {
     /// named here instead. Nothing is reacting for those policies, and nothing in
     /// this process will start them again.
     ///
-    /// Leadership is held by the process, not the worker, so a standby replica
-    /// takes such a policy over only once a consumer reads this and ends the
-    /// process. The escalation hook that replaces this seam is
-    /// funkode-io/replay#186.
+    /// Every entry here was also escalated through the hook
+    /// ([`PolicyRunnerBuilder::on_escalation`]), which by default ends the
+    /// process — so a consumer reads a non-empty list only after replacing that
+    /// default with one that returns. Leadership is held by the process, not the
+    /// worker, so those policies stay locked by this replica until it exits.
     pub fn stopped_workers(&self) -> Vec<StoppedWorker> {
         self.stopped.snapshot()
     }
@@ -370,8 +407,9 @@ impl PolicyRunnerDaemon {
 ///   restart already spent in the window and capped at
 ///   [`max_backoff`](Self::max_backoff);
 /// - at most [`max_restarts`](Self::max_restarts) restarts are allowed within
-///   [`restart_window`](Self::restart_window); past that the worker stays down
-///   and is named by [`PolicyRunnerDaemon::stopped_workers`].
+///   [`restart_window`](Self::restart_window); past that the worker stays down,
+///   is named by [`PolicyRunnerDaemon::stopped_workers`] and is escalated
+///   ([`PolicyRunnerBuilder::on_escalation`]).
 ///
 /// The budget is per worker, and so is everything a restart touches: it re-reads
 /// one policy's cursor and no other's, and leadership is unaffected because the
@@ -480,6 +518,92 @@ impl StoppedWorkers {
     }
 }
 
+// ── Escalation ───────────────────────────────────────────────────────────────
+
+/// Exit code the default escalation hook ends the process with.
+///
+/// `EX_SOFTWARE` from `sysexits.h`: a defect in the service, told apart from the
+/// `1` an ordinary error exit uses, so a crash-looping pod's exit code says which
+/// of the two it is.
+pub const ESCALATION_EXIT_CODE: i32 = 70;
+
+/// A Policy whose worker is down for good, handed to the consumer's escalation
+/// hook.
+///
+/// One per worker: a supervisor escalates once and then stops supervising, so a
+/// hook that counts its invocations counts Policies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Escalation {
+    /// The Policy nothing is reacting for.
+    pub policy: String,
+    /// What the runner gave up on.
+    pub reason: EscalationReason,
+}
+
+/// Why a worker is down for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EscalationReason {
+    /// The worker died more often than its [`WorkerSupervision`] budget allows.
+    /// `cause` is the panic message of the death that spent the last of it.
+    BudgetExhausted { restarts: u32, cause: String },
+    /// The lock manager that elects this worker has itself stopped for good, so
+    /// the worker can never be elected again. No restart was attempted: there is
+    /// nothing in this process left to restart it into.
+    Abandoned,
+}
+
+impl EscalationReason {
+    /// Restarts spent before giving up — zero when none was ever attempted.
+    fn restarts(&self) -> u32 {
+        match self {
+            Self::BudgetExhausted { restarts, .. } => *restarts,
+            Self::Abandoned => 0,
+        }
+    }
+}
+
+impl fmt::Display for EscalationReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BudgetExhausted { restarts, cause } => write!(
+                f,
+                "the worker died {restarts} times within its restart window; last cause: {cause}"
+            ),
+            Self::Abandoned => {
+                f.write_str("the lock manager that elects the worker has stopped for good")
+            }
+        }
+    }
+}
+
+/// What a consumer does about a Policy the runner has given up on.
+///
+/// Runs on the supervisor's task, after the stop has been recorded, so it may
+/// end the process without losing the report.
+type EscalationHook = Arc<dyn Fn(&Escalation) + Send + Sync>;
+
+/// End the process, which is the only outcome that frees the Policy.
+///
+/// Leadership is held by this process's lock-manager session, not by the worker
+/// task ([ADR-0008]), so a stopped worker's replica keeps the advisory lock and
+/// no [Standby] takes over. Exiting drops the session, which releases the lock.
+///
+/// [ADR-0008]: https://github.com/funkode-io/replay/blob/main/docs/adr/0008-policy-runner-shared-connection-leadership.md
+/// [Standby]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#standby
+fn exit_the_process() -> EscalationHook {
+    Arc::new(|escalation: &Escalation| {
+        tracing::error!(
+            policy = %escalation.policy,
+            reason = %escalation.reason,
+            exit_code = ESCALATION_EXIT_CODE,
+            "escalating: exiting so this process releases the policy's advisory lock \
+             and a standby replica can take it over"
+        );
+        std::process::exit(ESCALATION_EXIT_CODE);
+    })
+}
+
 /// Why a supervised task came back of its own accord.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
@@ -559,6 +683,7 @@ impl PolicyRunner {
             executors: HashMap::new(),
             notifications: true,
             supervision: WorkerSupervision::default(),
+            escalate: exit_the_process(),
         }
     }
 
@@ -852,6 +977,7 @@ impl PolicyRunner {
                     kind: "notify listener",
                     policy: None,
                     stopped: stopped_workers.clone(),
+                    escalate: Arc::clone(&self.escalate),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -896,6 +1022,7 @@ impl PolicyRunner {
                     kind: "lock manager",
                     policy: None,
                     stopped: stopped_workers.clone(),
+                    escalate: Arc::clone(&self.escalate),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -940,6 +1067,7 @@ impl PolicyRunner {
                     kind: "policy worker",
                     policy: Some(worker.name.clone()),
                     stopped: stopped_workers.clone(),
+                    escalate: Arc::clone(&self.escalate),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -1440,6 +1568,35 @@ struct SupervisedTask {
     policy: Option<String>,
     /// Where a permanent stop is published.
     stopped: StoppedWorkers,
+    /// What the consumer does about a permanent stop, once it is published.
+    escalate: EscalationHook,
+}
+
+impl SupervisedTask {
+    /// Publish a worker's permanent stop and hand it to the consumer.
+    ///
+    /// Recorded before the hook runs, in that order deliberately: the default
+    /// hook never returns, and a supplied one may be defective, so the library's
+    /// own report cannot depend on either. The hook is called only for a task
+    /// that owns a Policy — a shared task that stops is escalated by each worker
+    /// it abandons, naming the Policy an operator acts on rather than the
+    /// plumbing.
+    fn escalate(&self, reason: EscalationReason) {
+        let Some(policy) = self.policy.clone() else {
+            return;
+        };
+        self.stopped.record(&policy, reason.restarts());
+
+        let escalation = Escalation { policy, reason };
+        let hook = &self.escalate;
+        if std::panic::catch_unwind(AssertUnwindSafe(|| hook(&escalation))).is_err() {
+            tracing::error!(
+                policy = %escalation.policy,
+                "the escalation hook panicked; the worker stays stopped and this process \
+                 keeps the policy's advisory lock"
+            );
+        }
+    }
 }
 
 /// Own a task and restart it when it dies.
@@ -1450,13 +1607,18 @@ struct SupervisedTask {
 /// - the task returns [`Stop::Shutdown`] — it was asked to stop, and supervision
 ///   ends with it;
 /// - the task returns [`Stop::Abandoned`] — something it depends on is gone for
-///   good, so restarting it cannot help. It is recorded as stopped;
+///   good, so restarting it cannot help. It is recorded as stopped and escalated;
 /// - the task panicked — charged to `supervision`'s [`RestartBudget`], which
-///   either grants a restart after a backoff or declares the task stopped.
+///   either grants a restart after a backoff or declares the task stopped and
+///   escalates it.
 ///
 /// A stop is recorded against the policy a worker drives. The shared tasks name
 /// no policy: a lock manager that stops takes every policy's leadership with it,
 /// and each of those workers reports its own abandonment.
+///
+/// Nothing is recorded or escalated once the daemon is shutting down. A worker
+/// racing the lock manager's dropped leadership channel reads that as
+/// abandonment, and escalating it would exit the process on every clean shutdown.
 async fn supervise<F>(
     task: SupervisedTask,
     supervision: WorkerSupervision,
@@ -1465,12 +1627,8 @@ async fn supervise<F>(
 ) where
     F: Fn() -> JoinHandle<Stop>,
 {
-    let SupervisedTask {
-        kind,
-        policy,
-        stopped,
-    } = task;
-    let policy_name = policy.as_deref().unwrap_or("-");
+    let kind = task.kind;
+    let policy_name = task.policy.as_deref().unwrap_or("-");
     let mut budget = RestartBudget::new(supervision);
 
     loop {
@@ -1481,15 +1639,16 @@ async fn supervise<F>(
         let cause = match spawn().await {
             Ok(Stop::Shutdown) => return,
             Ok(Stop::Abandoned) => {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 tracing::error!(
                     task = kind,
                     policy = policy_name,
                     "a task this one depends on has stopped; it cannot be restarted \
                      into a process that no longer runs it"
                 );
-                if let Some(policy) = policy.as_deref() {
-                    stopped.record(policy, 0);
-                }
+                task.escalate(EscalationReason::Abandoned);
                 return;
             }
             // Aborted from outside (a runtime shutting down): not a fault, and
@@ -1497,6 +1656,10 @@ async fn supervise<F>(
             Err(error) if error.is_cancelled() => return,
             Err(error) => panic_cause(error),
         };
+
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         match budget.record_death(Instant::now()) {
             RestartDecision::Restart { backoff, restarts } => {
@@ -1523,9 +1686,7 @@ async fn supervise<F>(
                     cause = %cause,
                     "task exhausted its restart budget and is stopped"
                 );
-                if let Some(policy) = policy.as_deref() {
-                    stopped.record(policy, restarts);
-                }
+                task.escalate(EscalationReason::BudgetExhausted { restarts, cause });
                 return;
             }
         }
@@ -2755,14 +2916,15 @@ mod restart_budget_tests {
 #[cfg(test)]
 mod supervisor_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tokio::sync::watch;
     use tracing_test::traced_test;
 
     use super::{
-        supervise, RevokeLeadership, Stop, StoppedWorkers, SupervisedTask, WorkerSupervision,
+        supervise, Escalation, EscalationReason, RevokeLeadership, Stop, StoppedWorkers,
+        SupervisedTask, WorkerSupervision,
     };
 
     /// Backoffs short enough that a test waits on outcomes rather than on time.
@@ -2773,11 +2935,28 @@ mod supervisor_tests {
             .max_backoff(Duration::from_millis(2))
     }
 
-    fn a_policy_worker(stopped: &StoppedWorkers) -> SupervisedTask {
+    /// An escalation hook that records rather than exits — the only kind a test
+    /// can install, since the default one ends the test process.
+    #[derive(Clone, Default)]
+    struct Escalations(Arc<Mutex<Vec<Escalation>>>);
+
+    impl Escalations {
+        fn hook(&self) -> impl Fn(&Escalation) + Send + Sync + 'static {
+            let recorded = Arc::clone(&self.0);
+            move |escalation: &Escalation| recorded.lock().unwrap().push(escalation.clone())
+        }
+
+        fn recorded(&self) -> Vec<Escalation> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn a_policy_worker(stopped: &StoppedWorkers, escalations: &Escalations) -> SupervisedTask {
         SupervisedTask {
             kind: "policy worker",
             policy: Some("supervised".to_string()),
             stopped: stopped.clone(),
+            escalate: Arc::new(escalations.hook()),
         }
     }
 
@@ -2787,11 +2966,12 @@ mod supervisor_tests {
     async fn a_task_that_shuts_down_is_not_restarted() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let stopped = StoppedWorkers::default();
+        let escalations = Escalations::default();
         let attempts = Arc::new(AtomicUsize::new(0));
 
         let spawned = Arc::clone(&attempts);
         supervise(
-            a_policy_worker(&stopped),
+            a_policy_worker(&stopped, &escalations),
             supervision(),
             shutdown_rx,
             move || {
@@ -2803,6 +2983,7 @@ mod supervisor_tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(stopped.snapshot().is_empty());
+        assert!(escalations.recorded().is_empty());
     }
 
     /// A task that keeps dying is restarted its budget's worth of times and then
@@ -2816,11 +2997,12 @@ mod supervisor_tests {
     async fn a_task_that_keeps_dying_is_restarted_then_reported() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let stopped = StoppedWorkers::default();
+        let escalations = Escalations::default();
         let attempts = Arc::new(AtomicUsize::new(0));
 
         let spawned = Arc::clone(&attempts);
         supervise(
-            a_policy_worker(&stopped),
+            a_policy_worker(&stopped, &escalations),
             supervision(),
             shutdown_rx,
             move || {
@@ -2839,6 +3021,18 @@ mod supervisor_tests {
         assert_eq!(stopped.len(), 1);
         assert_eq!(stopped[0].policy, "supervised");
         assert_eq!(stopped[0].restarts, 2);
+
+        assert_eq!(
+            escalations.recorded(),
+            vec![Escalation {
+                policy: "supervised".to_string(),
+                reason: EscalationReason::BudgetExhausted {
+                    restarts: 2,
+                    cause: "died in the night".to_string(),
+                },
+            }],
+            "the hook fires once, naming the policy and why it is down"
+        );
 
         logs_assert(|lines| {
             let restarts: Vec<_> = lines
@@ -2869,11 +3063,12 @@ mod supervisor_tests {
     async fn an_abandoned_task_is_reported_without_being_restarted() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let stopped = StoppedWorkers::default();
+        let escalations = Escalations::default();
         let attempts = Arc::new(AtomicUsize::new(0));
 
         let spawned = Arc::clone(&attempts);
         supervise(
-            a_policy_worker(&stopped),
+            a_policy_worker(&stopped, &escalations),
             supervision(),
             shutdown_rx,
             move || {
@@ -2885,20 +3080,106 @@ mod supervisor_tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(stopped.snapshot()[0].policy, "supervised");
+        assert_eq!(
+            escalations.recorded(),
+            vec![Escalation {
+                policy: "supervised".to_string(),
+                reason: EscalationReason::Abandoned,
+            }],
+            "a worker nothing can elect again is as absent as one that spent its budget"
+        );
+    }
+
+    /// A hook that returns has declined to end the process. The library's own
+    /// obligation is unchanged: the worker is recorded as stopped, so the policy
+    /// is never silently absent.
+    #[tokio::test]
+    async fn a_hook_that_returns_leaves_the_worker_recorded_as_stopped() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+        let escalations = Escalations::default();
+
+        supervise(
+            a_policy_worker(&stopped, &escalations),
+            supervision().max_restarts(0),
+            shutdown_rx,
+            || tokio::spawn(async { panic!("died once") }),
+        )
+        .await;
+
+        assert_eq!(escalations.recorded().len(), 1);
+        assert_eq!(stopped.snapshot()[0].policy, "supervised");
+    }
+
+    /// A defective hook is the consumer's problem and must not become the
+    /// library's: the worker is recorded stopped before the hook runs, so a hook
+    /// that panics costs the process nothing it was not already losing.
+    #[tokio::test]
+    async fn a_panicking_hook_does_not_take_the_report_with_it() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+
+        supervise(
+            SupervisedTask {
+                kind: "policy worker",
+                policy: Some("supervised".to_string()),
+                stopped: stopped.clone(),
+                escalate: Arc::new(|_| panic!("the consumer's hook is defective")),
+            },
+            supervision().max_restarts(0),
+            shutdown_rx,
+            || tokio::spawn(async { panic!("died once") }),
+        )
+        .await;
+
+        assert_eq!(stopped.snapshot()[0].policy, "supervised");
+    }
+
+    /// A worker that stops while the daemon is shutting down has not failed at
+    /// anything: escalating there would exit a process that is already on its way
+    /// out, and would do it on every clean shutdown.
+    #[tokio::test]
+    async fn a_stop_during_shutdown_escalates_nothing() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+        let escalations = Escalations::default();
+
+        let shutting_down = shutdown_tx.clone();
+        supervise(
+            a_policy_worker(&stopped, &escalations),
+            supervision(),
+            shutdown_rx,
+            move || {
+                // The daemon is shutting down; a worker racing the lock manager's
+                // dropped leadership channel reads it as abandonment.
+                let _ = shutting_down.send(true);
+                tokio::spawn(async { Stop::Abandoned })
+            },
+        )
+        .await;
+
+        assert!(escalations.recorded().is_empty());
+        assert!(
+            stopped.snapshot().is_empty(),
+            "a shutdown is not a worker the runner gave up on"
+        );
     }
 
     /// A shared task names no policy, so its stop is left to the policies it
-    /// abandons to report — `stopped_workers` stays a list of policies.
+    /// abandons to report — `stopped_workers` stays a list of policies, and no
+    /// escalation fires for plumbing that owns no policy.
     #[tokio::test]
     async fn a_shared_task_that_stops_reports_no_policy() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let stopped = StoppedWorkers::default();
+        let escalations = Escalations::default();
 
         supervise(
             SupervisedTask {
                 kind: "lock manager",
                 policy: None,
                 stopped: stopped.clone(),
+                escalate: Arc::new(escalations.hook()),
             },
             supervision(),
             shutdown_rx,
@@ -2907,6 +3188,7 @@ mod supervisor_tests {
         .await;
 
         assert!(stopped.snapshot().is_empty());
+        assert!(escalations.recorded().is_empty());
     }
 
     /// Shutdown during a backoff ends supervision there and then: a daemon
@@ -2915,11 +3197,12 @@ mod supervisor_tests {
     async fn shutdown_during_a_backoff_ends_supervision() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let stopped = StoppedWorkers::default();
+        let escalations = Escalations::default();
         let attempts = Arc::new(AtomicUsize::new(0));
 
         let spawned = Arc::clone(&attempts);
         let supervisor = tokio::spawn(supervise(
-            a_policy_worker(&stopped),
+            a_policy_worker(&stopped, &escalations),
             // A backoff no test would wait out on purpose.
             supervision().initial_backoff(Duration::from_secs(30)),
             shutdown_rx,

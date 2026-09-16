@@ -163,7 +163,7 @@ worker per Policy, each owning that Policy's durable cursor, sharing the
 process's listener and lock-manager connections
 ([ADR-0008](docs/adr/0008-policy-runner-shared-connection-leadership.md)). The
 Policy is what reacts; the runner is what makes it run, restarts it within its
-[Restart budget] and reports on it.
+[Restart budget], [Escalates](#escalation) it when that runs out, and reports on it.
 _Avoid_: policy engine, subscriber, dispatcher, scheduler, worker pool.
 
 ### Leader
@@ -192,8 +192,19 @@ window, and how long it waits between attempts
 answer to a worker that *dies*, never to a reaction that *fails* (that is a
 [Dead letter]). Per worker: spending one leaves every other Policy's worker,
 cursor and the process's leadership untouched. A worker that spends its budget is
-stopped and named by the daemon rather than restarted again.
+stopped and [Escalated](#escalation) rather than restarted again.
 _Avoid_: retry policy, circuit breaker, restart limit, backoff policy.
+
+### Escalation
+
+What the [Policy runner] does about a worker that is down for good — it spent its
+[Restart budget], or the lock manager that elects it stopped. A consumer-supplied
+hook is called once, naming the Policy and the reason, and defaults to exiting the
+process
+([ADR-0018](docs/adr/0018-escalation-is-a-consumer-hook-that-exits-by-default.md)).
+Exiting is what releases the Policy's advisory lock, so a hook that returns leaves
+the Policy stopped in every replica.
+_Avoid_: alert, failover, panic, giving up.
 
 ### Liveness
 
@@ -303,6 +314,7 @@ it:
 [Leader]: #leader
 [Standby]: #standby
 [Restart budget]: #restart-budget
+[Escalation]: #escalation
 [Liveness]: #liveness
 [Progress]: #progress
 [Caught up]: #caught-up

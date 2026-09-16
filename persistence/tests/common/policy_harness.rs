@@ -21,6 +21,9 @@
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
 //! - [`PolicyDaemonHarness::stopped_workers`] — the workers the runner gave up
 //!   on, which is what an operator reads off the daemon in their own service.
+//! - [`PolicyDaemonHarness::escalations`] — what the consumer's escalation hook
+//!   was told. The harness installs a recording hook in place of the default,
+//!   which exits the process: in a test that is the test runner.
 //!
 //! And two things an operator can *do*:
 //!
@@ -67,8 +70,8 @@ use super::postgres_image::{postgres_container, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, DeadLetterRetrySummary, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon,
-    PostgresEventStore, StoppedWorker,
+    Cqrs, DeadLetterRetrySummary, Escalation, PolicyRunner, PolicyRunnerBuilder,
+    PolicyRunnerDaemon, PostgresEventStore, StoppedWorker,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -198,6 +201,25 @@ pub struct DeadLetter {
     pub error_message: String,
 }
 
+/// What the consumer's escalation hook was told, recorded instead of acted on.
+///
+/// Installed by the harness on every daemon it starts, because the default hook
+/// exits the process. A test that wants its own hook registers one in
+/// `configure`, which runs afterwards and therefore wins.
+#[derive(Clone, Default)]
+pub struct Escalations(Arc<std::sync::Mutex<Vec<Escalation>>>);
+
+impl Escalations {
+    fn hook(&self) -> impl Fn(&Escalation) + Send + Sync + 'static {
+        let recorded = Arc::clone(&self.0);
+        move |escalation: &Escalation| recorded.lock().unwrap().push(escalation.clone())
+    }
+
+    fn recorded(&self) -> Vec<Escalation> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 // ── The harness ──────────────────────────────────────────────────────────────
 
 /// A running daemon, its database, and the observations an operator has.
@@ -213,6 +235,7 @@ pub struct PolicyDaemonHarness {
     /// How the policy under test is registered. Kept so [`restart`](Self::restart)
     /// can build the same daemon again against the same database.
     configure: Arc<Configure>,
+    escalations: Escalations,
     daemon: Option<PolicyRunnerDaemon>,
 }
 
@@ -264,8 +287,9 @@ impl PolicyDaemonHarness {
         let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
         let policy_name = unique_policy_name(label);
         let configure: Arc<Configure> = Arc::new(configure);
+        let escalations = Escalations::default();
 
-        let daemon = spawn_daemon(&cqrs, configure.as_ref(), &policy_name);
+        let daemon = spawn_daemon(&cqrs, configure.as_ref(), &policy_name, &escalations);
 
         Self {
             _container: container,
@@ -273,6 +297,7 @@ impl PolicyDaemonHarness {
             cqrs,
             policy_name,
             configure,
+            escalations,
             daemon: Some(daemon),
         }
     }
@@ -292,6 +317,7 @@ impl PolicyDaemonHarness {
             &self.cqrs,
             self.configure.as_ref(),
             &self.policy_name,
+            &self.escalations,
         ));
     }
 
@@ -476,6 +502,22 @@ impl PolicyDaemonHarness {
         .await
     }
 
+    /// Everything the escalation hook has been told, in the order it was told.
+    pub fn escalations(&self) -> Vec<Escalation> {
+        self.escalations.recorded()
+    }
+
+    /// Wait until the runner has escalated `policy`, and return what it handed
+    /// the hook.
+    pub async fn await_escalation(&self, policy: &str) -> Escalation {
+        self.observe(&format!("{policy} to be escalated"), || async {
+            self.escalations()
+                .into_iter()
+                .find(|escalated| escalated.policy == policy)
+        })
+        .await
+    }
+
     /// Wait until the policy's persisted cursor has reached `position`, and
     /// return where it actually sits.
     pub async fn await_cursor_at_least(&self, position: i64) -> i64 {
@@ -571,13 +613,20 @@ fn unique_policy_name(label: &str) -> String {
 /// The daemon's tasks own everything they need, so the runner itself is free to
 /// drop here: a test can only reach the daemon through the harness, which is the
 /// point.
+///
+/// The recording escalation hook is installed *before* `configure` runs, so a
+/// test that supplies its own replaces it, and one that does not never has a
+/// stray escalation exit the test runner.
 fn spawn_daemon(
     cqrs: &Cqrs<PostgresEventStore>,
     configure: &Configure,
     policy_name: &str,
+    escalations: &Escalations,
 ) -> PolicyRunnerDaemon {
     configure(
-        PolicyRunner::builder(cqrs.clone()).register_services::<Probe>(()),
+        PolicyRunner::builder(cqrs.clone())
+            .register_services::<Probe>(())
+            .on_escalation(escalations.hook()),
         policy_name,
     )
     .build()

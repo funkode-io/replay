@@ -33,10 +33,10 @@ Each worker now runs under a supervisor that restarts it, bounded by a
   (funkode-io/replay#164) was invisible because a stopped Policy produced no
   signal at any level.
 
-- **Exhaustion does not end the process — yet.** Only a process exit releases the
-  advisory lock and lets a Standby take over, so escalation is a consumer-owned
-  hook (funkode-io/replay#186). Until it lands the library stops the worker and
-  says so, rather than exiting on a consumer's behalf.
+- **Exhaustion does not end the process here.** Only a process exit releases the
+  advisory lock and lets a Standby take over, so ending it is a consumer-owned
+  hook ([ADR-0018](0018-escalation-is-a-consumer-hook-that-exits-by-default.md)),
+  which this layer invokes rather than deciding for itself.
 
 - **The shared tasks carry the same budget but report through the Policies they
   abandon.** Their leadership senders are owned by the caller, not the task, so a
@@ -71,5 +71,5 @@ Each worker now runs under a supervisor that restarts it, bounded by a
   leaking.
 - Nothing is persisted: budget and stopped list are in-process state, so a
   process restart resets both and no schema change is involved.
-- `stopped_workers()` is a poll, not a notification. Turning it into something a
-  consumer is told about is the escalation hook's job (funkode-io/replay#186).
+- `stopped_workers()` is a poll; what a consumer is *told* about is the escalation
+  hook ([ADR-0018](0018-escalation-is-a-consumer-hook-that-exits-by-default.md)).

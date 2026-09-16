@@ -1,5 +1,6 @@
-//! A worker that dies is restarted — supervision, driven against a real daemon
-//! and a real database (funkode-io/replay#185).
+//! A worker that dies is restarted, and one that keeps dying is escalated —
+//! supervision, driven against a real daemon and a real database
+//! (funkode-io/replay#185, funkode-io/replay#186).
 //!
 //! The death injected here is one no single event can be blamed for: a panic
 //! raised while the worker prepares its read of the feed, the shape of a panic in
@@ -16,7 +17,9 @@
 //! already durable.
 //!
 //! Every assertion is something an operator could make: the policy reacted
-//! again, the cursor moved, the daemon names a worker it gave up on.
+//! again, the cursor moved, the daemon names a worker it gave up on, the
+//! consumer's escalation hook was told about it. Escalation is asserted through
+//! the hook and never by letting the default exit the test process.
 
 mod common;
 
@@ -26,7 +29,7 @@ use std::time::Duration;
 
 use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
 use replay_persistence::{
-    Dispatch, PersistedEvent, Policy, StartAt, StreamFilter, WorkerSupervision,
+    Dispatch, EscalationReason, PersistedEvent, Policy, StartAt, StreamFilter, WorkerSupervision,
 };
 
 /// Restarts fast enough that a test does not wait on production's caution, and
@@ -173,14 +176,24 @@ async fn a_worker_that_dies_outside_the_reaction_is_restarted_postgres_test() {
         "one death inside the budget must not stop the worker: {:?}",
         harness.stopped_workers()
     );
+    assert!(
+        harness.escalations().is_empty(),
+        "a restart within the budget is not the consumer's business: {:?}",
+        harness.escalations()
+    );
 
     harness.shutdown().await;
 }
 
 /// A worker that keeps dying is not restarted forever: the budget runs out, the
-/// runner says so, and the policy next door is untouched by any of it.
+/// runner hands the policy to the consumer's escalation hook, and the policy next
+/// door is untouched by any of it.
+///
+/// The hook the harness installs records rather than exits, which is the only way
+/// a test can watch the escalation path — the default would take the test runner
+/// with it (funkode-io/replay#186).
 #[tokio::test]
-async fn a_worker_that_exhausts_its_budget_stops_and_is_reported_postgres_test() {
+async fn a_worker_that_exhausts_its_budget_escalates_to_the_consumer_postgres_test() {
     let deaths = Arc::new(AtomicUsize::new(0));
     // Far more deaths than the budget allows, so the budget is what stops it.
     let staged = Arc::new(AtomicUsize::new(usize::MAX));
@@ -204,6 +217,17 @@ async fn a_worker_that_exhausts_its_budget_stops_and_is_reported_postgres_test()
     };
     let neighbour = neighbour_of(harness.policy_name());
 
+    let escalated = harness.await_escalation(harness.policy_name()).await;
+    assert_eq!(
+        escalated.reason,
+        EscalationReason::BudgetExhausted {
+            restarts: 2,
+            cause: "the worker died preparing its read of the feed".to_string(),
+        },
+        "the hook is told which policy is down and why"
+    );
+
+    // A hook that returns does not absolve the runner of saying so.
     let stopped = harness.await_stopped_worker(harness.policy_name()).await;
     assert_eq!(
         stopped.restarts, 2,
@@ -226,6 +250,12 @@ async fn a_worker_that_exhausts_its_budget_stops_and_is_reported_postgres_test()
         .await;
     assert!(neighbour_cursor >= ping.global_position);
 
+    assert_eq!(
+        harness.escalations().len(),
+        1,
+        "a hook that returns is called once and not again: {:?}",
+        harness.escalations()
+    );
     assert_eq!(
         harness.stopped_workers().len(),
         1,
