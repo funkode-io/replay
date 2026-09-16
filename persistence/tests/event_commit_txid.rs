@@ -191,7 +191,7 @@ async fn append(cqrs: &Cqrs<PostgresEventStore>, ledger: &LedgerUrn, command: Le
 #[tokio::test]
 async fn an_appended_event_carries_the_transaction_that_wrote_it_postgres_test() {
     let (pool, _container) = start_postgres().await;
-    apply_migrations(&pool, 1..=15).await;
+    apply_migrations(&pool, 1..=16).await;
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
     let ledger = LedgerUrn::new("stamped").unwrap();
@@ -220,7 +220,7 @@ async fn an_appended_event_carries_the_transaction_that_wrote_it_postgres_test()
 #[tokio::test]
 async fn compaction_stamps_the_snapshot_rows_it_writes_postgres_test() {
     let (pool, _container) = start_postgres().await;
-    apply_migrations(&pool, 1..=15).await;
+    apply_migrations(&pool, 1..=16).await;
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
     let ledger = LedgerUrn::new("compacted").unwrap();
@@ -267,7 +267,7 @@ async fn events_written_before_the_migration_carry_the_sentinel_postgres_test() 
     let ledger = LedgerUrn::new("pre-migration").unwrap();
     append(&cqrs, &ledger, LedgerCommand::AddTwice { amount: 10.0 }).await;
 
-    apply_migrations(&pool, 14..=15).await;
+    apply_migrations(&pool, 14..=16).await;
 
     append(&cqrs, &ledger, LedgerCommand::Add { amount: 5.0 }).await;
 
@@ -339,7 +339,7 @@ async fn an_append_blocked_by_the_migration_is_stamped_for_real_postgres_test() 
 #[tokio::test]
 async fn ordering_by_transaction_then_position_is_an_index_scan_postgres_test() {
     let (pool, _container) = start_postgres().await;
-    apply_migrations(&pool, 1..=15).await;
+    apply_migrations(&pool, 1..=16).await;
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
     let ledger = LedgerUrn::new("planned").unwrap();
@@ -367,6 +367,64 @@ async fn ordering_by_transaction_then_position_is_an_index_scan_postgres_test() 
         !plan.contains("Sort"),
         "the index scan already returns commit order, so nothing is sorted:\n{plan}"
     );
+}
+
+/// The other retry state: the build finished but nothing recorded it, because the process
+/// died in between. Re-running must adopt the index rather than fail on its name.
+#[tokio::test]
+async fn a_built_but_unrecorded_index_is_adopted_on_retry_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+    apply_migrations(&pool, 1..=15).await;
+
+    apply_migrations(&pool, 15..=16).await;
+
+    let valid: bool = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index \
+          WHERE indexrelid = to_regclass('idx_events_commit_txid_position')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the index survives the retry");
+    assert!(valid, "the retry left the index valid");
+}
+
+/// An index left behind by a build that never finished is the one state 0015's
+/// `IF NOT EXISTS` cannot tell from a finished one. 0016 can, and says what to run.
+#[tokio::test]
+async fn a_half_built_index_stops_the_migrations_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+    apply_migrations(&pool, 1..=15).await;
+
+    // What a cancelled CREATE INDEX CONCURRENTLY leaves: an index that exists, is
+    // maintained on every write, and may serve no query. Setting the flag is the only way
+    // to reach that state on purpose.
+    sqlx::query(
+        "UPDATE pg_index SET indisvalid = false \
+          WHERE indexrelid = to_regclass('idx_events_commit_txid_position')",
+    )
+    .execute(&pool)
+    .await
+    .expect("invalidating the index must succeed");
+
+    let (_, guard) = migrations(16..=16).pop().expect("0016 exists");
+    let refused = pool
+        .execute(sqlx::raw_sql(AssertSqlSafe(guard.clone())))
+        .await
+        .expect_err("0016 must refuse an index that is not valid");
+    assert!(
+        refused.to_string().contains("did not finish"),
+        "the refusal names the unfinished build: {refused}"
+    );
+
+    // And the recovery it names clears it.
+    pool.execute(sqlx::raw_sql(
+        "REINDEX INDEX CONCURRENTLY idx_events_commit_txid_position",
+    ))
+    .await
+    .expect("reindexing must succeed");
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(guard)))
+        .await
+        .expect("0016 must apply once the index is valid");
 }
 
 /// Wait until something is queued behind a lock on `events`.

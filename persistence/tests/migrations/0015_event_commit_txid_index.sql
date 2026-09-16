@@ -11,12 +11,17 @@
 -- CONCURRENTLY, hence `-- no-transaction` above and one statement in this file: a plain
 -- CREATE INDEX holds a lock that blocks appends for the length of the build, and
 -- CONCURRENTLY cannot run inside a transaction block.
--- No `IF NOT EXISTS`, unlike every other index in these migrations: those run inside a
--- transaction, so a failure leaves nothing behind and a retry starts clean. This one does
--- not. A cancelled or failed CONCURRENTLY build leaves an *invalid* index of this name —
--- maintained on every write, used by no query — and `IF NOT EXISTS` would skip straight
--- over it and let sqlx record the migration as applied. The deployment must stay failed
--- until an operator runs `DROP INDEX idx_events_commit_txid_position` (or `REINDEX INDEX
--- CONCURRENTLY` it) and re-runs.
-CREATE INDEX CONCURRENTLY idx_events_commit_txid_position
+--
+-- Outside a transaction the build and sqlx's record of it are two operations, so a retry
+-- has two states to survive, and they pull in opposite directions:
+--
+--   * Built, and then the process died before the record was written. `IF NOT EXISTS`
+--     makes the retry a no-op that records the migration, so this heals itself.
+--   * The build failed or was cancelled, leaving an *invalid* index of this name,
+--     maintained on every write and used by no query. `IF NOT EXISTS` skips it, so this
+--     statement on its own would record the migration over a broken schema.
+--
+-- So `IF NOT EXISTS` stays and 0016 — an ordinary transactional migration — refuses to
+-- apply while the index is invalid. Whatever this one adopts, the next one checks.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_commit_txid_position
     ON events (commit_txid, global_position);
