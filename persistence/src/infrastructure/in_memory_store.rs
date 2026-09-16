@@ -15,8 +15,10 @@ use replay::{Compactable, Event};
 
 /// In-memory event store implementation, only for testing purpose.
 ///
-/// Events are stored per-stream-URN in insertion order. The `aggregate_version` field on each
-/// event distinguishes current events (`None`) from archived compaction snapshots (`Some(n)`).
+/// Events are stored per-stream-URN in insertion order, each carrying the position it was
+/// appended at so a read across streams can interleave them as they were appended. The
+/// `aggregate_version` field on each event distinguishes current events (`None`) from
+/// archived compaction snapshots (`Some(n)`).
 ///
 /// Stream filters are normally *pushed down* to the database; the in-memory store has no
 /// schema to push down to, so it evaluates every filter as a per-event predicate instead. To
@@ -29,8 +31,19 @@ use replay::{Compactable, Event};
 /// path makes NO atomicity guarantee — the events are already stored when `handle` runs, and
 /// a failing `handle` does not roll them back. It exists purely to exercise projection
 /// routing and batch-handling logic in fast unit tests without a database.
+/// An appended event and the position it was appended at.
+type PositionedEvent = (u64, PersistedEvent<Value>);
+
 pub struct InMemoryEventStore {
-    events: RwLock<HashMap<Urn, Vec<PersistedEvent<Value>>>>,
+    /// Events per stream, each paired with the position it was appended at. A `HashMap`
+    /// has no order of its own, so a cross-stream read has nothing but this counter to
+    /// put the streams back into append order — it is the in-memory analogue of
+    /// `events.global_position`
+    /// (`docs/adr/0018-every-event-read-is-ordered-by-global-position.md`).
+    events: RwLock<HashMap<Urn, Vec<PositionedEvent>>>,
+    /// The next append position. Taken under the same write lock that publishes the
+    /// events, so positions and insertion order cannot disagree.
+    next_position: RwLock<u64>,
     /// Stream type per stream URN, recorded on append so [`StreamFilter::ForStreamTypes`] can
     /// be evaluated per-event without a database to push the filter down to.
     stream_types: RwLock<HashMap<Urn, String>>,
@@ -50,6 +63,7 @@ impl InMemoryEventStore {
     pub fn new() -> Self {
         Self {
             events: RwLock::new(HashMap::new()),
+            next_position: RwLock::new(0),
             stream_types: RwLock::new(HashMap::new()),
             projections: Vec::new(),
             last_compacted_version: RwLock::new(HashMap::new()),
@@ -182,8 +196,8 @@ impl EventStore for InMemoryEventStore {
                 .map(|events| {
                     events
                         .iter()
-                        .rfind(|e| e.aggregate_version.is_none())
-                        .map(|e| e.version)
+                        .rfind(|(_, e)| e.aggregate_version.is_none())
+                        .map(|(_, e)| e.version)
                         .unwrap_or(0)
                 })
                 .unwrap_or(0)
@@ -246,8 +260,12 @@ impl EventStore for InMemoryEventStore {
         // driving any async projections (the `RwLockWriteGuard` is not held across an await).
         {
             let mut store = self.events.write().unwrap();
+            let mut next_position = self.next_position.write().unwrap();
             let stream = store.entry(stream_id.clone()).or_default();
-            stream.extend(staged.iter().cloned());
+            for event in staged.iter().cloned() {
+                stream.push((*next_position, event));
+                *next_position += 1;
+            }
         }
 
         // Best-effort: drive registered projections after the events are stored and the write
@@ -268,9 +286,17 @@ impl EventStore for InMemoryEventStore {
             let store = self.events.read().unwrap();
             let stream_types = self.stream_types.read().unwrap().clone();
             let events = if let Some(stream_id) = Self::extract_stream_id(&filter) {
-                store.get(&stream_id).cloned().unwrap_or_default()
+                // One stream's `Vec` is already in append order.
+                store
+                    .get(&stream_id)
+                    .map(|stream| stream.iter().map(|(_, e)| e.clone()).collect())
+                    .unwrap_or_default()
             } else {
-                store.values().flatten().cloned().collect()
+                // Across streams the map hands them over in whatever order it likes, so
+                // the append positions are what puts them back in order.
+                let mut events: Vec<PositionedEvent> = store.values().flatten().cloned().collect();
+                events.sort_unstable_by_key(|(position, _)| *position);
+                events.into_iter().map(|(_, e)| e).collect()
             };
             (events, stream_types)
         };
@@ -320,14 +346,14 @@ impl EventStore for InMemoryEventStore {
                 Some(stream) => {
                     let head = stream
                         .iter()
-                        .filter(|e| e.aggregate_version.is_none())
-                        .map(|e| e.version)
+                        .filter(|(_, e)| e.aggregate_version.is_none())
+                        .map(|(_, e)| e.version)
                         .max()
                         .unwrap_or(0);
                     let events = stream
                         .iter()
-                        .filter(|e| e.aggregate_version.is_none())
-                        .map(|e| {
+                        .filter(|(_, e)| e.aggregate_version.is_none())
+                        .map(|(_, e)| {
                             serde_json::from_value::<A::Event>(e.data.clone())
                                 .map_err(crate::deser_error)
                         })
@@ -363,6 +389,7 @@ impl EventStore for InMemoryEventStore {
         // 2. Determine the next archive version number and archive all current events.
         {
             let mut store = self.events.write().unwrap();
+            let mut next_position = self.next_position.write().unwrap();
 
             if !store.contains_key(&stream_id) {
                 return Err(replay::Error::not_found("Stream not found")
@@ -374,33 +401,38 @@ impl EventStore for InMemoryEventStore {
 
             let next_version: i32 = stream
                 .iter()
-                .filter_map(|e| e.aggregate_version)
+                .filter_map(|(_, e)| e.aggregate_version)
                 .max()
                 .unwrap_or(0)
                 + 1;
 
             // Archive: mark every current (aggregate_version = None) event with the new version.
-            for event in stream.iter_mut() {
+            for (_, event) in stream.iter_mut() {
                 if event.aggregate_version.is_none() {
                     event.aggregate_version = Some(next_version);
                 }
             }
 
             // Insert compacted events as the new current stream (aggregate_version = None).
-            // Sequence versions restart from 1.
+            // Sequence versions restart from 1; positions continue from the log head, so the
+            // snapshot rows read back in the order this loop writes them — as in Postgres.
             for (seq, event) in (0_i64..).zip(compacted.iter()) {
                 let seq = seq + 1;
                 let data = serde_json::to_value(event).map_err(crate::ser_error)?;
-                stream.push(PersistedEvent {
-                    id: Uuid::new_v4(),
-                    data,
-                    stream_id: stream_id.clone(),
-                    r#type: event.event_type(),
-                    version: seq,
-                    created: Utc::now(),
-                    metadata: metadata.clone(),
-                    aggregate_version: None,
-                });
+                stream.push((
+                    *next_position,
+                    PersistedEvent {
+                        id: Uuid::new_v4(),
+                        data,
+                        stream_id: stream_id.clone(),
+                        r#type: event.event_type(),
+                        version: seq,
+                        created: Utc::now(),
+                        metadata: metadata.clone(),
+                        aggregate_version: None,
+                    },
+                ));
+                *next_position += 1;
             }
 
             // Advance the compaction watermark to the new live head version so
@@ -424,8 +456,8 @@ impl EventStore for InMemoryEventStore {
                 None => return Ok(false),
                 Some(stream) => stream
                     .iter()
-                    .filter(|e| e.aggregate_version.is_none())
-                    .map(|e| e.version)
+                    .filter(|(_, e)| e.aggregate_version.is_none())
+                    .map(|(_, e)| e.version)
                     .max()
                     .unwrap_or(0),
             }
@@ -1536,5 +1568,53 @@ mod tests {
 
         assert_eq!(*deposits.lock().unwrap(), vec![10.0, 5.0]);
         assert_eq!(handle_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A read that spans streams hands events over in append order, interleaved as they
+    /// were appended. The streams live in a `HashMap`, whose iteration order is arbitrary
+    /// and varies run to run, so without the append positions this returns one stream
+    /// then the other — an order no consumer appended.
+    #[tokio::test]
+    async fn cross_stream_reads_follow_append_order() {
+        let store = InMemoryEventStore::new();
+        let first = make_stream_id("order-a");
+        let second = make_stream_id("order-b");
+
+        add_events(
+            &store,
+            &first,
+            &[BankAccountEvent::Deposited { amount: 1.0 }],
+        )
+        .await;
+        add_events(
+            &store,
+            &second,
+            &[BankAccountEvent::Deposited { amount: 2.0 }],
+        )
+        .await;
+        add_events(
+            &store,
+            &first,
+            &[BankAccountEvent::Deposited { amount: 3.0 }],
+        )
+        .await;
+        add_events(
+            &store,
+            &second,
+            &[BankAccountEvent::Deposited { amount: 4.0 }],
+        )
+        .await;
+
+        let amounts: Vec<f64> = store
+            .stream_events::<BankAccountEvent>(StreamFilter::All)
+            .map_ok(|e| match e.data {
+                BankAccountEvent::Deposited { amount } => amount,
+                BankAccountEvent::Withdrawn { amount } => -amount,
+            })
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(amounts, vec![1.0, 2.0, 3.0, 4.0]);
     }
 }
