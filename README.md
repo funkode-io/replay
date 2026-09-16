@@ -2241,6 +2241,13 @@ bounds the future the runner awaits, and cannot interrupt work the reaction move
 onto another task or a command that never yields — see `CONTEXT.md`'s
 non-guarantees.
 
+It also does not cancel a statement already running in Postgres. A dispatch
+abandoned inside an append that is blocked on another transaction's stream lock
+holds its pool connection until that lock clears, and each retry takes another;
+set `lock_timeout` on the pool if your deployment expects that contention. A
+reaction that hangs in its own code holds no connection — the command handler runs
+before the append opens a transaction.
+
 ### Failure handling
 
 When a dispatch fails the runner classifies the error and responds accordingly:

@@ -297,6 +297,13 @@ it:
   thread or process boundary the runner does not impose; a reaction that must
   block belongs on `spawn_blocking`, where the timeout at least stops the runner
   waiting on it.
+- **A [Dispatch timeout] does not cancel work already running in Postgres.** It
+  ends this process's wait and sends the server nothing, so a dispatch abandoned
+  inside a statement holds its pool connection until that statement finishes. The
+  case that reaches this is an append blocked on another transaction's stream
+  lock; a reaction hanging in its own code holds no connection, because the
+  command handler runs before the append opens its transaction. Deployments that
+  expect lock contention should set `lock_timeout` on the pool.
 - **An OOM kill is not containable in-process.** The kernel ends the process; no
   supervision layer can catch it. The only defences are bounding what a reaction
   loads and bounding how long it may run.

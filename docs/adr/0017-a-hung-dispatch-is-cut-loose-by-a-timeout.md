@@ -54,7 +54,13 @@ timeout is how a hang becomes one.
 - The timeout cannot interrupt work the reaction moved onto another task; see
   `CONTEXT.md`'s non-guarantees.
 - An abandoned dispatch is cancelled mid-command: its transaction rolls back and
-  the positions its append consumed are burned (ADR-0015).
+  the positions its append consumed are burned (ADR-0015). The rollback is not
+  immediate. Cancelling the future stops this process waiting; it sends Postgres
+  nothing, so a dispatch abandoned inside `append_event`'s
+  `SELECT ... FOR UPDATE` holds its pool connection until the lock it was waiting
+  for clears — and each retry takes another. A reaction that hangs in its own code
+  (the common case) holds no connection at all: the command handler runs before
+  the append opens a transaction. See funkode-io/replay#205.
 - **A dispatch abandoned while committing may still have committed**, so a retry
   can re-execute work that landed. Unchanged at-least-once behaviour (ADR-0003),
   made safe by the causation guard.
