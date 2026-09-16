@@ -52,7 +52,9 @@ advances the cursor and fires nothing, like a compaction snapshot
 ([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
 `stream_filter` decides what a Policy *reacts to*, never how far it *gets*. The
 feed stops at a position it has not read, which may be an append still in flight —
-unless it is a [Burned position], which it crosses.
+unless it is a [Burned position], which it crosses. Stepping one position at a time
+is only safe because a position is held by exactly one event: a unique index
+enforces that (migration 0015), rather than `BIGSERIAL` implying it.
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation

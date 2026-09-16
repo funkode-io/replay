@@ -25,6 +25,12 @@ How far the cursor may then advance is a pure function of that window — the pr
 contiguous from `cursor + 1` — in `policy_feed`. Gap handling
 (funkode-io/replay#164) goes there.
 
+The rule rests on one event per position: a cursor that steps one position at a time
+steps *over* the second event at a shared position. Since
+funkode-io/replay#200 a unique index on `events (global_position)` enforces that
+(migration 0015) — `BIGSERIAL` never did, so before then the invariant everything
+here relies on was checked by nothing.
+
 ## Consequences
 
 - A `stream_filter` changes what a Policy reacts to, not how far it advances. Two
