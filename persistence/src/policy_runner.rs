@@ -204,6 +204,9 @@ impl PolicyRunnerBuilder {
     /// must arrange the ending itself: fail a liveness probe, drain and exit,
     /// page someone.
     ///
+    /// A test that starts a daemon should install a hook here for the same
+    /// reason: a test binary is a process, and the default ends it.
+    ///
     /// [ADR-0018]: https://github.com/funkode-io/replay/blob/main/docs/adr/0018-escalation-is-a-consumer-hook-that-exits-by-default.md
     ///
     /// ```rust,ignore
@@ -542,8 +545,12 @@ pub struct Escalation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EscalationReason {
-    /// The worker died more often than its [`WorkerSupervision`] budget allows.
-    /// `cause` is the panic message of the death that spent the last of it.
+    /// The worker died with its [`WorkerSupervision`] budget already spent:
+    /// `restarts` restarts had been made within the window, and this death is the
+    /// one none was left for. `cause` is its panic message.
+    ///
+    /// The worker therefore died `restarts + 1` times, and `restarts` is `0` when
+    /// the budget was `max_restarts(0)` and the first death was terminal.
     BudgetExhausted { restarts: u32, cause: String },
     /// The lock manager that elects this worker has itself stopped for good, so
     /// the worker can never be elected again. No restart was attempted: there is
@@ -566,7 +573,8 @@ impl fmt::Display for EscalationReason {
         match self {
             Self::BudgetExhausted { restarts, cause } => write!(
                 f,
-                "the worker died {restarts} times within its restart window; last cause: {cause}"
+                "the worker died with its restart budget spent \
+                 ({restarts} used in the window); cause: {cause}"
             ),
             Self::Abandoned => {
                 f.write_str("the lock manager that elects the worker has stopped for good")
@@ -3107,6 +3115,42 @@ mod supervisor_tests {
 
         assert_eq!(escalations.recorded().len(), 1);
         assert_eq!(stopped.snapshot()[0].policy, "supervised");
+
+        // A budget of zero makes the first death terminal, so no restart was ever
+        // made and the reason must not read as though one had been.
+        assert_eq!(
+            escalations.recorded()[0].reason,
+            EscalationReason::BudgetExhausted {
+                restarts: 0,
+                cause: "died once".to_string(),
+            }
+        );
+    }
+
+    /// `restarts` counts restarts made, not deaths suffered — the death being
+    /// escalated is the one no restart was left for, and the text an operator
+    /// reads must not turn the two into each other.
+    #[test]
+    fn the_reason_reads_as_restarts_spent_not_deaths_counted() {
+        let spent = EscalationReason::BudgetExhausted {
+            restarts: 2,
+            cause: "died in the night".to_string(),
+        }
+        .to_string();
+        assert!(
+            spent.contains("restart budget spent (2 used in the window)"),
+            "a worker restarted twice and dead a third time reads: {spent}"
+        );
+
+        let never_restarted = EscalationReason::BudgetExhausted {
+            restarts: 0,
+            cause: "died once".to_string(),
+        }
+        .to_string();
+        assert!(
+            !never_restarted.contains("0 times"),
+            "a budget of zero must not report zero deaths: {never_restarted}"
+        );
     }
 
     /// A defective hook is the consumer's problem and must not become the
@@ -3133,8 +3177,7 @@ mod supervisor_tests {
         assert_eq!(stopped.snapshot()[0].policy, "supervised");
     }
 
-    /// A worker that stops while the daemon is shutting down has not failed at
-    /// anything: escalating there would exit a process that is already on its way
+    /// A worker that stops while the daemon is shutting down has not failed at    /// anything: escalating there would exit a process that is already on its way
     /// out, and would do it on every clean shutdown.
     #[tokio::test]
     async fn a_stop_during_shutdown_escalates_nothing() {
