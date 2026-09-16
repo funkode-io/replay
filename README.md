@@ -2096,7 +2096,7 @@ let runner = PolicyRunner::builder(cqrs)
 
 ```rust,ignore
 use std::time::Duration;
-use replay_persistence::{PolicyRunnerBuilder, StartAt};
+use replay_persistence::{PolicyRunner, StartAt};
 
 let runner = PolicyRunner::builder(cqrs)
     .register_services::<BankAccount>(())          // enable Dispatch::to::<BankAccount>
@@ -2251,7 +2251,7 @@ checkpoint, so it costs at most a checkpoint's worth of re-delivery
 
 ```rust,ignore
 use std::time::Duration;
-use replay_persistence::WorkerSupervision;
+use replay_persistence::{PolicyRunner, WorkerSupervision};
 
 let runner = PolicyRunner::builder(cqrs)
     .register_policy(my_policy)

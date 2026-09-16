@@ -2759,6 +2759,7 @@ mod supervisor_tests {
     use std::time::Duration;
 
     use tokio::sync::watch;
+    use tracing_test::{internal::logs_assert, traced_test};
 
     use super::{
         supervise, RevokeLeadership, Stop, StoppedWorkers, SupervisedTask, WorkerSupervision,
@@ -2806,7 +2807,12 @@ mod supervisor_tests {
 
     /// A task that keeps dying is restarted its budget's worth of times and then
     /// reported, rather than restarted forever or dropped in silence.
+    ///
+    /// The `warn` is asserted here because it is what an operator sees first: it
+    /// has to name the policy and how many restarts the window has seen
+    /// (funkode-io/replay#185).
     #[tokio::test]
+    #[traced_test]
     async fn a_task_that_keeps_dying_is_restarted_then_reported() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let stopped = StoppedWorkers::default();
@@ -2833,6 +2839,28 @@ mod supervisor_tests {
         assert_eq!(stopped.len(), 1);
         assert_eq!(stopped[0].policy, "supervised");
         assert_eq!(stopped[0].restarts, 2);
+
+        logs_assert(|lines| {
+            let restarts: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("restarting after backoff"))
+                .collect();
+            if restarts.len() != 2 {
+                return Err(format!("one line per restart, got {}", restarts.len()));
+            }
+            for (nth, line) in restarts.iter().enumerate() {
+                for field in [
+                    "WARN",
+                    "policy=\"supervised\"",
+                    &format!("restarts={}", nth + 1),
+                ] {
+                    if !line.contains(field) {
+                        return Err(format!("the restart warning lacks {field}: {line}"));
+                    }
+                }
+            }
+            Ok(())
+        });
     }
 
     /// A worker whose lock manager is gone cannot be helped by restarting it, so
