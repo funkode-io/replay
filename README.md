@@ -2239,7 +2239,7 @@ cannot hold a worker for the life of the process:
 Exceeding it is a **retryable** failure: the dispatch is abandoned, retried under
 the same back-off as an `Unavailable` error, and parked with
 `error_kind = 'Timeout'` once the retries are exhausted
-([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It
+([ADR-0018](docs/adr/0018-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It
 bounds the future the runner awaits, and cannot interrupt work the reaction moved
 onto another task or a command that never yields — see `CONTEXT.md`'s
 non-guarantees.
@@ -2302,7 +2302,7 @@ lock-manager session rather than on the worker task.
 A worker that spends its budget is **stopped**, logged at `error`, and
 **escalated**: the runner calls the hook the consumer supplied on the builder,
 naming the Policy and why it is down. The default hook **exits the process**
-([ADR-0018](docs/adr/0018-escalation-is-a-consumer-hook-that-exits-by-default.md)).
+([ADR-0019](docs/adr/0019-escalation-is-a-consumer-hook-that-exits-by-default.md)).
 
 ```rust,ignore
 use replay_persistence::{EscalationReason, PolicyRunner};

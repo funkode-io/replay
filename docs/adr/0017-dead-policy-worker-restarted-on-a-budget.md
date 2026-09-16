@@ -35,7 +35,7 @@ Each worker now runs under a supervisor that restarts it, bounded by a
 
 - **Exhaustion does not end the process here.** Only a process exit releases the
   advisory lock and lets a Standby take over, so ending it is a consumer-owned
-  hook ([ADR-0018](0018-escalation-is-a-consumer-hook-that-exits-by-default.md)),
+  hook ([ADR-0019](0019-escalation-is-a-consumer-hook-that-exits-by-default.md)),
   which this layer invokes rather than deciding for itself.
 
 - **The shared tasks carry the same budget but report through the Policies they
@@ -72,4 +72,4 @@ Each worker now runs under a supervisor that restarts it, bounded by a
 - Nothing is persisted: budget and stopped list are in-process state, so a
   process restart resets both and no schema change is involved.
 - `stopped_workers()` is a poll; what a consumer is *told* about is the escalation
-  hook ([ADR-0018](0018-escalation-is-a-consumer-hook-that-exits-by-default.md)).
+  hook ([ADR-0019](0019-escalation-is-a-consumer-hook-that-exits-by-default.md)).

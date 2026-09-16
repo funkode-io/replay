@@ -207,7 +207,7 @@ impl PolicyRunnerBuilder {
     /// stop has been recorded in [`PolicyRunnerDaemon::stopped_workers`]. It runs
     /// in place of the default, which **exits the process** with
     /// [`ESCALATION_EXIT_CODE`] — the only outcome that releases the Policy's
-    /// advisory lock, so that a standby replica can take it over ([ADR-0018]).
+    /// advisory lock, so that a standby replica can take it over ([ADR-0019]).
     ///
     /// **A hook that returns leaves the Policy stopped in every replica**, so it
     /// must arrange the ending itself: fail a liveness probe, drain and exit,
@@ -216,7 +216,7 @@ impl PolicyRunnerBuilder {
     /// A test that starts a daemon should install a hook here for the same
     /// reason: a test binary is a process, and the default ends it.
     ///
-    /// [ADR-0018]: https://github.com/funkode-io/replay/blob/main/docs/adr/0018-escalation-is-a-consumer-hook-that-exits-by-default.md
+    /// [ADR-0019]: https://github.com/funkode-io/replay/blob/main/docs/adr/0019-escalation-is-a-consumer-hook-that-exits-by-default.md
     ///
     /// ```rust,ignore
     /// runner_builder.on_escalation(|escalation| {
@@ -2239,7 +2239,7 @@ impl Delivery<'_> {
     /// Execute one dispatch, abandoning it after [`Self::dispatch_timeout`].
     ///
     /// Cancelling the future is all a timeout can do: work the reaction moved
-    /// onto another task keeps running, unobserved (ADR-0017).
+    /// onto another task keeps running, unobserved (ADR-0018).
     async fn execute_dispatch_within(
         &self,
         global_position: i64,

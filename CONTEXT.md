@@ -151,7 +151,7 @@ _Avoid_: stuck, wedged, hung, stalled.
 
 How long the [Policy runner] awaits one command a [Policy] dispatched before it
 abandons it — per Policy, defaulting to 30s
-([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It cuts
+([ADR-0018](docs/adr/0018-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It cuts
 loose a reaction that has *stopped*; a merely slow one raises the limit rather
 than being parked by it. Exceeding it is retryable, so a hang reaches the same
 [Dead letter] a dependency outage does. Distinct from a [Blocked policy] in both
@@ -228,7 +228,7 @@ What the [Policy runner] does about a worker that is down for good — it spent 
 [Restart budget], or the lock manager that elects it stopped. A consumer-supplied
 hook is called once, naming the Policy and the reason, and defaults to exiting the
 process
-([ADR-0018](docs/adr/0018-escalation-is-a-consumer-hook-that-exits-by-default.md)).
+([ADR-0019](docs/adr/0019-escalation-is-a-consumer-hook-that-exits-by-default.md)).
 Exiting is what releases the Policy's advisory lock, so a hook that returns leaves
 the Policy stopped in every replica.
 _Avoid_: alert, failover, panic, giving up.
