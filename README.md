@@ -2227,6 +2227,30 @@ what a policy reacts to, the cursor still walks past everything else
 selective policy over a busy log may need several drains to reach its next event;
 raise `read_batch_size` if that latency matters.
 
+### Dispatch timeout
+
+Every dispatch is awaited for a bounded time, so a command that never returns
+cannot hold a worker for the life of the process:
+
+| Setting | `Policy` override | Env var | Default |
+|---------|-------------------|---------|---------|
+| Time one dispatch may run | `dispatch_timeout() -> Option<Duration>` | `REPLAY_DISPATCH_TIMEOUT_MS` | `30s` |
+
+Exceeding it is a **retryable** failure: the dispatch is abandoned, retried under
+the same back-off as an `Unavailable` error, and parked with
+`error_kind = 'Timeout'` once the retries are exhausted
+([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It
+bounds the future the runner awaits, and cannot interrupt work the reaction moved
+onto another task or a command that never yields — see `CONTEXT.md`'s
+non-guarantees.
+
+It also does not cancel a statement already running in Postgres. A dispatch
+abandoned inside an append that is blocked on another transaction's stream lock
+holds its pool connection until that lock clears, and each retry takes another;
+set `lock_timeout` on the pool if your deployment expects that contention. A
+reaction that hangs in its own code holds no connection — the command handler runs
+before the append opens a transaction.
+
 ### Failure handling
 
 When a dispatch fails the runner classifies the error and responds accordingly:
@@ -2234,8 +2258,9 @@ When a dispatch fails the runner classifies the error and responds accordingly:
 | Error category | Condition | Action |
 |----------------|-----------|--------|
 | **Business-rule violation** | `ErrorKind::BusinessRuleViolation` | Advance cursor immediately — the event is correct, the domain logic rejected the command. No retry, no dead-letter. |
-| **Retryable** | `Unavailable`, `RateLimited`, `Conflict` | Exponential back-off, up to `MAX_DISPATCH_RETRIES` (3) attempts. |
+| **Retryable** | `Unavailable`, `RateLimited`, `Conflict`, or a dispatch that exceeded its timeout | Exponential back-off, `MAX_DISPATCH_RETRIES` (3) retries after the first attempt — four in all. |
 | **Permanent** | All other errors, or retries exhausted | Write to `policy_dead_letters`, advance cursor. The policy keeps running. |
+| **Timeout** | The dispatch was still running when its `dispatch_timeout` expired | Abandon it, log at `warn` with the elapsed time, retry; on exhaustion write `error_kind = 'Timeout'` and advance cursor. |
 | **Panic** | The reaction (or a command it dispatched) panicked | Write to `policy_dead_letters` with `error_kind = 'Panic'` and the panic's message, log at `error`, advance cursor. Never retried — a reaction that panicked panics again ([ADR-0016](docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md)). |
 
 The panic boundary is the delivery of **one event**, so the worker survives and
@@ -2328,7 +2353,7 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
     policy_name      TEXT        NOT NULL,   -- stable policy name / cursor key
     global_position  BIGINT      NOT NULL,   -- position of the triggering event
     event_id         UUID        NOT NULL,   -- UUID of the triggering event
-    error_kind       TEXT        NOT NULL,   -- ErrorKind text, or "Panic"
+    error_kind       TEXT        NOT NULL,   -- ErrorKind text, or "Panic" / "Timeout"
     error_message    TEXT        NOT NULL,   -- human-readable detail for triage
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -2351,6 +2376,9 @@ SELECT * FROM events WHERE id = '<event_id from dead letter>';
 
 -- Reactions that panicked: defects in the reaction, not refused commands
 SELECT * FROM policy_dead_letters WHERE error_kind = 'Panic';
+
+-- Reactions that never came back: look at what the command was waiting for
+SELECT * FROM policy_dead_letters WHERE error_kind = 'Timeout';
 ```
 
 #### Retrying and discarding dead letters
