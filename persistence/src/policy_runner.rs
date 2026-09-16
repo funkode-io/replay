@@ -2759,7 +2759,7 @@ mod supervisor_tests {
     use std::time::Duration;
 
     use tokio::sync::watch;
-    use tracing_test::{internal::logs_assert, traced_test};
+    use tracing_test::traced_test;
 
     use super::{
         supervise, RevokeLeadership, Stop, StoppedWorkers, SupervisedTask, WorkerSupervision,
