@@ -205,7 +205,9 @@ pub struct DeadLetter {
 ///
 /// Installed by the harness on every daemon it starts, because the default hook
 /// exits the process. A test that wants its own hook registers one in
-/// `configure`, which runs afterwards and therefore wins.
+/// `configure`, which runs afterwards and therefore wins. Scoped to the daemon
+/// that fired them: [`PolicyDaemonHarness::restart`] clears the record, as the
+/// daemon's own `stopped_workers` list is cleared by being replaced.
 #[derive(Clone, Default)]
 pub struct Escalations(Arc<std::sync::Mutex<Vec<Escalation>>>);
 
@@ -217,6 +219,14 @@ impl Escalations {
 
     fn recorded(&self) -> Vec<Escalation> {
         self.0.lock().unwrap().clone()
+    }
+
+    /// Forget everything the previous daemon's hook was told. Escalations belong
+    /// to the daemon that fired them, like the stopped workers they accompany;
+    /// keeping them across a restart would let an `await_escalation` be satisfied
+    /// by the daemon before it.
+    fn cleared(&self) {
+        self.0.lock().unwrap().clear();
     }
 }
 
@@ -306,13 +316,17 @@ impl PolicyDaemonHarness {
     /// database — the process restart an operator would perform, minus the
     /// process.
     ///
-    /// Everything in memory (cursor position, in-flight work) is discarded; only
-    /// what the first daemon made durable survives. That is what makes this the
-    /// way to ask whether an event is re-delivered after a restart.
+    /// Everything in memory (cursor position, in-flight work, what the escalation
+    /// hook was told) is discarded; only what the first daemon made durable
+    /// survives. That is what makes this the way to ask whether an event is
+    /// re-delivered after a restart.
     pub async fn restart(&mut self) {
         if let Some(daemon) = self.daemon.take() {
             daemon.shutdown().await;
         }
+        // After the shutdown has joined every task, so nothing can record into
+        // the cleared recorder afterwards.
+        self.escalations.cleared();
         self.daemon = Some(spawn_daemon(
             &self.cqrs,
             self.configure.as_ref(),
