@@ -11,10 +11,10 @@
 //! later slices that build on this substrate.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -141,6 +141,7 @@ pub struct PolicyRunnerBuilder {
     policies: Vec<Arc<dyn ErasedPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
+    supervision: WorkerSupervision,
 }
 
 impl PolicyRunnerBuilder {
@@ -176,6 +177,14 @@ impl PolicyRunnerBuilder {
     /// deterministic testing without a NOTIFY wakeup.
     pub fn without_notifications(mut self) -> Self {
         self.notifications = false;
+        self
+    }
+
+    /// Replace the default [`WorkerSupervision`]: how long the runner waits
+    /// before restarting a worker that died outside its reaction, and how many
+    /// such restarts it allows within a window before giving up on it.
+    pub fn with_worker_supervision(mut self, supervision: WorkerSupervision) -> Self {
+        self.supervision = supervision;
         self
     }
 
@@ -225,6 +234,7 @@ impl PolicyRunnerBuilder {
             policies: self.policies,
             executors: self.executors,
             notifications: self.notifications,
+            supervision: self.supervision,
             stopped: StoppedPolicies::new(),
         }
     }
@@ -270,6 +280,7 @@ pub struct PolicyRunner {
     policies: Vec<Arc<dyn ErasedPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
+    supervision: WorkerSupervision,
     /// What this process remembers about the Policies that are stopped, shared by
     /// every drain path so a stop is judged the same way however it is driven.
     stopped: StoppedPolicies,
@@ -318,6 +329,7 @@ impl StoppedPolicies {
 pub struct PolicyRunnerDaemon {
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    stopped: StoppedWorkers,
 }
 
 impl PolicyRunnerDaemon {
@@ -326,6 +338,212 @@ impl PolicyRunnerDaemon {
         let _ = self.shutdown_tx.send(true);
         for task in self.tasks {
             let _ = task.await;
+        }
+    }
+
+    /// The workers the runner has given up on, in the order they stopped.
+    ///
+    /// A worker that dies outside its reaction is restarted (see
+    /// [`WorkerSupervision`]); one that dies more often than its budget allows is
+    /// named here instead. Nothing is reacting for those policies, and nothing in
+    /// this process will start them again.
+    ///
+    /// Leadership is held by the process, not the worker, so a standby replica
+    /// takes such a policy over only once a consumer reads this and ends the
+    /// process. The escalation hook that replaces this seam is
+    /// funkode-io/replay#186.
+    pub fn stopped_workers(&self) -> Vec<StoppedWorker> {
+        self.stopped.snapshot()
+    }
+}
+
+// ── Worker supervision ───────────────────────────────────────────────────────
+
+/// How the runner supervises a worker that dies for a reason the per-event path
+/// cannot contain — a panic in the drain loop, in cursor I/O, in the feed read.
+///
+/// Such a death kills the worker task. The runner restarts it, which costs at
+/// most a checkpoint's worth of re-delivery because the restarted worker resumes
+/// from the last durable checkpoint. Restarting is bounded twice over:
+///
+/// - each attempt waits [`initial_backoff`](Self::initial_backoff), doubled per
+///   restart already spent in the window and capped at
+///   [`max_backoff`](Self::max_backoff);
+/// - at most [`max_restarts`](Self::max_restarts) restarts are allowed within
+///   [`restart_window`](Self::restart_window); past that the worker stays down
+///   and is named by [`PolicyRunnerDaemon::stopped_workers`].
+///
+/// The budget is per worker, and so is everything a restart touches: it re-reads
+/// one policy's cursor and no other's, and leadership is unaffected because the
+/// advisory locks live on the process's shared lock-manager session rather than
+/// on the worker task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerSupervision {
+    max_restarts: u32,
+    window: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl Default for WorkerSupervision {
+    /// Five restarts a minute, backing off from 100 ms to at most 30 s: a
+    /// transient fault is ridden out without a human, while a worker dying from a
+    /// defect stops within about a minute instead of hiding in a restart loop.
+    fn default() -> Self {
+        Self {
+            max_restarts: 5,
+            window: Duration::from_secs(60),
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+impl WorkerSupervision {
+    /// How many restarts are allowed within [`restart_window`](Self::restart_window).
+    ///
+    /// `0` disables restarting: the first death stops the worker for good.
+    pub fn max_restarts(mut self, max_restarts: u32) -> Self {
+        self.max_restarts = max_restarts;
+        self
+    }
+
+    /// The sliding window the restart budget is counted over. A restart older
+    /// than this stops counting against it, so a worker that dies once a day is
+    /// restarted every day.
+    ///
+    /// `Duration::ZERO` means no window: restarts never age out, so
+    /// [`max_restarts`](Self::max_restarts) bounds the worker's whole life. A
+    /// zero window must not read as "every restart has already expired", which
+    /// would make the budget unbounded.
+    pub fn restart_window(mut self, window: Duration) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// How long the runner waits before the first restart in a window; each
+    /// further restart in the same window doubles it.
+    pub fn initial_backoff(mut self, initial_backoff: Duration) -> Self {
+        self.initial_backoff = initial_backoff;
+        self
+    }
+
+    /// The ceiling the doubling backoff stops at.
+    pub fn max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Backoff before the `restarts`-th restart of the current window (1-based).
+    fn backoff_for(&self, restarts: u32) -> Duration {
+        let doublings = restarts.saturating_sub(1).min(31);
+        self.initial_backoff
+            .saturating_mul(1u32 << doublings)
+            .min(self.max_backoff)
+    }
+}
+
+/// A worker the runner has given up on: it died more often than its
+/// [`WorkerSupervision`] budget allows, so it was not restarted again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedWorker {
+    /// The policy whose worker stopped. Nothing is reacting to its feed.
+    pub policy: String,
+    /// How many times it was restarted before the budget ran out.
+    pub restarts: u32,
+}
+
+/// The stopped workers, shared by the supervisors that record one and the
+/// [`PolicyRunnerDaemon`] a consumer reads them from.
+///
+/// Bounded by the number of registered policies: a supervisor records exactly
+/// one entry, and then it is done.
+#[derive(Clone, Default)]
+struct StoppedWorkers(Arc<Mutex<Vec<StoppedWorker>>>);
+
+impl StoppedWorkers {
+    fn record(&self, policy: &str, restarts: u32) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(StoppedWorker {
+                policy: policy.to_string(),
+                restarts,
+            });
+    }
+
+    fn snapshot(&self) -> Vec<StoppedWorker> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Why a supervised task came back of its own accord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// It was asked to stop, or the daemon that owns it is gone. Nothing to
+    /// supervise: this is the end of the line for that task.
+    Shutdown,
+    /// Something it depends on has stopped for good — for a worker, the lock
+    /// manager that elects it. Restarting cannot help, so the stop is published
+    /// rather than retried.
+    Abandoned,
+}
+
+/// What the supervisor does about a worker that just died.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartDecision {
+    /// Restart after `backoff`; this is restart number `restarts` in the window.
+    Restart { backoff: Duration, restarts: u32 },
+    /// The budget is spent: `restarts` restarts already happened in this window
+    /// and the worker stays down.
+    Exhausted { restarts: u32 },
+}
+
+/// One worker's restart budget: the restarts it has spent inside the current
+/// window.
+///
+/// Bounded by `max_restarts` entries — the budget is declared exhausted rather
+/// than recording one past it — and entries are dropped as they age out of the
+/// window.
+struct RestartBudget {
+    supervision: WorkerSupervision,
+    spent: VecDeque<Instant>,
+}
+
+impl RestartBudget {
+    fn new(supervision: WorkerSupervision) -> Self {
+        Self {
+            supervision,
+            spent: VecDeque::new(),
+        }
+    }
+
+    /// Charge a death that happened at `now` to the budget.
+    fn record_death(&mut self, now: Instant) -> RestartDecision {
+        while !self.supervision.window.is_zero()
+            && self
+                .spent
+                .front()
+                .is_some_and(|spent| now.duration_since(*spent) >= self.supervision.window)
+        {
+            self.spent.pop_front();
+        }
+
+        let already_spent = self.spent.len() as u32;
+        if already_spent >= self.supervision.max_restarts {
+            return RestartDecision::Exhausted {
+                restarts: already_spent,
+            };
+        }
+
+        self.spent.push_back(now);
+        let restarts = already_spent + 1;
+        RestartDecision::Restart {
+            backoff: self.supervision.backoff_for(restarts),
+            restarts,
         }
     }
 }
@@ -340,6 +558,7 @@ impl PolicyRunner {
             policies: Vec::new(),
             executors: HashMap::new(),
             notifications: true,
+            supervision: WorkerSupervision::default(),
         }
     }
 
@@ -618,6 +837,7 @@ impl PolicyRunner {
     pub fn start_polling(&self, interval: Duration) -> PolicyRunnerDaemon {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::with_capacity(self.policies.len() + 2);
+        let stopped_workers = StoppedWorkers::default();
 
         // ── Shared NOTIFY listener: one connection, broadcast fan-out ─────────
         // A single PgListener receives every append NOTIFY and rebroadcasts it to
@@ -625,73 +845,25 @@ impl PolicyRunner {
         let wake_tx = if self.notifications {
             let (wake_tx, _) = broadcast::channel::<()>(16);
             let pool = self.pool.clone();
-            let mut listener_shutdown_rx = shutdown_rx.clone();
+            let listener_shutdown_rx = shutdown_rx.clone();
             let tx = wake_tx.clone();
-            tasks.push(tokio::spawn(async move {
-                'reconnect: loop {
-                    if *listener_shutdown_rx.borrow() {
-                        return;
-                    }
-
-                    let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
-                        Ok(mut l) => match l.listen(REPLAY_NOTIFY_CHANNEL).await {
-                            Ok(()) => {
-                                tracing::debug!(
-                                    channel = REPLAY_NOTIFY_CHANNEL,
-                                    "shared LISTEN active; fanning NOTIFY to workers"
-                                );
-                                l
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = %error,
-                                    "shared LISTEN setup failed; workers fall back to polling"
-                                );
-                                tokio::select! {
-                                    _ = listener_shutdown_rx.changed() => return,
-                                    _ = tokio::time::sleep(interval) => {}
-                                }
-                                continue 'reconnect;
-                            }
-                        },
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %error,
-                                "shared PgListener connect failed; workers fall back to polling"
-                            );
-                            tokio::select! {
-                                _ = listener_shutdown_rx.changed() => return,
-                                _ = tokio::time::sleep(interval) => {}
-                            }
-                            continue 'reconnect;
-                        }
-                    };
-
-                    loop {
-                        tokio::select! {
-                            changed = listener_shutdown_rx.changed() => {
-                                if changed.is_err() || *listener_shutdown_rx.borrow() {
-                                    return;
-                                }
-                            }
-                            res = listener.recv() => match res {
-                                // Best-effort fan-out; a send error just means no
-                                // live receivers right now, which is fine.
-                                Ok(_) => {
-                                    let _ = tx.send(());
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        error = %error,
-                                        "shared PgListener recv error; reconnecting"
-                                    );
-                                    continue 'reconnect;
-                                }
-                            }
-                        }
-                    }
-                }
-            }));
+            tasks.push(tokio::spawn(supervise(
+                SupervisedTask {
+                    kind: "notify listener",
+                    policy: None,
+                    stopped: stopped_workers.clone(),
+                },
+                self.supervision,
+                shutdown_rx.clone(),
+                move || {
+                    tokio::spawn(run_notify_listener(
+                        pool.clone(),
+                        tx.clone(),
+                        listener_shutdown_rx.clone(),
+                        interval,
+                    ))
+                },
+            )));
             Some(wake_tx)
         } else {
             None
@@ -712,283 +884,74 @@ impl PolicyRunner {
         }
 
         {
+            // The senders live here rather than inside the task, so a manager
+            // that dies does not take every worker's leadership channel with it:
+            // a restarted manager publishes on the same channels, and the
+            // workers simply see leadership go false and come back.
+            let leadership = Arc::new(leadership);
             let pool = self.pool.clone();
-            let mut lock_shutdown_rx = shutdown_rx.clone();
-            tasks.push(tokio::spawn(async move {
-                // Which keys this session currently leads. Preserved across
-                // reconnects so a dropped session revokes exactly what it held.
-                let mut held = vec![false; leadership.len()];
-
-                // Revoke all locally-believed leadership. Used when the pinned
-                // session is lost: Postgres has already released the locks
-                // server-side, so we must stop the workers (set leadership false)
-                // before any standby can also acquire and double-process.
-                let revoke_all = |held: &mut [bool]| {
-                    for (idx, (_name, tx)) in leadership.iter().enumerate() {
-                        if held[idx] {
-                            held[idx] = false;
-                            let _ = tx.send(false);
-                        }
-                    }
-                };
-
-                'session: loop {
-                    if *lock_shutdown_rx.borrow() {
-                        break 'session;
-                    }
-
-                    // (Re)acquire the single pinned connection. All of this
-                    // instance's advisory locks live on this one session; when it
-                    // drops they are all released together, so on reconnect we
-                    // recompete for every key from scratch.
-                    let mut lock_conn = loop {
-                        if *lock_shutdown_rx.borrow() {
-                            return;
-                        }
-                        match pool.acquire().await {
-                            Ok(conn) => break conn,
-                            Err(error) => {
-                                tracing::error!(
-                                    error = %error,
-                                    "lock manager could not acquire its connection; retrying"
-                                );
-                                tokio::select! {
-                                    _ = lock_shutdown_rx.changed() => return,
-                                    _ = tokio::time::sleep(interval) => {}
-                                }
-                            }
-                        }
-                    };
-
-                    loop {
-                        if *lock_shutdown_rx.borrow() {
-                            // Clean shutdown: explicitly release every held lock on
-                            // the live connection so a standby can take over
-                            // immediately (without waiting for a TCP session timeout).
-                            for (idx, (name, tx)) in leadership.iter().enumerate() {
-                                if held[idx] {
-                                    let _ = sqlx::query(
-                                        "SELECT pg_advisory_unlock(hashtext($1)::bigint)",
-                                    )
-                                    .bind(name)
-                                    .execute(&mut *lock_conn)
-                                    .await;
-                                    held[idx] = false;
-                                    let _ = tx.send(false);
-                                }
-                            }
-                            break 'session;
-                        }
-
-                        // Liveness probe: if we already lead at least one policy,
-                        // verify the pinned session is still alive. A dropped
-                        // session releases ALL our advisory locks server-side, so we
-                        // must revoke leadership locally (stopping the workers before
-                        // a standby can also acquire) and reconnect to recompete.
-                        // This bounds any split-brain window to one poll interval.
-                        if held.iter().any(|h| *h) {
-                            if let Err(error) =
-                                sqlx::query("SELECT 1").execute(&mut *lock_conn).await
-                            {
-                                tracing::warn!(
-                                    error = %error,
-                                    "lock manager connection lost; revoking leadership and reconnecting"
-                                );
-                                revoke_all(&mut held);
-                                continue 'session;
-                            }
-                        }
-
-                        // Try to acquire any keys we do not yet hold.
-                        let mut connection_lost = false;
-                        for (idx, (name, tx)) in leadership.iter().enumerate() {
-                            if held[idx] {
-                                continue;
-                            }
-                            // pg_try_advisory_lock is non-blocking: returns true only
-                            // when this session exclusively holds the lock for `name`.
-                            match sqlx::query_scalar::<_, bool>(
-                                "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
-                            )
-                            .bind(name)
-                            .fetch_one(&mut *lock_conn)
-                            .await
-                            {
-                                Ok(true) => {
-                                    tracing::info!(policy = %name, "acquired advisory lock; leading");
-                                    held[idx] = true;
-                                    let _ = tx.send(true);
-                                }
-                                Ok(false) => {
-                                    tracing::debug!(
-                                        policy = %name,
-                                        "advisory lock held by another instance; standing by"
-                                    );
-                                }
-                                Err(error) => {
-                                    // A query error may mean the session has dropped:
-                                    // revoke leadership and reconnect rather than
-                                    // continuing to believe we lead the held keys.
-                                    tracing::warn!(
-                                        policy = %name,
-                                        error = %error,
-                                        "advisory lock query failed; reconnecting"
-                                    );
-                                    connection_lost = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if connection_lost {
-                            revoke_all(&mut held);
-                            continue 'session;
-                        }
-
-                        tokio::select! {
-                            _ = lock_shutdown_rx.changed() => {}
-                            _ = tokio::time::sleep(interval) => {}
-                        }
-                    }
-                }
-            }));
+            let lock_shutdown_rx = shutdown_rx.clone();
+            tasks.push(tokio::spawn(supervise(
+                SupervisedTask {
+                    kind: "lock manager",
+                    policy: None,
+                    stopped: stopped_workers.clone(),
+                },
+                self.supervision,
+                shutdown_rx.clone(),
+                move || {
+                    tokio::spawn(run_lock_manager(
+                        pool.clone(),
+                        Arc::clone(&leadership),
+                        lock_shutdown_rx.clone(),
+                        interval,
+                    ))
+                },
+            )));
         }
 
-        // ── Per-policy worker tasks ───────────────────────────────────────────
+        // ── Per-policy supervised workers ─────────────────────────────────────
+        // Every policy gets a supervisor that owns its worker task and restarts
+        // it when it dies for a reason the per-event path cannot contain. The
+        // supervisors are independent of one another, and none of them holds a
+        // lock: a restart re-reads one policy's cursor and leaves every other
+        // policy — and this process's leadership — untouched.
         for policy in &self.policies {
-            let policy = Arc::clone(policy);
-            let cqrs = self.cqrs.clone();
-            let pool = self.pool.clone();
-            let executors = self.executors.clone();
-            let stopped = self.stopped.clone();
-            let mut policy_shutdown_rx = shutdown_rx.clone();
             let name = policy.name().to_string();
-            let mut leader_rx = leadership_rx
+            let leader_rx = leadership_rx
                 .remove(&name)
                 .expect("every policy has a leadership channel");
-            let mut wake_rx = wake_tx.as_ref().map(broadcast::Sender::subscribe);
 
-            tasks.push(tokio::spawn(async move {
-                let max_depth = resolve_max_depth(policy.as_ref());
+            let worker = PolicyWorker {
+                policy: Arc::clone(policy),
+                cqrs: self.cqrs.clone(),
+                pool: self.pool.clone(),
+                executors: self.executors.clone(),
+                stopped: self.stopped.clone(),
+                shutdown_rx: shutdown_rx.clone(),
+                leader_rx,
+                wake_tx: wake_tx.clone(),
+                interval,
+                name,
+            };
 
-                'lifetime: loop {
-                    if *policy_shutdown_rx.borrow() {
-                        return;
-                    }
-
-                    // Wait until the shared lock manager elects this worker leader.
-                    while !*leader_rx.borrow() {
-                        tokio::select! {
-                            changed = policy_shutdown_rx.changed() => {
-                                if changed.is_err() || *policy_shutdown_rx.borrow() {
-                                    return;
-                                }
-                            }
-                            changed = leader_rx.changed() => {
-                                if changed.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-
-                    tracing::info!(policy = %name, "running as leader");
-
-                    // Initialize cursor from the stored checkpoint (or bootstrap).
-                    let mut cursor = match PolicyCursor::load(&pool, &name, policy.start_at()).await
-                    {
-                        Ok(cursor) => cursor,
-                        Err(error) => {
-                            tracing::error!(
-                                policy = %name,
-                                error = %error,
-                                "leader failed to initialize cursor; retrying"
-                            );
-                            tokio::select! {
-                                _ = policy_shutdown_rx.changed() => return,
-                                _ = tokio::time::sleep(interval) => {}
-                            }
-                            continue 'lifetime;
-                        }
-                    };
-
-                    // Leadership polling loop.
-                    loop {
-                        if *policy_shutdown_rx.borrow() || !*leader_rx.borrow() {
-                            break;
-                        }
-
-                        match drain_policy_once(
-                            &cqrs,
-                            &pool,
-                            &executors,
-                            policy.as_ref(),
-                            &mut cursor,
-                            &stopped,
-                            max_depth,
-                        )
-                        .await
-                        {
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::error!(
-                                    policy = %name,
-                                    error = %error,
-                                    "policy polling iteration failed"
-                                );
-                            }
-                        }
-
-                        // Wait for the next wakeup: NOTIFY broadcast (if enabled),
-                        // poll timeout, leadership change, or shutdown — whichever
-                        // fires first.
-                        if let Some(ref mut wake) = wake_rx {
-                            tokio::select! {
-                                changed = policy_shutdown_rx.changed() => {
-                                    if changed.is_err() || *policy_shutdown_rx.borrow() {
-                                        break;
-                                    }
-                                }
-                                changed = leader_rx.changed() => {
-                                    if changed.is_err() {
-                                        break;
-                                    }
-                                }
-                                _ = tokio::time::sleep(interval) => {}
-                                res = wake.recv() => {
-                                    // Ok or Lagged both mean "drain now"; Closed
-                                    // means the listener stopped, fall back to polling.
-                                    if let Err(broadcast::error::RecvError::Closed) = res {
-                                        wake_rx = None;
-                                    }
-                                }
-                            }
-                        } else {
-                            tokio::select! {
-                                changed = policy_shutdown_rx.changed() => {
-                                    if changed.is_err() || *policy_shutdown_rx.borrow() {
-                                        break;
-                                    }
-                                }
-                                changed = leader_rx.changed() => {
-                                    if changed.is_err() {
-                                        break;
-                                    }
-                                }
-                                _ = tokio::time::sleep(interval) => {}
-                            }
-                        }
-                    }
-
-                    if *policy_shutdown_rx.borrow() {
-                        return;
-                    }
-                    // Lost leadership without shutdown: loop back and wait to be
-                    // re-elected before draining again.
-                }
-            }));
+            tasks.push(tokio::spawn(supervise(
+                SupervisedTask {
+                    kind: "policy worker",
+                    policy: Some(worker.name.clone()),
+                    stopped: stopped_workers.clone(),
+                },
+                self.supervision,
+                shutdown_rx.clone(),
+                move || tokio::spawn(worker.clone().run()),
+            )));
         }
 
-        PolicyRunnerDaemon { shutdown_tx, tasks }
+        PolicyRunnerDaemon {
+            shutdown_tx,
+            tasks,
+            stopped: stopped_workers,
+        }
     }
 
     async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
@@ -1006,6 +969,579 @@ impl PolicyRunner {
         )
         .await
     }
+}
+
+/// Receive every append `NOTIFY` on one connection and fan it out to the workers.
+///
+/// A wakeup is a latency hint, never a correctness requirement: a worker that
+/// misses one still drains on its poll interval, which is why every failure here
+/// is a reconnect rather than an error anybody has to see.
+async fn run_notify_listener(
+    pool: Pool<Postgres>,
+    wake_tx: broadcast::Sender<()>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    interval: Duration,
+) -> Stop {
+    'reconnect: loop {
+        if *shutdown_rx.borrow() {
+            return Stop::Shutdown;
+        }
+
+        let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+            Ok(mut l) => match l.listen(REPLAY_NOTIFY_CHANNEL).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        channel = REPLAY_NOTIFY_CHANNEL,
+                        "shared LISTEN active; fanning NOTIFY to workers"
+                    );
+                    l
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "shared LISTEN setup failed; workers fall back to polling"
+                    );
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return Stop::Shutdown,
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                    continue 'reconnect;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "shared PgListener connect failed; workers fall back to polling"
+                );
+                tokio::select! {
+                    _ = shutdown_rx.changed() => return Stop::Shutdown,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                continue 'reconnect;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return Stop::Shutdown;
+                    }
+                }
+                res = listener.recv() => match res {
+                    // Best-effort fan-out; a send error just means no
+                    // live receivers right now, which is fine.
+                    Ok(_) => {
+                        let _ = wake_tx.send(());
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "shared PgListener recv error; reconnecting"
+                        );
+                        continue 'reconnect;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The lock manager's pinned connection, ended rather than returned when the
+/// manager lets go of it.
+///
+/// Postgres releases a session advisory lock only when the *session* ends, and a
+/// pooled connection outlives the task that borrowed it: sqlx pings a dropped
+/// connection and puts it back in the idle queue with its session state intact,
+/// locks and all. A lock manager that panicked would therefore leave every
+/// Policy it led locked by an idle connection — unleadable here and in every
+/// standby replica, and invisible, because a worker waiting to be elected looks
+/// exactly like a healthy standby. A `Drop` rather than a line at the end of the
+/// task, so the unwind path releases the locks too.
+struct PinnedSession(sqlx::pool::PoolConnection<Postgres>);
+
+impl PinnedSession {
+    fn pin(connection: sqlx::pool::PoolConnection<Postgres>) -> Self {
+        Self(connection)
+    }
+}
+
+impl Drop for PinnedSession {
+    fn drop(&mut self) {
+        // Takes effect when the connection itself drops, immediately after this.
+        self.0.close_on_drop();
+    }
+}
+
+impl std::ops::Deref for PinnedSession {
+    type Target = sqlx::PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PinnedSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Revoke every policy's leadership when the lock manager lets go of it.
+struct RevokeLeadership(Arc<Vec<(String, watch::Sender<bool>)>>);
+
+impl Drop for RevokeLeadership {
+    fn drop(&mut self) {
+        for (_name, tx) in self.0.iter() {
+            let _ = tx.send(false);
+        }
+    }
+}
+
+/// Hold every policy's advisory lock on one pinned connection and publish who
+/// leads what.
+///
+/// `leadership` is owned by the caller rather than by this task, so a manager
+/// that dies and is restarted resumes publishing on the same channels instead of
+/// closing them under the workers.
+async fn run_lock_manager(
+    pool: Pool<Postgres>,
+    leadership: Arc<Vec<(String, watch::Sender<bool>)>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    interval: Duration,
+) -> Stop {
+    // Covers every way this task can end, the unwind included: leaving a `true`
+    // behind would let this process's workers drain a policy whose advisory lock
+    // the dead session has already released, and which a standby may already
+    // hold. It also revokes on the way in, where a fresh session holds no locks
+    // whatever its predecessor believed.
+    let _revoke_on_exit = RevokeLeadership(Arc::clone(&leadership));
+    for (_name, tx) in leadership.iter() {
+        let _ = tx.send(false);
+    }
+
+    // Which keys this session currently leads. Preserved across
+    // reconnects so a dropped session revokes exactly what it held.
+    let mut held = vec![false; leadership.len()];
+
+    // Revoke all locally-believed leadership. Used when the pinned
+    // session is lost: Postgres has already released the locks
+    // server-side, so we must stop the workers (set leadership false)
+    // before any standby can also acquire and double-process.
+    let revoke_all = |held: &mut [bool]| {
+        for (idx, (_name, tx)) in leadership.iter().enumerate() {
+            if held[idx] {
+                held[idx] = false;
+                let _ = tx.send(false);
+            }
+        }
+    };
+
+    'session: loop {
+        if *shutdown_rx.borrow() {
+            break 'session;
+        }
+
+        // (Re)acquire the single pinned connection. All of this
+        // instance's advisory locks live on this one session; when it
+        // ends they are all released together, so on reconnect we
+        // recompete for every key from scratch.
+        let mut lock_conn = loop {
+            if *shutdown_rx.borrow() {
+                return Stop::Shutdown;
+            }
+            match pool.acquire().await {
+                Ok(conn) => break PinnedSession::pin(conn),
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "lock manager could not acquire its connection; retrying"
+                    );
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return Stop::Shutdown,
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                }
+            }
+        };
+
+        loop {
+            if *shutdown_rx.borrow() {
+                // Clean shutdown: explicitly release every held lock on
+                // the live connection so a standby can take over
+                // immediately (without waiting for a TCP session timeout).
+                for (idx, (name, tx)) in leadership.iter().enumerate() {
+                    if held[idx] {
+                        let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+                            .bind(name)
+                            .execute(&mut *lock_conn)
+                            .await;
+                        held[idx] = false;
+                        let _ = tx.send(false);
+                    }
+                }
+                break 'session;
+            }
+
+            // Liveness probe: if we already lead at least one policy,
+            // verify the pinned session is still alive. A dropped
+            // session releases ALL our advisory locks server-side, so we
+            // must revoke leadership locally (stopping the workers before
+            // a standby can also acquire) and reconnect to recompete.
+            // This bounds any split-brain window to one poll interval.
+            if held.iter().any(|h| *h) {
+                if let Err(error) = sqlx::query("SELECT 1").execute(&mut *lock_conn).await {
+                    tracing::warn!(
+                        error = %error,
+                        "lock manager connection lost; revoking leadership and reconnecting"
+                    );
+                    revoke_all(&mut held);
+                    continue 'session;
+                }
+            }
+
+            // Try to acquire any keys we do not yet hold.
+            let mut connection_lost = false;
+            for (idx, (name, tx)) in leadership.iter().enumerate() {
+                if held[idx] {
+                    continue;
+                }
+                // pg_try_advisory_lock is non-blocking: returns true only
+                // when this session exclusively holds the lock for `name`.
+                match sqlx::query_scalar::<_, bool>(
+                    "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
+                )
+                .bind(name)
+                .fetch_one(&mut *lock_conn)
+                .await
+                {
+                    Ok(true) => {
+                        tracing::info!(policy = %name, "acquired advisory lock; leading");
+                        held[idx] = true;
+                        let _ = tx.send(true);
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            policy = %name,
+                            "advisory lock held by another instance; standing by"
+                        );
+                    }
+                    Err(error) => {
+                        // A query error may mean the session has dropped:
+                        // revoke leadership and reconnect rather than
+                        // continuing to believe we lead the held keys.
+                        tracing::warn!(
+                            policy = %name,
+                            error = %error,
+                            "advisory lock query failed; reconnecting"
+                        );
+                        connection_lost = true;
+                        break;
+                    }
+                }
+            }
+            if connection_lost {
+                revoke_all(&mut held);
+                continue 'session;
+            }
+
+            tokio::select! {
+                _ = shutdown_rx.changed() => {}
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    }
+
+    Stop::Shutdown
+}
+
+/// Everything one policy's worker needs to run, cloned afresh on each restart.
+///
+/// The supervisor keeps this and spawns each attempt from a clone, which is what
+/// makes a restart possible at all.
+#[derive(Clone)]
+struct PolicyWorker {
+    policy: Arc<dyn ErasedPolicy>,
+    cqrs: Cqrs<PostgresEventStore>,
+    pool: Pool<Postgres>,
+    executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
+    stopped: StoppedPolicies,
+    shutdown_rx: watch::Receiver<bool>,
+    leader_rx: watch::Receiver<bool>,
+    /// Kept as the sender so each attempt subscribes its own receiver; a
+    /// restarted worker misses the wakeups it was dead for, which costs latency
+    /// and nothing else (polling is the correctness baseline).
+    wake_tx: Option<broadcast::Sender<()>>,
+    interval: Duration,
+    name: String,
+}
+
+impl PolicyWorker {
+    /// Drive one policy until shutdown: wait to be elected, load the cursor,
+    /// drain until leadership or the process ends.
+    ///
+    /// Returning is the *clean* exit, and says which one it was. Anything else —
+    /// a panic in the drain loop, in cursor I/O, in the feed read — unwinds this
+    /// task and is the supervisor's business.
+    async fn run(self) -> Stop {
+        let PolicyWorker {
+            policy,
+            cqrs,
+            pool,
+            executors,
+            stopped,
+            mut shutdown_rx,
+            mut leader_rx,
+            wake_tx,
+            interval,
+            name,
+        } = self;
+        let mut wake_rx = wake_tx.as_ref().map(broadcast::Sender::subscribe);
+
+        let max_depth = resolve_max_depth(policy.as_ref());
+
+        'lifetime: loop {
+            if *shutdown_rx.borrow() {
+                return Stop::Shutdown;
+            }
+
+            // Wait until the shared lock manager elects this worker leader.
+            while !*leader_rx.borrow() {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return Stop::Shutdown;
+                        }
+                    }
+                    changed = leader_rx.changed() => {
+                        // The channel is closed: the lock manager this worker is
+                        // elected by is gone for good, so nothing will ever make
+                        // it a leader again.
+                        if changed.is_err() {
+                            return Stop::Abandoned;
+                        }
+                    }
+                }
+            }
+
+            tracing::info!(policy = %name, "running as leader");
+
+            // Initialize cursor from the stored checkpoint (or bootstrap).
+            let mut cursor = match PolicyCursor::load(&pool, &name, policy.start_at()).await {
+                Ok(cursor) => cursor,
+                Err(error) => {
+                    tracing::error!(
+                        policy = %name,
+                        error = %error,
+                        "leader failed to initialize cursor; retrying"
+                    );
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return Stop::Shutdown,
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                    continue 'lifetime;
+                }
+            };
+
+            // Where this worker picks up, once per election. It is the only
+            // line a process killed from outside leaves: the same
+            // `next_position` on every restart names a poison event
+            // (`SELECT * FROM events WHERE global_position = <next_position>`), a
+            // position that advances means the process is leaking instead.
+            tracing::info!(
+                policy = %name,
+                resuming_after = cursor.position,
+                next_position = cursor.position + 1,
+                "policy worker is leading; resuming after its last checkpoint"
+            );
+
+            // Leadership polling loop.
+            loop {
+                if *shutdown_rx.borrow() || !*leader_rx.borrow() {
+                    break;
+                }
+
+                match drain_policy_once(
+                    &cqrs,
+                    &pool,
+                    &executors,
+                    policy.as_ref(),
+                    &mut cursor,
+                    &stopped,
+                    max_depth,
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            policy = %name,
+                            error = %error,
+                            "policy polling iteration failed"
+                        );
+                    }
+                }
+
+                // Wait for the next wakeup: NOTIFY broadcast (if enabled),
+                // poll timeout, leadership change, or shutdown — whichever
+                // fires first.
+                if let Some(ref mut wake) = wake_rx {
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        changed = leader_rx.changed() => {
+                            if changed.is_err() {
+                                return Stop::Abandoned;
+                            }
+                        }
+                        _ = tokio::time::sleep(interval) => {}
+                        res = wake.recv() => {
+                            // Ok or Lagged both mean "drain now"; Closed
+                            // means the listener stopped, fall back to polling.
+                            if let Err(broadcast::error::RecvError::Closed) = res {
+                                wake_rx = None;
+                            }
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        changed = leader_rx.changed() => {
+                            if changed.is_err() {
+                                return Stop::Abandoned;
+                            }
+                        }
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                }
+            }
+
+            if *shutdown_rx.borrow() {
+                return Stop::Shutdown;
+            }
+            // Lost leadership without shutdown: loop back and wait to be
+            // re-elected before draining again.
+        }
+    }
+}
+
+/// What is under supervision, for the log and for whoever hears it stop.
+struct SupervisedTask {
+    /// What kind of task it is: `policy worker`, `lock manager`, `notify listener`.
+    kind: &'static str,
+    /// The policy a worker drives. `None` for the process-wide shared tasks.
+    policy: Option<String>,
+    /// Where a permanent stop is published.
+    stopped: StoppedWorkers,
+}
+
+/// Own a task and restart it when it dies.
+///
+/// `spawn` is called for each attempt, so the caller decides what a restarted
+/// task is built from. Three outcomes, and only one of them is quiet:
+///
+/// - the task returns [`Stop::Shutdown`] — it was asked to stop, and supervision
+///   ends with it;
+/// - the task returns [`Stop::Abandoned`] — something it depends on is gone for
+///   good, so restarting it cannot help. It is recorded as stopped;
+/// - the task panicked — charged to `supervision`'s [`RestartBudget`], which
+///   either grants a restart after a backoff or declares the task stopped.
+///
+/// A stop is recorded against the policy a worker drives. The shared tasks name
+/// no policy: a lock manager that stops takes every policy's leadership with it,
+/// and each of those workers reports its own abandonment.
+async fn supervise<F>(
+    task: SupervisedTask,
+    supervision: WorkerSupervision,
+    mut shutdown_rx: watch::Receiver<bool>,
+    spawn: F,
+) where
+    F: Fn() -> JoinHandle<Stop>,
+{
+    let SupervisedTask {
+        kind,
+        policy,
+        stopped,
+    } = task;
+    let policy_name = policy.as_deref().unwrap_or("-");
+    let mut budget = RestartBudget::new(supervision);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
+        let cause = match spawn().await {
+            Ok(Stop::Shutdown) => return,
+            Ok(Stop::Abandoned) => {
+                tracing::error!(
+                    task = kind,
+                    policy = policy_name,
+                    "a task this one depends on has stopped; it cannot be restarted \
+                     into a process that no longer runs it"
+                );
+                if let Some(policy) = policy.as_deref() {
+                    stopped.record(policy, 0);
+                }
+                return;
+            }
+            // Aborted from outside (a runtime shutting down): not a fault, and
+            // respawning into a dying runtime helps nobody.
+            Err(error) if error.is_cancelled() => return,
+            Err(error) => panic_cause(error),
+        };
+
+        match budget.record_death(Instant::now()) {
+            RestartDecision::Restart { backoff, restarts } => {
+                tracing::warn!(
+                    task = kind,
+                    policy = policy_name,
+                    restarts,
+                    window_secs = supervision.window.as_secs(),
+                    backoff_ms = backoff.as_millis() as u64,
+                    cause = %cause,
+                    "task died outside its reaction; restarting after backoff"
+                );
+                tokio::select! {
+                    _ = shutdown_rx.changed() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+            }
+            RestartDecision::Exhausted { restarts } => {
+                tracing::error!(
+                    task = kind,
+                    policy = policy_name,
+                    restarts,
+                    window_secs = supervision.window.as_secs(),
+                    cause = %cause,
+                    "task exhausted its restart budget and is stopped"
+                );
+                if let Some(policy) = policy.as_deref() {
+                    stopped.record(policy, restarts);
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Read a dead task's panic message, so a restart says what killed the worker.
+fn panic_cause(error: tokio::task::JoinError) -> String {
+    let payload = error.into_panic();
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "panic carrying a payload of an unrecognised type".to_string()
 }
 
 /// Maximum number of times a retryable dispatch error is retried before the
@@ -2057,5 +2593,475 @@ mod tests {
         assert!(err
             .to_string()
             .contains("policy dispatch metadata contains a key that collides"));
+    }
+}
+
+#[cfg(test)]
+mod restart_budget_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{RestartBudget, RestartDecision, WorkerSupervision};
+
+    /// Three restarts a minute, 100 ms doubling to a 400 ms ceiling.
+    fn supervision() -> WorkerSupervision {
+        WorkerSupervision::default()
+            .max_restarts(3)
+            .restart_window(Duration::from_secs(60))
+            .initial_backoff(Duration::from_millis(100))
+            .max_backoff(Duration::from_millis(400))
+    }
+
+    fn restart(decision: RestartDecision) -> (Duration, u32) {
+        match decision {
+            RestartDecision::Restart { backoff, restarts } => (backoff, restarts),
+            RestartDecision::Exhausted { restarts } => {
+                panic!("expected a restart, got exhaustion after {restarts}")
+            }
+        }
+    }
+
+    /// A worker failing against a struggling database must not spin: each
+    /// restart in the window waits twice as long as the one before it.
+    #[test]
+    fn each_restart_in_a_window_waits_twice_as_long() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision());
+
+        assert_eq!(
+            restart(budget.record_death(now)),
+            (Duration::from_millis(100), 1)
+        );
+        assert_eq!(
+            restart(budget.record_death(now + Duration::from_millis(1))),
+            (Duration::from_millis(200), 2)
+        );
+        assert_eq!(
+            restart(budget.record_death(now + Duration::from_millis(2))),
+            (Duration::from_millis(400), 3)
+        );
+    }
+
+    /// The doubling stops at the configured ceiling rather than growing until a
+    /// restart is indistinguishable from never happening.
+    #[test]
+    fn the_backoff_stops_doubling_at_the_ceiling() {
+        let supervision = supervision().max_restarts(10);
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision);
+
+        let backoffs: Vec<Duration> = (0..6)
+            .map(|nth| restart(budget.record_death(now + Duration::from_millis(nth))).0)
+            .collect();
+
+        assert_eq!(
+            backoffs,
+            vec![
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(400),
+                Duration::from_millis(400),
+                Duration::from_millis(400),
+            ]
+        );
+    }
+
+    /// "Restarting forever" must never pass for "running": once the window's
+    /// restarts are spent the worker stays down.
+    #[test]
+    fn a_fourth_death_inside_the_window_exhausts_a_budget_of_three() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision());
+
+        for nth in 0..3 {
+            restart(budget.record_death(now + Duration::from_millis(nth)));
+        }
+
+        assert_eq!(
+            budget.record_death(now + Duration::from_secs(59)),
+            RestartDecision::Exhausted { restarts: 3 }
+        );
+    }
+
+    /// The budget is a window, not a lifetime total: a worker that dies once a
+    /// day is restarted every day.
+    #[test]
+    fn a_death_past_the_window_restarts_with_a_fresh_budget() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision());
+
+        for nth in 0..3 {
+            restart(budget.record_death(now + Duration::from_millis(nth)));
+        }
+
+        // Far enough out that every earlier restart has aged out of the window.
+        let later = now + Duration::from_secs(61);
+        assert_eq!(
+            restart(budget.record_death(later)),
+            (Duration::from_millis(100), 1),
+            "the first restart of a new window backs off from the start again"
+        );
+    }
+
+    /// A budget of zero is how a consumer says "never restart this": the first
+    /// death is terminal, and nothing waits for a backoff that will not be used.
+    #[test]
+    fn a_budget_of_zero_makes_the_first_death_terminal() {
+        let mut budget = RestartBudget::new(supervision().max_restarts(0));
+
+        assert_eq!(
+            budget.record_death(Instant::now()),
+            RestartDecision::Exhausted { restarts: 0 }
+        );
+    }
+
+    /// A zero-length window is "no window", not "everything has already expired":
+    /// the budget still bounds the restarts.
+    #[test]
+    fn a_window_of_zero_still_bounds_the_restarts() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision().restart_window(Duration::ZERO));
+
+        for nth in 0..3 {
+            restart(budget.record_death(now + Duration::from_millis(nth)));
+        }
+
+        assert_eq!(
+            budget.record_death(now + Duration::from_secs(3_600)),
+            RestartDecision::Exhausted { restarts: 3 },
+            "no age makes a restart stop counting against a zero window"
+        );
+    }
+
+    /// The bookkeeping is bounded by the budget, not by how long the process has
+    /// been up or by how often the worker has died in it.
+    #[test]
+    fn the_recorded_deaths_never_outgrow_the_budget() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision());
+
+        for nth in 0..1_000 {
+            let _ = budget.record_death(now + Duration::from_millis(nth));
+        }
+
+        assert!(
+            budget.spent.len() <= 3,
+            "the window holds at most the budget, got {}",
+            budget.spent.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tracing_test::traced_test;
+
+    use super::{
+        supervise, RevokeLeadership, Stop, StoppedWorkers, SupervisedTask, WorkerSupervision,
+    };
+
+    /// Backoffs short enough that a test waits on outcomes rather than on time.
+    fn supervision() -> WorkerSupervision {
+        WorkerSupervision::default()
+            .max_restarts(2)
+            .initial_backoff(Duration::from_millis(1))
+            .max_backoff(Duration::from_millis(2))
+    }
+
+    fn a_policy_worker(stopped: &StoppedWorkers) -> SupervisedTask {
+        SupervisedTask {
+            kind: "policy worker",
+            policy: Some("supervised".to_string()),
+            stopped: stopped.clone(),
+        }
+    }
+
+    /// A task that stops because it was asked to is not a fault: it is not
+    /// restarted, and nothing is reported.
+    #[tokio::test]
+    async fn a_task_that_shuts_down_is_not_restarted() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let spawned = Arc::clone(&attempts);
+        supervise(
+            a_policy_worker(&stopped),
+            supervision(),
+            shutdown_rx,
+            move || {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async { Stop::Shutdown })
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(stopped.snapshot().is_empty());
+    }
+
+    /// A task that keeps dying is restarted its budget's worth of times and then
+    /// reported, rather than restarted forever or dropped in silence.
+    ///
+    /// The `warn` is asserted here because it is what an operator sees first: it
+    /// has to name the policy and how many restarts the window has seen
+    /// (funkode-io/replay#185).
+    #[tokio::test]
+    #[traced_test]
+    async fn a_task_that_keeps_dying_is_restarted_then_reported() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let spawned = Arc::clone(&attempts);
+        supervise(
+            a_policy_worker(&stopped),
+            supervision(),
+            shutdown_rx,
+            move || {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async { panic!("died in the night") })
+            },
+        )
+        .await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "the first run plus two restarts"
+        );
+        let stopped = stopped.snapshot();
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].policy, "supervised");
+        assert_eq!(stopped[0].restarts, 2);
+
+        logs_assert(|lines| {
+            let restarts: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("restarting after backoff"))
+                .collect();
+            if restarts.len() != 2 {
+                return Err(format!("one line per restart, got {}", restarts.len()));
+            }
+            for (nth, line) in restarts.iter().enumerate() {
+                for field in [
+                    "WARN",
+                    "policy=\"supervised\"",
+                    &format!("restarts={}", nth + 1),
+                ] {
+                    if !line.contains(field) {
+                        return Err(format!("the restart warning lacks {field}: {line}"));
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// A worker whose lock manager is gone cannot be helped by restarting it, so
+    /// it is reported straight away instead of burning a budget first.
+    #[tokio::test]
+    async fn an_abandoned_task_is_reported_without_being_restarted() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let spawned = Arc::clone(&attempts);
+        supervise(
+            a_policy_worker(&stopped),
+            supervision(),
+            shutdown_rx,
+            move || {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async { Stop::Abandoned })
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(stopped.snapshot()[0].policy, "supervised");
+    }
+
+    /// A shared task names no policy, so its stop is left to the policies it
+    /// abandons to report — `stopped_workers` stays a list of policies.
+    #[tokio::test]
+    async fn a_shared_task_that_stops_reports_no_policy() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+
+        supervise(
+            SupervisedTask {
+                kind: "lock manager",
+                policy: None,
+                stopped: stopped.clone(),
+            },
+            supervision(),
+            shutdown_rx,
+            || tokio::spawn(async { panic!("the lock manager died") }),
+        )
+        .await;
+
+        assert!(stopped.snapshot().is_empty());
+    }
+
+    /// Shutdown during a backoff ends supervision there and then: a daemon
+    /// shutting down never waits out a restart it is not going to make.
+    #[tokio::test]
+    async fn shutdown_during_a_backoff_ends_supervision() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let spawned = Arc::clone(&attempts);
+        let supervisor = tokio::spawn(supervise(
+            a_policy_worker(&stopped),
+            // A backoff no test would wait out on purpose.
+            supervision().initial_backoff(Duration::from_secs(30)),
+            shutdown_rx,
+            move || {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async { panic!("died once") })
+            },
+        ));
+
+        // Let the first death happen, then shut down mid-backoff.
+        while attempts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let _ = shutdown_tx.send(true);
+
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("supervision must end with the shutdown, not with the backoff")
+            .expect("the supervisor task must not panic");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "no restart was made");
+        assert!(stopped.snapshot().is_empty());
+    }
+
+    /// A lock manager that dies while leading releases its advisory locks with
+    /// its session, so a standby may take them at once. Leadership must therefore
+    /// be revoked on the unwind, not when the next attempt starts a backoff
+    /// later, or this process's workers would drain a policy it no longer leads.
+    #[tokio::test]
+    async fn leadership_is_revoked_as_a_dying_manager_unwinds() {
+        let (leader_tx, leader_rx) = watch::channel(false);
+        let leadership = Arc::new(vec![("led".to_string(), leader_tx)]);
+
+        let manager = tokio::spawn({
+            let leadership = Arc::clone(&leadership);
+            async move {
+                let _revoke_on_exit = RevokeLeadership(Arc::clone(&leadership));
+                let _ = leadership[0].1.send(true);
+                panic!("died while leading");
+            }
+        });
+
+        assert!(manager.await.is_err(), "the manager must have panicked");
+        assert!(
+            !*leader_rx.borrow(),
+            "leadership must be false the moment the manager's task is gone"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pinned_session_tests {
+    use std::time::{Duration, Instant};
+
+    use sqlx::postgres::PgPoolOptions;
+    use testcontainers_modules::postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    use super::PinnedSession;
+
+    /// Try to take `key` on `session`, reporting whether it was free.
+    async fn try_lock(session: &mut sqlx::PgConnection, key: i64) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(session)
+            .await
+            .expect("the lock attempt must reach the server")
+    }
+
+    /// How long the server is given to release the locks of a session that is on
+    /// its way out: the close is sqlx's to schedule, so the release is awaited
+    /// rather than assumed to have landed by the next statement.
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Postgres releases a session advisory lock when the *session* ends, and
+    /// sqlx returns a dropped pool connection to the idle queue with its locks
+    /// intact. The whole fix rests on `close_on_drop` ending the session
+    /// instead; if that ever stops holding, it fails here rather than as a
+    /// Policy nobody in the fleet can lead (funkode-io/replay#185).
+    ///
+    /// Deliberately not pinned to the suite's image tag: a session-scoped
+    /// advisory lock has been released at session end on every PostgreSQL this
+    /// crate supports, so the version is not what this test is about.
+    #[tokio::test]
+    async fn a_dropped_pinned_session_releases_its_advisory_locks_postgres_test() {
+        let container = postgres::Postgres::default()
+            .start()
+            .await
+            .expect("failed to start the postgres container");
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to read the container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to read the container port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("failed to create the postgres pool");
+
+        // The observer is its own session, never the pool's: a pooled
+        // connection handed back after the drop may be the very session that
+        // took the lock, and a session can always re-take a lock it holds.
+        let mut observer = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+            .await
+            .expect("failed to connect the observing session");
+        let key: i64 = 0x5eed;
+
+        {
+            let mut pinned = PinnedSession::pin(
+                pool.acquire()
+                    .await
+                    .expect("failed to acquire the connection"),
+            );
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(key)
+                .execute(&mut *pinned)
+                .await
+                .expect("the pinned session must take the lock");
+
+            assert!(
+                !try_lock(&mut observer, key).await,
+                "nobody else can take a lock the pinned session holds"
+            );
+        }
+
+        let deadline = Instant::now() + RELEASE_TIMEOUT;
+        loop {
+            if try_lock(&mut observer, key).await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a dropped PinnedSession must end its session and release its \
+                 locks; after {RELEASE_TIMEOUT:?} the lock was still held by a \
+                 connection nobody is using"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
