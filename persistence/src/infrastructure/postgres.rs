@@ -508,16 +508,13 @@ impl PostgresEventStoreBuilder {
         let mut replayed = 0usize;
 
         loop {
-            let events =
+            let (events, next_cursor) =
                 Self::load_replay_chunk(&mut *tx, filter.clone(), cursor, chunk_size).await?;
 
-            let Some(last) = events.last() else { break };
-
-            cursor = Some(ReplayCursor {
-                created: last.created,
-                version: last.version,
-                id: last.id,
-            });
+            if events.is_empty() {
+                break;
+            }
+            cursor = next_cursor;
 
             let fetched = events.len();
             replayed += fetched;
@@ -546,32 +543,22 @@ impl PostgresEventStoreBuilder {
         filter: StreamFilter,
         after: Option<ReplayCursor>,
         chunk_size: usize,
-    ) -> Result<Vec<PersistedEvent<Value>>, replay::Error> {
+    ) -> Result<(Vec<PersistedEvent<Value>>, Option<ReplayCursor>), replay::Error> {
         let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-            "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version \
+            "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, global_position \
              FROM events WHERE (",
         );
         PostgresEventStore::add_filters(&mut query_builder, filter);
         query_builder.push(")");
 
-        if let Some(ReplayCursor {
-            created,
-            version,
-            id,
-        }) = after
-        {
+        if let Some(ReplayCursor { global_position }) = after {
             query_builder
-                .push(" AND (created, version, id) > (")
-                .push_bind(created)
-                .push(", ")
-                .push_bind(version)
-                .push(", ")
-                .push_bind(id)
-                .push(")");
+                .push(" AND global_position > ")
+                .push_bind(global_position);
         }
 
         query_builder
-            .push(" ORDER BY created, version, id ASC LIMIT ")
+            .push(" ORDER BY global_position ASC LIMIT ")
             // Saturating rather than `as`: a wrapped cast would send Postgres a negative
             // LIMIT. Unreachable in practice — no buffer holds `i64::MAX` events — but the
             // clamp costs nothing and the wrap fails obscurely.
@@ -583,24 +570,28 @@ impl PostgresEventStoreBuilder {
             .await
             .map_err(crate::db_error)?;
 
-        rows.into_iter()
-            .map(PersistedEvent::<Value>::try_from)
-            .collect()
+        let mut cursor = None;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let global_position: i64 = row.get("global_position");
+            cursor = Some(ReplayCursor { global_position });
+            events.push(PersistedEvent::<Value>::try_from(row)?);
+        }
+
+        Ok((events, cursor))
     }
 }
 
-/// Where a chunked replay left off: the sort key of the last event handed over.
+/// Where a chunked replay left off: the `global_position` of the last event handed over.
 ///
-/// Replay order is `(created, version)`, which is not unique — versions restart per
-/// stream and separate transactions can share a `created` instant — so a `>` cursor on
-/// that pair alone would skip every row after the first of a tied group. `id` breaks the
-/// tie, making the key a total order and the paging lossless, without changing the order
-/// events are replayed in.
+/// `global_position` is a `BIGSERIAL` assigned at INSERT under the same `streams … FOR
+/// UPDATE` lock that hands out `version`, so it is a unique total order that agrees with
+/// append order — a `>` cursor on it pages losslessly, without the `(created, version)`
+/// tie hazards (versions restart per stream, and separate transactions can share a
+/// `created` instant).
 #[derive(Clone, Copy)]
 struct ReplayCursor {
-    created: chrono::DateTime<Utc>,
-    version: i64,
-    id: Uuid,
+    global_position: i64,
 }
 
 impl PostgresEventStore {
@@ -790,7 +781,7 @@ impl EventStore for PostgresEventStore {
             let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(sql);
             Self::add_filters(&mut query_builder, filter.clone());
 
-            let query_builder = query_builder.push(" ORDER BY created, version ASC");
+            let query_builder = query_builder.push(" ORDER BY global_position ASC");
 
             let mut rows = query_builder
                 .build()
@@ -861,7 +852,7 @@ impl EventStore for PostgresEventStore {
         // 2. Stream the current live events inside the transaction (now protected by the lock),
         //    processing rows one at a time so the full history is never held in memory.
         let event_stream = sqlx::query(
-            "SELECT data FROM events WHERE stream_id = $1 AND aggregate_version IS NULL ORDER BY version",
+            "SELECT data FROM events WHERE stream_id = $1 AND aggregate_version IS NULL ORDER BY global_position",
         )
         .bind(&stream_id_str)
         .fetch(&mut *tx)

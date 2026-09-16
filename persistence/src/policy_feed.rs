@@ -3,7 +3,7 @@
 //!
 //! Contiguity is decided on the unfiltered `global_position` stream: a position the
 //! Policy's filter excludes advances the cursor and fires nothing, like a compaction
-//! snapshot (ADR-0004, ADR-0012). Pure, so it needs no database.
+//! snapshot (ADR-0004, ADR-0013). Pure, so it needs no database.
 
 /// One position from the window read past a Policy's cursor. `delivered` is `None`
 /// for a compaction snapshot or an event the Policy's filter excludes.
