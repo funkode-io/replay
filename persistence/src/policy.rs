@@ -173,9 +173,10 @@ pub trait Policy: Send + Sync {
     /// the back-off an `Unavailable` error gets, then parked as a dead letter
     /// of kind `Timeout`. Raise it for a reaction that is legitimately slow.
     ///
-    /// It bounds the future the runner awaits: dropping that future cancels the
-    /// command at its next suspension point and cannot interrupt work the
-    /// reaction has moved onto another task.
+    /// It bounds the future the runner awaits: cancellation happens at a
+    /// suspension point, so it cannot interrupt work the reaction moved onto
+    /// another task, nor a command that never yields (see `CONTEXT.md`'s
+    /// non-guarantees).
     fn dispatch_timeout(&self) -> Option<Duration> {
         None
     }

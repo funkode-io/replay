@@ -2101,19 +2101,21 @@ fn resolve_read_batch_size(policy: &dyn ErasedPolicy, checkpoint_size: u32) -> u
 /// default 30s. `0` and unparseable values fall back to the default rather than
 /// abandoning every dispatch the moment it starts.
 fn resolve_dispatch_timeout(policy: &dyn ErasedPolicy) -> Duration {
-    dispatch_timeout_or_default(policy.dispatch_timeout_erased())
+    dispatch_timeout_or_default(
+        policy.dispatch_timeout_erased(),
+        std::env::var(DISPATCH_TIMEOUT_ENV_VAR).ok(),
+    )
 }
 
-/// The precedence itself, over the override a policy declared.
-fn dispatch_timeout_or_default(declared: Option<Duration>) -> Duration {
+/// The precedence itself, over values rather than the process environment, so it
+/// is testable without mutating global state.
+fn dispatch_timeout_or_default(declared: Option<Duration>, env: Option<String>) -> Duration {
     if let Some(timeout) = declared {
         if !timeout.is_zero() {
             return timeout;
         }
     }
-    std::env::var(DISPATCH_TIMEOUT_ENV_VAR)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+    env.and_then(|raw| raw.parse::<u64>().ok())
         .filter(|millis| *millis > 0)
         .map_or(DEFAULT_DISPATCH_TIMEOUT, Duration::from_millis)
 }
@@ -2167,29 +2169,52 @@ mod tests {
 
     use super::{
         dispatch_timeout_or_default, merge_dispatch_metadata, panic_message, DispatchFailure,
-        DEFAULT_DISPATCH_TIMEOUT, DISPATCH_TIMEOUT_ENV_VAR, TIMEOUT_ERROR_KIND,
+        DEFAULT_DISPATCH_TIMEOUT, TIMEOUT_ERROR_KIND,
     };
 
     #[test]
     fn a_policy_that_declares_a_timeout_gets_it() {
         let declared = Duration::from_millis(250);
 
-        assert_eq!(dispatch_timeout_or_default(Some(declared)), declared);
+        assert_eq!(
+            dispatch_timeout_or_default(Some(declared), Some("900".into())),
+            declared,
+            "a declared override beats the environment"
+        );
+    }
+
+    #[test]
+    fn the_env_var_is_read_when_no_policy_declares_a_timeout() {
+        assert_eq!(
+            dispatch_timeout_or_default(None, Some("900".into())),
+            Duration::from_millis(900)
+        );
     }
 
     /// A zero timeout would abandon every dispatch the moment it started, so it
-    /// is read as "unset" rather than obeyed.
+    /// is read as "unset" rather than obeyed — from either source.
     #[test]
     fn a_zero_timeout_is_not_a_timeout() {
-        // Process-global, and tests share the process: only assert the default
-        // when nothing has set it.
-        if std::env::var(DISPATCH_TIMEOUT_ENV_VAR).is_err() {
-            assert_eq!(
-                dispatch_timeout_or_default(Some(Duration::ZERO)),
-                DEFAULT_DISPATCH_TIMEOUT
-            );
-            assert_eq!(dispatch_timeout_or_default(None), DEFAULT_DISPATCH_TIMEOUT);
-        }
+        assert_eq!(
+            dispatch_timeout_or_default(Some(Duration::ZERO), None),
+            DEFAULT_DISPATCH_TIMEOUT
+        );
+        assert_eq!(
+            dispatch_timeout_or_default(None, Some("0".into())),
+            DEFAULT_DISPATCH_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn an_unparseable_env_var_falls_back_to_the_default() {
+        assert_eq!(
+            dispatch_timeout_or_default(None, Some("30s".into())),
+            DEFAULT_DISPATCH_TIMEOUT
+        );
+        assert_eq!(
+            dispatch_timeout_or_default(None, None),
+            DEFAULT_DISPATCH_TIMEOUT
+        );
     }
 
     /// A timeout is parked under its own kind, and says what it exceeded: the

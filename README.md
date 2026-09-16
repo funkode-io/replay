@@ -2238,7 +2238,8 @@ the same back-off as an `Unavailable` error, and parked with
 `error_kind = 'Timeout'` once the retries are exhausted
 ([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It
 bounds the future the runner awaits, and cannot interrupt work the reaction moved
-onto another task.
+onto another task or a command that never yields — see `CONTEXT.md`'s
+non-guarantees.
 
 ### Failure handling
 
@@ -2247,7 +2248,7 @@ When a dispatch fails the runner classifies the error and responds accordingly:
 | Error category | Condition | Action |
 |----------------|-----------|--------|
 | **Business-rule violation** | `ErrorKind::BusinessRuleViolation` | Advance cursor immediately — the event is correct, the domain logic rejected the command. No retry, no dead-letter. |
-| **Retryable** | `Unavailable`, `RateLimited`, `Conflict`, or a dispatch that exceeded its timeout | Exponential back-off, up to `MAX_DISPATCH_RETRIES` (3) attempts. |
+| **Retryable** | `Unavailable`, `RateLimited`, `Conflict`, or a dispatch that exceeded its timeout | Exponential back-off, `MAX_DISPATCH_RETRIES` (3) retries after the first attempt — four in all. |
 | **Permanent** | All other errors, or retries exhausted | Write to `policy_dead_letters`, advance cursor. The policy keeps running. |
 | **Timeout** | The dispatch was still running when its `dispatch_timeout` expired | Abandon it, log at `warn` with the elapsed time, retry; on exhaustion write `error_kind = 'Timeout'` and advance cursor. |
 | **Panic** | The reaction (or a command it dispatched) panicked | Write to `policy_dead_letters` with `error_kind = 'Panic'` and the panic's message, log at `error`, advance cursor. Never retried — a reaction that panicked panics again ([ADR-0016](docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md)). |

@@ -156,30 +156,32 @@ async fn a_hung_dispatch_is_parked_as_a_timeout_and_the_policy_keeps_reacting_po
     );
 
     // A worker cut loose from a hung reaction says so, with the one number that
-    // is not inferable from the table: how long it waited.
+    // is not inferable from the table: how long it waited. Keyed on the fields,
+    // not the sentence — ADR-0014 keeps log wording free to change.
     logs_assert(|lines: &[&str]| {
-        let timed_out: Vec<&str> = lines
+        let position = format!("global_position={}", hung.global_position);
+        let warned: Vec<&str> = lines
             .iter()
             .copied()
-            .filter(|line| line.contains("exceeded its dispatch timeout"))
+            .filter(|line| {
+                line.contains("WARN")
+                    && line.contains(harness.policy_name())
+                    && line.contains(&position)
+                    && line.contains("elapsed_ms=")
+                    && line.contains("timeout_ms=")
+            })
             .collect();
-        let position = format!("global_position={}", hung.global_position);
-        if timed_out.is_empty() {
-            return Err(
-                "expected at least one WARN naming the abandoned dispatch, got none".into(),
-            );
+        if warned.is_empty() {
+            let warnings: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|line| line.contains("WARN"))
+                .collect();
+            return Err(format!(
+                "expected a WARN carrying the policy, {position}, timeout_ms and elapsed_ms, got {warnings:#?}"
+            ));
         }
-        match timed_out.iter().find(|line| {
-            line.contains("WARN")
-                && line.contains(harness.policy_name())
-                && line.contains(&position)
-                && line.contains("elapsed_ms=")
-        }) {
-            Some(_) => Ok(()),
-            None => Err(format!(
-                "expected a WARN naming the policy, {position} and the elapsed time, got {timed_out:#?}"
-            )),
-        }
+        Ok(())
     });
 
     harness.shutdown().await;

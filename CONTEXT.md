@@ -290,6 +290,13 @@ it:
   task.** It bounds the future the runner awaits; a `tokio::spawn`, a blocking
   pool or a request already in flight keeps running, unobserved, after the runner
   has stopped waiting for it.
+- **A [Dispatch timeout] cannot cut loose a reaction that never yields.**
+  Cancellation happens at a suspension point, so a command that blocks the thread
+  — `std::thread::sleep`, a synchronous client, a tight CPU loop — runs past its
+  limit and holds the worker until it returns on its own. Bounding that needs a
+  thread or process boundary the runner does not impose; a reaction that must
+  block belongs on `spawn_blocking`, where the timeout at least stops the runner
+  waiting on it.
 - **An OOM kill is not containable in-process.** The kernel ends the process; no
   supervision layer can catch it. The only defences are bounding what a reaction
   loads and bounding how long it may run.
