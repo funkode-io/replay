@@ -67,9 +67,13 @@ _Avoid_: trigger, cause, origin.
 A recorded failure of a [Policy] reaction that could not be completed — a
 _recorded skip_, never a silent one. When a reaction fails permanently (or
 exhausts its retries) the runner stores a dead letter and advances past the
-triggering event so a single bad event never wedges the Policy. Dead letters are
-queryable so an operator can later inspect them and either [Retry] or [Discard]
-them.
+triggering event so a single bad event never wedges the Policy. A reaction that
+**panics** is one of these: the panic is contained at the event it was reacting
+to, parked on first occurrence without a retry, and recorded as kind `Panic` so
+an operator can tell a defect in the reaction from a command the domain refused
+([ADR-0016](docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md)).
+Dead letters are queryable so an operator can later inspect them and either
+[Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.
 
 ### Retry
@@ -259,6 +263,9 @@ it:
   runner's containment boundaries are the reaction to one event and the worker; a
   task the reaction hands to a runtime or a blocking pool unwinds in its own
   task, outside both, and neither parks a [Dead letter] nor restarts anything.
+- **No panic is contained under `panic = "abort"`.** Containment is unwinding: a
+  binary that aborts on panic ends the process before the runner's catch can park
+  a [Dead letter].
 - **An OOM kill is not containable in-process.** The kernel ends the process; no
   supervision layer can catch it. The only defences are bounding what a reaction
   loads and bounding how long it may run.

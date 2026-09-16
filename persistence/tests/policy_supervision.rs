@@ -124,8 +124,8 @@ async fn a_worker_that_dies_outside_the_reaction_is_restarted_postgres_test() {
                 .with_worker_supervision(quick_supervision())
                 .register_policy(DiesOutsideTheReaction {
                     name: policy.to_string(),
-                    deaths_to_stage: staged,
-                    deaths,
+                    deaths_to_stage: Arc::clone(&staged),
+                    deaths: Arc::clone(&deaths),
                     only_after_reacting: true,
                     reacted: Arc::new(AtomicBool::new(false)),
                 })
@@ -193,8 +193,8 @@ async fn a_worker_that_exhausts_its_budget_stops_and_is_reported_postgres_test()
                 .with_worker_supervision(quick_supervision().max_restarts(2))
                 .register_policy(DiesOutsideTheReaction {
                     name: policy.to_string(),
-                    deaths_to_stage: staged,
-                    deaths,
+                    deaths_to_stage: Arc::clone(&staged),
+                    deaths: Arc::clone(&deaths),
                     only_after_reacting: false,
                     reacted: Arc::new(AtomicBool::new(false)),
                 })

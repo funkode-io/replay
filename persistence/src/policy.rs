@@ -164,6 +164,11 @@ pub trait Policy: Send + Sync {
     ///
     /// Invariant: because delivery is at-least-once, target aggregate command
     /// handlers must absorb duplicate causation ids as no-ops.
+    ///
+    /// A panic here does not stop the Policy: the runner contains it at the
+    /// event being delivered, parks a dead letter recording the panic, and
+    /// carries on with the next event. A panic inside a task this reaction
+    /// **spawns itself** is outside that boundary and is contained by nothing.
     fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch>;
 }
 
