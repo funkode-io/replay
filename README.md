@@ -2080,7 +2080,7 @@ machinery — causation stamping, failure handling, batching, advisory lock — 
 full `Policy` impl.
 
 ```rust,ignore
-let runner = PolicyRunnerBuilder::new(cqrs, pool)
+let runner = PolicyRunner::builder(cqrs)
     .register_services::<FeeLedger>(fee_services)
     .register_policy_fn::<BankAccountEvent, _>(
         "deposit_fee",
@@ -2104,7 +2104,7 @@ let runner = PolicyRunnerBuilder::new(cqrs, pool)
 use std::time::Duration;
 use replay_persistence::{PolicyRunnerBuilder, StartAt};
 
-let runner = PolicyRunnerBuilder::new(cqrs, pool)
+let runner = PolicyRunner::builder(cqrs)
     .register_services::<BankAccount>(())          // enable Dispatch::to::<BankAccount>
     .register_services::<FeeLedger>(fee_services)
     .register_policy(FeePolicy { ledger_id })
@@ -2181,7 +2181,7 @@ If `PgListener` setup fails (e.g. in environments without `LISTEN` support) the
 task falls back silently to pure polling. You can also opt-out explicitly:
 
 ```rust,ignore
-let runner = PolicyRunnerBuilder::new(cqrs, pool)
+let runner = PolicyRunner::builder(cqrs)
     .register_policy(my_policy)
     .without_notifications() // pure polling; no PgListener connection opened
     .build();
@@ -2249,16 +2249,16 @@ parks a dead letter for it), and any panic in a binary built with
 
 #### Restarting a worker that dies
 
-That table covers a dispatch that *returns* an error. A worker can also die
-outright — a panic in the drain loop, in cursor I/O, in the feed read. The runner
-restarts it on a budget; the restart resumes from the last durable checkpoint, so
-it costs at most a checkpoint's worth of re-delivery.
+That table covers what the delivery of one event can contain. A worker can also
+die outright — a panic in the drain loop, in cursor I/O, in the feed read. The
+runner restarts it on a budget; the restart resumes from the last durable
+checkpoint, so it costs at most a checkpoint's worth of re-delivery.
 
 ```rust,ignore
 use std::time::Duration;
 use replay_persistence::WorkerSupervision;
 
-let runner = PolicyRunnerBuilder::new(cqrs, pool)
+let runner = PolicyRunner::builder(cqrs)
     .register_policy(my_policy)
     .with_worker_supervision(
         WorkerSupervision::default()   // 5 restarts a minute, 100 ms → 30 s

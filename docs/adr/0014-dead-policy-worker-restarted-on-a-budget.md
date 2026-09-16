@@ -58,10 +58,10 @@ Each worker now runs under a supervisor that restarts it, bounded by a
 
 ## Consequences
 
-- A panic *inside* the reaction still kills the worker; containing it at the
-  event and parking a [Dead letter](../../CONTEXT.md#dead-letter) is
-  funkode-io/replay#183, which will keep a poison event from consuming a restart
-  budget.
+- A panic *inside* the reaction never reaches supervision: it is contained at the
+  event and parked as a [Dead letter](../../CONTEXT.md#dead-letter)
+  ([ADR-0016](0016-panicking-reaction-parked-as-a-permanent-failure.md)), so a
+  poison event cannot consume a restart budget.
 - **A dispatch that fails is never supervision's business.** Restarting on a
   failed dispatch would re-deliver the same event forever, which is the loop the
   dead-letter contract exists to prevent, so no test here asserts it.

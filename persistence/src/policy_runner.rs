@@ -369,6 +369,11 @@ impl WorkerSupervision {
     /// The sliding window the restart budget is counted over. A restart older
     /// than this stops counting against it, so a worker that dies once a day is
     /// restarted every day.
+    ///
+    /// `Duration::ZERO` means no window: restarts never age out, so
+    /// [`max_restarts`](Self::max_restarts) bounds the worker's whole life. A
+    /// zero window must not read as "every restart has already expired", which
+    /// would make the budget unbounded.
     pub fn restart_window(mut self, window: Duration) -> Self {
         self.window = window;
         self
@@ -476,10 +481,11 @@ impl RestartBudget {
 
     /// Charge a death that happened at `now` to the budget.
     fn record_death(&mut self, now: Instant) -> RestartDecision {
-        while self
-            .spent
-            .front()
-            .is_some_and(|spent| now.duration_since(*spent) >= self.supervision.window)
+        while !self.supervision.window.is_zero()
+            && self
+                .spent
+                .front()
+                .is_some_and(|spent| now.duration_since(*spent) >= self.supervision.window)
         {
             self.spent.pop_front();
         }
@@ -1039,23 +1045,35 @@ impl std::ops::DerefMut for PinnedSession {
     }
 }
 
+/// Revoke every policy's leadership when the lock manager lets go of it.
+struct RevokeLeadership(Arc<Vec<(String, watch::Sender<bool>)>>);
+
+impl Drop for RevokeLeadership {
+    fn drop(&mut self) {
+        for (_name, tx) in self.0.iter() {
+            let _ = tx.send(false);
+        }
+    }
+}
+
 /// Hold every policy's advisory lock on one pinned connection and publish who
 /// leads what.
 ///
 /// `leadership` is owned by the caller rather than by this task, so a manager
 /// that dies and is restarted resumes publishing on the same channels instead of
-/// closing them under the workers. Each attempt starts by revoking what it does
-/// not hold: a fresh session holds no locks, whatever its predecessor believed.
+/// closing them under the workers.
 async fn run_lock_manager(
     pool: Pool<Postgres>,
     leadership: Arc<Vec<(String, watch::Sender<bool>)>>,
     mut shutdown_rx: watch::Receiver<bool>,
     interval: Duration,
 ) -> Stop {
-    // This session holds nothing yet. Say so before competing for anything: a
-    // predecessor that died mid-leadership left its last word on these channels,
-    // and a worker acting on it would be draining a policy this process no
-    // longer leads.
+    // Covers every way this task can end, the unwind included: leaving a `true`
+    // behind would let this process's workers drain a policy whose advisory lock
+    // the dead session has already released, and which a standby may already
+    // hold. It also revokes on the way in, where a fresh session holds no locks
+    // whatever its predecessor believed.
+    let _revoke_on_exit = RevokeLeadership(Arc::clone(&leadership));
     for (_name, tx) in leadership.iter() {
         let _ = tx.send(false);
     }
@@ -2574,6 +2592,24 @@ mod restart_budget_tests {
         );
     }
 
+    /// A zero-length window is "no window", not "everything has already expired":
+    /// the budget still bounds the restarts.
+    #[test]
+    fn a_window_of_zero_still_bounds_the_restarts() {
+        let now = Instant::now();
+        let mut budget = RestartBudget::new(supervision().restart_window(Duration::ZERO));
+
+        for nth in 0..3 {
+            restart(budget.record_death(now + Duration::from_millis(nth)));
+        }
+
+        assert_eq!(
+            budget.record_death(now + Duration::from_secs(3_600)),
+            RestartDecision::Exhausted { restarts: 3 },
+            "no age makes a restart stop counting against a zero window"
+        );
+    }
+
     /// The bookkeeping is bounded by the budget, not by how long the process has
     /// been up or by how often the worker has died in it.
     #[test]
@@ -2601,7 +2637,9 @@ mod supervisor_tests {
 
     use tokio::sync::watch;
 
-    use super::{supervise, Stop, StoppedWorkers, SupervisedTask, WorkerSupervision};
+    use super::{
+        supervise, RevokeLeadership, Stop, StoppedWorkers, SupervisedTask, WorkerSupervision,
+    };
 
     /// Backoffs short enough that a test waits on outcomes rather than on time.
     fn supervision() -> WorkerSupervision {
@@ -2753,5 +2791,30 @@ mod supervisor_tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1, "no restart was made");
         assert!(stopped.snapshot().is_empty());
+    }
+
+    /// A lock manager that dies while leading releases its advisory locks with
+    /// its session, so a standby may take them at once. Leadership must therefore
+    /// be revoked on the unwind, not when the next attempt starts a backoff
+    /// later, or this process's workers would drain a policy it no longer leads.
+    #[tokio::test]
+    async fn leadership_is_revoked_as_a_dying_manager_unwinds() {
+        let (leader_tx, leader_rx) = watch::channel(false);
+        let leadership = Arc::new(vec![("led".to_string(), leader_tx)]);
+
+        let manager = tokio::spawn({
+            let leadership = Arc::clone(&leadership);
+            async move {
+                let _revoke_on_exit = RevokeLeadership(Arc::clone(&leadership));
+                let _ = leadership[0].1.send(true);
+                panic!("died while leading");
+            }
+        });
+
+        assert!(manager.await.is_err(), "the manager must have panicked");
+        assert!(
+            !*leader_rx.borrow(),
+            "leadership must be false the moment the manager's task is gone"
+        );
     }
 }

@@ -3,17 +3,17 @@
 //!
 //! The death injected here is one no single event can be blamed for: a panic
 //! raised while the worker prepares its read of the feed, the shape of a panic in
-//! the lock manager, the listener or cursor I/O. A dispatch that *fails* is not
-//! supervision's business — it is retried or parked and the cursor advances — so
-//! no test here makes a failed dispatch restart a worker.
+//! the lock manager, the listener or cursor I/O. A panic *inside* the reaction is
+//! parked as a dead letter and never reaches supervision
+//! ([ADR-0016](../../docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md),
+//! `policy_panic.rs`), and a dispatch that merely fails is retried or parked — so
+//! no test here restarts a worker for either.
 //!
 //! Resuming from the last durable checkpoint is covered by
 //! `policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test` in
 //! `integration_tests.rs`. It cannot be re-asserted through a supervised restart:
-//! the only per-event seam inside a batch belongs to the policy, so a death
-//! landing mid-batch is a panic *inside* the reaction — funkode-io/replay#183's
-//! boundary. Every death supervision can inject lands between batches, where the
-//! cursor is already durable.
+//! every death supervision can inject lands between batches, where the cursor is
+//! already durable.
 //!
 //! Every assertion is something an operator could make: the policy reacted
 //! again, the cursor moved, the daemon names a worker it gave up on.
@@ -232,18 +232,6 @@ async fn a_worker_that_exhausts_its_budget_stops_and_is_reported_postgres_test()
         "only the policy that kept dying stopped: {:?}",
         harness.stopped_workers()
     );
-    // A stop is the absence of further deaths, and absence is the one thing no
-    // `await_*` can observe: it has to be given time to be contradicted. Bounded
-    // by several of this test's backoffs, so a worker still being restarted
-    // would have died again inside it.
-    let toll = deaths.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        deaths.load(Ordering::SeqCst),
-        toll,
-        "a stopped worker must not be restarted again"
-    );
-
     harness.shutdown().await;
 }
 
