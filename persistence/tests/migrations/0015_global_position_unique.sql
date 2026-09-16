@@ -15,9 +15,16 @@
 --
 -- Deliberately not `IF NOT EXISTS`: a concurrent build that fails leaves an index behind
 -- that is present but invalid, and `IF NOT EXISTS` would step over it and report success,
--- leaving the rule unenforced. Rerunning instead fails with "relation already exists" —
--- the leftover has to be dropped (`DROP INDEX CONCURRENTLY idx_events_global_position_unique`)
--- and the build repeated.
+-- leaving the rule unenforced. Rerunning fails with "relation already exists" instead, and
+-- what to do then depends on which of two leftovers this is:
+--
+--   SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_events_global_position_unique'::regclass;
+--
+-- `false` — the build failed: `DROP INDEX CONCURRENTLY idx_events_global_position_unique`
+-- and rerun. `true` — the build succeeded and the process died before sqlx recorded the
+-- migration (it writes the `_sqlx_migrations` row in a second statement): the rule is
+-- already enforced, so record version 15 as applied rather than rebuilding a valid index
+-- over a live table.
 --
 -- A unique index, not a UNIQUE table constraint: the enforcement is identical, and
 -- promoting it (`ALTER TABLE … ADD CONSTRAINT … USING INDEX`) buys a catalog entry at the
