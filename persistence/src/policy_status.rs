@@ -147,7 +147,7 @@ impl PolicyStatusStore {
     /// `MIN(global_position) > cursor` probe, and a per-policy `LATERAL`
     /// aggregate over `policy_dead_letters`.  The dead-letter lateral is
     /// filtered by `pc.name`, so it uses the `(policy_name, created_at)` index;
-    /// the `MIN`/`MAX` on `events` are probes on `idx_events_global_position`.
+    /// the `MIN`/`MAX` on `events` are probes on `idx_events_global_position_unique`.
     /// The event log is never scanned.
     pub async fn list(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
         let rows = sqlx::query(

@@ -1,0 +1,16 @@
+-- no-transaction
+-- Never used. Dropped.
+--
+-- 0009 built it for a feed query that was never issued:
+--
+--   SELECT ... FROM events WHERE global_position > $cursor AND compacted_snapshot = false
+--
+-- The `AND` went into the SELECT list instead, in the same change that added the index
+-- (#93): a synthetic snapshot row has to be *read* so the cursor can advance past it,
+-- and only delivery is decided on the flag (ADR-0004, ADR-0013). Postgres uses a partial
+-- index only when the query predicate implies the index's, and `global_position > $1`
+-- implies nothing about `compacted_snapshot`, so no plan has ever reached this index.
+--
+-- It is not free: every append maintains it. 0015's unique index serves the feed's read
+-- (`the_feed_read_still_scans_an_index_postgres_test`).
+DROP INDEX CONCURRENTLY IF EXISTS idx_events_policy_feed;
