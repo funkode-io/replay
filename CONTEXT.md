@@ -149,7 +149,9 @@ abandons it — per Policy, defaulting to 30s
 a reaction that has *stopped* loose from its worker; it is not a latency budget,
 and a reaction that is merely slow raises it rather than being parked by it.
 Exceeding it is retryable, so a hang reaches the same [Dead letter] a dependency
-outage does, by the same back-off.
+outage does, by the same back-off. Distinct from a [Blocked policy] in both
+directions: a Policy held inside one reaction has a healthy feed in front of it,
+and a blocked one is not running a reaction at all.
 _Avoid_: deadline, SLA, watchdog, timeout (unqualified).
 
 ### Policy runner
@@ -282,6 +284,7 @@ it:
 [Policy]: #policy
 [Policy feed]: #policy-feed
 [Dead letter]: #dead-letter
+[Blocked policy]: #blocked-policy
 [Dispatch timeout]: #dispatch-timeout
 [Retry]: #retry
 [Discard]: #discard

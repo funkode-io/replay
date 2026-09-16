@@ -66,7 +66,7 @@ impl Policy for HangingPolicy {
                 self.reactions.fetch_add(1, Ordering::SeqCst);
                 vec![Dispatch::to::<Probe>(
                     ProbeUrn::new("wedged").unwrap(),
-                    ProbeCommand::Hang {
+                    ProbeCommand::Sleep {
                         millis: self.hang_for.as_millis() as u64,
                     },
                 )]
@@ -94,7 +94,7 @@ fn hanging_policy(
     }
 }
 
-/// The whole of the watchdog in one run: the hung dispatch is abandoned and
+/// The whole of the [Dispatch timeout] in one run: the dispatch is abandoned and
 /// retried, parked once the retries are exhausted, recorded as a timeout rather
 /// than as a panic or a returned error, and the worker carries on.
 #[tokio::test]

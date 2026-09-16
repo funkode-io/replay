@@ -1414,7 +1414,7 @@ impl Delivery<'_> {
 
     /// Execute one dispatch, bounded in time.
     ///
-    /// The watchdog on the dispatch path: a command that does not come back holds
+    /// The [Dispatch timeout] in force: a command that does not come back holds
     /// the worker and nothing else — no error, no log line, no cursor movement, so
     /// a frozen pipeline looks exactly like an idle one. Dropping the future when
     /// `limit` expires turns that into an ordinary retryable failure the runner
@@ -2095,7 +2095,7 @@ mod tests {
         );
     }
 
-    /// The classification a returned error carries is untouched by the watchdog.
+    /// The classification a returned error carries is untouched by the timeout.
     #[test]
     fn a_returned_error_keeps_its_own_kind() {
         let declined = DispatchFailure::Returned(replay::Error::business_rule_violation(

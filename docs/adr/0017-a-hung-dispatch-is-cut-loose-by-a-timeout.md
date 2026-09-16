@@ -3,11 +3,11 @@
 **Status:** accepted
 
 Nothing bounded the dispatch path in time. A command handler that blocked — a
-stalled connection, a lock it would never get, a read that never returned — held
-its worker indefinitely while every other Policy carried on normally, so the
-deployment looked healthy while one pipeline was frozen. Unlike a panic, the
-failure produced no error, no log line and no cursor movement: it was
-indistinguishable from a Policy with nothing to do.
+connection that never answered, a lock it would never get, a read that never
+returned — held its worker indefinitely while every other Policy carried on
+normally, so the deployment looked healthy while one pipeline was frozen. Unlike
+a panic, the failure produced no error, no log line and no cursor movement: it
+was indistinguishable from a Policy with nothing to do.
 
 The runner already knows what to do with a retryable failure: back off, retry,
 park a [Dead letter] when the budget runs out. A timeout is how a hang becomes
