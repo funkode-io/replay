@@ -290,16 +290,14 @@ impl PolicyRunnerDaemon {
     /// The workers the runner has given up on, in the order they stopped.
     ///
     /// A worker that dies outside its reaction is restarted (see
-    /// [`WorkerSupervision`]); one that dies more often than its budget allows
-    /// is not, and is named here. An empty list is the healthy case, which is
-    /// what makes a non-empty one worth alerting on: nothing is reacting for the
-    /// policies it names, and nothing in this process will start them again.
+    /// [`WorkerSupervision`]); one that dies more often than its budget allows is
+    /// named here instead. Nothing is reacting for those policies, and nothing in
+    /// this process will start them again.
     ///
-    /// This is the seam the escalation hook (funkode-io/replay#186) replaces.
-    /// Until it lands, exhausting the budget stops the worker rather than ending
-    /// the process, and the advisory lock that elects the leader is held by the
-    /// process rather than by the worker — so a standby replica takes the policy
-    /// over only once a consumer reads this and ends the process itself.
+    /// Leadership is held by the process, not the worker, so a standby replica
+    /// takes such a policy over only once a consumer reads this and ends the
+    /// process. The escalation hook that replaces this seam is
+    /// funkode-io/replay#186.
     pub fn stopped_workers(&self) -> Vec<StoppedWorker> {
         self.stopped.snapshot()
     }
@@ -310,19 +308,13 @@ impl PolicyRunnerDaemon {
 /// How the runner supervises a worker that dies for a reason the per-event path
 /// cannot contain — a panic in the drain loop, in cursor I/O, in the feed read.
 ///
-/// Such a death kills the worker task, and an unsupervised worker is simply gone
-/// until somebody notices the work stopped. The runner restarts it instead,
-/// which is safe because a restarted worker resumes from the last durable
-/// checkpoint and re-delivers at most a checkpoint's worth of events —
-/// at-least-once is the contract reactions are already written against.
-///
-/// Restarting is bounded twice over, because "restarting forever" must never be
-/// mistaken for "running":
+/// Such a death kills the worker task. The runner restarts it, which costs at
+/// most a checkpoint's worth of re-delivery because the restarted worker resumes
+/// from the last durable checkpoint. Restarting is bounded twice over:
 ///
 /// - each attempt waits [`initial_backoff`](Self::initial_backoff), doubled per
 ///   restart already spent in the window and capped at
-///   [`max_backoff`](Self::max_backoff), so a worker failing against a
-///   struggling database does not spin against it;
+///   [`max_backoff`](Self::max_backoff);
 /// - at most [`max_restarts`](Self::max_restarts) restarts are allowed within
 ///   [`restart_window`](Self::restart_window); past that the worker stays down
 ///   and is named by [`PolicyRunnerDaemon::stopped_workers`].
@@ -340,11 +332,9 @@ pub struct WorkerSupervision {
 }
 
 impl Default for WorkerSupervision {
-    /// Five restarts a minute, backing off from 100 ms to at most 30 s.
-    ///
-    /// Chosen so a transient fault — a failover, a dropped connection — is
-    /// ridden out without a human, while a worker dying from a defect stops
-    /// within about a minute instead of hiding behind a restart loop.
+    /// Five restarts a minute, backing off from 100 ms to at most 30 s: a
+    /// transient fault is ridden out without a human, while a worker dying from a
+    /// defect stops within about a minute instead of hiding in a restart loop.
     fn default() -> Self {
         Self {
             max_restarts: 5,
@@ -973,12 +963,10 @@ async fn run_notify_listener(
 /// pooled connection outlives the task that borrowed it: sqlx pings a dropped
 /// connection and puts it back in the idle queue with its session state intact,
 /// locks and all. A lock manager that panicked would therefore leave every
-/// Policy it led locked by an idle connection nobody is using — unleadable by
-/// this process *and* by every standby replica, and invisible, because a worker
-/// waiting to be elected looks exactly like a standby that is meant to be
-/// waiting. Ending the session is what makes a restart recover rather than
-/// wedge, so it must happen even on the unwind path, which is why it is a `Drop`
-/// and not a line of code at the end of the task.
+/// Policy it led locked by an idle connection — unleadable here and in every
+/// standby replica, and invisible, because a worker waiting to be elected looks
+/// exactly like a healthy standby. A `Drop` rather than a line at the end of the
+/// task, so the unwind path releases the locks too.
 struct PinnedSession(sqlx::pool::PoolConnection<Postgres>);
 
 impl PinnedSession {
@@ -1166,9 +1154,8 @@ async fn run_lock_manager(
 
 /// Everything one policy's worker needs to run, cloned afresh on each restart.
 ///
-/// A worker is a task that can die, so its inputs are held here rather than
-/// captured in a closure: the supervisor keeps this and spawns a new task from a
-/// clone of it, which is what makes a restart possible at all.
+/// The supervisor keeps this and spawns each attempt from a clone, which is what
+/// makes a restart possible at all.
 #[derive(Clone)]
 struct PolicyWorker {
     policy: Arc<dyn ErasedPolicy>,
@@ -1253,15 +1240,11 @@ impl PolicyWorker {
                 }
             };
 
-            // Where this worker is picking up, said once per election rather
-            // than once per event. It is the only line a process that dies
-            // *outside* the runtime leaves behind: an OOM kill takes the process
-            // between two instructions, so nothing can be logged as it happens,
-            // and the last thing the runner said before going quiet is the
-            // position it was about to work from. A process killed by one poison
-            // event therefore prints the same `next_position` on every restart,
-            // which names the event to look at:
-            // `SELECT * FROM events WHERE global_position = <next_position>`.
+            // Where this worker picks up, once per election. It is the only
+            // line a process killed from outside leaves: the same
+            // `next_position` on every restart names a poison event
+            // (`SELECT * FROM events WHERE global_position = <next_position>`), a
+            // position that advances means the process is leaking instead.
             tracing::info!(
                 policy = %name,
                 resuming_after = cursor.position,
@@ -1370,8 +1353,7 @@ struct SupervisedTask {
 ///
 /// A stop is recorded against the policy a worker drives. The shared tasks name
 /// no policy: a lock manager that stops takes every policy's leadership with it,
-/// and each of those workers reports its own abandonment, which is the unit an
-/// operator acts on.
+/// and each of those workers reports its own abandonment.
 async fn supervise<F>(
     task: SupervisedTask,
     supervision: WorkerSupervision,
@@ -1447,8 +1429,7 @@ async fn supervise<F>(
     }
 }
 
-/// Read a dead task's panic message, so a restart says what killed the worker
-/// rather than only that something did.
+/// Read a dead task's panic message, so a restart says what killed the worker.
 fn panic_cause(error: tokio::task::JoinError) -> String {
     let payload = error.into_panic();
     if let Some(message) = payload.downcast_ref::<&'static str>() {

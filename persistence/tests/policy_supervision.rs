@@ -1,28 +1,22 @@
 //! A worker that dies is restarted — supervision, driven against a real daemon
 //! and a real database (funkode-io/replay#185).
 //!
-//! The death injected here is one the per-event path cannot contain and cannot
-//! be blamed on any single event: a panic raised while the worker prepares its
-//! read of the feed. That is the shape of a panic in the lock manager, the
-//! listener or cursor I/O — the causes #185 names — and it is deliberately *not*
-//! a failure of a dispatch. A dispatch that fails is not supervision's business
-//! at all: a retryable error is retried, anything else is parked as a dead
-//! letter and the cursor advances, which is the contract that keeps one bad
-//! event from stopping a policy. A test that made a dispatch failure restart a
-//! worker would contradict it, so there is none here.
+//! The death injected here is one no single event can be blamed for: a panic
+//! raised while the worker prepares its read of the feed, the shape of a panic in
+//! the lock manager, the listener or cursor I/O. A dispatch that *fails* is not
+//! supervision's business — it is retried or parked and the cursor advances — so
+//! no test here makes a failed dispatch restart a worker.
 //!
-//! Resuming from the last durable checkpoint after a death is covered by
+//! Resuming from the last durable checkpoint is covered by
 //! `policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test` in
-//! `integration_tests.rs`, which is also what makes a pod restart safe. It is
-//! not re-asserted through a supervised restart here because it cannot be: the
-//! only per-event seam inside a batch belongs to the policy, so a death landing
-//! mid-batch is a panic *inside* the reaction — the boundary funkode-io/replay#183
-//! owns. Every death supervision can inject lands between batches, where the
+//! `integration_tests.rs`. It cannot be re-asserted through a supervised restart:
+//! the only per-event seam inside a batch belongs to the policy, so a death
+//! landing mid-batch is a panic *inside* the reaction — funkode-io/replay#183's
+//! boundary. Every death supervision can inject lands between batches, where the
 //! cursor is already durable.
 //!
 //! Every assertion is something an operator could make: the policy reacted
-//! again, the cursor moved, the daemon names a worker it gave up on. The only
-//! in-process state a test touches is the fault it injected itself.
+//! again, the cursor moved, the daemon names a worker it gave up on.
 
 mod common;
 
@@ -46,14 +40,11 @@ fn quick_supervision() -> WorkerSupervision {
 
 /// A policy that kills its worker from *outside* the reaction.
 ///
-/// `stream_filter` is called by the worker as it prepares its read of the feed,
-/// before any event is delivered, so a panic there stands in for the panics this
-/// ticket is about: the lock manager, the listener, cursor I/O. It is nothing to
-/// do with the event that happens to be next, which is the distinction that
-/// keeps a restart from being a substitute for parking a dead letter.
-///
-/// The reaction itself is ordinary — it echoes every ping — so a worker that
-/// came back is visible by it reacting again.
+/// `stream_filter` is called as the worker prepares its read of the feed, before
+/// any event is delivered, so a panic there stands in for the panics this ticket
+/// is about and has nothing to do with the event that happens to be next. The
+/// reaction itself is ordinary — it echoes every ping — so a worker that came
+/// back is visible by it reacting again.
 struct DiesOutsideTheReaction {
     name: String,
     /// How many more times the worker should die. Decremented as it dies, so a

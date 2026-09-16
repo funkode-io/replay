@@ -2243,15 +2243,9 @@ When a dispatch fails the runner classifies the error and responds accordingly:
 #### Restarting a worker that dies
 
 That table covers a dispatch that *returns* an error. A worker can also die
-outright — a panic in the drain loop, in cursor I/O, in the feed read — which
-kills its task and, unsupervised, would leave the policy not running until
-somebody noticed the work had stopped.
-
-The runner restarts such a worker. It is safe because a restarted worker resumes
-from its last durable checkpoint and re-delivers at most a checkpoint's worth of
-events, which is the at-least-once contract reactions are already written
-against. Restarting is bounded by a budget, so "restarting forever" is never
-mistaken for "running":
+outright — a panic in the drain loop, in cursor I/O, in the feed read. The runner
+restarts it on a budget; the restart resumes from the last durable checkpoint, so
+it costs at most a checkpoint's worth of re-delivery.
 
 ```rust,ignore
 use std::time::Duration;
@@ -2270,11 +2264,10 @@ let runner = PolicyRunnerBuilder::new(cqrs, pool)
 ```
 
 Each restart waits `initial_backoff` doubled per restart already spent in the
-window, capped at `max_backoff`, and logs at `warn` naming the policy, the cause
-and how many restarts the window has seen. Restarts are per worker: one policy's
-restart re-reads that policy's cursor only, and leadership is untouched because
-the advisory locks live on the process's shared lock-manager session rather than
-on the worker task.
+window, capped at `max_backoff`, and logs at `warn` with the policy, the cause
+and the window's restart count. A restart re-reads that policy's cursor only;
+leadership is untouched, because the advisory locks live on the process's shared
+lock-manager session rather than on the worker task.
 
 A worker that spends its budget is **stopped**, logged at `error`, and named by
 `daemon.stopped_workers()`:
@@ -2287,46 +2280,40 @@ for stopped in daemon.stopped_workers() {
 }
 ```
 
-An empty list is the healthy case. A non-empty one is worth alerting on, and
-worth acting on: because leadership is held by the *process*, a standby replica
-takes the policy over only once this process exits, so a service that wants
-failover should end itself when it reads a stopped worker.
+A non-empty list is worth alerting on and acting on: leadership is held by the
+*process*, so a standby replica takes the policy over only once this process
+exits.
 
-The two shared tasks — the lock manager that holds every policy's advisory lock
-and the NOTIFY listener — are supervised on the same budget. They own no policy,
-so they are not listed as stopped workers; they are reported through their
-consequences. A lock manager that spends its budget takes every policy's
-leadership with it, and each of those workers reports itself stopped in turn, so
-`stopped_workers()` names the policies that are down rather than the plumbing
-that took them down. A listener that gives up costs latency only: workers fall
-back to the poll interval, which is the correctness baseline.
+The lock manager and the NOTIFY listener are supervised on the same budget. They
+own no policy, so they are reported through their consequences: a lock manager
+that gives up takes every policy's leadership with it and each of those workers
+reports itself stopped, so `stopped_workers()` names policies rather than
+plumbing. A listener that gives up costs latency only — workers fall back to the
+poll interval.
 
 Two deaths the runner does **not** contain: a panic inside a task the reaction
 spawns itself (it unwinds in its own task, outside both boundaries) and an OOM
-kill (the kernel ends the process; no supervision layer can catch that).
+kill.
 
 #### Reading a process that died without saying so
 
-An OOM kill leaves no log line of its own — the process ends between two
-instructions. What it does leave is the last thing the runner said, so every
-time a worker is elected it logs at `info` where it is picking up:
+An OOM kill leaves no log line of its own, so every election logs at `info` where
+the worker picks up:
 
 ```text
 INFO policy worker is leading; resuming after its last checkpoint
      policy=price_fanout resuming_after=264785 next_position=264786
 ```
 
-Once per election, not per event, so an idle policy stays silent. In a crash
-loop the same `next_position` reappears on every restart, which names the event
-to look at:
+Once per election, not per event. In a crash loop the same `next_position`
+reappears on every restart, naming the event to look at:
 
 ```sql
 SELECT * FROM events WHERE global_position = 264786;
 ```
 
-A process killed by an *accumulating* leak instead shows the position advancing
-between restarts — it is making progress, just not surviving — which is the
-difference between "one event is killing us" and "we leak".
+A position that advances between restarts means the opposite: the process is
+making progress and still dying, i.e. leaking rather than choking on one event.
 
 #### `policy_dead_letters` table
 
