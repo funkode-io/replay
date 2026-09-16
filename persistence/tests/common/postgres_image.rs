@@ -3,11 +3,15 @@
 //! One place decides the server version, so "which Postgres is this suite
 //! verified against?" has a single answer and moving it is a one-line change.
 //!
-//! The pinned tag is not a free choice: the crate's documented floor is
-//! PostgreSQL 13 (see the README), and the suite is verified on a release that
-//! is still receiving upstream fixes. Testing on an end-of-life server would
-//! mean the suite passes on a version no deployment should be running while
-//! saying nothing about the versions they are.
+//! The pinned tag is the crate's documented floor (README "Requirements"), not the
+//! newest release: the floor is what the crate promises, so the floor is what the suite
+//! verifies. A run on a newer server cannot fail on a feature the floor lacks — which is
+//! exactly how five tests came to run on `postgres:11-alpine` unnoticed until
+//! funkode-io/replay#193 needed a type it does not have.
+//!
+//! PostgreSQL 13 is out of upstream support since November 2025. Pinning it states what
+//! the crate still runs on, not what a deployment should be running; raising the pin is
+//! raising the floor, and belongs in the README in the same change.
 //!
 //! `allow(dead_code)` module-wide: every test binary that says `mod common;` compiles
 //! this module, including the ones that never start a container.
@@ -17,7 +21,7 @@ use testcontainers_modules::postgres;
 use testcontainers_modules::testcontainers::{ContainerRequest, ImageExt};
 
 /// Image tag pinning the PostgreSQL release the suite runs against.
-pub const POSTGRES_TAG: &str = "17-alpine";
+pub const POSTGRES_TAG: &str = "13-alpine";
 
 /// The port the server listens on inside the container.
 pub const POSTGRES_PORT: u16 = 5432;

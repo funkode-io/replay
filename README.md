@@ -16,9 +16,12 @@ You can chose you implement just `Stream` (state will be built from events) or `
 
 `es-replay-persistence` requires **PostgreSQL 13 or later**.
 
-That is the oldest release the integration suite is willing to claim, not a feature
-floor; the suite itself is verified against a release still receiving upstream fixes,
-and the pinned image tag lives in `persistence/tests/common/postgres_image.rs`.
+That floor is a feature floor, not just the oldest release the suite is willing to
+claim: every event is stamped with the transaction that wrote it, in the `xid8` type
+PostgreSQL 13 added
+([0018](persistence/tests/migrations/0018_event_commit_txid.sql)). The integration suite
+runs against 13 itself — the floor is what is promised, so the floor is what is verified
+— and the pinned image tag lives in `persistence/tests/common/postgres_image.rs`.
 
 The core `es-replay` crate has no database requirement at all, and is the half that runs
 on WASM.
