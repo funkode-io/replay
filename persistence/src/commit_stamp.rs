@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use sqlx::{postgres::PgRow, Row};
+
 /// A transaction id, ordered as Postgres orders `xid8`: numerically, without wraparound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CommitStamp(u64);
@@ -29,6 +31,11 @@ impl CommitStamp {
                 .with_operation("read_commit_txid")
                 .with_context("commit_txid", text)
         })
+    }
+
+    /// The stamp in `column`, which the query must have selected as `::text`.
+    pub(crate) fn from_row(row: &PgRow, column: &str) -> Result<Self, replay::Error> {
+        Self::parse(row.get::<String, _>(column).as_str())
     }
 }
 

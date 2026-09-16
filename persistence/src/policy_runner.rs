@@ -2141,7 +2141,7 @@ async fn read_feed(
     let mut window = Vec::with_capacity(rows.len());
     for row in rows {
         let global_position: i64 = row.get("global_position");
-        let commit_txid = CommitStamp::parse(row.get::<String, _>("commit_txid").as_str())?;
+        let commit_txid = CommitStamp::from_row(&row, "commit_txid")?;
         let is_snapshot: bool = row.get("compacted_snapshot");
         let matches_filter: bool = row.get("matches_filter");
 
@@ -2275,6 +2275,9 @@ impl PolicyCursor {
                 point: stored,
                 persisted: stored,
             };
+            // Even a row this policy's last leader wrote goes through `adopt`: a fresh
+            // process cannot tell that row from one an operator has since edited, and
+            // the derivation costs one indexed read per election.
             cursor.adopt(pool, name, stored).await?;
             return Ok(cursor);
         }
@@ -2392,7 +2395,7 @@ async fn read_point(
 
     row.map(|row| {
         Ok(CursorPoint {
-            commit_txid: CommitStamp::parse(row.get::<String, _>("commit_txid").as_str())?,
+            commit_txid: CommitStamp::from_row(&row, "commit_txid")?,
             position: row.get("position"),
         })
     })
@@ -2448,9 +2451,10 @@ async fn write_point(
 /// The transaction that belongs with `position`: the one that wrote the last event at or
 /// before it.
 ///
-/// [`CommitStamp::SENTINEL`] when there is no such event — a cursor at 0, an empty log,
-/// or a position ahead of the head — which orders before every real transaction, exactly
-/// as a cursor that has processed nothing should.
+/// [`CommitStamp::SENTINEL`] when there is no such event — a cursor at 0, or a log with
+/// nothing in it yet — which orders before every real transaction, exactly as a cursor
+/// that has processed nothing should. A position past the head takes the head's
+/// transaction: the events between are the ones the policy is being told it has passed.
 async fn commit_txid_at(
     pool: &Pool<Postgres>,
     position: i64,
@@ -3278,7 +3282,7 @@ mod cursor_tests {
             .expect("reading the appended event must succeed");
 
             points.push(CursorPoint {
-                commit_txid: CommitStamp::parse(row.get::<String, _>("commit_txid").as_str())
+                commit_txid: CommitStamp::from_row(&row, "commit_txid")
                     .expect("an appended event carries a readable stamp"),
                 position: row.get("global_position"),
             });
@@ -3455,26 +3459,40 @@ mod cursor_tests {
     #[tokio::test]
     async fn a_cursor_written_before_the_stamp_resumes_where_it_was_postgres_test() {
         let (pool, _container) = start_postgres().await;
+        let events = append_events(&pool, 3).await;
 
-        // The row the migration leaves behind: a position, and the sentinel.
+        // The log a deployment upgrades with: events already there when 0018 arrived
+        // carry the sentinel, and the ones appended since carry a real id.
+        sqlx::query("UPDATE events SET commit_txid = '0'::xid8 WHERE global_position <= $1")
+            .bind(events[1].position)
+            .execute(&pool)
+            .await
+            .expect("staging the pre-stamp events must succeed");
+
+        // The row 0020 leaves behind: a position, and the sentinel.
         sqlx::query("INSERT INTO policy_cursors (name, position) VALUES ($1, $2)")
             .bind(POLICY)
-            .bind(41_i64)
+            .bind(events[1].position)
             .execute(&pool)
             .await
             .expect("staging the migrated cursor must succeed");
 
+        let expected = CursorPoint {
+            commit_txid: CommitStamp::SENTINEL,
+            position: events[1].position,
+        };
         let cursor = PolicyCursor::load(&pool, POLICY, StartAt::Now)
             .await
             .expect("loading must succeed");
 
         assert_eq!(
-            cursor.point,
-            CursorPoint {
-                commit_txid: CommitStamp::SENTINEL,
-                position: 41,
-            },
+            cursor.point, expected,
             "a migrated cursor resumes at its position, behind every real transaction"
+        );
+        assert_eq!(
+            stored(&pool).await,
+            expected,
+            "and the row is left alone: there is nothing to complete"
         );
     }
 }
