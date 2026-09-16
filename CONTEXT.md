@@ -51,7 +51,8 @@ stream it rises with `version` and across streams it is a total order. Every eve
 read sorts on it and nothing else
 ([ADR-0018](docs/adr/0018-every-event-read-is-ordered-by-global-position.md)).
 `created` is a wall-clock audit stamp a time-travel read may *filter* on; it orders
-nothing. A position may be missing (a [Burned position]) but never repeated.
+nothing. A position may be missing (a [Burned position]) but never repeated — a
+unique index enforces that (migration 0015).
 _Avoid_: offset, sequence number, event time.
 
 ### Policy feed
@@ -64,8 +65,7 @@ advances the cursor and fires nothing, like a compaction snapshot
 `stream_filter` decides what a Policy *reacts to*, never how far it *gets*. The
 feed stops at a position it has not read, which may be an append still in flight —
 unless it is a [Burned position], which it crosses. Stepping one position at a time
-is only safe because a position is held by exactly one event: a unique index
-enforces that (migration 0015), rather than `BIGSERIAL` implying it.
+is only safe because a position is held by exactly one event.
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation

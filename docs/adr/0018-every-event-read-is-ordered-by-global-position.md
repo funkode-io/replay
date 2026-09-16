@@ -67,16 +67,16 @@ the rule that change established and finishes applying it.
 - **Gaps do not matter.** A burned position leaves a hole; relative order is unaffected,
   which is all a full stream read depends on. Contiguity is the feed's problem
   (ADR-0015), not a read's.
-- **Uniqueness is now load-bearing.** A `>` cursor with no tiebreaker steps over the
-  second row of a duplicated position.
-  [#200](https://github.com/funkode-io/replay/issues/200) turns `BIGSERIAL`'s
-  "unique in practice" into a unique index.
+- **Uniqueness is load-bearing.** A `>` cursor with no tiebreaker steps over the second
+  row of a duplicated position. `BIGSERIAL` implies no constraint; the unique index
+  [#200](https://github.com/funkode-io/replay/issues/200) added (migration 0015) is what
+  makes the key one.
 - **Compaction's write order is load-bearing too.** Snapshot rows take their positions from
   the INSERT loop, so a rewrite emitted out of `version` order would hand a
   non-commutative stream back inverted. Pinned by
   `compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postgres_test`.
-- **The `(created, version, id)` index is replaced by one on `created`** (migrations 0014
-  and 0015). Nothing sorts on that key any more; what survives is the range predicate on
+- **The `(created, version, id)` index is replaced by one on `created`** (migrations 0018
+  and 0019). Nothing sorts on that key any more; what survives is the range predicate on
   the leading column. On 50 000 seeded rows: 3 056 kB → 1 112 kB, same plan.
 - **`replay_keeps_events_that_share_created_and_version_postgres_test` guards a hazard that
   no longer exists.** It stays as a regression test for the paging it exercises.
