@@ -160,7 +160,7 @@ position.
 
 The id of the transaction that wrote an event, carried on the event as `commit_txid`
 and written by every insert path
-([0014](persistence/tests/migrations/0014_event_commit_txid.sql)). Its purpose is an
+([0018](persistence/tests/migrations/0018_event_commit_txid.sql)). Its purpose is an
 ordering the [Policy feed] can trust without reasoning about holes: a transaction id
 can be compared against a snapshot of transactions that have ended, whereas a
 `global_position` can be a [Burned position]. Events that predate the stamp carry the

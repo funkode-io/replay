@@ -10,9 +10,6 @@
 //! fails, a database that already holds duplicates stops the migration and is told which
 //! positions they are, and the feed's read still reaches its rows through an index.
 
-use std::borrow::Cow;
-
-use sqlx::migrate::Migrator;
 use sqlx::{PgPool, Row};
 use testcontainers_modules::{
     postgres,
@@ -20,11 +17,10 @@ use testcontainers_modules::{
 };
 
 mod common;
+use common::migrations::{through as migrations_through, MIGRATOR};
 use common::postgres_image::postgres_container;
 
 const POSTGRES_PORT: u16 = 5432;
-
-static MIGRATOR: Migrator = sqlx::migrate!("./tests/migrations");
 
 /// The migration that adds the unique index, and the one before it: the tests that stage
 /// a broken database migrate up to `BEFORE_UNIQUE` and then run the rest.
@@ -48,21 +44,6 @@ async fn start_postgres() -> (ContainerAsync<postgres::Postgres>, PgPool) {
         .expect("Failed to connect to Postgres");
 
     (container, pool)
-}
-
-/// The migration set truncated at `version`, so a test can populate the schema as it
-/// stood before a migration and then run that migration against real data.
-fn migrations_through(version: i64) -> Migrator {
-    Migrator {
-        migrations: Cow::Owned(
-            MIGRATOR
-                .iter()
-                .filter(|migration| migration.version <= version)
-                .cloned()
-                .collect(),
-        ),
-        ..Migrator::DEFAULT
-    }
 }
 
 async fn seed_stream(pool: &PgPool, stream_id: &str) {
