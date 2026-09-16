@@ -166,7 +166,19 @@ impl replay::Aggregate for Probe {
 pub struct AppendedEvent {
     pub event_id: Uuid,
     pub global_position: i64,
+    /// The transaction that wrote it, as a Policy's cursor records it
+    /// (funkode-io/replay#194). Text, because `xid8` is an unsigned 64-bit counter sqlx
+    /// has no codec for.
+    pub commit_txid: String,
     pub stream_id: String,
+}
+
+/// A Policy's persisted cursor: the transaction it stopped in and the position it
+/// stopped at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCursor {
+    pub commit_txid: String,
+    pub position: i64,
 }
 
 /// A command the policy dispatched, observed as the event it wrote.
@@ -344,17 +356,20 @@ impl PolicyDaemonHarness {
             .expect("append must succeed");
 
         let stream_id = id.to_urn().to_string();
-        let row =
-            sqlx::query("SELECT id, global_position FROM events WHERE metadata->>($1::text) = $2")
-                .bind(PING_MARKER_KEY)
-                .bind(marker.to_string())
-                .fetch_one(&self.pool)
-                .await
-                .expect("the appended event must be readable");
+        let row = sqlx::query(
+            "SELECT id, global_position, commit_txid::text AS commit_txid \
+             FROM events WHERE metadata->>($1::text) = $2",
+        )
+        .bind(PING_MARKER_KEY)
+        .bind(marker.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .expect("the appended event must be readable");
 
         AppendedEvent {
             event_id: row.get("id"),
             global_position: row.get("global_position"),
+            commit_txid: row.get("commit_txid"),
             stream_id,
         }
     }
@@ -406,6 +421,33 @@ impl PolicyDaemonHarness {
             .fetch_optional(&self.pool)
             .await
             .expect("cursor observation must be readable")
+    }
+
+    /// The policy's persisted cursor as the row holds it — both halves.
+    pub async fn stored_cursor(&self) -> Option<StoredCursor> {
+        sqlx::query(
+            "SELECT position, commit_txid::text AS commit_txid \
+             FROM policy_cursors WHERE name = $1",
+        )
+        .bind(&self.policy_name)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("cursor observation must be readable")
+        .map(|row| StoredCursor {
+            commit_txid: row.get("commit_txid"),
+            position: row.get("position"),
+        })
+    }
+
+    /// The operator's move from ADR-0012, as they make it: a position, written straight
+    /// into the row against a running deployment, with no second column to remember.
+    pub async fn move_cursor_to(&self, position: i64) {
+        sqlx::query("UPDATE policy_cursors SET position = $2, updated_at = now() WHERE name = $1")
+            .bind(&self.policy_name)
+            .bind(position)
+            .execute(&self.pool)
+            .await
+            .expect("the operator's move must succeed");
     }
 
     /// The workers the runner has given up on — what an operator sees when a

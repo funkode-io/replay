@@ -8,10 +8,15 @@
 //! Advancing one position at a time assumes each one names a single event; a unique
 //! index on `events (global_position)` makes that so (migration 0015).
 
+use crate::commit_stamp::CommitStamp;
+
 /// One position from the window read past a Policy's cursor. `delivered` is `None`
 /// for a compaction snapshot or an event the Policy's filter excludes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowPosition<E> {
+    /// The transaction that wrote the event at this position, carried so a checkpoint
+    /// can record the pair the cursor stopped at (funkode-io/replay#194).
+    pub(crate) commit_txid: CommitStamp,
     pub(crate) global_position: i64,
     pub(crate) delivered: Option<E>,
 }
@@ -20,6 +25,7 @@ impl<E> WindowPosition<E> {
     #[cfg(test)]
     pub(crate) fn delivered(global_position: i64, event: E) -> Self {
         Self {
+            commit_txid: CommitStamp::SENTINEL,
             global_position,
             delivered: Some(event),
         }
@@ -29,6 +35,7 @@ impl<E> WindowPosition<E> {
     #[cfg(test)]
     pub(crate) fn skipped(global_position: i64) -> Self {
         Self {
+            commit_txid: CommitStamp::SENTINEL,
             global_position,
             delivered: None,
         }
