@@ -108,6 +108,7 @@ define_aggregate! {
             Echo { tag: String },
             Refuse { reason: String },
             Explode { reason: String },
+            Sleep { millis: u64 },
         },
         events: {
             Pinged { tag: String },
@@ -158,6 +159,16 @@ impl replay::Aggregate for Probe {
             // boundary — the one a panic in `react` never reaches, because it
             // happens while awaiting the dispatch rather than before it.
             ProbeCommand::Explode { reason } => panic!("probe exploded: {reason}"),
+            // A command that does not come back for `millis`: either side of a
+            // dispatch timeout, depending on what a test passes. Sleeping rather
+            // than blocking, because what the runner abandons is a future it is
+            // awaiting.
+            ProbeCommand::Sleep { millis } => {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+                Ok(vec![ProbeEvent::Echoed {
+                    tag: format!("slept-{millis}ms"),
+                }])
+            }
         }
     }
 }

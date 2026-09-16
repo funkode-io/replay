@@ -76,6 +76,9 @@ triggering event so a single bad event never wedges the Policy. A reaction that
 to, parked on first occurrence without a retry, and recorded as kind `Panic` so
 an operator can tell a defect in the reaction from a command the domain refused
 ([ADR-0016](docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md)).
+A reaction the runner **abandoned on its [Dispatch timeout]** is another: retried
+like any transient failure and, once the retries are exhausted, recorded as kind
+`Timeout`.
 Dead letters are queryable so an operator can later inspect them and either
 [Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.
@@ -143,6 +146,18 @@ in-flight append could explain. Since the runner crosses a [Burned position] on
 its own, a Policy that stays blocked is one waiting on an append that really is in
 flight.
 _Avoid_: stuck, wedged, hung, stalled.
+
+### Dispatch timeout
+
+How long the [Policy runner] awaits one command a [Policy] dispatched before it
+abandons it — per Policy, defaulting to 30s
+([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It cuts
+loose a reaction that has *stopped*; a merely slow one raises the limit rather
+than being parked by it. Exceeding it is retryable, so a hang reaches the same
+[Dead letter] a dependency outage does. Distinct from a [Blocked policy] in both
+directions: a Policy held inside one reaction has a healthy feed in front of it,
+and a blocked one is not running a reaction at all.
+_Avoid_: deadline, SLA, watchdog, timeout (unqualified).
 
 ### Burned position
 
@@ -307,6 +322,24 @@ it:
 - **No panic is contained under `panic = "abort"`.** Containment is unwinding: a
   binary that aborts on panic ends the process before the runner's catch can park
   a [Dead letter].
+- **A [Dispatch timeout] cannot interrupt work the reaction moved onto another
+  task.** It bounds the future the runner awaits; a `tokio::spawn`, a blocking
+  pool or a request already in flight keeps running, unobserved, after the runner
+  has stopped waiting for it.
+- **A [Dispatch timeout] cannot cut loose a reaction that never yields.**
+  Cancellation happens at a suspension point, so a command that blocks the thread
+  — `std::thread::sleep`, a synchronous client, a tight CPU loop — runs past its
+  limit and holds the worker until it returns on its own. Bounding that needs a
+  thread or process boundary the runner does not impose; a reaction that must
+  block belongs on `spawn_blocking`, where the timeout at least stops the runner
+  waiting on it.
+- **A [Dispatch timeout] does not cancel work already running in Postgres.** It
+  ends this process's wait and sends the server nothing, so a dispatch abandoned
+  inside a statement holds its pool connection until that statement finishes. The
+  case that reaches this is an append blocked on another transaction's stream
+  lock; a reaction hanging in its own code holds no connection, because the
+  command handler runs before the append opens its transaction. Deployments that
+  expect lock contention should set `lock_timeout` on the pool.
 - **An OOM kill is not containable in-process.** The kernel ends the process; no
   supervision layer can catch it. The only defences are bounding what a reaction
   loads and bounding how long it may run.
@@ -315,6 +348,7 @@ it:
 [Policy]: #policy
 [Policy feed]: #policy-feed
 [Dead letter]: #dead-letter
+[Dispatch timeout]: #dispatch-timeout
 [Retry]: #retry
 [Discard]: #discard
 [Cursor move]: #cursor-move
