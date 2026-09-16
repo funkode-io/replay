@@ -1,0 +1,20 @@
+-- no-transaction
+-- An index on `created` alone, for the only thing `created` is still read for.
+--
+-- Every event read now orders by `global_position` (#199): `created` is the wall-clock
+-- audit stamp, not the sequencing key, so the `(created, version, id)` key 0013 indexed
+-- is no longer sorted on anywhere. What remains is the range predicate a time-travel
+-- read puts on `created` alone (`StreamFilter::CreatedAfter` / `CreatedBefore`), which
+-- only needs the leading column:
+--
+--   SELECT ... FROM events WHERE created <= $1 ORDER BY global_position
+--
+-- On 50 000 seeded rows the three-column index measured 3 056 kB against this one's
+-- 1 112 kB, for the same plan — two columns maintained by every append that no query
+-- reads. 0015 drops it once this one exists.
+--
+-- CONCURRENTLY, so appends keep running while the index is built on a populated table;
+-- that cannot run inside a transaction, hence `-- no-transaction` above. No
+-- IF NOT EXISTS: a concurrent build that fails leaves an *invalid* index behind, and
+-- IF NOT EXISTS would step over it and report success with no usable index.
+CREATE INDEX CONCURRENTLY idx_events_created ON events (created);
