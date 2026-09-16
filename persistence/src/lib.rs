@@ -26,6 +26,7 @@ pub use policy::{Dispatch, Policy, StartAt};
 pub use policy_runner::{
     DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, PolicyRunner, PolicyRunnerBuilder,
     PolicyRunnerDaemon, StoppedWorker, WorkerSupervision, PANIC_ERROR_KIND, REPLAY_NOTIFY_CHANNEL,
+    TIMEOUT_ERROR_KIND,
 };
 pub use policy_status::{PolicyCondition, PolicyStatus, PolicyStatusStore};
 pub use query::Query;

@@ -9,6 +9,7 @@
 //! WASM runner. The server-side execution lives in the runner (native only).
 
 use std::any::{Any, TypeId};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -160,6 +161,26 @@ pub trait Policy: Send + Sync {
         None
     }
 
+    /// How long the runner awaits one [`Dispatch`] of this policy before it
+    /// abandons it.
+    ///
+    /// Resolution order (most-specific-first):
+    ///   1. This per-policy override (when `Some`).
+    ///   2. Environment variable `REPLAY_DISPATCH_TIMEOUT_MS`.
+    ///   3. Built-in default (30s).
+    ///
+    /// Exceeding it is a **retryable** failure: the dispatch is retried under
+    /// the back-off an `Unavailable` error gets, then parked as a dead letter
+    /// of kind `Timeout`. Raise it for a reaction that is legitimately slow.
+    ///
+    /// It bounds the future the runner awaits: cancellation happens at a
+    /// suspension point, so it cannot interrupt work the reaction moved onto
+    /// another task, nor a command that never yields (see `CONTEXT.md`'s
+    /// non-guarantees).
+    fn dispatch_timeout(&self) -> Option<Duration> {
+        None
+    }
+
     /// Pure reaction: given an event, return the commands to dispatch.
     ///
     /// Invariant: because delivery is at-least-once, target aggregate command
@@ -190,6 +211,8 @@ pub(crate) trait ErasedPolicy: Send + Sync {
 
     fn checkpoint_batch_size_erased(&self) -> Option<u32>;
 
+    fn dispatch_timeout_erased(&self) -> Option<Duration>;
+
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch>;
 }
 
@@ -216,6 +239,10 @@ impl<P: Policy> ErasedPolicy for P {
 
     fn checkpoint_batch_size_erased(&self) -> Option<u32> {
         Policy::checkpoint_batch_size(self)
+    }
+
+    fn dispatch_timeout_erased(&self) -> Option<Duration> {
+        Policy::dispatch_timeout(self)
     }
 
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {
