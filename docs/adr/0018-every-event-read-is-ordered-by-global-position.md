@@ -56,10 +56,11 @@ the rule that change established and finishes applying it.
   the order *deterministic*, which is not the same as *right*: the inversion above is a
   strict `created` difference, not a tie, so `id` never gets a vote.
 - **Order by commit visibility (`xid8`).** The right key for the feed's "has every earlier
-  writer finished?" question, and it is being pursued there
-  ([#171](https://github.com/funkode-io/replay/issues/171)). It answers a different
-  question from this one — a point-in-time read of a committed stream needs relative
-  order, not a visibility watermark — and it costs a column, a backfill and a cursor
+  writer finished?" question, and it is being pursued there — `events.commit_txid` landed
+  with [#193](https://github.com/funkode-io/replay/issues/193), unread until
+  [#171](https://github.com/funkode-io/replay/issues/171) moves the feed onto it. It
+  answers a different question from this one: a point-in-time read of a committed stream
+  needs relative order, not a visibility watermark — and it costs a backfill and a cursor
   format change, which this rule does not.
 
 ## Consequences
@@ -75,8 +76,8 @@ the rule that change established and finishes applying it.
   the INSERT loop, so a rewrite emitted out of `version` order would hand a
   non-commutative stream back inverted. Pinned by
   `compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postgres_test`.
-- **The `(created, version, id)` index is replaced by one on `created`** (migrations 0018
-  and 0019). Nothing sorts on that key any more; what survives is the range predicate on
+- **The `(created, version, id)` index is replaced by one on `created`** (migrations 0020
+  and 0021). Nothing sorts on that key any more; what survives is the range predicate on
   the leading column. On 50 000 seeded rows: 3 056 kB → 1 112 kB, same plan.
 - **`replay_keeps_events_that_share_created_and_version_postgres_test` guards a hazard that
   no longer exists.** It stays as a regression test for the paging it exercises.
