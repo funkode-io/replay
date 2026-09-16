@@ -2969,3 +2969,99 @@ mod supervisor_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pinned_session_tests {
+    use std::time::{Duration, Instant};
+
+    use sqlx::postgres::PgPoolOptions;
+    use testcontainers_modules::postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    use super::PinnedSession;
+
+    /// Try to take `key` on `session`, reporting whether it was free.
+    async fn try_lock(session: &mut sqlx::PgConnection, key: i64) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(session)
+            .await
+            .expect("the lock attempt must reach the server")
+    }
+
+    /// How long the server is given to release the locks of a session that is on
+    /// its way out: the close is sqlx's to schedule, so the release is awaited
+    /// rather than assumed to have landed by the next statement.
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Postgres releases a session advisory lock when the *session* ends, and
+    /// sqlx returns a dropped pool connection to the idle queue with its locks
+    /// intact. The whole fix rests on `close_on_drop` ending the session
+    /// instead; if that ever stops holding, it fails here rather than as a
+    /// Policy nobody in the fleet can lead (funkode-io/replay#185).
+    ///
+    /// Deliberately not pinned to the suite's image tag: a session-scoped
+    /// advisory lock has been released at session end on every PostgreSQL this
+    /// crate supports, so the version is not what this test is about.
+    #[tokio::test]
+    async fn a_dropped_pinned_session_releases_its_advisory_locks_postgres_test() {
+        let container = postgres::Postgres::default()
+            .start()
+            .await
+            .expect("failed to start the postgres container");
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to read the container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to read the container port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("failed to create the postgres pool");
+
+        // The observer is its own session, never the pool's: a pooled
+        // connection handed back after the drop may be the very session that
+        // took the lock, and a session can always re-take a lock it holds.
+        let mut observer = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+            .await
+            .expect("failed to connect the observing session");
+        let key: i64 = 0x5eed;
+
+        {
+            let mut pinned = PinnedSession::pin(
+                pool.acquire()
+                    .await
+                    .expect("failed to acquire the connection"),
+            );
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(key)
+                .execute(&mut *pinned)
+                .await
+                .expect("the pinned session must take the lock");
+
+            assert!(
+                !try_lock(&mut observer, key).await,
+                "nobody else can take a lock the pinned session holds"
+            );
+        }
+
+        let deadline = Instant::now() + RELEASE_TIMEOUT;
+        loop {
+            if try_lock(&mut observer, key).await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a dropped PinnedSession must end its session and release its \
+                 locks; after {RELEASE_TIMEOUT:?} the lock was still held by a \
+                 connection nobody is using"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
