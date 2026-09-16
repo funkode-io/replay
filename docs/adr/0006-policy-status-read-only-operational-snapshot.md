@@ -29,7 +29,7 @@ operational tables the runner already maintains.
   position that actually exists), and a per-policy aggregate over
   [`policy_dead_letters`](../../persistence/tests/migrations/0010_policy_dead_letters.sql)
   (`COUNT(*)` + `MAX(created_at)`). The event log is never scanned: both `events`
-  reads are `MIN`/`MAX` probes on `idx_events_global_position`, O(log events)
+  reads are `MIN`/`MAX` probes on `idx_events_global_position_unique`, O(log events)
   each. The dead-letter aggregate still walks one policy's index entries, so
   status scales with dead letters, not with the log.
 
