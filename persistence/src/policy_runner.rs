@@ -104,11 +104,10 @@ pub const PANIC_ERROR_KIND: &str = "Panic";
 /// The `error_kind` written to `policy_dead_letters` when a dispatch was
 /// **abandoned on its timeout** rather than returning an error.
 ///
-/// A hang is not a refusal and not an outage the dependency reported: it is a
-/// reaction that never came back, and it is diagnosed by looking at what the
-/// command was waiting for. Distinct from every [`replay::ErrorKind`] rendering
-/// and from [`PANIC_ERROR_KIND`], so `WHERE error_kind = 'Timeout'` finds
-/// exactly the reactions that were cut loose.
+/// Distinct from every [`replay::ErrorKind`] rendering and from
+/// [`PANIC_ERROR_KIND`]: a hang is diagnosed by looking at what the command was
+/// waiting for, and nothing else could carry that — a command that never
+/// returned produced no error to take a kind from.
 pub const TIMEOUT_ERROR_KIND: &str = "Timeout";
 
 // ── Closure-based policy adapter ─────────────────────────────────────────────
@@ -390,10 +389,10 @@ impl PolicyRunner {
     ///   in place** with the fresh error ([`DeadLetterRetry::StillFailing`]);
     ///   no second row is ever inserted.
     /// - the reaction **hangs** → it is abandoned on the same dispatch timeout
-    ///   the live drain applies, so a bulk retry of parked hangs is bounded in
-    ///   time rather than wedging the operator's call. The row is updated to
-    ///   [`TIMEOUT_ERROR_KIND`] and reported `StillFailing`. Unlike the drain,
-    ///   a retry does not re-attempt: an operator retries.
+    ///   the drain applies, so a bulk retry of parked hangs returns instead of
+    ///   wedging the operator's call. The row is updated to
+    ///   [`TIMEOUT_ERROR_KIND`] and reported `StillFailing`, without the drain's
+    ///   re-attempts: an operator retries.
     /// - the reaction **panics** → same treatment as a permanent failure, with
     ///   the row updated to [`PANIC_ERROR_KIND`] and the panic's message. The
     ///   panic never reaches the caller, so a bulk retry continues with the
@@ -1032,10 +1031,9 @@ fn is_retryable(kind: replay::ErrorKind) -> bool {
 
 /// A dispatch that did not complete, and why.
 ///
-/// The two arms are the two ways a command fails to commit, and they are kept
-/// apart all the way to the parked row: a returned error carries a kind the
-/// aggregate chose, a timeout carries no error at all because nothing ever came
-/// back to produce one.
+/// The arms stay apart all the way to the parked row: a returned error carries a
+/// kind the aggregate chose, a timeout carries none because nothing came back to
+/// produce one.
 enum DispatchFailure {
     /// The command ran to completion and returned an error.
     Returned(replay::Error),
@@ -1356,14 +1354,13 @@ fn log_superseded(name: &str, cursor: &PolicyCursor) {
     );
 }
 
-/// The runner's machinery for delivering events to **one** policy, for as long
-/// as its settings hold: the execution path, the tables, and the time each
-/// dispatch is allowed.
+/// The runner's machinery for delivering events to **one** policy: the
+/// execution path, the tables, and the time each dispatch is allowed.
 ///
-/// Held together because the per-event path threads all of it unchanged through
-/// three layers (containment → retry → one dispatch), and because it is exactly
-/// what an out-of-band [`PolicyRunner::retry_dead_letter`] must reproduce for a
-/// parked row to be re-run the way the drain ran it.
+/// One value because the per-event path threads all of it unchanged through
+/// three layers (containment → retry → one dispatch), and because
+/// [`PolicyRunner::retry_dead_letter`] must reproduce it to re-run a parked row
+/// the way the drain ran it.
 struct Delivery<'a> {
     cqrs: &'a Cqrs<PostgresEventStore>,
     pool: &'a Pool<Postgres>,
@@ -1450,9 +1447,8 @@ impl Delivery<'_> {
     /// that *panics* is absorbed one level out, in [`Self::react_to_event`], which
     /// is the only failure this function cannot observe.
     ///
-    /// Each dispatch is awaited for at most [`Delivery::dispatch_timeout`], so an
-    /// attempt is bounded in time as well as in failures; a whole event therefore
-    /// takes at most one timeout per dispatch per attempt, plus the back-offs.
+    /// Each dispatch is awaited for at most [`Delivery::dispatch_timeout`], so
+    /// an event costs at most one timeout per dispatch per attempt.
     ///
     /// **Re-react safety**: on retry the policy's `react` is called again for the
     /// same event.  Because `react` is a pure function and the at-least-once +
@@ -1537,15 +1533,10 @@ impl Delivery<'_> {
 
     /// Execute one dispatch, bounded in time.
     ///
-    /// The [Dispatch timeout] in force: a command that does not come back holds
-    /// the worker and nothing else — no error, no log line, no cursor movement, so
-    /// a frozen pipeline looks exactly like an idle one. Dropping the future when
-    /// `limit` expires turns that into an ordinary retryable failure the runner
-    /// already knows how to retry, exhaust and park.
+    /// Execute one dispatch, abandoning it after [`Self::dispatch_timeout`].
     ///
-    /// What is bounded is **the future this runner awaits**. Dropping it cancels
-    /// the command at its next suspension point; work the reaction has moved onto
-    /// another task keeps running, unobserved, after the runner stops waiting.
+    /// Cancelling the future is all a timeout can do: work the reaction moved
+    /// onto another task keeps running, unobserved (ADR-0017).
     async fn execute_dispatch_within(
         &self,
         global_position: i64,

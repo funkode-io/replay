@@ -150,10 +150,9 @@ _Avoid_: stuck, wedged, hung, stalled.
 How long the [Policy runner] awaits one command a [Policy] dispatched before it
 abandons it — per Policy, defaulting to 30s
 ([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It cuts
-a reaction that has *stopped* loose from its worker; it is not a latency budget,
-and a reaction that is merely slow raises it rather than being parked by it.
-Exceeding it is retryable, so a hang reaches the same [Dead letter] a dependency
-outage does, by the same back-off. Distinct from a [Blocked policy] in both
+loose a reaction that has *stopped*; a merely slow one raises the limit rather
+than being parked by it. Exceeding it is retryable, so a hang reaches the same
+[Dead letter] a dependency outage does. Distinct from a [Blocked policy] in both
 directions: a Policy held inside one reaction has a healthy feed in front of it,
 and a blocked one is not running a reaction at all.
 _Avoid_: deadline, SLA, watchdog, timeout (unqualified).
@@ -288,10 +287,9 @@ it:
   binary that aborts on panic ends the process before the runner's catch can park
   a [Dead letter].
 - **A [Dispatch timeout] cannot interrupt work the reaction moved onto another
-  task.** It bounds the future the runner awaits: dropping that future cancels
-  the command at its next suspension point, while a `tokio::spawn`, a blocking
-  pool or a request already in flight in a detached client keeps running,
-  unobserved, after the runner has stopped waiting for it.
+  task.** It bounds the future the runner awaits; a `tokio::spawn`, a blocking
+  pool or a request already in flight keeps running, unobserved, after the runner
+  has stopped waiting for it.
 - **An OOM kill is not containable in-process.** The kernel ends the process; no
   supervision layer can catch it. The only defences are bounding what a reaction
   loads and bounding how long it may run.

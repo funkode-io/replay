@@ -1,14 +1,10 @@
 //! A reaction that hangs is cut loose by the dispatch timeout.
 //!
-//! Nothing bounded the dispatch path in time: a command that never returned
-//! held its worker for the life of the process, with no error, no log line and
-//! no cursor movement — indistinguishable from a Policy with nothing to do.
-//! These tests assert the bound from where an operator stands: the Policy keeps
-//! reacting, its cursor keeps moving, and the reaction that hung is readable as
-//! a parked [Dead letter] that says it timed out.
-//!
-//! Every observation goes through `tests/common/policy_harness.rs`: a real
-//! daemon, a real database, no inspection of tasks or channels.
+//! Asserted from where an operator stands: the Policy keeps reacting, its cursor
+//! keeps moving, and the reaction that hung is readable as a parked
+//! [Dead letter] that says it timed out. Every observation goes through
+//! `tests/common/policy_harness.rs` — a real daemon, a real database, no
+//! inspection of tasks or channels.
 
 mod common;
 
@@ -30,18 +26,27 @@ const HANGS: &str = "hang";
 /// so a test that passes proves the dispatch was abandoned rather than awaited.
 const HANG_FOR: Duration = Duration::from_secs(600);
 
-/// The timeout the Policy under test sets. Short enough that four attempts plus
-/// their back-offs fit comfortably inside the harness's observation budget.
-const DISPATCH_TIMEOUT: Duration = Duration::from_millis(150);
+/// The timeout a Policy that is expected to blow it sets: short enough that four
+/// attempts plus their back-offs fit inside the harness's observation budget.
+const TIGHT_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// A Policy that dispatches a hung command for `HANGS` and an echo for anything
-/// else, counting how many times it was asked to react to the hanging event.
+/// The timeout a Policy that is expected to stay inside it sets. It bounds the
+/// whole dispatch — the aggregate load and the append too, not just the command's
+/// own sleep — so it is set where a loaded CI box cannot reach it.
+const AMPLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the command sleeps when the test wants it to finish in time.
+const SLEEP_FOR: Duration = Duration::from_millis(50);
+
+/// Dispatches a command that never returns for `HANGS`, an echo for anything
+/// else, counting the reactions.
 ///
 /// The count is how "retried under the existing backoff" is visible from
 /// outside: each retry calls `react` again before anything is parked.
 struct HangingPolicy {
     name: String,
     hang_for: Duration,
+    timeout: Duration,
     reactions: Arc<AtomicUsize>,
 }
 
@@ -57,7 +62,7 @@ impl Policy for HangingPolicy {
     }
 
     fn dispatch_timeout(&self) -> Option<Duration> {
-        Some(DISPATCH_TIMEOUT)
+        Some(self.timeout)
     }
 
     fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
@@ -80,15 +85,18 @@ impl Policy for HangingPolicy {
     }
 }
 
-/// Register a [`HangingPolicy`] whose hung command sleeps for `hang_for`.
+/// Register a [`HangingPolicy`] whose command sleeps for `hang_for` under a
+/// `timeout`.
 fn hanging_policy(
     hang_for: Duration,
+    timeout: Duration,
     reactions: Arc<AtomicUsize>,
 ) -> impl Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static {
     move |builder, policy| {
         builder.register_policy(HangingPolicy {
             name: policy.to_string(),
             hang_for,
+            timeout,
             reactions: Arc::clone(&reactions),
         })
     }
@@ -101,8 +109,11 @@ fn hanging_policy(
 #[traced_test]
 async fn a_hung_dispatch_is_parked_as_a_timeout_and_the_policy_keeps_reacting_postgres_test() {
     let reactions = Arc::new(AtomicUsize::new(0));
-    let harness =
-        PolicyDaemonHarness::start("hangs", hanging_policy(HANG_FOR, Arc::clone(&reactions))).await;
+    let harness = PolicyDaemonHarness::start(
+        "hangs",
+        hanging_policy(HANG_FOR, TIGHT_TIMEOUT, Arc::clone(&reactions)),
+    )
+    .await;
 
     let hung = harness.ping("subject-1", HANGS).await;
 
@@ -179,10 +190,9 @@ async fn a_hung_dispatch_is_parked_as_a_timeout_and_the_policy_keeps_reacting_po
 #[tokio::test]
 async fn a_dispatch_that_finishes_inside_its_timeout_is_unaffected_postgres_test() {
     let reactions = Arc::new(AtomicUsize::new(0));
-    let slow_but_fine = DISPATCH_TIMEOUT / 5;
     let harness = PolicyDaemonHarness::start(
         "within_timeout",
-        hanging_policy(slow_but_fine, Arc::clone(&reactions)),
+        hanging_policy(SLEEP_FOR, AMPLE_TIMEOUT, Arc::clone(&reactions)),
     )
     .await;
 
@@ -216,7 +226,7 @@ async fn retrying_a_parked_timeout_re_parks_it_rather_than_hanging_the_retry_pos
     let reactions = Arc::new(AtomicUsize::new(0));
     let harness = PolicyDaemonHarness::start(
         "timeout_retry",
-        hanging_policy(HANG_FOR, Arc::clone(&reactions)),
+        hanging_policy(HANG_FOR, TIGHT_TIMEOUT, Arc::clone(&reactions)),
     )
     .await;
 

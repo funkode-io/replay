@@ -2233,15 +2233,12 @@ cannot hold a worker for the life of the process:
 |---------|-------------------|---------|---------|
 | Time one dispatch may run | `dispatch_timeout() -> Option<Duration>` | `REPLAY_DISPATCH_TIMEOUT_MS` | `30s` |
 
-Exceeding it is a **retryable** failure: the dispatch is abandoned, retried
-under the same back-off as an `Unavailable` error, and parked with
+Exceeding it is a **retryable** failure: the dispatch is abandoned, retried under
+the same back-off as an `Unavailable` error, and parked with
 `error_kind = 'Timeout'` once the retries are exhausted
-([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)).
-
-The bound is on **the future the runner awaits**. Dropping it cancels the
-command at its next suspension point; work the reaction has moved onto another
-task (`tokio::spawn`, a blocking pool, a request in flight in a detached client)
-keeps running after the runner has stopped waiting for it.
+([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It
+bounds the future the runner awaits, and cannot interrupt work the reaction moved
+onto another task.
 
 ### Failure handling
 

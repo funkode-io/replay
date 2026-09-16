@@ -169,19 +169,13 @@ pub trait Policy: Send + Sync {
     ///   2. Environment variable `REPLAY_DISPATCH_TIMEOUT_MS`.
     ///   3. Built-in default (30s).
     ///
-    /// Raise it for a reaction that is legitimately slow; a limit chosen for
-    /// fast reactions would park it as a failure.
+    /// Exceeding it is a **retryable** failure: the dispatch is retried under
+    /// the back-off an `Unavailable` error gets, then parked as a dead letter
+    /// of kind `Timeout`. Raise it for a reaction that is legitimately slow.
     ///
-    /// A dispatch that exceeds the limit is abandoned and treated as a
-    /// **retryable** failure: it is retried under the same back-off as an
-    /// `Unavailable` error and parked as a dead letter of kind `Timeout` once
-    /// the retries are exhausted.
-    ///
-    /// The bound is on **the future the runner awaits**. Dropping that future
-    /// cancels the command at its next suspension point; it cannot interrupt
-    /// work the reaction has moved onto another task (`tokio::spawn`, a
-    /// blocking pool, a request already in flight in a detached client), which
-    /// keeps running after the runner has stopped waiting for it.
+    /// It bounds the future the runner awaits: dropping that future cancels the
+    /// command at its next suspension point and cannot interrupt work the
+    /// reaction has moved onto another task.
     fn dispatch_timeout(&self) -> Option<Duration> {
         None
     }
