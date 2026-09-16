@@ -26,6 +26,9 @@ use tokio::task::JoinHandle;
 
 use replay::{Aggregate, Metadata};
 
+use crate::burned_position::{
+    resume_after_burned, sequence_holders, BurnedPositions, Permanence, Resume,
+};
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
 use crate::policy_blocked::{probe_blocked, resolve_blocked_warn_after, BlockedWatch};
 use crate::policy_feed::{feed_from_window, Feed, Gap, WindowPosition};
@@ -232,7 +235,7 @@ impl PolicyRunnerBuilder {
             executors: self.executors,
             notifications: self.notifications,
             supervision: self.supervision,
-            blocked: Arc::new(BlockedWatch::new(resolve_blocked_warn_after())),
+            stopped: StoppedPolicies::new(),
         }
     }
 }
@@ -278,9 +281,48 @@ pub struct PolicyRunner {
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
     supervision: WorkerSupervision,
-    /// Rate gate for the blocked-policy warning, shared by every drain path so a
-    /// blocked Policy is reported at the same bounded rate however it is driven.
+    /// What this process remembers about the Policies that are stopped, shared by
+    /// every drain path so a stop is judged the same way however it is driven.
+    stopped: StoppedPolicies,
+}
+
+/// What a running process remembers about a Policy that is parked in front of a
+/// hole: how long it has been there, and whether any transaction can still fill it.
+///
+/// The two are separate questions with separate answers — one is about elapsed time
+/// and decides when to report, the other is about running transactions and decides
+/// when to move — but they share a subject and a lifetime: the moment a Policy is no
+/// longer parked where it was, both are stale ([`forget`](Self::forget)).
+#[derive(Clone)]
+struct StoppedPolicies {
+    /// Rate gate for the blocked-policy warning.
     blocked: Arc<BlockedWatch>,
+    /// Candidate transactions for each Policy's hole, as first observed.
+    burned: Arc<BurnedPositions>,
+}
+
+impl StoppedPolicies {
+    fn new() -> Self {
+        Self {
+            blocked: Arc::new(BlockedWatch::new(resolve_blocked_warn_after())),
+            burned: Arc::new(BurnedPositions::new()),
+        }
+    }
+
+    /// Note that `policy` is parked in front of `gap` without judging it: the poll
+    /// that first sees a hole may still have work in front of it, and the hole is no
+    /// younger for that.
+    fn sighted(&self, policy: &str, gap: Gap) {
+        self.blocked
+            .sighted(policy, gap.expected, std::time::Instant::now());
+    }
+
+    /// Forget everything known about where `policy` was stopped: it is no longer
+    /// parked there, so the next hole is a fresh wait and a fresh question.
+    fn forget(&self, policy: &str) {
+        self.blocked.cleared(policy);
+        self.burned.cleared(policy);
+    }
 }
 
 /// Handle for background policy tasks spawned by [`PolicyRunner::start_polling`].
@@ -795,7 +837,7 @@ impl PolicyRunner {
     pub fn start_polling(&self, interval: Duration) -> PolicyRunnerDaemon {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::with_capacity(self.policies.len() + 2);
-        let stopped = StoppedWorkers::default();
+        let stopped_workers = StoppedWorkers::default();
 
         // ── Shared NOTIFY listener: one connection, broadcast fan-out ─────────
         // A single PgListener receives every append NOTIFY and rebroadcasts it to
@@ -809,7 +851,7 @@ impl PolicyRunner {
                 SupervisedTask {
                     kind: "notify listener",
                     policy: None,
-                    stopped: stopped.clone(),
+                    stopped: stopped_workers.clone(),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -853,7 +895,7 @@ impl PolicyRunner {
                 SupervisedTask {
                     kind: "lock manager",
                     policy: None,
-                    stopped: stopped.clone(),
+                    stopped: stopped_workers.clone(),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -885,7 +927,7 @@ impl PolicyRunner {
                 cqrs: self.cqrs.clone(),
                 pool: self.pool.clone(),
                 executors: self.executors.clone(),
-                blocked: Arc::clone(&self.blocked),
+                stopped: self.stopped.clone(),
                 shutdown_rx: shutdown_rx.clone(),
                 leader_rx,
                 wake_tx: wake_tx.clone(),
@@ -897,7 +939,7 @@ impl PolicyRunner {
                 SupervisedTask {
                     kind: "policy worker",
                     policy: Some(worker.name.clone()),
-                    stopped: stopped.clone(),
+                    stopped: stopped_workers.clone(),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -908,7 +950,7 @@ impl PolicyRunner {
         PolicyRunnerDaemon {
             shutdown_tx,
             tasks,
-            stopped,
+            stopped: stopped_workers,
         }
     }
 
@@ -922,7 +964,7 @@ impl PolicyRunner {
             &self.executors,
             policy,
             &mut cursor,
-            &self.blocked,
+            &self.stopped,
             max_depth,
         )
         .await
@@ -1223,7 +1265,7 @@ struct PolicyWorker {
     cqrs: Cqrs<PostgresEventStore>,
     pool: Pool<Postgres>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
-    blocked: Arc<BlockedWatch>,
+    stopped: StoppedPolicies,
     shutdown_rx: watch::Receiver<bool>,
     leader_rx: watch::Receiver<bool>,
     /// Kept as the sender so each attempt subscribes its own receiver; a
@@ -1247,7 +1289,7 @@ impl PolicyWorker {
             cqrs,
             pool,
             executors,
-            blocked,
+            stopped,
             mut shutdown_rx,
             mut leader_rx,
             wake_tx,
@@ -1325,7 +1367,7 @@ impl PolicyWorker {
                     &executors,
                     policy.as_ref(),
                     &mut cursor,
-                    &blocked,
+                    &stopped,
                     max_depth,
                 )
                 .await
@@ -1519,7 +1561,7 @@ async fn drain_policy_once(
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     policy: &dyn ErasedPolicy,
     cursor: &mut PolicyCursor,
-    blocked: &BlockedWatch,
+    stopped: &StoppedPolicies,
     max_depth: u32,
 ) -> Result<usize, replay::Error> {
     let name = policy.name().to_string();
@@ -1542,7 +1584,7 @@ async fn drain_policy_once(
             );
             // The gap was read from the position the operator has just replaced:
             // reporting it would name a stop that no longer exists.
-            blocked.cleared(&name);
+            stopped.forget(&name);
             return Ok(0);
         }
 
@@ -1550,10 +1592,15 @@ async fn drain_policy_once(
             // Parked in front of a hole, and the cursor is where the read left it.
             Some(gap) => {
                 trace_gap(&name, gap);
-                report_blocked(pool, &name, gap, blocked).await?;
+                // A hole no running transaction can fill is crossed here; anything
+                // else is an append the feed is right to wait for, and waiting is
+                // what gets reported.
+                if !skip_burned_positions(pool, &name, cursor, gap, stopped).await? {
+                    report_blocked(pool, &name, gap, &stopped.blocked).await?;
+                }
             }
             // Caught up: a healthy idle policy, and it stays silent.
-            None => blocked.cleared(&name),
+            None => stopped.forget(&name),
         }
         return Ok(0);
     }
@@ -1562,12 +1609,17 @@ async fn drain_policy_once(
         // A truncated window: the policy advances over the prefix now and parks at
         // the hole. The hole is as old as this poll even though this poll had work,
         // so the clock starts here rather than on the first empty poll.
+        //
+        // Whether the hole can ever fill is asked on the *next* poll, once the
+        // prefix has been delivered and the feed comes back empty: the answer costs
+        // a query, and a poll with work in front of it has somewhere better to be.
+        // The delay is one poll, and the positions are no less burned for it.
         Some(gap) => {
             trace_gap(&name, gap);
-            blocked.sighted(&name, gap.expected, std::time::Instant::now());
+            stopped.sighted(&name, gap);
         }
         // Advancing with nothing in the way.
-        None => blocked.cleared(&name),
+        None => stopped.forget(&name),
     }
 
     let mut executed = 0;
@@ -1647,13 +1699,81 @@ fn trace_gap(name: &str, gap: Gap) {
     );
 }
 
+/// Cross a hole no transaction can ever fill, returning whether the Policy moved.
+///
+/// The feed stops at a missing `global_position` because it cannot tell an append
+/// still committing from a position burned by one that aborted — `nextval` is not
+/// transactional, so an aborted append's positions are gone for good
+/// (funkode-io/replay#164). The two are told apart by who holds the sequence:
+/// only a transaction that has already taken the missing position can write it, and
+/// it holds a lock on the sequence until it ends (see [`crate::burned_position`]).
+///
+/// The order of the two queries is the correctness argument and not an accident:
+/// the lock is read first, and only a position still missing *after* that read can
+/// never appear, because Postgres publishes a commit before releasing its locks.
+///
+/// Every burned position in front of the cursor is crossed in one move, so an
+/// aborted batch that burned thousands costs one poll rather than thousands.
+async fn skip_burned_positions(
+    pool: &Pool<Postgres>,
+    name: &str,
+    cursor: &mut PolicyCursor,
+    gap: Gap,
+    stopped: &StoppedPolicies,
+) -> Result<bool, replay::Error> {
+    let Some(holders) = sequence_holders(pool).await? else {
+        // More transactions hold the sequence than this process will track. An
+        // incomplete candidate set can only produce a wrong "permanent", so the
+        // poll declines to judge and looks again next time.
+        return Ok(false);
+    };
+    if stopped.burned.verdict(name, gap.expected, holders) == Permanence::Fillable {
+        return Ok(false);
+    }
+
+    let resume = resume_after_burned(pool, name, cursor.position).await?;
+    let Resume::Skip { next_position } = resume else {
+        // The cursor moved under us, or the hole is gone: either way this verdict
+        // is about a position the Policy is no longer parked in front of.
+        stopped.forget(name);
+        return Ok(false);
+    };
+
+    // The record is written after the checkpoint, not before: a cursor moved by an
+    // operator between the read above and this write loses the compare-and-set, and
+    // this process then crossed nothing. A `warn` saying otherwise would send
+    // whoever reads it looking for a move that never happened.
+    let parked_at = cursor.position;
+    cursor.position = next_position - 1;
+    match cursor.checkpoint(pool, name).await? {
+        Checkpoint::Written => tracing::warn!(
+            policy = %name,
+            cursor = parked_at,
+            skipped_from = gap.expected,
+            skipped_to = next_position - 1,
+            skipped = next_position - gap.expected,
+            next_position,
+            "policy feed skipped global_position values that can never appear: no \
+             transaction still holds them, so they were burned by an append that \
+             aborted. Advancing past them (funkode-io/replay#164)"
+        ),
+        Checkpoint::Superseded => log_superseded(name, cursor),
+    }
+    stopped.forget(name);
+
+    Ok(true)
+}
+
 /// Report a Policy parked in front of a hole long enough for the hole to be
 /// permanent rather than an append still landing.
 ///
 /// The wait is by design (ADR-0003 skip-safety): a `global_position` is assigned at
 /// `INSERT` and visible at `COMMIT`, so a missing one is normally about to land.
-/// Waiting forever is not — `nextval` is non-transactional, so an aborted append
-/// burns its positions and nothing will ever fill them (funkode-io/replay#164).
+/// A hole that outlives the transactions that could fill it is crossed by
+/// [`skip_burned_positions`] instead, so what reaches this warning is a wait that is
+/// still legitimate and has lasted longer than an operator wants to be left guessing
+/// about — a long-running append, or a Policy whose cursor an operator has parked in
+/// front of a position that does not exist yet.
 ///
 /// [`BlockedWatch`] decides which poll reports; the probe then runs at most once
 /// per interval, to name the head and how long the cursor has been parked.
@@ -1681,9 +1801,12 @@ async fn report_blocked(
         missing_position = gap.expected,
         next_position = gap.found,
         blocked_for_secs = parked.elapsed.as_secs(),
-        "policy is blocked: its feed stops at a global_position that does not exist. \
-         If the position was burned by an aborted append it will never appear, and the \
-         cursor must be moved past it (funkode-io/replay#164)"
+        "policy is blocked: its feed stops at a global_position that does not exist \
+         yet. A transaction still holds it, so this is an append that has not \
+         committed, or a cursor parked in front of a position that was never \
+         written. A position no transaction holds is crossed automatically \
+         (funkode-io/replay#170), so do not move the cursor past this one until the \
+         append it is waiting for is known to be gone"
     );
 
     Ok(())
@@ -1989,7 +2112,7 @@ async fn load_event_by_id(
 /// Read the window of positions past `cursor` the policy may advance over.
 ///
 /// Unfiltered — every `global_position > cursor`, up to `limit` — because contiguity
-/// belongs to the position stream, not to the rows the policy asked for (ADR-0012).
+/// belongs to the position stream, not to the rows the policy asked for (ADR-0013).
 /// `filter` is evaluated per row as `matches_filter` and decides delivery only; an
 /// excluded row advances the cursor like a compaction snapshot
 /// (`compacted_snapshot = TRUE`, ADR-0004). [`feed_from_window`] then truncates the
