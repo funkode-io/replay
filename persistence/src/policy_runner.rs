@@ -143,7 +143,7 @@ pub struct PolicyRunnerBuilder {
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
     supervision: WorkerSupervision,
-    escalate: EscalationHook,
+    on_escalation: EscalationHook,
 }
 
 impl PolicyRunnerBuilder {
@@ -197,15 +197,14 @@ impl PolicyRunnerBuilder {
     /// The hook is called once per Policy, on the supervisor's task, after the
     /// stop has been recorded in [`PolicyRunnerDaemon::stopped_workers`]. It runs
     /// in place of the default, which **exits the process** with
-    /// [`ESCALATION_EXIT_CODE`].
+    /// [`ESCALATION_EXIT_CODE`] — the only outcome that releases the Policy's
+    /// advisory lock, so that a standby replica can take it over ([ADR-0018]).
     ///
-    /// **A hook that returns leaves the Policy stopped fleet-wide.** Leadership
-    /// is held by this process's lock-manager session rather than by the worker
-    /// task, so the advisory lock stays held, no standby replica takes the Policy
-    /// over, and nothing reacts for it until the process ends. Overriding the
-    /// default therefore means taking on the ending: fail a liveness probe, drain
-    /// and exit, page someone — something must, or the Policy is down until a
-    /// human notices.
+    /// **A hook that returns leaves the Policy stopped in every replica**, so it
+    /// must arrange the ending itself: fail a liveness probe, drain and exit,
+    /// page someone.
+    ///
+    /// [ADR-0018]: https://github.com/funkode-io/replay/blob/main/docs/adr/0018-escalation-is-a-consumer-hook-that-exits-by-default.md
     ///
     /// ```rust,ignore
     /// runner_builder.on_escalation(|escalation| {
@@ -217,7 +216,7 @@ impl PolicyRunnerBuilder {
     where
         F: Fn(&Escalation) + Send + Sync + 'static,
     {
-        self.escalate = Arc::new(hook);
+        self.on_escalation = Arc::new(hook);
         self
     }
 
@@ -268,7 +267,7 @@ impl PolicyRunnerBuilder {
             executors: self.executors,
             notifications: self.notifications,
             supervision: self.supervision,
-            escalate: self.escalate,
+            on_escalation: self.on_escalation,
             stopped: StoppedPolicies::new(),
         }
     }
@@ -316,7 +315,7 @@ pub struct PolicyRunner {
     notifications: bool,
     supervision: WorkerSupervision,
     /// What the consumer does about a worker this runner has given up on.
-    escalate: EscalationHook,
+    on_escalation: EscalationHook,
     /// What this process remembers about the Policies that are stopped, shared by
     /// every drain path so a stop is judged the same way however it is driven.
     stopped: StoppedPolicies,
@@ -387,8 +386,7 @@ impl PolicyRunnerDaemon {
     /// Every entry here was also escalated through the hook
     /// ([`PolicyRunnerBuilder::on_escalation`]), which by default ends the
     /// process — so a consumer reads a non-empty list only after replacing that
-    /// default with one that returns. Leadership is held by the process, not the
-    /// worker, so those policies stay locked by this replica until it exits.
+    /// default with one that returns.
     pub fn stopped_workers(&self) -> Vec<StoppedWorker> {
         self.stopped.snapshot()
     }
@@ -683,7 +681,7 @@ impl PolicyRunner {
             executors: HashMap::new(),
             notifications: true,
             supervision: WorkerSupervision::default(),
-            escalate: exit_the_process(),
+            on_escalation: exit_the_process(),
         }
     }
 
@@ -977,7 +975,7 @@ impl PolicyRunner {
                     kind: "notify listener",
                     policy: None,
                     stopped: stopped_workers.clone(),
-                    escalate: Arc::clone(&self.escalate),
+                    on_escalation: Arc::clone(&self.on_escalation),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -1022,7 +1020,7 @@ impl PolicyRunner {
                     kind: "lock manager",
                     policy: None,
                     stopped: stopped_workers.clone(),
-                    escalate: Arc::clone(&self.escalate),
+                    on_escalation: Arc::clone(&self.on_escalation),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -1067,7 +1065,7 @@ impl PolicyRunner {
                     kind: "policy worker",
                     policy: Some(worker.name.clone()),
                     stopped: stopped_workers.clone(),
-                    escalate: Arc::clone(&self.escalate),
+                    on_escalation: Arc::clone(&self.on_escalation),
                 },
                 self.supervision,
                 shutdown_rx.clone(),
@@ -1569,7 +1567,7 @@ struct SupervisedTask {
     /// Where a permanent stop is published.
     stopped: StoppedWorkers,
     /// What the consumer does about a permanent stop, once it is published.
-    escalate: EscalationHook,
+    on_escalation: EscalationHook,
 }
 
 impl SupervisedTask {
@@ -1588,7 +1586,7 @@ impl SupervisedTask {
         self.stopped.record(&policy, reason.restarts());
 
         let escalation = Escalation { policy, reason };
-        let hook = &self.escalate;
+        let hook = &self.on_escalation;
         if std::panic::catch_unwind(AssertUnwindSafe(|| hook(&escalation))).is_err() {
             tracing::error!(
                 policy = %escalation.policy,
@@ -2956,7 +2954,7 @@ mod supervisor_tests {
             kind: "policy worker",
             policy: Some("supervised".to_string()),
             stopped: stopped.clone(),
-            escalate: Arc::new(escalations.hook()),
+            on_escalation: Arc::new(escalations.hook()),
         }
     }
 
@@ -3124,7 +3122,7 @@ mod supervisor_tests {
                 kind: "policy worker",
                 policy: Some("supervised".to_string()),
                 stopped: stopped.clone(),
-                escalate: Arc::new(|_| panic!("the consumer's hook is defective")),
+                on_escalation: Arc::new(|_| panic!("the consumer's hook is defective")),
             },
             supervision().max_restarts(0),
             shutdown_rx,
@@ -3179,7 +3177,7 @@ mod supervisor_tests {
                 kind: "lock manager",
                 policy: None,
                 stopped: stopped.clone(),
-                escalate: Arc::new(escalations.hook()),
+                on_escalation: Arc::new(escalations.hook()),
             },
             supervision(),
             shutdown_rx,
