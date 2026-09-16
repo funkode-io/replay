@@ -13,7 +13,12 @@
 //!
 //! Resuming from the last durable checkpoint after a death is covered by
 //! `policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test` in
-//! `integration_tests.rs`, which is also what makes a pod restart safe.
+//! `integration_tests.rs`, which is also what makes a pod restart safe. It is
+//! not re-asserted through a supervised restart here because it cannot be: the
+//! only per-event seam inside a batch belongs to the policy, so a death landing
+//! mid-batch is a panic *inside* the reaction — the boundary funkode-io/replay#183
+//! owns. Every death supervision can inject lands between batches, where the
+//! cursor is already durable.
 //!
 //! Every assertion is something an operator could make: the policy reacted
 //! again, the cursor moved, the daemon names a worker it gave up on. The only

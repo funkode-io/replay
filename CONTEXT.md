@@ -177,7 +177,6 @@ stop is an observation rather than a silence. The budget is per worker: spending
 one leaves every other Policy's worker, cursor and the process's leadership
 untouched.
 _Avoid_: retry policy, circuit breaker, restart limit, backoff policy.
-_Avoid_: retry policy, circuit breaker, restart limit, backoff policy.
 
 ### Liveness
 
