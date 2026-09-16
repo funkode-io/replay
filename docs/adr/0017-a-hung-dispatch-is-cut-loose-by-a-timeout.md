@@ -46,9 +46,11 @@ timeout is how a hang becomes one.
 
 ## Consequences
 
-- A hung reaction costs one parked row and at most
-  `(1 + MAX_DISPATCH_RETRIES) × dispatch_timeout` plus back-offs before the
-  worker moves on.
+- A hung reaction costs at most `(1 + MAX_DISPATCH_RETRIES) × dispatch_timeout`
+  plus back-offs before the worker moves on, and one parked row **per failing
+  dispatch** — a reaction returning several commands parks one row each, as it
+  already does for returned permanent errors, and retrying any of them replays
+  the whole reaction (funkode-io/replay#204).
 - The timeout cannot interrupt work the reaction moved onto another task; see
   `CONTEXT.md`'s non-guarantees.
 - An abandoned dispatch is cancelled mid-command: its transaction rolls back and

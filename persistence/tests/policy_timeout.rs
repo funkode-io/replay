@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
+use common::policy_harness::{
+    PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn, OBSERVE_TIMEOUT,
+};
 use replay_persistence::{
     Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder, StartAt, TIMEOUT_ERROR_KIND,
 };
@@ -235,7 +237,17 @@ async fn retrying_a_parked_timeout_re_parks_it_rather_than_hanging_the_retry_pos
     let hung = harness.ping("subject-1", HANGS).await;
     harness.await_dead_letters(1).await;
 
-    let summary = harness.retry_parked().await;
+    // The assertion is that this *returns*, so it gets a deadline of its own:
+    // unbounded, a regression in the retry path would sit here for HANG_FOR and
+    // be killed by CI instead of failing as a test.
+    let summary = tokio::time::timeout(OBSERVE_TIMEOUT, harness.retry_parked())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the operator's retry did not return within {OBSERVE_TIMEOUT:?}: \
+                 it is replaying a reaction that hangs without a dispatch timeout"
+            )
+        });
     assert_eq!(summary.resolved, 0, "a command that hangs cannot resolve");
     assert_eq!(
         summary.still_failing, 1,
