@@ -1,13 +1,9 @@
 //! Same-stream events must replay in append order, even when their `created`
-//! timestamps disagree with their versions.
+//! timestamps disagree with their versions — why, and why `global_position` is the key
+//! instead: `docs/adr/0018-every-event-read-is-ordered-by-global-position.md`.
 //!
-//! `created` defaults to `now()` = `transaction_timestamp()` (stamped at BEGIN), while
-//! `version` is assigned later, under the `streams … FOR UPDATE` lock inside
-//! `append_event`. A transaction that begins earlier but wins the lock later lands a
-//! higher `version` carrying an older `created`, so a read that sorts by
-//! `(created, version)` places it before its own predecessor and rebuilds the wrong
-//! aggregate state. These tests pin `global_position` as the one sequencing key every
-//! read sorts on: for a plain append, for the rows compaction writes, and against a
+//! These tests pin that order where it is written as well as where it is read: a plain
+//! append whose `created` stamps are inverted, the rows compaction writes, and a
 //! `created` filter, which selects rows without deciding their order.
 
 use futures::TryStreamExt;
@@ -183,30 +179,31 @@ async fn same_stream_replays_in_append_order_not_created_order_postgres_test() {
 }
 
 impl replay::Compactable for Acl {
-    /// Rewrites the live stream to itself. The minimal form of an ACL is one `Granted`
-    /// per surviving member, which replays the same in any order and so would say
-    /// nothing about the order the snapshot rows were written in. Keeping the
-    /// grant/revoke pair makes the rewritten stream order-dependent, which is what the
-    /// test below reads back.
+    /// Rewrites the live stream **reversed**. A realistic minimal ACL — one `Granted` per
+    /// surviving member — replays the same whatever order it is stored in, so it could
+    /// not tell a correctly written snapshot from a scrambled one. Reversing produces a
+    /// sequence that is both order-dependent and different from the live order, so the
+    /// test can compare what was stored against what this returned.
     async fn compacted_events(
         &self,
         events: impl futures::TryStream<Ok = AclEvent, Error = replay::Error> + Send,
     ) -> replay::Result<replay::Compaction<AclEvent>> {
-        events
-            .try_collect::<Vec<AclEvent>>()
-            .await
-            .map(replay::Compaction::Rewrite)
+        let mut events: Vec<AclEvent> = events.try_collect().await?;
+        events.reverse();
+        Ok(replay::Compaction::Rewrite(events))
     }
 }
 
-/// `version` and `global_position` within a stream generation, in position order.
-async fn versions_in_position_order(
+/// `(type, member)` of each event of one stream generation, in `global_position` order —
+/// the order a read hands them over in.
+async fn events_in_position_order(
     pool: &PgPool,
     stream_key: &str,
     aggregate_version: Option<i32>,
-) -> Vec<i64> {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT version FROM events
+) -> Vec<(String, String)> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT type, COALESCE(data->'Granted'->>'member', data->'Revoked'->>'member')
+           FROM events
           WHERE stream_id = $1
             AND aggregate_version IS NOT DISTINCT FROM $2
           ORDER BY global_position",
@@ -218,13 +215,13 @@ async fn versions_in_position_order(
     .expect("reading back the stream must succeed")
 }
 
-/// Compaction writes its snapshot rows itself, one INSERT per compacted event, so their
-/// `global_position` order is only the order they replay in for as long as that loop
-/// keeps emitting them in `version` order. Reads sort on `global_position` alone, so a
-/// rewrite that emitted them any other way would hand a non-commutative stream back
-/// inverted — the #199 failure arriving from the write side.
+/// Compaction writes its snapshot rows itself, one INSERT per compacted event, and a read
+/// hands them back in `global_position` order — the order those INSERTs ran in. So the
+/// sequence `compacted_events` returns only survives compaction while the write loop
+/// emits it in order: any other write order hands a non-commutative stream back
+/// scrambled, which is the #199 failure arriving from the write side.
 #[tokio::test]
-async fn compaction_writes_snapshot_rows_in_version_order_postgres_test() {
+async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postgres_test() {
     let (pool, _container) = start_postgres().await;
 
     let cqrs =
@@ -255,25 +252,45 @@ async fn compaction_writes_snapshot_rows_in_version_order_postgres_test() {
     let outcome = cqrs.compact(&acl, meta).await.expect("compaction succeeds");
     assert_eq!(outcome, CompactionOutcome::Compacted { archive_version: 1 });
 
+    let reversed = vec![
+        ("Revoked".to_string(), "alice".to_string()),
+        ("Granted".to_string(), "bob".to_string()),
+        ("Granted".to_string(), "alice".to_string()),
+    ];
     assert_eq!(
-        versions_in_position_order(&pool, &stream_key, None).await,
-        vec![1, 2, 3],
-        "the snapshot rows compaction wrote must carry ascending versions when read in \
-         `global_position` order"
+        events_in_position_order(&pool, &stream_key, None).await,
+        reversed,
+        "the snapshot rows must come back in the order `compacted_events` returned them"
     );
     assert_eq!(
-        versions_in_position_order(&pool, &stream_key, Some(1)).await,
-        vec![1, 2, 3],
-        "archiving stamps the originals in place, so the archived generation keeps the \
-         positions it was appended at"
+        cqrs.fetch_aggregate::<Acl>(&stream_id)
+            .await
+            .unwrap()
+            .members,
+        vec!["bob".to_string(), "alice".to_string()],
+        "replaying that stored order must fold to what it says: the revoke lands first, \
+         so alice's later grant stands"
     );
 
-    let compacted = cqrs.fetch_aggregate::<Acl>(&stream_id).await.unwrap();
+    let archived: Vec<_> = replay_persistence::PostgresEventStore::new(pool.clone())
+        .stream_events_by_stream_id::<Acl>(&stream_id, AggregateVersion::Version(1), None, None)
+        .try_collect()
+        .await
+        .expect("reading the archived generation must succeed");
     assert_eq!(
-        compacted.members,
+        archived.len(),
+        3,
+        "archiving stamps the originals in place; they keep the positions they were \
+         appended at"
+    );
+    let original = cqrs
+        .fetch_aggregate_at::<Acl>(&stream_id, AggregateVersion::Version(1), None, None)
+        .await
+        .expect("replaying the archived generation must succeed");
+    assert_eq!(
+        original.members,
         vec!["bob".to_string()],
-        "replaying the compacted stream must reproduce the pre-compaction state — the \
-         revoke still follows the grant it revokes"
+        "the archived generation still replays to the pre-compaction state"
     );
 }
 

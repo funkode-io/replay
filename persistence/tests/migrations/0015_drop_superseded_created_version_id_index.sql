@@ -1,10 +1,6 @@
 -- no-transaction
--- Drop the keyset index 0013 built for `ORDER BY created, version, id`.
---
--- Nothing issues that order any more: the inline-projection rebuild pages on
--- `global_position` and so does every other event read (#199). Its surviving use — the
--- `created` range predicate of a time-travel read — is served by `idx_events_created`
--- from 0014, at a third of the size.
+-- Drop the keyset index 0013 built for `ORDER BY created, version, id`. No read issues
+-- that order any more (ADR-0018); `idx_events_created` from 0014 covers what is left.
 --
 -- CONCURRENTLY so the drop takes no lock that would block appends; that cannot run
 -- inside a transaction, hence `-- no-transaction` above.

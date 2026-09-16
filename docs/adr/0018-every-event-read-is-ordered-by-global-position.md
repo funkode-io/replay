@@ -74,7 +74,7 @@ the rule that change established and finishes applying it.
 - **Compaction's write order is load-bearing too.** Snapshot rows take their positions from
   the INSERT loop, so a rewrite emitted out of `version` order would hand a
   non-commutative stream back inverted. Pinned by
-  `compaction_writes_snapshot_rows_in_version_order_postgres_test`.
+  `compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postgres_test`.
 - **The `(created, version, id)` index is replaced by one on `created`** (migrations 0014
   and 0015). Nothing sorts on that key any more; what survives is the range predicate on
   the leading column. On 50 000 seeded rows: 3 056 kB → 1 112 kB, same plan.

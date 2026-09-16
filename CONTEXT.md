@@ -50,10 +50,8 @@ same `streams … FOR UPDATE` section that hands out a stream `version`, so with
 stream it rises with `version` and across streams it is a total order. Every event
 read sorts on it and nothing else
 ([ADR-0018](docs/adr/0018-every-event-read-is-ordered-by-global-position.md)).
-`created` is a wall-clock audit stamp — stamped when a transaction *begins*, so two
-appends can carry it in the opposite order to the one they were sequenced in. A
-time-travel read may *filter* on `created`; nothing orders by it. A position may be
-missing (a [Burned position]) but never repeated.
+`created` is a wall-clock audit stamp a time-travel read may *filter* on; it orders
+nothing. A position may be missing (a [Burned position]) but never repeated.
 _Avoid_: offset, sequence number, event time.
 
 ### Policy feed

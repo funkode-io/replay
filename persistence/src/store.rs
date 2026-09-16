@@ -63,11 +63,8 @@ pub trait EventStore: Send + Sync {
         )
     }
 
-    /// Stream the events matching `filter`, in append order.
-    ///
-    /// Append order is the store's sequencing order — `global_position` on Postgres, insertion
-    /// order in memory — never `created`, which is stamped when a transaction begins and can
-    /// run backwards against the order the appends were sequenced in
+    /// Stream the events matching `filter`, in append order — `global_position` on Postgres,
+    /// insertion order in memory, never `created`
     /// (`docs/adr/0018-every-event-read-is-ordered-by-global-position.md`). A filter on
     /// `created` selects which events are returned; it does not order them.
     fn stream_events<E: Event>(

@@ -1,10 +1,7 @@
 //! `created` is a filter, not a sort key — and the index behind it says so.
 //!
-//! Every event read now orders by `global_position` (#199), so nothing sorts on
-//! `(created, version, id)` any more. What survives is the range predicate a
-//! time-travel read puts on `created` alone, which a single-column index serves on the
-//! same plan: on 50 000 seeded rows the three-column index measured 3 056 kB against
-//! 1 112 kB, maintained by every append for two columns no query reads.
+//! Why the wide `(created, version, id)` index gave way to one on `created` alone:
+//! `docs/adr/0018-every-event-read-is-ordered-by-global-position.md`.
 
 use sqlx::{PgPool, Row};
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
