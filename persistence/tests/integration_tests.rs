@@ -2725,7 +2725,7 @@ async fn withdraw_fee_policy_drain_postgres_test() {
 /// front of it, silently (funkode-io/replay#166).
 #[tokio::test]
 async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
-    let container = postgres::Postgres::default().start().await.unwrap();
+    let container = postgres_container().start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -2832,7 +2832,7 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
 /// getting it wrong fails the read rather than skipping the row.
 #[tokio::test]
 async fn policy_filter_that_is_null_per_row_skips_and_advances_postgres_test() {
-    let container = postgres::Postgres::default().start().await.unwrap();
+    let container = postgres_container().start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3199,7 +3199,7 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
 /// on its own since #170, and would never reach the operator.
 #[tokio::test]
 async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_test() {
-    let container = postgres::Postgres::default().start().await.unwrap();
+    let container = postgres_container().start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3339,7 +3339,7 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
 /// of checkpointing its own.
 #[tokio::test]
 async fn policy_checkpoint_yields_to_a_concurrent_cursor_move_postgres_test() {
-    let container = postgres::Postgres::default().start().await.unwrap();
+    let container = postgres_container().start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -6214,7 +6214,7 @@ async fn policy_status_working_behind_postgres_test() {
 /// permanent hole), then append again two positions past the first.
 #[tokio::test]
 async fn policy_status_blocked_on_missing_position_postgres_test() {
-    let container = postgres::Postgres::default().start().await.unwrap();
+    let container = postgres_container().start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)

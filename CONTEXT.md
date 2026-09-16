@@ -167,6 +167,18 @@ a burned one by itself, naming it in a `warn`
 _Avoid_: gap, hole (as a name for the permanent kind), lost position, skipped
 position.
 
+### Commit stamp
+
+The id of the transaction that wrote an event, carried on the event as `commit_txid`
+and written by every insert path
+([0018](persistence/tests/migrations/0018_event_commit_txid.sql)). Its purpose is an
+ordering the [Policy feed] can trust without reasoning about holes: a transaction id
+can be compared against a snapshot of transactions that have ended, whereas a
+`global_position` can be a [Burned position]. Events that predate the stamp carry the
+sentinel `0`, which orders before every real id. Nothing reads it yet
+(funkode-io/replay#171).
+_Avoid_: commit id, transaction number, xmin, sequence.
+
 ### Policy runner
 
 The set of background workers that drive every [Policy] in a process — one
