@@ -2074,7 +2074,7 @@ machinery — causation stamping, failure handling, batching, advisory lock — 
 full `Policy` impl.
 
 ```rust,ignore
-let runner = PolicyRunnerBuilder::new(cqrs, pool)
+let runner = PolicyRunner::builder(cqrs)
     .register_services::<FeeLedger>(fee_services)
     .register_policy_fn::<BankAccountEvent, _>(
         "deposit_fee",
@@ -2096,9 +2096,9 @@ let runner = PolicyRunnerBuilder::new(cqrs, pool)
 
 ```rust,ignore
 use std::time::Duration;
-use replay_persistence::{PolicyRunnerBuilder, StartAt};
+use replay_persistence::{PolicyRunner, StartAt};
 
-let runner = PolicyRunnerBuilder::new(cqrs, pool)
+let runner = PolicyRunner::builder(cqrs)
     .register_services::<BankAccount>(())          // enable Dispatch::to::<BankAccount>
     .register_services::<FeeLedger>(fee_services)
     .register_policy(FeePolicy { ledger_id })
@@ -2175,7 +2175,7 @@ If `PgListener` setup fails (e.g. in environments without `LISTEN` support) the
 task falls back silently to pure polling. You can also opt-out explicitly:
 
 ```rust,ignore
-let runner = PolicyRunnerBuilder::new(cqrs, pool)
+let runner = PolicyRunner::builder(cqrs)
     .register_policy(my_policy)
     .without_notifications() // pure polling; no PgListener connection opened
     .build();
@@ -2265,6 +2265,82 @@ the Policy reacts to every later event. Two panics are outside it: one inside a
 task the reaction **spawns itself** (it unwinds in its own task, and nothing
 parks a dead letter for it), and any panic in a binary built with
 `panic = "abort"`, where the process ends before a catch can run.
+
+#### Restarting a worker that dies
+
+That table covers what the delivery of one event can contain. A worker can also
+die outright — a panic in the drain loop, in cursor I/O, in the feed read. The
+runner restarts it on a budget; the restart resumes from the last durable
+checkpoint, so it costs at most a checkpoint's worth of re-delivery
+([ADR-0017](docs/adr/0017-dead-policy-worker-restarted-on-a-budget.md)).
+
+```rust,ignore
+use std::time::Duration;
+use replay_persistence::{PolicyRunner, WorkerSupervision};
+
+let runner = PolicyRunner::builder(cqrs)
+    .register_policy(my_policy)
+    .with_worker_supervision(
+        WorkerSupervision::default()   // 5 restarts a minute, 100 ms → 30 s
+            .max_restarts(10)          // 0 disables restarting entirely
+            .restart_window(Duration::from_secs(300))
+            .initial_backoff(Duration::from_millis(250))
+            .max_backoff(Duration::from_secs(60)),
+    )
+    .build();
+```
+
+Each restart waits `initial_backoff` doubled per restart already spent in the
+window, capped at `max_backoff`, and logs at `warn` with the policy, the cause
+and the window's restart count. A restart re-reads that policy's cursor only;
+leadership is untouched, because the advisory locks live on the process's shared
+lock-manager session rather than on the worker task.
+
+A worker that spends its budget is **stopped**, logged at `error`, and named by
+`daemon.stopped_workers()`:
+
+```rust,ignore
+for stopped in daemon.stopped_workers() {
+    // Nothing is reacting for `stopped.policy`, and nothing in this process
+    // will start it again.
+    tracing::error!(policy = %stopped.policy, restarts = stopped.restarts, "policy is down");
+}
+```
+
+A non-empty list is worth alerting on and acting on: leadership is held by the
+*process*, so a standby replica takes the policy over only once this process
+exits.
+
+The lock manager and the NOTIFY listener are supervised on the same budget. They
+own no policy, so they are reported through their consequences: a lock manager
+that gives up takes every policy's leadership with it and each of those workers
+reports itself stopped, so `stopped_workers()` names policies rather than
+plumbing. A listener that gives up costs latency only — workers fall back to the
+poll interval.
+
+Two deaths the runner does **not** contain: a panic inside a task the reaction
+spawns itself (it unwinds in its own task, outside both boundaries) and an OOM
+kill.
+
+#### Reading a process that died without saying so
+
+An OOM kill leaves no log line of its own, so every election logs at `info` where
+the worker picks up:
+
+```text
+INFO policy worker is leading; resuming after its last checkpoint
+     policy=price_fanout resuming_after=264785 next_position=264786
+```
+
+Once per election, not per event. In a crash loop the same `next_position`
+reappears on every restart, naming the event to look at:
+
+```sql
+SELECT * FROM events WHERE global_position = 264786;
+```
+
+A position that advances between restarts means the opposite: the process is
+making progress and still dying, i.e. leaking rather than choking on one event.
 
 #### `policy_dead_letters` table
 
@@ -2428,7 +2504,9 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 
 `head` is the raw `MAX(global_position)`. Because `global_position` is a
 `BIGSERIAL` assigned at INSERT but only made visible at COMMIT, a higher position
-can commit before a lower one, so the head can momentarily contain gaps. When you
+can commit before a lower one, so the head can momentarily contain gaps. A position
+that is present, though, names exactly one event: a unique index enforces it, so a
+cursor stepping position by position cannot step over an event. When you
 need a **stable cut** of the log — the largest position `H` such that every
 position in `1..=H` is present, e.g. to freeze a version at publish time — use
 `PostgresEventStore::contiguous_high_water_mark()` instead of `head`; replaying
