@@ -43,9 +43,22 @@ effects when it processes an event, it cannot be safely rebuilt by replaying
 history the way a versioned [Projection] can. (Planned; not yet implemented.)
 _Avoid_: reactor, saga, process manager, automation, trigger, reaction.
 
+### Global position
+
+The sequencing key of the event log: a `BIGSERIAL` on `events`, drawn inside the
+same `streams … FOR UPDATE` section that hands out a stream `version`, so within a
+stream it rises with `version` and across streams it is a total order. Every event
+read sorts on it and nothing else
+([ADR-0018](docs/adr/0018-every-event-read-is-ordered-by-global-position.md)).
+`created` is a wall-clock audit stamp — stamped when a transaction *begins*, so two
+appends can carry it in the opposite order to the one they were sequenced in. A
+time-travel read may *filter* on `created`; nothing orders by it. A position may be
+missing (a [Burned position]) but never repeated.
+_Avoid_: offset, sequence number, event time.
+
 ### Policy feed
 
-The slice of the event log one [Policy] reads on a poll: every `global_position`
+The slice of the event log one [Policy] reads on a poll: every [Global position]
 past its cursor, up to its read batch size, **before** its `stream_filter` is
 applied. Contiguity is decided on those unfiltered positions; an excluded position
 advances the cursor and fires nothing, like a compaction snapshot
@@ -297,6 +310,7 @@ it:
 [Policy status]: #policy-status
 [Blocked policy]: #blocked-policy
 [Burned position]: #burned-position
+[Global position]: #global-position
 [Policy runner]: #policy-runner
 [Leader]: #leader
 [Standby]: #standby
