@@ -2244,7 +2244,7 @@ cannot hold a worker for the life of the process:
 Exceeding it is a **retryable** failure: the dispatch is abandoned, retried under
 the same back-off as an `Unavailable` error, and parked with
 `error_kind = 'Timeout'` once the retries are exhausted
-([ADR-0017](docs/adr/0017-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It
+([ADR-0018](docs/adr/0018-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It
 bounds the future the runner awaits, and cannot interrupt work the reaction moved
 onto another task or a command that never yields — see `CONTEXT.md`'s
 non-guarantees.
@@ -2304,8 +2304,44 @@ and the window's restart count. A restart re-reads that policy's cursor only;
 leadership is untouched, because the advisory locks live on the process's shared
 lock-manager session rather than on the worker task.
 
-A worker that spends its budget is **stopped**, logged at `error`, and named by
-`daemon.stopped_workers()`:
+A worker that spends its budget is **stopped**, logged at `error`, and
+**escalated**: the runner calls the hook the consumer supplied on the builder,
+naming the Policy and why it is down. The default hook **exits the process**
+([ADR-0019](docs/adr/0019-escalation-is-a-consumer-hook-that-exits-by-default.md)).
+
+```rust,ignore
+use replay_persistence::{EscalationReason, PolicyRunner};
+
+let runner = PolicyRunner::builder(cqrs)
+    .register_policy(my_policy)
+    .on_escalation(|escalation| {
+        // `escalation.policy` is down; `escalation.reason` says whether it spent
+        // its restart budget or lost the lock manager that elects it.
+        metrics.policy_down(&escalation.policy);
+        liveness_probe.fail();  // something must end this process — see below
+    })
+    .build();
+```
+
+Why the default exits: leadership is held per Policy by *this process's*
+lock-manager session, not by the worker task, so a stopped worker's replica keeps
+the advisory lock and no standby takes over. Ending the process drops the session,
+which releases the lock, which is what lets a standby take the Policy over. A
+service that configures nothing therefore recovers by being restarted instead of
+lingering half-dead. The exit code is `ESCALATION_EXIT_CODE` (70, `EX_SOFTWARE`),
+so a crash-looping pod's exit code tells a supervision escalation apart from an
+ordinary error exit.
+
+What you take on by overriding it: **a hook that returns leaves the Policy stopped
+fleet-wide.** The advisory lock stays held, no replica reacts for that Policy, and
+nothing changes until the process ends — so your hook must arrange that ending
+(fail a liveness probe, drain and exit, page someone). The library keeps its own
+half of the bargain either way: the worker is recorded as stopped before the hook
+runs, so it is never silently absent, and a hook that panics is caught and logged
+rather than taking the report with it.
+
+Every escalated worker is also named by `daemon.stopped_workers()` — a poll for a
+consumer whose hook returns:
 
 ```rust,ignore
 for stopped in daemon.stopped_workers() {
@@ -2315,16 +2351,12 @@ for stopped in daemon.stopped_workers() {
 }
 ```
 
-A non-empty list is worth alerting on and acting on: leadership is held by the
-*process*, so a standby replica takes the policy over only once this process
-exits.
-
 The lock manager and the NOTIFY listener are supervised on the same budget. They
 own no policy, so they are reported through their consequences: a lock manager
 that gives up takes every policy's leadership with it and each of those workers
-reports itself stopped, so `stopped_workers()` names policies rather than
-plumbing. A listener that gives up costs latency only — workers fall back to the
-poll interval.
+escalates as `EscalationReason::Abandoned`, so escalation names policies rather
+than plumbing. A listener that gives up costs latency only — workers fall back to
+the poll interval. A clean `daemon.shutdown()` escalates nothing.
 
 Two deaths the runner does **not** contain: a panic inside a task the reaction
 spawns itself (it unwinds in its own task, outside both boundaries) and an OOM
