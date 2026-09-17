@@ -199,6 +199,7 @@ impl HeartbeatColumn {
             column: self.clone(),
             min_gap,
             next_write: None,
+            failure_reported: false,
         }
     }
 }
@@ -214,6 +215,10 @@ pub(crate) struct Heartbeat {
     min_gap: Duration,
     /// Earliest instant the next write may happen; `None` before the first.
     next_write: Option<Instant>,
+    /// Whether a failure has already been reported. No failure here is worth a
+    /// second line: the database this write went to is the one the drain uses,
+    /// and a drain that is also failing says so at `error`.
+    failure_reported: bool,
 }
 
 impl Heartbeat {
@@ -234,20 +239,29 @@ impl Heartbeat {
                 .execute(pool)
                 .await;
 
-        if let Err(error) = written {
-            if is_undefined_column(&error) {
-                // Said once, then never attempted again: a consumer whose schema
-                // predates the heartbeat reads liveness from the daemon, and a
-                // line per poll about a column they have not added is noise.
-                self.column.absent.store(true, Ordering::Relaxed);
-                tracing::debug!(
-                    policy = %policy,
-                    "policy_cursors has no last_polled_at column; the durable heartbeat is off \
-                     for this process. Liveness is readable from the daemon either way"
-                );
-            } else {
-                tracing::debug!(policy = %policy, error = %error, "heartbeat write failed");
-            }
+        let Err(error) = written else {
+            return;
+        };
+
+        if is_undefined_column(&error) {
+            // Attempted once per process, then left alone: a consumer whose
+            // schema predates the heartbeat reads liveness from the daemon, and
+            // a line per poll about a column they have not added is noise.
+            self.column.absent.store(true, Ordering::Relaxed);
+        }
+        if !self.failure_reported {
+            self.failure_reported = true;
+            tracing::debug!(
+                policy = %policy,
+                error = %error,
+                durable_heartbeat = if self.column.absent.load(Ordering::Relaxed) {
+                    "off for this process"
+                } else {
+                    "retried on the next poll"
+                },
+                "the durable heartbeat write failed; liveness is readable from the daemon \
+                 either way"
+            );
         }
     }
 

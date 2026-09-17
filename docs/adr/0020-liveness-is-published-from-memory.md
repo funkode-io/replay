@@ -42,9 +42,11 @@ The daemon now publishes [Liveness](../../CONTEXT.md#liveness) per worker:
   `policy_cursors.last_polled_at`, stamped with the database's clock by the
   Leader. It is what a UI reads from a replica that leads nothing. The crate
   writes it when it exists and, on Postgres `42703`, stops attempting it for the
-  life of the process and says so once — so the column may be added before or
-  after the crate version that writes it, and a consumer who never adds it pays
-  one failed statement.
+  life of the process — so the column may be added before or after the crate
+  version that writes it, and a consumer who never adds it pays one failed
+  statement. A failed write is reported once per worker, whatever the reason: the
+  heartbeat is a report about the work, and a report that talks over the work is
+  worse than none.
 
 - **The stamp is rate-limited to one write per poll interval.** A `NOTIFY` wakes a
   worker per append, so an unthrottled stamp would add a write per event to the
