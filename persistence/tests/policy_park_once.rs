@@ -135,22 +135,11 @@ fn parked_for(parked: &[DeadLetter], position: i64) -> Vec<&DeadLetter> {
         .collect()
 }
 
-/// The regression: a permanent failure alongside a retryable sibling is parked
-/// once, not once per attempt.
-#[tokio::test]
-async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forces_postgres_test() {
-    let reactions = Arc::new(AtomicUsize::new(0));
-    let harness =
-        PolicyDaemonHarness::start("park_once", parking_policy(Arc::clone(&reactions))).await;
-
-    let mixed = harness.ping("subject-1", MIXED).await;
-
-    // The cursor moves only after the delivery has parked everything it is going
-    // to park, so a count read afterwards is the final one.
-    harness.await_cursor_at_least(mixed.global_position).await;
-
-    let parked = harness.dead_letters().await;
-    let rows = parked_for(&parked, mixed.global_position);
+/// Assert that the event at `position` parked exactly one row for each of the
+/// two commands its reaction returned — the permanent one and the one whose
+/// retries were exhausted — and nothing else.
+fn assert_one_row_per_failing_command(parked: &[DeadLetter], position: i64) {
+    let rows = parked_for(parked, position);
     assert_eq!(
         rows.len(),
         2,
@@ -172,6 +161,24 @@ async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forc
         1,
         "the command whose retries were exhausted must be parked once, got {rows:#?}"
     );
+}
+
+/// The regression: a permanent failure alongside a retryable sibling is parked
+/// once, not once per attempt.
+#[tokio::test]
+async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forces_postgres_test() {
+    let reactions = Arc::new(AtomicUsize::new(0));
+    let harness =
+        PolicyDaemonHarness::start("park_once", parking_policy(Arc::clone(&reactions))).await;
+
+    let mixed = harness.ping("subject-1", MIXED).await;
+
+    // The cursor moves only after the delivery has parked everything it is going
+    // to park, so a count read afterwards is the final one.
+    harness.await_cursor_at_least(mixed.global_position).await;
+
+    let parked = harness.dead_letters().await;
+    assert_one_row_per_failing_command(&parked, mixed.global_position);
 
     // The premise of the test: the retryable sibling did force further attempts,
     // each of which re-executed the permanent command.
@@ -181,16 +188,14 @@ async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forc
         reactions.load(Ordering::SeqCst)
     );
 
+    // Order must not matter: the same pair the other way round parks the same
+    // two rows.
     let reversed = harness.ping("subject-2", REVERSED).await;
     harness
         .await_cursor_at_least(reversed.global_position)
         .await;
     let parked = harness.dead_letters().await;
-    assert_eq!(
-        parked_for(&parked, reversed.global_position).len(),
-        2,
-        "order must not matter: one row per failing command either way, got {parked:#?}"
-    );
+    assert_one_row_per_failing_command(&parked, reversed.global_position);
 
     // Still leading, still reading.
     let next = harness.ping("subject-3", "hello").await;
@@ -200,11 +205,12 @@ async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forc
     harness.shutdown().await;
 }
 
-/// The deliveries that never retried are untouched: one row per failing command,
-/// whether the reaction returned two commands or one, and whether the single
-/// command failed permanently or ran out of retries.
+/// The deliveries no sibling forces a second attempt on are untouched: one row
+/// per failing command, whether the reaction returned two commands that both
+/// fail permanently or a single one, and whether that single command failed
+/// permanently or ran out of retries on its own.
 #[tokio::test]
-async fn a_delivery_that_settles_on_one_attempt_parks_one_row_per_failing_command_postgres_test() {
+async fn a_delivery_without_a_retryable_sibling_parks_one_row_per_failing_command_postgres_test() {
     let reactions = Arc::new(AtomicUsize::new(0));
     let harness =
         PolicyDaemonHarness::start("park_unchanged", parking_policy(Arc::clone(&reactions))).await;
