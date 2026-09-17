@@ -40,10 +40,19 @@ ADR-0015 rejects it with a test that makes it be wrong on demand.
 
 ## Consequences
 
-- A long-running write delays the events committed after it until it ends. That is
-  bounded by the write and self-healing, never permanent; the runner traces the wait at
-  `debug` and escalates to `warn` past the threshold, so it is distinguishable from a
-  Policy that is simply idle.
+- A long-running write delays the events committed after it until it ends. The watermark is
+  the oldest transaction still running **in the instance**, and a transaction takes an xid on
+  its first write to any table, so the delaying write need not touch `events` — nor even be
+  in the same database. Read-only transactions cost nothing, having no xid. The delay is
+  bounded by that transaction and self-healing, never permanent; the runner traces the wait at
+  `debug` and escalates to `warn` past the threshold, so it is distinguishable from a Policy
+  that is simply idle. Scope and the narrower watermark that would fix it:
+  [#214](https://github.com/funkode-io/replay/issues/214).
+- A cursor's position is no longer monotonic. Consecutive points in this order can hold
+  decreasing positions — an xid is taken before the insert that draws a position — so a
+  Policy that has consumed its whole feed may store a position below `MAX(global_position)`.
+  Anything reading `policy_cursors.position` as progress, `PolicyStatus` included, is reading
+  one half of a pair (#196).
 - A Policy is no longer stopped by a position, so there is nothing to detect, nothing to
   prove and nothing to skip: the gap machinery, the sequence-lock probe and the skip
   warning have no subject (#197).
@@ -53,9 +62,11 @@ ADR-0015 rejects it with a test that makes it be wrong on demand.
 - Events written before migration 0018 carry the sentinel stamp `0`, which orders before
   every real transaction, so a migrated log is read in position order at its head and a
   cursor that predates 0022 resumes where it left off.
-- `StartAt::Now` starts at the head position under the transaction that wrote it, so a
-  write in flight at that moment is history the Policy skips. Starting at the watermark
-  instead would catch it and replay every event committed while any transaction was open;
-  no point in the order does both.
+- `StartAt::Now` starts at the greatest point the order has reached among visible rows, not
+  at `MAX(global_position)`: those name different rows, and starting at the position would
+  replay a committed event whose transaction is younger than the head's. A write in flight at
+  that moment is history the Policy skips. Starting at the watermark instead would catch it
+  and replay every event committed while any transaction was open; no point in the order does
+  both.
 - The stable-cut API (`contiguous_high_water_mark`) is unchanged and still speaks in
   positions; rebuilding it on the watermark is a separate question.

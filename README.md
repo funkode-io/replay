@@ -2599,8 +2599,9 @@ DEBUG replay_persistence::policy_runner: policy feed is waiting for an open writ
       policy=price_fanout cursor=264785 cursor_commit_txid=91827 withheld_position=264786
       withheld_commit_txid=91830 watermark=91830
 WARN  replay_persistence::policy_runner: policy is waiting on a write that has not
-      ended: … policy=price_fanout cursor=264785 head=264956 withheld_position=264786
-      withheld_commit_txid=91830 watermark=91830 waiting_for_secs=259200
+      ended: … policy=price_fanout cursor=264785 cursor_commit_txid=91827 head=264956
+      withheld_position=264786 withheld_commit_txid=91830 watermark=91830
+      waiting_for_secs=259200
 ```
 
 | Setting | Env var | Default |
@@ -2622,8 +2623,22 @@ A caught-up idle policy logs nothing at all.
 ### What to do about a policy that is waiting
 
 Nothing, usually: the wait ends when the write ends, and moving the cursor past it would
-skip the events that write is about to publish. Find the open transaction instead —
-`SELECT * FROM pg_stat_activity WHERE state <> 'idle' ORDER BY xact_start` — and end it.
+skip the events that write is about to publish. Find the open transaction instead and end
+it. Transaction ids are instance-wide, so the culprit may be in another database and may be
+`idle in transaction` rather than running a statement — what identifies it is holding an
+xid, and the oldest xid is the one holding the watermark:
+
+```sql
+SELECT pid, datname, usename, state, backend_xid,
+       now() - xact_start AS open_for, query
+FROM pg_stat_activity
+WHERE backend_xid IS NOT NULL
+ORDER BY age(backend_xid) DESC;
+```
+
+The first row is the transaction every waiting Policy is behind. `idle_in_transaction_session_timeout`
+bounds the accidental version of this; see
+[#214](https://github.com/funkode-io/replay/issues/214) for the scope of the stall.
 
 Positions the log will never issue need no handling. `nextval` is not transactional, so a
 `global_position` taken by an append that aborts is burned for good; because the feed

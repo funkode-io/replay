@@ -1887,6 +1887,7 @@ async fn report_waiting(
     tracing::warn!(
         policy = %name,
         cursor = cursor.position,
+        cursor_commit_txid = %cursor.commit_txid,
         head = wait.head,
         withheld_position = wait.withheld.position,
         withheld_commit_txid = %wait.withheld.commit_txid,
@@ -2581,34 +2582,52 @@ async fn commit_txid_at(
 
 /// The point a Policy registered for the first time starts from.
 ///
-/// [`StartAt::Now`] is the log's head *position*, stamped with the transaction that
-/// wrote the event there. A write that is in flight at that moment is therefore not
-/// delivered: its transaction is older than the head's, so it sits behind this point in
-/// the feed's order. That is the meaning of `Now` — the history a Policy is registered
-/// not to process includes the write that is still finishing — and it is a choice, not
-/// an oversight. The alternative start point that would catch it is the watermark, and
-/// it costs the opposite mistake: every event committed while any transaction was open
-/// is then history the Policy replays, unboundedly far back for a long-running one.
+/// [`StartAt::Now`] is the greatest point the feed's own order has reached: the last row
+/// in `(commit_txid, global_position)` among those visible. Not `MAX(global_position)`,
+/// which names a different row — an xid is taken at a transaction's first write to any
+/// table, so a transaction that writes elsewhere first can commit an event with a higher
+/// `commit_txid` at a *lower* position. Starting at the head position would leave that
+/// row sorting after the cursor, and a Policy registered to skip history would replay it.
+///
+/// A write in flight at that moment is not delivered: its transaction is older than
+/// everything visible, so it lands behind this point and stays there. That is what `Now`
+/// means — the history a Policy is registered not to process includes the write that is
+/// still finishing — and it is a choice. The start point that would catch it is the
+/// watermark, and it costs the opposite mistake: every event committed while any
+/// transaction was open becomes history the Policy replays, unboundedly far back for a
+/// long-running one.
+///
 /// `Beginning` is position 0 under the sentinel stamp, which precedes every event.
 async fn bootstrap_point(
     pool: &Pool<Postgres>,
     start_at: StartAt,
 ) -> Result<FeedPoint, replay::Error> {
-    let position = match start_at {
-        StartAt::Beginning => 0,
-        StartAt::Now => {
-            let head =
-                sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(global_position) FROM events")
-                    .fetch_one(pool)
-                    .await
-                    .map_err(crate::db_error)?;
-            head.unwrap_or_default()
-        }
+    if start_at == StartAt::Beginning {
+        return Ok(FeedPoint {
+            commit_txid: CommitStamp::SENTINEL,
+            position: 0,
+        });
+    }
+
+    let row = sqlx::query(
+        "SELECT commit_txid::text AS commit_txid, global_position FROM events \
+         ORDER BY commit_txid DESC, global_position DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    // An empty log has no point to start from, so `Now` and `Beginning` coincide.
+    let Some(row) = row else {
+        return Ok(FeedPoint {
+            commit_txid: CommitStamp::SENTINEL,
+            position: 0,
+        });
     };
 
     Ok(FeedPoint {
-        commit_txid: commit_txid_at(pool, position).await?,
-        position,
+        commit_txid: CommitStamp::from_row(&row, "commit_txid")?,
+        position: row.get("global_position"),
     })
 }
 

@@ -20,7 +20,7 @@ use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PolicyRunner, PostgresEventStore, StartAt};
 
 mod common;
-use common::held_append::hold_an_append_open;
+use common::held_append::{append_inside, hold_an_append_open};
 use common::postgres_image::{postgres_container, POSTGRES_PORT};
 
 const AUDIT: &str = "commit_visibility_audit";
@@ -422,15 +422,28 @@ async fn the_order_a_policy_walks_is_the_order_the_log_committed_in_postgres_tes
     };
     draining.await;
 
-    let total = (WRITERS * APPENDS_PER_WRITER) as i64;
-    drain_until(&runner, &pool, head(&pool).await, 10).await;
+    // Drained on the count delivered, not on the cursor reaching the numeric head: the
+    // cursor walks in commit order, where a later point can hold a lower position, so a
+    // correct run need never store `MAX(global_position)`.
+    let total = WRITERS * APPENDS_PER_WRITER;
+    for _ in 0..10 {
+        runner.drain().await.expect("drain must succeed");
+        if delivered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+            == total
+        {
+            break;
+        }
+    }
 
     let delivered = delivered
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     assert_eq!(
-        delivered.len() as i64,
+        delivered.len(),
         total,
         "every event is delivered exactly once"
     );
@@ -701,6 +714,86 @@ async fn a_policy_starting_now_skips_a_write_that_was_already_in_flight_postgres
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone(),
         vec![2.0],
+        "only the event appended after the policy started is delivered"
+    );
+}
+
+/// The head a Policy starts at is the greatest point in the feed's order, which is not the
+/// greatest position: a transaction that writes elsewhere before it appends carries a lower
+/// `commit_txid` than one that appended earlier, so the last position and the last point
+/// can belong to different rows.
+///
+/// Starting at `MAX(global_position)` therefore leaves a *committed* event sorting after the
+/// cursor, and a Policy registered to skip history delivers it as news.
+#[tokio::test]
+async fn a_policy_starting_now_skips_a_committed_event_whose_transaction_is_younger_postgres_test()
+{
+    let (pool, _container) = start_postgres().await;
+
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let add = |stream: &'static str, amount: f64| {
+        let cqrs = cqrs.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &LedgerUrn::new(stream).unwrap(),
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    add("now-order-early", 10.0).await;
+    add("now-order-late", 5.0).await;
+
+    // Takes its transaction id first and appends last: lower `commit_txid`, higher position.
+    let mut early = pool.begin().await.expect("beginning must succeed");
+    sqlx::query_scalar::<_, String>("SELECT pg_current_xact_id()::text")
+        .fetch_one(&mut *early)
+        .await
+        .expect("assigning a transaction id must succeed");
+
+    // Appends first and so takes the lower position, under a higher `commit_txid`.
+    let late = hold_an_append_open(&pool, 2).await;
+    let late_position = late.position;
+    let early_position = append_inside(&mut early, &pool, 1).await;
+    assert!(
+        early_position > late_position,
+        "the fixture must produce the inversion it is testing: {early_position} <= {late_position}"
+    );
+
+    late.tx.commit().await.expect("committing must succeed");
+    early.commit().await.expect("committing must succeed");
+
+    let delivered: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&delivered);
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Now, move |event| {
+            let LedgerEvent::Added { amount } = event.data;
+            recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(amount);
+            vec![]
+        })
+        .build();
+
+    // Everything above is committed, so all of it is history.
+    runner.drain().await.expect("drain must succeed");
+
+    // And the policy is started, not parked: the next append arrives.
+    add("now-order-early", 1.0).await;
+    drain_until(&runner, &pool, early_position + 1, 5).await;
+
+    assert_eq!(
+        delivered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+        vec![1.0],
         "only the event appended after the policy started is delivered"
     );
 }
