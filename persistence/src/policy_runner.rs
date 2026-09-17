@@ -1800,14 +1800,7 @@ struct FailedDispatch {
     failure: DispatchFailure,
 }
 
-/// What a parked row names: the aggregate instance a command was addressed to,
-/// and the command's type.
-///
-/// Taken from the [`Dispatch`] before it is executed, because that is the last
-/// point at which it is legible: the `(id, command)` pair the executor receives
-/// is an opaque `Any` (funkode-io/replay#210). The command's *variant* and
-/// payload are not here — `Aggregate::Command` carries no `Debug`/`Serialize`
-/// bound — so what a row identifies is the command type.
+/// What a parked row names, read off a [`Dispatch`] before it is executed.
 #[derive(Clone)]
 struct DispatchIdentity {
     aggregate_name: &'static str,

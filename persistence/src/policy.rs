@@ -69,9 +69,7 @@ impl Dispatch {
         Dispatch {
             target: TypeId::of::<A>(),
             aggregate_name: std::any::type_name::<A>(),
-            // The identity a parked dead letter is read by, taken here because
-            // here is the only place it exists in the open: past this point the
-            // pair is an opaque `Any` the runner cannot look inside
+            // Legible only here: past this point the pair is an opaque `Any`
             // (funkode-io/replay#210).
             target_stream_id: id.clone().into(),
             command_name: std::any::type_name::<A::Command>(),
