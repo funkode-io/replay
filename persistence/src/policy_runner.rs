@@ -110,6 +110,14 @@ pub const HEARTBEAT_CADENCE: Duration = Duration::from_secs(5);
 /// half the cadence would be longer still.
 const HEARTBEAT_LOCK_WAIT: Duration = Duration::from_secs(1);
 
+/// The shortest cadence a consumer may ask for
+/// ([`PolicyRunnerBuilder::with_heartbeat`]).
+///
+/// Ten beats a second is already far past what any staleness threshold can use,
+/// and below it the beat stops being a report and becomes a write loop against
+/// the row the checkpoint uses.
+pub const HEARTBEAT_MIN_CADENCE: Duration = Duration::from_millis(100);
+
 /// The `error_kind` written to `policy_dead_letters` when a reaction **panicked**
 /// rather than returning an error.
 ///
@@ -219,8 +227,21 @@ impl PolicyRunnerBuilder {
     /// consumer reads a Leader as gone after some multiple of this — three beats
     /// is the usual choice — so shortening it shortens detection, at one
     /// statement per beat per replica.
+    ///
+    /// Floored at [`HEARTBEAT_MIN_CADENCE`]: a cadence of zero is a write loop
+    /// rather than a fast heartbeat, and turning the durable half off is
+    /// [`without_heartbeat`](Self::without_heartbeat) rather than a cadence
+    /// nobody could serve.
     pub fn with_heartbeat(mut self, cadence: Duration) -> Self {
-        self.heartbeat = Some(cadence);
+        if cadence < HEARTBEAT_MIN_CADENCE {
+            tracing::warn!(
+                asked_ms = cadence.as_millis() as u64,
+                using_ms = HEARTBEAT_MIN_CADENCE.as_millis() as u64,
+                "heartbeat cadence below the floor; using the floor. To stop writing \
+                 the heartbeat entirely, call without_heartbeat()"
+            );
+        }
+        self.heartbeat = Some(cadence.max(HEARTBEAT_MIN_CADENCE));
         self
     }
 
@@ -1572,6 +1593,18 @@ async fn run_lock_manager(
 /// the Leader's beat with its own idleness. A Leader whose worker has *stopped*
 /// still holds the lock, and still beats — `liveness = 'Stopped'` against a fresh
 /// beat is the half-dead state nothing could see in funkode-io/replay#164.
+///
+/// Leadership is read from the same channels the workers are elected by, so a
+/// beat is exactly as current as the election that drives the work. It is not a
+/// fence: a replica whose pinned lock session has just dropped can write one more
+/// beat before its lock manager notices and revokes, so a `led_by` naming the
+/// previous Leader can survive a failover by up to a beat. That is the split-brain
+/// window [ADR-0008] already bounds for the workers themselves, and here it costs
+/// a stale line in a report rather than a double-processed event: the new Leader
+/// overwrites the row on its next beat. Reading this row as authority over who
+/// may act would be the mistake; it reports, and the advisory lock decides.
+///
+/// [ADR-0008]: https://github.com/funkode-io/replay/blob/main/docs/adr/0008-policy-runner-shared-connection-leadership.md
 async fn run_heartbeat(
     pool: Pool<Postgres>,
     liveness: LivenessRegistry,
@@ -1580,7 +1613,20 @@ async fn run_heartbeat(
     mut shutdown_rx: watch::Receiver<bool>,
     cadence: Duration,
 ) -> Stop {
+    // A schedule rather than a sleep between beats: sleeping `cadence` *after*
+    // each write would make every period `cadence + however long the write took`,
+    // so a slow database would stretch the one interval a consumer's staleness
+    // threshold is derived from. `Skip` drops a tick the previous beat ran into
+    // instead of firing twice to catch up — a beat that missed its slot is of no
+    // use, and the next one is due immediately anyway.
+    let mut schedule = tokio::time::interval(cadence);
+    schedule.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return Stop::Shutdown,
+            _ = schedule.tick() => {}
+        }
         if *shutdown_rx.borrow() {
             return Stop::Shutdown;
         }
@@ -1606,11 +1652,6 @@ async fn run_heartbeat(
             .collect();
 
         writer.beat(&pool, &beats).await;
-
-        tokio::select! {
-            _ = shutdown_rx.changed() => {}
-            _ = tokio::time::sleep(cadence) => {}
-        }
     }
 }
 /// Everything one policy's worker needs to run, cloned afresh on each restart.

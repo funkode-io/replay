@@ -88,10 +88,10 @@ use replay_persistence::{
 /// outcomes, so the interval only bounds how long an idle poll loop dawdles.
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// How often the daemon under test writes the durable heartbeat. Short for the
-/// same reason the poll interval is: these tests wait on beats arriving, not on
-/// production's cadence.
-pub const DAEMON_HEARTBEAT_CADENCE: Duration = Duration::from_millis(100);
+/// How often the daemon under test writes the durable heartbeat: the floor the
+/// crate allows, for the same reason the poll interval is short — these tests
+/// wait on beats arriving, not on production's cadence.
+pub const DAEMON_HEARTBEAT_CADENCE: Duration = replay_persistence::HEARTBEAT_MIN_CADENCE;
 
 /// How long an `await_*` observation may go unsatisfied before it is a failure.
 pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);

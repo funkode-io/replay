@@ -87,6 +87,27 @@ task beats it out to the cursor row for consumers that are not in that process.
   liveness answered in seconds. One statement per beat per replica covers every
   Policy it leads.
 
+- **The cadence is a schedule, not a sleep between beats.** Sleeping the cadence
+  *after* each write makes every period `cadence + however long the write took`,
+  so a slow database stretches the very interval a staleness threshold is derived
+  from. A `tokio::time::interval` with `MissedTickBehavior::Skip` charges the write
+  to the tick it happened in, and drops a tick the previous beat ran into rather
+  than firing twice to catch up. Cadences are floored at `HEARTBEAT_MIN_CADENCE`
+  (100ms): below that the beat is a write loop against the row the checkpoint
+  uses, and turning it off is `without_heartbeat()`.
+
+- **The beat reports leadership; it does not fence it.** It is read from the same
+  channels the workers are elected by, so it is exactly as current as the election
+  that drives the work — and a replica whose pinned lock session has just dropped
+  can write one more beat before its lock manager revokes. A `led_by` can
+  therefore outlive a failover by up to a beat, self-healed by the new Leader's
+  next one. That is the split-brain window
+  [ADR-0008](0008-policy-runner-shared-connection-leadership.md) already bounds for
+  the workers, and here it costs a stale line in a report rather than a
+  double-processed event. Fencing it properly would mean an epoch published by the
+  lock manager and compared in the write; the cost is not worth a field nobody
+  acts on automatically.
+
 ## Consequences
 
 - A consumer alerts on `last_beat_at` older than three beats and on

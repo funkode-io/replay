@@ -28,8 +28,8 @@ pub use policy_liveness::{Liveness, WorkerLiveness};
 pub use policy_runner::{
     DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, EscalationReason,
     PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, StoppedWorker, WorkerSupervision,
-    ESCALATION_EXIT_CODE, HEARTBEAT_CADENCE, PANIC_ERROR_KIND, REPLAY_NOTIFY_CHANNEL,
-    TIMEOUT_ERROR_KIND,
+    ESCALATION_EXIT_CODE, HEARTBEAT_CADENCE, HEARTBEAT_MIN_CADENCE, PANIC_ERROR_KIND,
+    REPLAY_NOTIFY_CHANNEL, TIMEOUT_ERROR_KIND,
 };
 pub use policy_status::{PolicyCondition, PolicyStatus, PolicyStatusStore};
 pub use query::Query;

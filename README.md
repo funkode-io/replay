@@ -2577,6 +2577,12 @@ let runner = PolicyRunner::builder(cqrs)
     .build();
 ```
 
+The cadence is a schedule, not a sleep between beats: time spent writing is
+charged to the tick it happened in, so a slow write moves one beat rather than
+every beat after it. Cadences below `HEARTBEAT_MIN_CADENCE` (100 ms) are floored —
+that end of the range is a write loop, not a faster signal, and
+`.without_heartbeat()` is how you turn it off.
+
 Alerting:
 
 - **Page** on `last_beat_at` older than 3 beats (15 s at the default) and on
@@ -2585,8 +2591,16 @@ Alerting:
   (≈2.5 min at defaults). One hung dispatch legitimately costs `dispatch_timeout`
   × four attempts, and the runner already handles that by parking a dead letter.
 
+One caveat on `led_by` and failover: the beat reports leadership, it does not
+fence it. A replica whose lock session has just dropped can write one last beat
+before its lock manager notices and revokes, so for up to a beat the row can still
+name the previous leader — the same split-brain window
+[ADR-0008](docs/adr/0008-policy-runner-shared-connection-leadership.md) bounds for
+the workers, self-healed by the new leader's next beat. The advisory lock decides
+who may act; this row only says who did.
+
 The columns are yours, not the crate's: they are written when present, and their
-absence turns the durable heartbeat off for the process (attempted once, reported
+absence turns the durable heartbeat off for the daemon (attempted once, reported
 once) — so the migration can be applied before or after the crate version that
 writes it. Add all four or none. Only the replica holding a policy's advisory lock
 writes its row, so a standby never overwrites a leader's beat, and the crate never

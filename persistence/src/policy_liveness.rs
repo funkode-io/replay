@@ -6,11 +6,14 @@
 //! Neither implies the other: a [Standby] runs and advances nothing, and the
 //! [Leader] of a [Blocked policy] runs and advances nothing either.
 //!
-//! The durable half is one column, `policy_cursors.last_polled_at`, written
-//! opportunistically by the worker that polls: it is what lets a consumer read a
-//! Leader's last poll from a replica that is not the Leader. The column belongs
-//! to the consumer's schema, so a database without it is a no-op rather than an
-//! error ([`Heartbeat`]).
+//! The durable half is a [`Beat`]: the replica that holds a Policy's advisory
+//! lock writes that worker's state, its last completed poll and its own name to
+//! the cursor row, on a cadence fixed independently of the work
+//! ([`crate::PolicyRunnerDaemon`] spawns the task that does it). A worker cannot
+//! write its own — it is blocked precisely while a reaction hangs, which is the
+//! case the beat is for. The columns belong to the consumer's schema, so a
+//! database without them is a no-op rather than an error
+//! ([`HeartbeatColumns`]).
 //!
 //! [Standby]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#standby
 //! [Leader]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#leader
