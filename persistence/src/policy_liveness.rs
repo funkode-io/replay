@@ -398,9 +398,10 @@ impl HeartbeatWriter {
             tracing::warn!(
                 error = %error,
                 policies = %policies,
-                "the durable heartbeat write failed and is not being retried per beat; \
-                 anything reading policy_cursors for liveness will see it go stale while \
-                 this process is healthy. Liveness stays readable from the daemon"
+                "the durable heartbeat write failed; later beats keep attempting it and \
+                 this warning is not repeated, so for as long as the failure lasts \
+                 anything reading policy_cursors for liveness will see it go stale \
+                 while this process is healthy. Liveness stays readable from the daemon"
             );
         }
     }

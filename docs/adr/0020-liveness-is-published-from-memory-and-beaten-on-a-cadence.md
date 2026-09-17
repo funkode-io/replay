@@ -38,8 +38,8 @@ task beats it out to the cursor row for consumers that are not in that process.
   path.** A stamp written by the worker as it polls goes silent for every reason
   the worker is busy — a restart backoff of up to 30s, a hung reaction, standing
   by — so staleness meant "busy or dead" and answered nothing. The beat keeps its
-  cadence whatever the workload, so a stale beat means one thing: the Leader's
-  process is gone.
+  cadence whatever the workload, so a stale beat means one thing: no replica is
+  successfully beating for that Policy.
 
 - **The beat cannot come from the worker, so it comes from a sibling task.** A
   worker awaiting a hung dispatch cannot write anything, and that is the case the
@@ -47,13 +47,18 @@ task beats it out to the cursor row for consumers that are not in that process.
   the NOTIFY listener, owns no Policy, and reads the same in-memory registry
   `daemon.liveness()` reads. Its guarantee is exact: *this process is alive, and
   here is its supervisor's knowledge of each worker.* Every way a worker task can
-  end is observed through its `JoinHandle` before the next beat goes out; the one
-  thing that leaves no trace there — a reaction that hangs — is what the poll
-  stamp in the same row covers. Between the two fields there is no gap.
+  end is observed through its `JoinHandle`, so the state reaches the registry
+  without the worker's cooperation — but the supervisor and the beat are separate
+  tasks, so a worker that dies just before a tick can be beaten as `Leading` once
+  more: liveness lags a termination by up to one cadence, which is inside the
+  three-beat threshold a consumer pages on. The one ending that leaves no trace in
+  the `JoinHandle` — a reaction that hangs — is what the poll stamp in the same row
+  covers. Between the two fields there is no gap.
 
-- **Three facts, kept apart**: `last_beat_at` stale ⇒ no live Leader;
-  `liveness` ⇒ what that Leader's supervisor knows; `last_polled_at` old against a
-  fresh beat ⇒ alive but not finishing polls, busy or wedged.
+- **Three facts, kept apart**: `last_beat_at` stale ⇒ no Leader beating
+  successfully; `liveness` ⇒ what that Leader's supervisor knows, as of up to a
+  cadence ago; `last_polled_at` old against a fresh beat ⇒ alive but not finishing
+  polls, busy or wedged.
 
 - **A replica beats only for the Policies whose advisory lock it holds**, read
   from the same leadership channels the workers are elected by. One row per Policy
