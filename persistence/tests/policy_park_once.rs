@@ -23,6 +23,10 @@ use replay_persistence::{Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder, 
 /// retryable one forces.
 const MIXED: &str = "mixed";
 
+/// The same pair the other way round: the retryable command comes first, so on
+/// every attempt but the last it breaks out before the permanent one runs.
+const REVERSED: &str = "reversed";
+
 /// Tag whose reaction returns two commands that both fail permanently on the
 /// first attempt — nothing forces a second one.
 const BOTH_PERMANENT: &str = "both-permanent";
@@ -94,6 +98,10 @@ impl Policy for ParkingPolicy {
             MIXED => vec![
                 Self::refuse(PERMANENT_REASON),
                 Self::flake(RETRYABLE_REASON),
+            ],
+            REVERSED => vec![
+                Self::flake(RETRYABLE_REASON),
+                Self::refuse(PERMANENT_REASON),
             ],
             BOTH_PERMANENT => vec![Self::refuse("first"), Self::refuse("second")],
             ONE_PERMANENT => vec![Self::refuse(PERMANENT_REASON)],
@@ -173,8 +181,19 @@ async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forc
         reactions.load(Ordering::SeqCst)
     );
 
+    let reversed = harness.ping("subject-2", REVERSED).await;
+    harness
+        .await_cursor_at_least(reversed.global_position)
+        .await;
+    let parked = harness.dead_letters().await;
+    assert_eq!(
+        parked_for(&parked, reversed.global_position).len(),
+        2,
+        "order must not matter: one row per failing command either way, got {parked:#?}"
+    );
+
     // Still leading, still reading.
-    let next = harness.ping("subject-2", "hello").await;
+    let next = harness.ping("subject-3", "hello").await;
     let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
     assert_eq!(dispatched.event_type, "Echoed");
 
