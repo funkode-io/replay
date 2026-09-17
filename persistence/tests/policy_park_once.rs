@@ -43,6 +43,11 @@ const ONE_RETRYABLE: &str = "one-retryable";
 const PERMANENT_REASON: &str = "permanent-command";
 const RETRYABLE_REASON: &str = "transient-command";
 
+/// The reasons the two permanently failing commands of [`BOTH_PERMANENT`]
+/// report, so each is distinguishable in the rows they park.
+const FIRST_REASON: &str = "first-command";
+const SECOND_REASON: &str = "second-command";
+
 /// The `error_kind` a refused command is parked under.
 const PERMANENT_KIND: &str = "Invalid Input";
 
@@ -103,7 +108,7 @@ impl Policy for ParkingPolicy {
                 Self::flake(RETRYABLE_REASON),
                 Self::refuse(PERMANENT_REASON),
             ],
-            BOTH_PERMANENT => vec![Self::refuse("first"), Self::refuse("second")],
+            BOTH_PERMANENT => vec![Self::refuse(FIRST_REASON), Self::refuse(SECOND_REASON)],
             ONE_PERMANENT => vec![Self::refuse(PERMANENT_REASON)],
             ONE_RETRYABLE => vec![Self::flake(RETRYABLE_REASON)],
             tag => vec![Dispatch::to::<Probe>(
@@ -135,6 +140,13 @@ fn parked_for(parked: &[DeadLetter], position: i64) -> Vec<&DeadLetter> {
         .collect()
 }
 
+/// How many of `rows` are what a command failing with `reason` parks.
+fn rows_for(rows: &[&DeadLetter], kind: &str, reason: &str) -> usize {
+    rows.iter()
+        .filter(|row| row.error_kind == kind && row.error_message.contains(reason))
+        .count()
+}
+
 /// Assert that the event at `position` parked exactly one row for each of the
 /// two commands its reaction returned — the permanent one and the one whose
 /// retries were exhausted — and nothing else.
@@ -146,18 +158,12 @@ fn assert_one_row_per_failing_command(parked: &[DeadLetter], position: i64) {
         "one row per failing command, not one per command per attempt, got {rows:#?}"
     );
     assert_eq!(
-        rows.iter()
-            .filter(|row| row.error_kind == PERMANENT_KIND
-                && row.error_message.contains(PERMANENT_REASON))
-            .count(),
+        rows_for(&rows, PERMANENT_KIND, PERMANENT_REASON),
         1,
         "the permanently failing command must be parked exactly once, got {rows:#?}"
     );
     assert_eq!(
-        rows.iter()
-            .filter(|row| row.error_kind == RETRYABLE_KIND
-                && row.error_message.contains(RETRYABLE_REASON))
-            .count(),
+        rows_for(&rows, RETRYABLE_KIND, RETRYABLE_REASON),
         1,
         "the command whose retries were exhausted must be parked once, got {rows:#?}"
     );
@@ -224,15 +230,33 @@ async fn a_delivery_without_a_retryable_sibling_parks_one_row_per_failing_comman
         .await;
     let parked = harness.dead_letters().await;
 
+    let both_rows = parked_for(&parked, both.global_position);
     assert_eq!(
-        parked_for(&parked, both.global_position).len(),
+        both_rows.len(),
         2,
         "two commands failing permanently on the first attempt park two rows, got {parked:#?}"
     );
     assert_eq!(
-        parked_for(&parked, single.global_position).len(),
+        rows_for(&both_rows, PERMANENT_KIND, FIRST_REASON),
+        1,
+        "the first command must be parked exactly once, got {both_rows:#?}"
+    );
+    assert_eq!(
+        rows_for(&both_rows, PERMANENT_KIND, SECOND_REASON),
+        1,
+        "the second command must be parked exactly once, got {both_rows:#?}"
+    );
+
+    let single_rows = parked_for(&parked, single.global_position);
+    assert_eq!(
+        single_rows.len(),
         1,
         "a single permanently failing command parks one row, got {parked:#?}"
+    );
+    assert_eq!(
+        rows_for(&single_rows, PERMANENT_KIND, PERMANENT_REASON),
+        1,
+        "the row must be the one that command parks, got {single_rows:#?}"
     );
 
     let retried = parked_for(&parked, exhausted.global_position);
@@ -241,7 +265,11 @@ async fn a_delivery_without_a_retryable_sibling_parks_one_row_per_failing_comman
         1,
         "a single command that exhausts its retries parks one row, got {parked:#?}"
     );
-    assert_eq!(retried[0].error_kind, RETRYABLE_KIND);
+    assert_eq!(
+        rows_for(&retried, RETRYABLE_KIND, RETRYABLE_REASON),
+        1,
+        "the row must be the one that command parks, got {retried:#?}"
+    );
 
     harness.shutdown().await;
 }
