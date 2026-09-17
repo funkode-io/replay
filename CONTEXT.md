@@ -249,8 +249,11 @@ _Avoid_: alert, failover, panic, giving up.
 The axis reporting whether a [Policy]'s worker exists and is running — leading,
 standing by, restarting, stopped or unknown. Only the process running the
 [Policy runner] knows it, so it is published from memory and never derived from
-the operational tables. It implies nothing about [Progress], and nothing about
-it can be inferred from Progress.
+the operational tables
+([ADR-0020](docs/adr/0020-liveness-is-published-from-memory.md)). Its one durable
+trace is the [Leader]'s last poll, stamped on the cursor row where a replica that
+leads nothing can read it — a reading, not the verdict. It implies nothing about
+[Progress], and nothing about it can be inferred from Progress.
 _Avoid_: uptime, availability, aliveness, worker status.
 
 ### Progress

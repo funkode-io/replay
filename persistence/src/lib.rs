@@ -9,6 +9,7 @@ mod persisted_event;
 mod policy;
 mod policy_blocked;
 mod policy_feed;
+mod policy_liveness;
 mod policy_runner;
 mod policy_status;
 mod query;
@@ -22,6 +23,7 @@ pub use infrastructure::{InMemoryEventStore, PostgresEventStore, PostgresInlineP
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
 pub use policy::{Dispatch, Policy, StartAt};
+pub use policy_liveness::{Liveness, WorkerLiveness};
 pub use policy_runner::{
     DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, EscalationReason,
     PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, StoppedWorker, WorkerSupervision,
@@ -52,9 +54,9 @@ pub mod prelude {
     pub use super::{
         AggregateVersion, CompactionOutcome, Cqrs, DeadLetterDiscard, DeadLetterRetry,
         DeadLetterRetrySummary, Dispatch, Escalation, EscalationReason, EventSink, EventStore,
-        InMemoryEventStore, InlineProjection, NoSink, PersistedEvent, Policy, PolicyCondition,
-        PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
-        PostgresEventStore, PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter,
-        WorkerSupervision,
+        InMemoryEventStore, InlineProjection, Liveness, NoSink, PersistedEvent, Policy,
+        PolicyCondition, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus,
+        PolicyStatusStore, PostgresEventStore, PostgresInlineProjection, Query, StartAt,
+        StoppedWorker, StreamFilter, WorkerLiveness, WorkerSupervision,
     };
 }

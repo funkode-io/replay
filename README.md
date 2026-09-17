@@ -2335,8 +2335,8 @@ half of the bargain either way: the worker is recorded as stopped before the hoo
 runs, so it is never silently absent, and a hook that panics is caught and logged
 rather than taking the report with it.
 
-Every escalated worker is also named by `daemon.stopped_workers()` — a poll for a
-consumer whose hook returns:
+Every escalated worker is also named by `daemon.stopped_workers()`, and reads as
+`Liveness::Stopped` — a poll for a consumer whose hook returns:
 
 ```rust,ignore
 for stopped in daemon.stopped_workers() {
@@ -2490,6 +2490,63 @@ impl From<MyAggregateError> for replay::Error {
 The simplest path is `type Error = replay::Error` (used throughout the examples
 here), which satisfies the bound with the identity conversion.
 
+### Reading each worker's liveness
+
+`daemon.liveness()` answers "is this worker running". `PolicyStatusStore` (below)
+answers "is this Policy moving". **Neither implies the other**: a standby replica
+runs and advances nothing, and a leader parked in front of a hole runs and
+advances nothing either. Liveness is known only to the process running the
+workers, so it is published from memory and never derived from the tables
+([ADR-0020](docs/adr/0020-liveness-is-published-from-memory.md)).
+
+```rust,ignore
+use replay_persistence::Liveness;
+
+for worker in daemon.liveness() {
+    let last_poll = worker.last_polled_at.map(|at| at.elapsed());
+    match worker.liveness {
+        // Nothing is reacting for this policy, and nothing here will start it.
+        Liveness::Stopped => probe.fail(&worker.policy),
+        _ => tracing::info!(
+            policy = %worker.policy, liveness = %worker.liveness, ?last_poll, "policy worker"
+        ),
+    }
+}
+```
+
+| `Liveness` | Meaning |
+|------------|---------|
+| `Leading` | Elected for this policy and draining its feed. |
+| `StandingBy` | Running, holding no advisory lock for it — another replica leads, or none does yet. Healthy and deliberately idle. |
+| `Restarting` | Dead, inside the backoff before its next restart. |
+| `Stopped` | Down for good: budget spent, or the lock manager that elects it stopped. Already escalated. |
+| `Unknown` | Spawned and not yet at its first election. Never a guess at "stopped". |
+
+`last_polled_at` is a monotonic `Instant`, recorded when a poll **comes back**, so
+a worker held inside one long reaction reads as `Leading` with an ageing stamp —
+which is what tells it from an idle one. A `StandingBy` worker drives nothing and
+normally has none. `Liveness` has a stable `as_str()` / `Display` form for JSON/UI
+consumers.
+
+#### Reading liveness from a replica that leads nothing
+
+The accessor above only sees this process's workers. For a UI with a connection
+string rather than a handle, the leader also stamps its last poll on the cursor
+row — **if your schema has the column**:
+
+```sql
+ALTER TABLE policy_cursors
+    ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMP WITH TIME ZONE;
+```
+
+The column is yours, not the crate's: it is written when present and its absence
+is a no-op (attempted once per process, then left alone), so this migration can be
+applied before or after the crate version that writes it. The stamp uses the
+database's clock, and is written at most once per poll interval. It is a reading,
+not a verdict: a `last_polled_at` that stops moving says the leader stopped
+polling, but only `daemon.liveness()` in that leader's own process can say which
+of the five states it is in.
+
 ### Monitoring policy status
 
 A running policy is otherwise opaque: its cursor and dead letters live in
@@ -2570,6 +2627,11 @@ Only policies that have actually run appear: a registered-but-never-started poli
 has no `policy_cursors` row and is therefore absent from `list()`. The store only
 *observes* — retrying or discarding a dead letter is a separate, deliberate action
 (see the triage queries above).
+
+`PolicyStatus` carries **no liveness field**, deliberately: every field here is
+derived from the operational tables, and no table can see whether a worker task
+exists. A `CaughtUp` policy whose worker died looks exactly like one that is idle
+— `daemon.liveness()` is what tells them apart.
 
 ### What a blocked policy writes to the log
 

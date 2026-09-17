@@ -33,6 +33,7 @@ use crate::burned_position::{
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
 use crate::policy_blocked::{probe_blocked, resolve_blocked_warn_after, BlockedWatch};
 use crate::policy_feed::{feed_from_window, Feed, Gap, WindowPosition};
+use crate::policy_liveness::{HeartbeatColumn, LivenessHandle, LivenessRegistry, WorkerLiveness};
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
 /// Erased, services-bound execution path for one aggregate type.
@@ -377,6 +378,7 @@ pub struct PolicyRunnerDaemon {
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     stopped: StoppedWorkers,
+    liveness: LivenessRegistry,
 }
 
 impl PolicyRunnerDaemon {
@@ -401,6 +403,41 @@ impl PolicyRunnerDaemon {
     /// default with one that returns.
     pub fn stopped_workers(&self) -> Vec<StoppedWorker> {
         self.stopped.snapshot()
+    }
+
+    /// What each of this process's workers is doing: leading, standing by,
+    /// restarting, stopped or unknown, with the instant each last finished a
+    /// poll ([`WorkerLiveness`]).
+    ///
+    /// This is the [Liveness] axis — "is this worker running" — and it is known
+    /// only here: it is published from memory by the workers themselves and is
+    /// never derived from the operational tables. [`crate::PolicyStatusStore`]
+    /// answers the other one, "is this Policy moving", from the tables alone.
+    /// Neither implies the other: a [Standby] runs and advances nothing, and a
+    /// [Leader] parked in front of a hole runs and advances nothing either.
+    ///
+    /// Every registered Policy appears, including one whose worker has not
+    /// reached its first election ([`Liveness::Unknown`]). A Policy another
+    /// replica leads is [`Liveness::StandingBy`] here — a standby is healthy and
+    /// deliberately idle, and reading it as down is the false alarm this
+    /// accessor exists to prevent.
+    ///
+    /// ```rust,ignore
+    /// for worker in daemon.liveness() {
+    ///     tracing::info!(
+    ///         policy = %worker.policy,
+    ///         liveness = %worker.liveness,
+    ///         last_poll_secs = worker.last_polled_at.map(|at| at.elapsed().as_secs()),
+    ///         "policy worker"
+    ///     );
+    /// }
+    /// ```
+    ///
+    /// [Liveness]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#liveness
+    /// [Standby]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#standby
+    /// [Leader]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#leader
+    pub fn liveness(&self) -> Vec<WorkerLiveness> {
+        self.liveness.snapshot()
     }
 }
 
@@ -979,6 +1016,10 @@ impl PolicyRunner {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::with_capacity(self.policies.len() + 2);
         let stopped_workers = StoppedWorkers::default();
+        let liveness = LivenessRegistry::default();
+        // One answer per process about the consumer's schema, shared by every
+        // worker and kept across restarts.
+        let heartbeat_column = HeartbeatColumn::default();
 
         // ── Shared NOTIFY listener: one connection, broadcast fan-out ─────────
         // A single PgListener receives every append NOTIFY and rebroadcasts it to
@@ -993,6 +1034,7 @@ impl PolicyRunner {
                     kind: "notify listener",
                     policy: None,
                     stopped: stopped_workers.clone(),
+                    liveness: None,
                     on_escalation: Arc::clone(&self.on_escalation),
                 },
                 self.supervision,
@@ -1038,6 +1080,7 @@ impl PolicyRunner {
                     kind: "lock manager",
                     policy: None,
                     stopped: stopped_workers.clone(),
+                    liveness: None,
                     on_escalation: Arc::clone(&self.on_escalation),
                 },
                 self.supervision,
@@ -1075,6 +1118,8 @@ impl PolicyRunner {
                 leader_rx,
                 wake_tx: wake_tx.clone(),
                 interval,
+                liveness: liveness.register(&name),
+                heartbeat_column: heartbeat_column.clone(),
                 name,
             };
 
@@ -1083,6 +1128,7 @@ impl PolicyRunner {
                     kind: "policy worker",
                     policy: Some(worker.name.clone()),
                     stopped: stopped_workers.clone(),
+                    liveness: Some(worker.liveness.clone()),
                     on_escalation: Arc::clone(&self.on_escalation),
                 },
                 self.supervision,
@@ -1095,6 +1141,7 @@ impl PolicyRunner {
             shutdown_tx,
             tasks,
             stopped: stopped_workers,
+            liveness,
         }
     }
 
@@ -1417,6 +1464,11 @@ struct PolicyWorker {
     /// and nothing else (polling is the correctness baseline).
     wake_tx: Option<broadcast::Sender<()>>,
     interval: Duration,
+    /// Where this worker publishes what it is doing, shared with its supervisor.
+    liveness: LivenessHandle,
+    /// Whether the consumer's schema carries `policy_cursors.last_polled_at`,
+    /// shared across restarts so a worker that comes back does not re-ask.
+    heartbeat_column: HeartbeatColumn,
     name: String,
 }
 
@@ -1438,9 +1490,14 @@ impl PolicyWorker {
             mut leader_rx,
             wake_tx,
             interval,
+            liveness,
+            heartbeat_column,
             name,
         } = self;
         let mut wake_rx = wake_tx.as_ref().map(broadcast::Sender::subscribe);
+        // At most one durable stamp per poll interval, however often a NOTIFY
+        // wakes this worker.
+        let mut heartbeat = heartbeat_column.writer(interval);
 
         let max_depth = resolve_max_depth(policy.as_ref());
 
@@ -1450,6 +1507,12 @@ impl PolicyWorker {
             }
 
             // Wait until the shared lock manager elects this worker leader.
+            if !*leader_rx.borrow() {
+                // Unelected and running: the state a replica that leads nothing
+                // spends its whole life in, and the one an operator must never
+                // read as down.
+                liveness.standing_by();
+            }
             while !*leader_rx.borrow() {
                 tokio::select! {
                     changed = shutdown_rx.changed() => {
@@ -1469,6 +1532,7 @@ impl PolicyWorker {
             }
 
             tracing::info!(policy = %name, "running as leader");
+            liveness.leading();
 
             // Initialize cursor from the stored checkpoint (or bootstrap).
             let mut cursor = match PolicyCursor::load(&pool, &name, policy.start_at()).await {
@@ -1525,6 +1589,14 @@ impl PolicyWorker {
                         );
                     }
                 }
+
+                // Published after the drain rather than before it, so the stamp
+                // reads "last poll that came back": a worker held inside one long
+                // reaction is leading with an ageing stamp, which is what tells it
+                // from an idle one.
+                let polled_at = Instant::now();
+                liveness.polled(polled_at);
+                heartbeat.beat(&pool, &name, polled_at).await;
 
                 // Wait for the next wakeup: NOTIFY broadcast (if enabled),
                 // poll timeout, leadership change, or shutdown — whichever
@@ -1584,6 +1656,10 @@ struct SupervisedTask {
     policy: Option<String>,
     /// Where a permanent stop is published.
     stopped: StoppedWorkers,
+    /// Where a worker's own state is published. `None` for the process-wide
+    /// shared tasks, which drive no Policy and so have no liveness of their own:
+    /// what a consumer reads is the workers they abandon.
+    liveness: Option<LivenessHandle>,
     /// What the consumer does about a permanent stop, once it is published.
     on_escalation: EscalationHook,
 }
@@ -1602,6 +1678,9 @@ impl SupervisedTask {
             return;
         };
         self.stopped.record(&policy, reason.restarts());
+        if let Some(liveness) = &self.liveness {
+            liveness.stopped();
+        }
 
         let escalation = Escalation { policy, reason };
         let hook = &self.on_escalation;
@@ -1688,6 +1767,9 @@ async fn supervise<F>(
                     cause = %cause,
                     "task died outside its reaction; restarting after backoff"
                 );
+                if let Some(liveness) = &task.liveness {
+                    liveness.restarting();
+                }
                 tokio::select! {
                     _ = shutdown_rx.changed() => return,
                     _ = tokio::time::sleep(backoff) => {}
@@ -3181,9 +3263,10 @@ mod supervisor_tests {
     use tracing_test::traced_test;
 
     use super::{
-        supervise, Escalation, EscalationReason, RevokeLeadership, Stop, StoppedWorkers,
-        SupervisedTask, WorkerSupervision,
+        supervise, Escalation, EscalationReason, LivenessRegistry, RevokeLeadership, Stop,
+        StoppedWorkers, SupervisedTask, WorkerSupervision,
     };
+    use crate::Liveness;
 
     /// Backoffs short enough that a test waits on outcomes rather than on time.
     fn supervision() -> WorkerSupervision {
@@ -3210,10 +3293,20 @@ mod supervisor_tests {
     }
 
     fn a_policy_worker(stopped: &StoppedWorkers, escalations: &Escalations) -> SupervisedTask {
+        a_policy_worker_reporting(stopped, escalations, &LivenessRegistry::default())
+    }
+
+    /// The same, with its liveness published where a test can read it.
+    fn a_policy_worker_reporting(
+        stopped: &StoppedWorkers,
+        escalations: &Escalations,
+        liveness: &LivenessRegistry,
+    ) -> SupervisedTask {
         SupervisedTask {
             kind: "policy worker",
             policy: Some("supervised".to_string()),
             stopped: stopped.clone(),
+            liveness: Some(liveness.register("supervised")),
             on_escalation: Arc::new(escalations.hook()),
         }
     }
@@ -3322,11 +3415,12 @@ mod supervisor_tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let stopped = StoppedWorkers::default();
         let escalations = Escalations::default();
+        let liveness = LivenessRegistry::default();
         let attempts = Arc::new(AtomicUsize::new(0));
 
         let spawned = Arc::clone(&attempts);
         supervise(
-            a_policy_worker(&stopped, &escalations),
+            a_policy_worker_reporting(&stopped, &escalations, &liveness),
             supervision(),
             shutdown_rx,
             move || {
@@ -3339,12 +3433,65 @@ mod supervisor_tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(stopped.snapshot()[0].policy, "supervised");
         assert_eq!(
+            liveness.snapshot()[0].liveness,
+            Liveness::Stopped,
+            "a worker nothing can elect again reads as stopped, not standing by"
+        );
+        assert_eq!(
             escalations.recorded(),
             vec![Escalation {
                 policy: "supervised".to_string(),
                 reason: EscalationReason::Abandoned,
             }],
             "a worker nothing can elect again is as absent as one that spent its budget"
+        );
+    }
+
+    /// The two states supervision owns, in the order it produces them: a worker
+    /// waiting out its backoff is restarting — down now, back shortly — and one
+    /// whose budget then runs out is stopped.
+    #[tokio::test]
+    async fn a_worker_reports_restarting_inside_its_backoff_and_stopped_after_it() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let stopped = StoppedWorkers::default();
+        let escalations = Escalations::default();
+        let liveness = LivenessRegistry::default();
+
+        // One restart, and a backoff long enough to be observed rather than
+        // raced past.
+        let supervision = supervision()
+            .max_restarts(1)
+            .initial_backoff(Duration::from_millis(200))
+            .max_backoff(Duration::from_millis(200));
+
+        let supervising = tokio::spawn(supervise(
+            a_policy_worker_reporting(&stopped, &escalations, &liveness),
+            supervision,
+            shutdown_rx,
+            || tokio::spawn(async { panic!("died in the night") }),
+        ));
+
+        await_liveness(&liveness, Liveness::Restarting).await;
+        supervising.await.expect("supervision must end cleanly");
+
+        assert_eq!(liveness.snapshot()[0].liveness, Liveness::Stopped);
+        assert_eq!(stopped.snapshot()[0].restarts, 1);
+    }
+
+    /// Wait for the supervised worker to publish `expected`, failing rather than
+    /// hanging if it never does.
+    async fn await_liveness(liveness: &LivenessRegistry, expected: Liveness) {
+        let published = tokio::time::timeout(Duration::from_secs(5), async {
+            while liveness.snapshot()[0].liveness != expected {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            published.is_ok(),
+            "the worker never reported {expected}; it reported {}",
+            liveness.snapshot()[0].liveness
         );
     }
 
@@ -3418,6 +3565,7 @@ mod supervisor_tests {
                 kind: "policy worker",
                 policy: Some("supervised".to_string()),
                 stopped: stopped.clone(),
+                liveness: None,
                 on_escalation: Arc::new(|_| panic!("the consumer's hook is defective")),
             },
             supervision().max_restarts(0),
@@ -3472,6 +3620,7 @@ mod supervisor_tests {
                 kind: "lock manager",
                 policy: None,
                 stopped: stopped.clone(),
+                liveness: None,
                 on_escalation: Arc::new(escalations.hook()),
             },
             supervision(),

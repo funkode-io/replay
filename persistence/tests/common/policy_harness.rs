@@ -21,6 +21,10 @@
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
 //! - [`PolicyDaemonHarness::stopped_workers`] — the workers the runner gave up
 //!   on, which is what an operator reads off the daemon in their own service.
+//! - [`PolicyDaemonHarness::liveness`] — what each worker in this process is
+//!   doing, read off the daemon the same way.
+//! - [`PolicyDaemonHarness::last_polled_at`] — the durable stamp a worker leaves
+//!   on its cursor row, which is what a replica that leads nothing can read.
 //! - [`PolicyDaemonHarness::escalations`] — what the consumer's escalation hook
 //!   was told. The harness installs a recording hook in place of the default,
 //!   which exits the process: in a test that is the test runner.
@@ -30,6 +34,12 @@
 //! - [`PolicyDaemonHarness::restart`] — stop the daemon and start an identical
 //!   one against the same database, so a test can ask what survived in memory
 //!   (nothing) and what survived in the tables (everything that matters).
+//! - [`PolicyDaemonHarness::start_replica`] — start a *second* runner against
+//!   the same database, which is how a test reaches a Standby: whichever runner
+//!   loses the advisory lock leads nothing and must say so.
+//! - [`PolicyDaemonHarness::drop_heartbeat_column`] — take
+//!   `policy_cursors.last_polled_at` away, standing in for a consumer whose
+//!   schema predates it.
 //! - [`PolicyDaemonHarness::retry_parked`] — the bulk retry of everything the
 //!   policy parked, run out of band while the daemon keeps polling.
 //!
@@ -60,6 +70,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use testcontainers_modules::postgres;
@@ -70,8 +81,8 @@ use super::postgres_image::{postgres_container, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, DeadLetterRetrySummary, Escalation, PolicyRunner, PolicyRunnerBuilder,
-    PolicyRunnerDaemon, PostgresEventStore, StoppedWorker,
+    Cqrs, DeadLetterRetrySummary, Escalation, Liveness, PolicyRunner, PolicyRunnerBuilder,
+    PolicyRunnerDaemon, PostgresEventStore, StoppedWorker, WorkerLiveness,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -468,6 +479,73 @@ impl PolicyDaemonHarness {
             .stopped_workers()
     }
 
+    /// What every worker in this daemon is doing, and when each last polled.
+    pub fn liveness(&self) -> Vec<WorkerLiveness> {
+        self.daemon
+            .as_ref()
+            .expect("the daemon is only taken by shutdown")
+            .liveness()
+    }
+
+    /// Wait until this daemon reports `policy` as `expected`, and return the
+    /// whole reading — the last poll included.
+    pub async fn await_liveness(&self, policy: &str, expected: Liveness) -> WorkerLiveness {
+        self.observe(&format!("{policy} to report {expected}"), || async {
+            self.liveness()
+                .into_iter()
+                .find(|worker| worker.policy == policy && worker.liveness == expected)
+        })
+        .await
+    }
+
+    /// The durable stamp on the policy's cursor row: when its Leader last
+    /// polled, as any replica can read it.
+    pub async fn last_polled_at(&self) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT last_polled_at FROM policy_cursors WHERE name = $1",
+        )
+        .bind(&self.policy_name)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("the heartbeat observation must be readable")
+        .flatten()
+    }
+
+    /// Take `policy_cursors.last_polled_at` away: the schema of a consumer who
+    /// has not added the column, which the runner must tolerate.
+    ///
+    /// The column is the consumer's, not the crate's, so this is a schema a
+    /// deployment can genuinely be in rather than a fault injected for the test.
+    /// Call [`restart`](Self::restart) afterwards to run a daemon that never saw
+    /// it.
+    pub async fn drop_heartbeat_column(&self) {
+        sqlx::query("ALTER TABLE policy_cursors DROP COLUMN last_polled_at")
+            .execute(&self.pool)
+            .await
+            .expect("dropping the heartbeat column must succeed");
+    }
+
+    /// Start a second runner against this harness's database, registering the
+    /// same policy under the same name — the other replica.
+    ///
+    /// Both compete for the one advisory lock that elects the policy's Leader,
+    /// and the runner already polling holds it, so the replica stands by. It is
+    /// a separate daemon with its own liveness, which is the point: a Standby
+    /// must report itself from its own process.
+    pub fn start_replica(&self) -> PolicyDaemonReplica {
+        let escalations = Escalations::default();
+        let daemon = spawn_daemon(
+            &self.cqrs,
+            self.configure.as_ref(),
+            &self.policy_name,
+            &escalations,
+        );
+        PolicyDaemonReplica {
+            escalations,
+            daemon: Some(daemon),
+        }
+    }
+
     /// The policy's dead letters — the reactions it parked — oldest first.
     pub async fn dead_letters(&self) -> Vec<DeadLetter> {
         let rows = sqlx::query(
@@ -620,6 +698,43 @@ impl PolicyDaemonHarness {
     /// belong to that test's own `#[tokio::test]` runtime, which is dropped (and
     /// aborts them) as the test unwinds, and they hold locks in a database no
     /// other test can see, which the container takes with it.
+    pub async fn shutdown(mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.shutdown().await;
+        }
+    }
+}
+
+/// The second runner in a test: another process's daemon, against the same
+/// database and the same policy name.
+///
+/// It exposes what a replica can be asked about itself — its own workers'
+/// liveness — and nothing else. Everything in the database is already readable
+/// through the harness that owns it, and reading it twice would only invite a
+/// test to assert the same row from two places.
+pub struct PolicyDaemonReplica {
+    escalations: Escalations,
+    daemon: Option<PolicyRunnerDaemon>,
+}
+
+impl PolicyDaemonReplica {
+    /// What every worker in this replica is doing.
+    pub fn liveness(&self) -> Vec<WorkerLiveness> {
+        self.daemon
+            .as_ref()
+            .expect("the daemon is only taken by shutdown")
+            .liveness()
+    }
+
+    /// What this replica's escalation hook was told — a Standby that escalates
+    /// is the false alarm the liveness axis exists to prevent, so a test says so
+    /// rather than only checking the state.
+    pub fn escalations(&self) -> Vec<Escalation> {
+        self.escalations.recorded()
+    }
+
+    /// Stop this replica and await every task it spawned, releasing any advisory
+    /// lock it managed to take.
     pub async fn shutdown(mut self) {
         if let Some(daemon) = self.daemon.take() {
             daemon.shutdown().await;
