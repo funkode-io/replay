@@ -23,9 +23,9 @@ pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
 pub use policy::{Dispatch, Policy, StartAt};
 pub use policy_runner::{
-    DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, PolicyRunner, PolicyRunnerBuilder,
-    PolicyRunnerDaemon, StoppedWorker, WorkerSupervision, PANIC_ERROR_KIND, REPLAY_NOTIFY_CHANNEL,
-    TIMEOUT_ERROR_KIND,
+    DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, EscalationReason,
+    PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, StoppedWorker, WorkerSupervision,
+    ESCALATION_EXIT_CODE, PANIC_ERROR_KIND, REPLAY_NOTIFY_CHANNEL, TIMEOUT_ERROR_KIND,
 };
 pub use policy_status::{PolicyCondition, PolicyStatus, PolicyStatusStore};
 pub use query::Query;
@@ -51,9 +51,9 @@ pub mod prelude {
     // Persistence types from this crate
     pub use super::{
         AggregateVersion, CompactionOutcome, Cqrs, DeadLetterDiscard, DeadLetterRetry,
-        DeadLetterRetrySummary, Dispatch, EventSink, EventStore, InMemoryEventStore,
-        InlineProjection, NoSink, PersistedEvent, Policy, PolicyCondition, PolicyRunner,
-        PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
+        DeadLetterRetrySummary, Dispatch, Escalation, EscalationReason, EventSink, EventStore,
+        InMemoryEventStore, InlineProjection, NoSink, PersistedEvent, Policy, PolicyCondition,
+        PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
         PostgresEventStore, PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter,
         WorkerSupervision,
     };
