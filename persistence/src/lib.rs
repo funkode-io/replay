@@ -1,5 +1,6 @@
 mod aggregate_version;
 mod burned_position;
+mod commit_stamp;
 mod cqrs;
 mod error;
 mod filters;

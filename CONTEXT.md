@@ -124,8 +124,11 @@ the `policy_cursors` row that records how far it has processed — by writing th
 row directly while the system runs. The third controlling action alongside
 [Retry] and [Discard], and the coarsest: it moves the Policy itself rather than
 one parked reaction, skipping events when it moves forward and re-delivering
-them when it moves backward. The running leader adopts the new position when its
-feed is empty, and never writes a position that predates the move
+them when it moves backward. The instruction is a position, as it has always
+been: the row also records the [Commit stamp] the Policy stopped in, and the
+runner derives that half from the position an operator writes. The running
+leader adopts the new position when its feed is empty, and never writes a
+position that predates the move
 ([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
 _Avoid_: reset, seek, rewind (as a name for the act; a rewind is one direction of
 it).
@@ -190,8 +193,10 @@ and written by every insert path
 ordering the [Policy feed] can trust without reasoning about holes: a transaction id
 can be compared against a snapshot of transactions that have ended, whereas a
 `global_position` can be a [Burned position]. Events that predate the stamp carry the
-sentinel `0`, which orders before every real id. Nothing reads it yet
-(funkode-io/replay#171).
+sentinel `0`, which orders before every real id. A [Policy]'s cursor records the stamp
+it stopped in alongside the position
+([0022](persistence/tests/migrations/0022_policy_cursor_commit_txid.sql)); the feed
+itself still reads by position (funkode-io/replay#171).
 _Avoid_: commit id, transaction number, xmin, sequence.
 
 ### Policy runner
@@ -383,6 +388,7 @@ it:
 [Policy status]: #policy-status
 [Blocked policy]: #blocked-policy
 [Burned position]: #burned-position
+[Commit stamp]: #commit-stamp
 [Global position]: #global-position
 [Policy runner]: #policy-runner
 [Leader]: #leader
