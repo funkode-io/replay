@@ -2,6 +2,8 @@
 
 **Status:** accepted
 **Amends:** ADR-0002 (which had the store call `handle` once per append)
+**Amended by:** [ADR-0018](0018-every-event-read-is-ordered-by-global-position.md) — the
+keyset key below is now `global_position` alone
 
 `store_events_stream` pulls its producer one event at a time so a bulk append never has
 to fit in memory — but it retained every appended event as a `serde_json::Value` so the
@@ -22,10 +24,11 @@ registration or version drift — is bounded the same way and by the same `flush
 is the worse of the two: an append is bounded by what a caller submits, while a rebuild
 loads *all* matching history, at startup, on the deploy that bumped a projection version.
 Because the replay must stay in the rebuild transaction (one snapshot, one rollback), the
-chunks are paged with a keyset cursor — `WHERE (created, version, id) > (…) ORDER BY
-created, version, id LIMIT N` — rather than read from a row stream, which cannot borrow
-the transaction while `handle` writes to it. `id` breaks ties in `(created, version)`,
-which is not unique, so the paging cannot skip rows.
+chunks are paged with a keyset cursor — `WHERE global_position > (…) ORDER BY
+global_position LIMIT N` — rather than read from a row stream, which cannot borrow the
+transaction while `handle` writes to it. The key is unique, so the paging cannot skip
+rows. (This shipped as `(created, version, id)`, with `id` breaking the ties
+`(created, version)` admits; ADR-0018 replaced it.)
 
 One transaction is not by itself one snapshot: at the default READ COMMITTED isolation
 every page query takes a fresh one, so an append committed mid-rebuild would be folded
@@ -64,15 +67,14 @@ event. `flush_size` follows the crate's tunable convention: store override →
   per chunk. Such state belongs in the projection's own fields or its view. Documented on
   `InlineProjection::handle` and in the README.
 - **A rebuild costs one round trip per chunk.** Keyset paging reissues a bounded query per
-  chunk instead of scanning once, and it reads `(created, version, id)` order, indexed by
-  migration `0013_replay_keyset_index.sql` (which supersedes the `(created, version)` index
-  from `0005`).
+  chunk instead of scanning once, and it reads `global_position` order, indexed by
+  `idx_events_global_position`.
 - **A rebuild can now fail on a serialization error.** `REPEATABLE READ` aborts rather
   than blocks when a concurrent writer touches a row it has written, so two instances
   rebuilding the same projection at once end with one loud startup failure instead of a
   silently double-applied view.
 - **Replay order is now fully determined.** Events that tie on `(created, version)` used to
-  arrive in whatever order the scan produced; they now arrive by `id` within the tie.
+  arrive in whatever order the scan produced; under ADR-0018's key no two events can tie.
 - The in-memory store applies projections after a whole append by construction and is
   test-only, so it keeps single-call delivery. A projection written against it and deployed
   on Postgres must not rely on that.

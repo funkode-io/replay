@@ -20,8 +20,8 @@ use common::postgres_image::{postgres_container, POSTGRES_PORT};
 use replay_persistence::{Dispatch, StartAt};
 
 /// The migration before the one that gives the cursor its transaction half: a database
-/// staged here is one a live deployment is on when 0020 reaches it.
-const BEFORE_CURSOR_STAMP: i64 = 19;
+/// staged here is one a live deployment is on when 0022 reaches it.
+const BEFORE_CURSOR_STAMP: i64 = 21;
 
 /// The sentinel a cursor that predates the stamp carries: it orders before every real
 /// transaction, which is where every event that cursor has processed sits too.

@@ -1,0 +1,12 @@
+-- no-transaction
+-- An index on `created` alone, for the only thing `created` is still read for: the range
+-- predicate of a time-travel read (`StreamFilter::CreatedAfter` / `CreatedBefore`).
+-- Nothing sorts on `(created, version, id)` any more, and the size it costs per append is
+-- measured in docs/adr/0018-every-event-read-is-ordered-by-global-position.md; 0021 drops
+-- it once this index exists.
+--
+-- CONCURRENTLY, so appends keep running while the index is built on a populated table;
+-- that cannot run inside a transaction, hence `-- no-transaction` above. No
+-- IF NOT EXISTS: a concurrent build that fails leaves an *invalid* index behind, and
+-- IF NOT EXISTS would step over it and report success with no usable index.
+CREATE INDEX CONCURRENTLY idx_events_created ON events (created);

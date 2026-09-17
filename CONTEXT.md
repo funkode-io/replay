@@ -43,9 +43,21 @@ effects when it processes an event, it cannot be safely rebuilt by replaying
 history the way a versioned [Projection] can. (Planned; not yet implemented.)
 _Avoid_: reactor, saga, process manager, automation, trigger, reaction.
 
+### Global position
+
+The sequencing key of the event log: a `BIGSERIAL` on `events`, drawn inside the
+same `streams … FOR UPDATE` section that hands out a stream `version`, so within a
+stream it rises with `version` and across streams it is a total order. Every event
+read sorts on it and nothing else
+([ADR-0018](docs/adr/0018-every-event-read-is-ordered-by-global-position.md)).
+`created` is a wall-clock audit stamp a time-travel read may *filter* on; it orders
+nothing. A position may be missing (a [Burned position]) but never repeated — a
+unique index enforces that (migration 0015).
+_Avoid_: offset, sequence number, event time.
+
 ### Policy feed
 
-The slice of the event log one [Policy] reads on a poll: every `global_position`
+The slice of the event log one [Policy] reads on a poll: every [Global position]
 past its cursor, up to its read batch size, **before** its `stream_filter` is
 applied. Contiguity is decided on those unfiltered positions; an excluded position
 advances the cursor and fires nothing, like a compaction snapshot
@@ -53,8 +65,7 @@ advances the cursor and fires nothing, like a compaction snapshot
 `stream_filter` decides what a Policy *reacts to*, never how far it *gets*. The
 feed stops at a position it has not read, which may be an append still in flight —
 unless it is a [Burned position], which it crosses. Stepping one position at a time
-is only safe because a position is held by exactly one event: a unique index
-enforces that (migration 0015), rather than `BIGSERIAL` implying it.
+is only safe because a position is held by exactly one event.
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation
@@ -184,7 +195,7 @@ can be compared against a snapshot of transactions that have ended, whereas a
 `global_position` can be a [Burned position]. Events that predate the stamp carry the
 sentinel `0`, which orders before every real id. A [Policy]'s cursor records the stamp
 it stopped in alongside the position
-([0020](persistence/tests/migrations/0020_policy_cursor_commit_txid.sql)); the feed
+([0022](persistence/tests/migrations/0022_policy_cursor_commit_txid.sql)); the feed
 itself still reads by position (funkode-io/replay#171).
 _Avoid_: commit id, transaction number, xmin, sequence.
 
@@ -351,6 +362,7 @@ it:
 [Blocked policy]: #blocked-policy
 [Burned position]: #burned-position
 [Commit stamp]: #commit-stamp
+[Global position]: #global-position
 [Policy runner]: #policy-runner
 [Leader]: #leader
 [Standby]: #standby

@@ -3747,7 +3747,7 @@ mod cursor_tests {
     /// Completing a transaction half is bookkeeping, not progress: a Policy that has
     /// been parked for ten minutes still reads as parked for ten minutes afterwards.
     ///
-    /// The case is a database upgraded through 0020 whose cursor sits on an event
+    /// The case is a database upgraded through 0022 whose cursor sits on an event
     /// appended after 0018: the row takes the sentinel, and the first leader to load it
     /// derives the real id.
     #[tokio::test]
@@ -3790,7 +3790,7 @@ mod cursor_tests {
         );
     }
 
-    /// A cursor that predates 0020 carries the sentinel and the position it had. It
+    /// A cursor that predates 0022 carries the sentinel and the position it had. It
     /// resumes exactly there: the sentinel is the transaction every event it has already
     /// processed was stamped with, because they all predate 0018 too.
     #[tokio::test]
@@ -3806,7 +3806,7 @@ mod cursor_tests {
             .await
             .expect("staging the pre-stamp events must succeed");
 
-        // The row 0020 leaves behind: a position, and the sentinel.
+        // The row 0022 leaves behind: a position, and the sentinel.
         sqlx::query("INSERT INTO policy_cursors (name, position) VALUES ($1, $2)")
             .bind(POLICY)
             .bind(events[1].position)

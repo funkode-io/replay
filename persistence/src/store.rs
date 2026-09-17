@@ -63,6 +63,10 @@ pub trait EventStore: Send + Sync {
         )
     }
 
+    /// Stream the events matching `filter`, in append order — `global_position` on Postgres,
+    /// insertion order in memory, never `created`
+    /// (`docs/adr/0018-every-event-read-is-ordered-by-global-position.md`). A filter on
+    /// `created` selects which events are returned; it does not order them.
     fn stream_events<E: Event>(
         &self,
         filter: crate::StreamFilter,

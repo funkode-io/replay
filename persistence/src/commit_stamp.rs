@@ -17,7 +17,7 @@ pub(crate) struct CommitStamp(u64);
 impl CommitStamp {
     /// `InvalidTransactionId`: never assigned to a transaction, so it names no write and
     /// orders before every real id. Carried by every event that predates migration 0018
-    /// and by every cursor that predates 0020.
+    /// and by every cursor that predates 0022.
     pub(crate) const SENTINEL: Self = CommitStamp(0);
 
     /// Read a stamp out of a `commit_txid::text` column.
