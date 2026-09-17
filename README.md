@@ -2497,7 +2497,7 @@ answers "is this Policy moving". **Neither implies the other**: a standby replic
 runs and advances nothing, and a leader parked in front of a hole runs and
 advances nothing either. Liveness is known only to the process running the
 workers, so it is published from memory and never derived from the tables
-([ADR-0020](docs/adr/0020-liveness-is-published-from-memory.md)).
+([ADR-0020](docs/adr/0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)).
 
 ```rust,ignore
 use replay_persistence::Liveness;
@@ -2528,24 +2528,65 @@ which is what tells it from an idle one. A `StandingBy` worker drives nothing an
 normally has none. `Liveness` has a stable `as_str()` / `Display` form for JSON/UI
 consumers.
 
-#### Reading liveness from a replica that leads nothing
+#### Reading liveness from outside the process
 
-The accessor above only sees this process's workers. For a UI with a connection
-string rather than a handle, the leader also stamps its last poll on the cursor
-row — **if your schema has the column**:
+The accessor above only sees this process's workers. For a UI, a dashboard or a
+sidecar with a connection string rather than a handle, each replica **beats** for
+the policies it leads — on a fixed cadence, independent of the poll interval and
+of what any worker is doing:
 
 ```sql
 ALTER TABLE policy_cursors
-    ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMP WITH TIME ZONE;
+    ADD COLUMN IF NOT EXISTS last_beat_at   TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS liveness       TEXT,
+    ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS led_by         TEXT;
 ```
 
-The column is yours, not the crate's: it is written when present and its absence
-is a no-op (attempted once per process, then left alone), so this migration can be
-applied before or after the crate version that writes it. The stamp uses the
-database's clock, and is written at most once per poll interval. It is a reading,
-not a verdict: a `last_polled_at` that stops moving says the leader stopped
-polling, but only `daemon.liveness()` in that leader's own process can say which
-of the five states it is in.
+```sql
+SELECT name, liveness, led_by,
+       now() - last_beat_at   AS since_beat,
+       last_beat_at - last_polled_at AS poll_age
+FROM   policy_cursors
+ORDER  BY name;
+```
+
+| Reading | Means |
+|---------|-------|
+| `since_beat` small, `liveness = 'Leading'` | healthy leader |
+| `since_beat` small, `liveness = 'Stopped'` | the policy is down and its replica is fine — nothing reacts, and no standby takes over until that process exits |
+| `since_beat` small, `poll_age` large | alive but not finishing polls: a long batch, or a reaction that hangs |
+| `since_beat` large, or the row never beat | **no live leader** — the process is gone, or no replica holds the lock |
+
+Fixed cadence is the whole point of the beat: a stamp written by the worker as it
+polls would go quiet during a restart backoff, while a reaction hangs, and while
+standing by, so staleness would mean "busy or dead" and answer nothing. The beat
+is written by a task of its own, supervised alongside the lock manager, so it
+keeps time while a worker is held inside a reaction.
+
+```rust,ignore
+let runner = PolicyRunner::builder(cqrs)
+    .register_policy(my_policy)
+    .with_heartbeat(Duration::from_secs(5))  // default: HEARTBEAT_CADENCE
+    .replica_id(std::env::var("POD_NAME")?)  // default: HOSTNAME; `led_by` in the row
+    .build();
+```
+
+Alerting:
+
+- **Page** on `last_beat_at` older than 3 beats (15 s at the default) and on
+  `liveness = 'Stopped'`. Both are unambiguous.
+- **Warn, do not page**, on `last_polled_at` older than `5 × dispatch_timeout`
+  (≈2.5 min at defaults). One hung dispatch legitimately costs `dispatch_timeout`
+  × four attempts, and the runner already handles that by parking a dead letter.
+
+The columns are yours, not the crate's: they are written when present, and their
+absence turns the durable heartbeat off for the process (attempted once, reported
+once) — so the migration can be applied before or after the crate version that
+writes it. Add all four or none. Only the replica holding a policy's advisory lock
+writes its row, so a standby never overwrites a leader's beat, and the crate never
+reads any of it back. `.without_heartbeat()` turns it off entirely; liveness stays
+readable in-process.
 
 ### Monitoring policy status
 
