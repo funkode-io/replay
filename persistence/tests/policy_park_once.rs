@@ -34,6 +34,11 @@ const REVERSED: &str = "reversed";
 /// attempt loop, and must not take the failure before it down with it.
 const PANIC_AFTER_PERMANENT: &str = "panic-after-permanent";
 
+/// Tag whose reaction returns a permanently failing command and a retryable one
+/// on its first call and *panics* on every call after it: the attempt that
+/// settles the delivery never produced the failures the first one buffered.
+const PANIC_ON_RETRY: &str = "panic-on-retry";
+
 /// Tag whose reaction returns two commands that both fail permanently on the
 /// first attempt — nothing forces a second one.
 const BOTH_PERMANENT: &str = "both-permanent";
@@ -58,6 +63,9 @@ const SECOND_REASON: &str = "second-command";
 /// The reason the panicking command's handler panics with.
 const PANIC_REASON: &str = "detonator armed";
 
+/// The message [`PANIC_ON_RETRY`]'s reaction panics with on its second call.
+const REACT_PANIC_MESSAGE: &str = "reaction exploded on the retry";
+
 /// The `error_kind` a refused command is parked under.
 const PERMANENT_KIND: &str = "Invalid Input";
 
@@ -71,6 +79,9 @@ const RETRYABLE_KIND: &str = "Unavailable";
 struct ParkingPolicy {
     name: String,
     reactions: Arc<AtomicUsize>,
+    /// Calls to [`PANIC_ON_RETRY`]'s reaction, which panics on all but the
+    /// first.
+    retries: Arc<AtomicUsize>,
 }
 
 impl ParkingPolicy {
@@ -131,6 +142,15 @@ impl Policy for ParkingPolicy {
             PANIC_AFTER_PERMANENT => {
                 vec![Self::refuse(PERMANENT_REASON), Self::explode(PANIC_REASON)]
             }
+            PANIC_ON_RETRY => {
+                if self.retries.fetch_add(1, Ordering::SeqCst) > 0 {
+                    panic!("{REACT_PANIC_MESSAGE}");
+                }
+                vec![
+                    Self::refuse(PERMANENT_REASON),
+                    Self::flake(RETRYABLE_REASON),
+                ]
+            }
             ONE_PERMANENT => vec![Self::refuse(PERMANENT_REASON)],
             ONE_RETRYABLE => vec![Self::flake(RETRYABLE_REASON)],
             tag => vec![Dispatch::to::<Probe>(
@@ -146,10 +166,12 @@ impl Policy for ParkingPolicy {
 fn parking_policy(
     reactions: Arc<AtomicUsize>,
 ) -> impl Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static {
+    let retries = Arc::new(AtomicUsize::new(0));
     move |builder, policy| {
         builder.register_policy(ParkingPolicy {
             name: policy.to_string(),
             reactions: Arc::clone(&reactions),
+            retries: Arc::clone(&retries),
         })
     }
 }
@@ -262,6 +284,42 @@ async fn a_panic_parks_the_failures_the_attempt_produced_before_it_postgres_test
         rows_for(&rows, PANIC_ERROR_KIND, PANIC_REASON),
         1,
         "the panicking command must be parked as a panic, got {rows:#?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A reaction that panics on a retry parks its panic alone: the failures the
+/// earlier attempt buffered are not outcomes of the attempt that settled the
+/// delivery.
+#[tokio::test]
+async fn a_reaction_that_panics_on_a_retry_parks_the_panic_alone_postgres_test() {
+    let reactions = Arc::new(AtomicUsize::new(0));
+    let harness =
+        PolicyDaemonHarness::start("park_react_panic", parking_policy(Arc::clone(&reactions)))
+            .await;
+
+    let panicked = harness.ping("subject-1", PANIC_ON_RETRY).await;
+    harness
+        .await_cursor_at_least(panicked.global_position)
+        .await;
+
+    let parked = harness.dead_letters().await;
+    let rows = parked_for(&parked, panicked.global_position);
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the settling attempt's outcome is parked, got {rows:#?}"
+    );
+    assert_eq!(
+        rows_for(&rows, PANIC_ERROR_KIND, REACT_PANIC_MESSAGE),
+        1,
+        "the row must be the panic the retry raised, got {rows:#?}"
+    );
+    assert_eq!(
+        rows_for(&rows, PERMANENT_KIND, PERMANENT_REASON),
+        0,
+        "an earlier attempt's permanent failure must not be parked by a later one, got {rows:#?}"
     );
 
     harness.shutdown().await;

@@ -1810,6 +1810,10 @@ struct PendingFailures(Mutex<Attempt>);
 impl PendingFailures {
     /// Start attempt `number`, discarding what the previous one failed on — a
     /// retry re-executes the same commands and produces its own failures.
+    ///
+    /// Called before the reaction runs, not before the first dispatch: `react`
+    /// is user code and can panic, and the panic path must not park an earlier
+    /// attempt's failures as if this one had produced them.
     fn begin(&self, number: u32) {
         let mut attempt = self.lock();
         attempt.number = number;
@@ -2232,10 +2236,10 @@ impl Delivery<'_> {
     ) -> Result<usize, replay::Error> {
         let policy_name = self.policy_name;
         for attempt in 0..=MAX_DISPATCH_RETRIES {
+            pending.begin(attempt);
             let dispatches = policy.react_erased(raw);
             let mut executed = 0usize;
             let mut need_retry = false;
-            pending.begin(attempt);
 
             for dispatch in dispatches {
                 match self
