@@ -32,6 +32,16 @@ the daemon runs, and the in-memory position is a lease on it.
   correction. This is the same optimistic-concurrency shape `Cqrs::execute` uses
   on aggregate versions, applied to the cursor.
 
+- **The instruction is a position; the transaction half is derived from it.** The
+  cursor became a pair — `(commit_txid, position)` — when events started carrying
+  the transaction that wrote them (funkode-io/replay#194). An operator still writes
+  the position alone, and the runner completes the pair from the log: the
+  transaction that belongs with a position is the one that wrote the last event at
+  or before it, which is exactly what the runner would have stored itself. It
+  writes the completed pair back, so the row shows the point the Policy resumes
+  from rather than the half-instruction it was given. The compare-and-set covers
+  both halves.
+
 - **The cursor may move in either direction.** Nothing clamps the adopted value
   to be greater than the in-memory one. Moving forward skips events (the #164
   recovery); moving backward re-delivers them, which the at-least-once contract
@@ -57,6 +67,11 @@ the daemon runs, and the in-memory position is a lease on it.
   but it does not help the operator in the incident: they have a psql prompt
   against the database, not a handle on the running process. SQL is the surface
   that already exists; this ADR makes it honest rather than replacing it.
+
+- **Honouring a transaction half an operator writes by hand.** It cannot be told
+  apart from the stale one left in the row by a position-only move, and the move is
+  the documented instruction. A pair the runner wrote survives derivation unchanged,
+  so nothing is lost by treating the position as the whole instruction.
 
 ## Consequences
 

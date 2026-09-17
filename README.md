@@ -2143,6 +2143,11 @@ UPDATE policy_cursors SET position = 264786, updated_at = now()
 WHERE name = 'price_fanout';
 ```
 
+The row also records the transaction that wrote the event at that position
+(`commit_txid`), which is the half the feed will be ordered by. You never write it:
+the runner derives it from the position you set, so the instruction stays the one
+column it has always been.
+
 The leader picks the new position up **the next time its feed comes back empty**
 — within one poll `interval` for an idle or stuck policy, and after it has caught
 up for a busy one. A policy with work to do pays nothing for this: the re-read

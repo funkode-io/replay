@@ -1,0 +1,22 @@
+-- A Policy's cursor records the transaction it stopped in, alongside the position
+-- (funkode-io/replay#194).
+--
+-- A single position cannot name a point in an order that is not position order, and
+-- funkode-io/replay#171 makes the feed's order `(commit_txid, global_position)`. This
+-- migration gives the cursor the second half it will need; the feed still reads by
+-- position, so nothing about delivery changes here.
+--
+-- The default is the sentinel, *not* `pg_current_xact_id()` as on `events` (0018): the
+-- column names a point in the log the Policy has reached, not the transaction that
+-- wrote the cursor row. A row created with a position alone therefore carries the
+-- sentinel, and the runner derives the transaction that belongs with that position —
+-- the operator's control surface stays one column wide (ADR-0012).
+--
+-- Existing rows take the sentinel and keep their position, which is exactly where they
+-- already are: every event that predates 0018 carries the sentinel too, so among those
+-- events the pair order is the position order the cursor was written in.
+--
+-- One row per Policy, so the ACCESS EXCLUSIVE lock is over a handful of rows; the
+-- constant default is catalog-only in any case (PostgreSQL 11+), so no rewrite.
+ALTER TABLE policy_cursors
+    ADD COLUMN IF NOT EXISTS commit_txid xid8 NOT NULL DEFAULT '0'::xid8;
