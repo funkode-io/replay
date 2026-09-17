@@ -96,16 +96,16 @@ async fn an_operator_moving_the_position_alone_is_honoured_by_a_running_leader_p
     assert!(redelivered >= 2, "the rewind re-delivered the event");
 
     let resumed = harness
-        .observe("the cursor to be back on a real transaction", || async {
+        .observe("the cursor to be back where it was", || async {
             harness
                 .stored_cursor()
                 .await
-                .filter(|cursor| cursor.commit_txid != SENTINEL)
+                .filter(|cursor| cursor.position >= ping.global_position)
         })
         .await;
-    assert!(
-        resumed.position >= ping.global_position,
-        "the policy caught up again after the rewind: {resumed:?}"
+    assert_ne!(
+        resumed.commit_txid, SENTINEL,
+        "the policy caught up again after the rewind, on a real transaction: {resumed:?}"
     );
 
     harness.shutdown().await;

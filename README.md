@@ -2122,7 +2122,7 @@ to `start_at()`:
 
 | `StartAt` | Behaviour |
 |-----------|-----------|
-| `StartAt::Now` (default) | Cursor begins at the current global head; only newly appended events are processed. Safe when you don't want to fire commands retroactively across existing history. |
+| `StartAt::Now` (default) | Cursor begins at the head of the feed's order — the greatest `(commit_txid, global_position)` among visible events — so only what sorts after it is processed. Safe when you don't want to fire commands retroactively across existing history. The cut is a point in the log's order, not an instant: a write already in flight is delivered if its transaction is younger than the head's and skipped if it is older. |
 | `StartAt::Beginning` | Cursor begins at position 0; the full event history is drained once, then the policy follows live appends. Use this for backfill or projections derived from audit events. |
 
 The cursor is written to Postgres **at least every `checkpoint_batch_size` events**
@@ -2143,10 +2143,24 @@ UPDATE policy_cursors SET position = 264786, updated_at = now()
 WHERE name = 'price_fanout';
 ```
 
-The row also records the transaction that wrote the event at that position
-(`commit_txid`), which is the half the feed will be ordered by. You never write it:
-the runner derives it from the position you set, so the instruction stays the one
-column it has always been.
+The row also records the transaction that wrote the event the policy stopped at
+(`commit_txid`), which is the half the feed is ordered by. You never write it: the
+runner derives it, so the instruction stays the one column it has always been.
+
+What it derives is the *conservative* reading of your position, because a position is
+not a cut in `(commit_txid, global_position)` order — an event past it may have been
+written by an older transaction than the event at it. The runner takes `position = P`
+to mean "everything at or before P is processed" and resumes from the greatest point
+that still delivers every event past P: the earliest transaction holding one, or one
+below the commit watermark when none is readable yet. The row keeps the position you
+wrote and shows the derived transaction beside it.
+
+The consequence to expect: a handful of events at or before P, written by transactions
+younger than the resume point, may be delivered again. That is the direction the
+ambiguity is resolved in — the same idempotency contract that covers crash re-delivery
+covers this, while the other direction would skip an event silently and permanently.
+To place a policy exactly, write both columns: a row whose `commit_txid` is the one on
+the event at `position` names a point, and the runner takes it as written.
 
 The leader picks the new position up **the next time its feed comes back empty**
 — within one poll `interval` for an idle or stuck policy, and after it has caught
@@ -2694,8 +2708,8 @@ dead letters outrank lag**:
 `"Degraded"`, `"Blocked"`) for JSON/UI consumers.
 
 `missing_position` and `Blocked` describe a position the feed stops at, which the feed
-no longer does: it reads in commit order and a missing position is not in that order at
-all. The fields are still reported and are being removed
+no longer does: it reads in `(commit_txid, global_position)` order, and a missing
+position is not in that order at all. The fields are still reported and are being removed
 ([#196](https://github.com/funkode-io/replay/issues/196)); what does hold a policy back
 is a write that has not committed, and the log below is where it shows.
 

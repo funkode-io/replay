@@ -60,13 +60,23 @@ ADR-0015 rejects it with a test that makes it be wrong on demand.
   by the `LIMIT`, resumed by a row comparison on the cursor pair. Written as two `AND`ed
   comparisons it would be neither the same set nor an index scan.
 - Events written before migration 0018 carry the sentinel stamp `0`, which orders before
-  every real transaction, so a migrated log is read in position order at its head and a
-  cursor that predates 0022 resumes where it left off.
+  every real transaction, so a migrated log is read in position order at its head.
+- A cursor row that names no event — one that predates 0022 and carries the sentinel, or
+  the one-column move ADR-0012 gives an operator — is read as "everything at or before
+  this position is processed" and completed to the greatest point that still delivers
+  every event past it: the earliest transaction holding one, or one below the watermark
+  when none is readable. Completing it to the transaction *at* the position would be
+  wrong in exactly the case the upgrade produces — a write in flight at a higher position
+  under an older transaction sorts behind that point and is lost. The conservative point
+  may re-deliver events at or before the position instead, which is the direction
+  at-least-once delivery already resolves. A row that does name an event is a point, and
+  is resumed from as written.
 - `StartAt::Now` starts at the greatest point the order has reached among visible rows, not
   at `MAX(global_position)`: those name different rows, and starting at the position would
-  replay a committed event whose transaction is younger than the head's. A write in flight at
-  that moment is history the Policy skips. Starting at the watermark instead would catch it
-  and replay every event committed while any transaction was open; no point in the order does
-  both.
+  replay a committed event whose transaction is younger than the head's. It is a cut in the
+  log's order, not in time: a write in flight at that moment is delivered if its transaction
+  is younger than the head's and skipped if it is older. Starting at the watermark would
+  catch every open write and replay every event committed while any transaction was open;
+  no point in the order does both.
 - The stable-cut API (`contiguous_high_water_mark`) is unchanged and still speaks in
   positions; rebuilding it on the watermark is a separate question.

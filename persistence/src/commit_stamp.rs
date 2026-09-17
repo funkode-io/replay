@@ -37,6 +37,12 @@ impl CommitStamp {
     pub(crate) fn from_row(row: &PgRow, column: &str) -> Result<Self, replay::Error> {
         Self::parse(row.get::<String, _>(column).as_str())
     }
+
+    /// The stamp one below this one: a point the feed reads *before* every transaction
+    /// from here up. Saturates at the sentinel, which already precedes them all.
+    pub(crate) fn previous(self) -> Self {
+        CommitStamp(self.0.saturating_sub(1))
+    }
 }
 
 impl fmt::Display for CommitStamp {
@@ -72,6 +78,15 @@ mod tests {
     fn the_sentinel_orders_before_every_real_transaction() {
         assert!(CommitStamp::SENTINEL < CommitStamp::parse("1").unwrap());
         assert_eq!(CommitStamp::SENTINEL.to_string(), "0");
+    }
+
+    #[test]
+    fn the_stamp_before_one_is_below_it_and_never_below_the_sentinel() {
+        assert_eq!(
+            CommitStamp::parse("100").unwrap().previous().to_string(),
+            "99"
+        );
+        assert_eq!(CommitStamp::SENTINEL.previous(), CommitStamp::SENTINEL);
     }
 
     #[test]

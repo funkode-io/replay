@@ -6,7 +6,7 @@
 //! need a theory of holes and now need none — a position burned from the sequence, an
 //! insert that was rolled back, a transaction holding a position it never writes — plus
 //! the two properties that replace it: an append in flight is delivered in its place
-//! when it commits, and the order a Policy walks is the order the log committed in.
+//! when it commits, and the order a Policy walks is the log's transaction order.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -126,9 +126,10 @@ async fn stored_cursor(pool: &PgPool, policy: &str) -> i64 {
         .unwrap_or_default()
 }
 
-/// The log in the order the feed reads it: the transaction that wrote each event,
-/// then its position.
-async fn events_in_commit_order(pool: &PgPool) -> Vec<Uuid> {
+/// The log in the order the feed reads it: the transaction that wrote each event, then
+/// its position. Transaction *ids* are taken at a transaction's first write, so this is
+/// not the order the commits completed in — it is the order the feed delivers.
+async fn events_in_feed_order(pool: &PgPool) -> Vec<Uuid> {
     sqlx::query("SELECT id FROM events ORDER BY commit_txid, global_position")
         .fetch_all(pool)
         .await
@@ -167,7 +168,7 @@ async fn drain_until(runner: &PolicyRunner, pool: &PgPool, want: i64, polls: usi
     );
 }
 
-/// A position no event will ever carry is not a hole in commit order — it is simply
+/// A position no event will ever carry is not a hole in feed order — it is simply
 /// not in it. Whatever burned it, the Policy reacts to the next event on its next poll:
 /// nothing skipped, nothing warned, nothing to detect.
 #[tokio::test]
@@ -278,7 +279,7 @@ async fn a_position_that_can_never_appear_does_not_delay_a_policy_postgres_test(
 /// in one batch once it commits.
 ///
 /// Delivering the later append first would be the silent loss the whole order exists to
-/// rule out: the in-flight write sits *before* it in commit order, so the Policy would
+/// rule out: the in-flight write sits *before* it in feed order, so the Policy would
 /// have passed the point its events belong at.
 #[tokio::test]
 #[traced_test]
@@ -341,7 +342,7 @@ async fn an_append_in_flight_is_delivered_in_its_place_when_it_commits_postgres_
         "nothing written after an open transaction may be delivered before it ends"
     );
 
-    // It commits: both events arrive, in the order the log committed them.
+    // It commits: both events arrive, in the order the feed reads them.
     in_flight
         .tx
         .commit()
@@ -361,10 +362,14 @@ async fn an_append_in_flight_is_delivered_in_its_place_when_it_commits_postgres_
 /// global_position)` order — no event turning up behind a point it had passed, none
 /// delivered twice, none missing.
 ///
+/// Transaction-ID order, not commit-completion order: an xid is taken at a transaction's
+/// first write, so a transaction that commits later can still be delivered first. That is
+/// the guarantee — a total order every reader agrees on — and it is all the feed claims.
+///
 /// Concurrency is what makes the assertion worth making: the appends interleave, so
 /// positions become visible out of order and the drains run while writes are open.
 #[tokio::test]
-async fn the_order_a_policy_walks_is_the_order_the_log_committed_in_postgres_test() {
+async fn the_order_a_policy_walks_is_the_logs_transaction_order_postgres_test() {
     const WRITERS: usize = 8;
     const APPENDS_PER_WRITER: usize = 5;
 
@@ -423,7 +428,7 @@ async fn the_order_a_policy_walks_is_the_order_the_log_committed_in_postgres_tes
     draining.await;
 
     // Drained on the count delivered, not on the cursor reaching the numeric head: the
-    // cursor walks in commit order, where a later point can hold a lower position, so a
+    // cursor walks in feed order, where a later point can hold a lower position, so a
     // correct run need never store `MAX(global_position)`.
     let total = WRITERS * APPENDS_PER_WRITER;
     for _ in 0..10 {
@@ -449,8 +454,8 @@ async fn the_order_a_policy_walks_is_the_order_the_log_committed_in_postgres_tes
     );
     assert_eq!(
         delivered,
-        events_in_commit_order(&pool).await,
-        "and in commit order, which is the order the cursor walks"
+        events_in_feed_order(&pool).await,
+        "and in transaction-ID order, which is the order the cursor walks"
     );
 }
 
@@ -649,13 +654,14 @@ async fn a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test(
 
 /// What `StartAt::Now` means in this order, pinned because the order is what gives it a
 /// second reading: a write already in flight when a Policy is first registered is history
-/// it skips, not an event it is owed.
+/// it skips *when that write's transaction is older than the head's*.
 ///
 /// The head the Policy starts at was written by a younger transaction than the one still
 /// running, so the in-flight write sits *behind* that start point and is never delivered —
 /// while everything committed after it is. Starting at the watermark instead would catch
 /// it, at the price of replaying every event committed while any transaction was open; no
-/// point in the order does both (ADR-0021).
+/// point in the order does both (ADR-0021). The other side of the cut is
+/// [`a_policy_starting_now_delivers_an_in_flight_write_that_is_younger_than_the_head_postgres_test`].
 #[tokio::test]
 async fn a_policy_starting_now_skips_a_write_that_was_already_in_flight_postgres_test() {
     let (pool, _container) = start_postgres().await;
@@ -715,6 +721,74 @@ async fn a_policy_starting_now_skips_a_write_that_was_already_in_flight_postgres
             .clone(),
         vec![2.0],
         "only the event appended after the policy started is delivered"
+    );
+}
+
+/// The other side of the `Now` cut, and the reason it is stated as a point rather than an
+/// instant: an append already in flight whose transaction is *younger* than the visible
+/// head sorts after the start point, so it is delivered when it commits.
+///
+/// Not a defect of the start point but the shape of the order — no visible point excludes
+/// every open write, because a write that has not committed can hold any transaction id
+/// above the watermark. A consumer registering `Now` is promised the head of the order,
+/// not a boundary in time.
+#[tokio::test]
+async fn a_policy_starting_now_delivers_an_in_flight_write_that_is_younger_than_the_head_postgres_test(
+) {
+    let (pool, _container) = start_postgres().await;
+
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let add = |stream: &'static str, amount: f64| {
+        let cqrs = cqrs.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &LedgerUrn::new(stream).unwrap(),
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    add("start-now-young-main", 10.0).await;
+    add("start-now-young-held", 5.0).await;
+
+    // In flight, and younger than everything visible: nothing commits after it, so the
+    // head the policy starts at is the older transaction.
+    let in_flight = hold_an_append_open(&pool, 2).await;
+    let held = in_flight.position;
+
+    let delivered: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&delivered);
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Now, move |event| {
+            let LedgerEvent::Added { amount } = event.data;
+            recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(amount);
+            vec![]
+        })
+        .build();
+    runner.drain().await.expect("drain must succeed");
+
+    in_flight
+        .tx
+        .commit()
+        .await
+        .expect("committing must succeed");
+    drain_until(&runner, &pool, held, 5).await;
+
+    assert_eq!(
+        delivered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+        vec![5.0],
+        "the write in flight was younger than the head, so it is not history"
     );
 }
 
