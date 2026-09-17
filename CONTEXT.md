@@ -60,7 +60,7 @@ _Avoid_: offset, sequence number, event time.
 The slice of the event log one [Policy] reads on a poll: every event past its cursor
 whose writing transaction has ended, in `([Commit stamp], [Global position])` order, up
 to its read batch size and **before** its `stream_filter` is applied
-([ADR-0020](docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)). An excluded
+([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)). An excluded
 position advances the cursor and fires nothing, like a compaction snapshot: a
 `stream_filter` decides what a Policy *reacts to*, never how far it *gets*
 ([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). The feed
@@ -90,6 +90,8 @@ an operator can tell a defect in the reaction from a command the domain refused
 A reaction the runner **abandoned on its [Dispatch timeout]** is another: retried
 like any transient failure and, once the retries are exhausted, recorded as kind
 `Timeout`.
+A delivery parks what its settling attempt failed on: a command that fails
+permanently is recorded once, however many attempts a retryable sibling forces.
 Dead letters are queryable so an operator can later inspect them and either
 [Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.
@@ -179,7 +181,7 @@ A `global_position` taken from the sequence by a transaction that then aborted.
 `nextval` is not transactional, so the value is never returned to the sequence and
 no event can ever carry it. Since the [Policy feed] reads in [Commit stamp] order it
 is not a hole in what a Policy reads — it belongs to no event, so it is simply not in
-that order ([ADR-0020](docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)).
+that order ([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)).
 It is still visible in the log's numbering, where positions are not dense.
 _Avoid_: gap, hole (as a name for the permanent kind), lost position, skipped
 position.
@@ -196,7 +198,7 @@ sentinel `0`, which orders before every real id. A [Policy]'s cursor records the
 it stopped in alongside the position
 ([0022](persistence/tests/migrations/0022_policy_cursor_commit_txid.sql)), and the feed
 reads by the pair, below the watermark of transactions that have all ended
-([ADR-0020](docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)).
+([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)).
 _Avoid_: commit id, transaction number, xmin, sequence.
 
 ### Policy runner
@@ -254,9 +256,25 @@ _Avoid_: alert, failover, panic, giving up.
 The axis reporting whether a [Policy]'s worker exists and is running — leading,
 standing by, restarting, stopped or unknown. Only the process running the
 [Policy runner] knows it, so it is published from memory and never derived from
-the operational tables. It implies nothing about [Progress], and nothing about
-it can be inferred from Progress.
+the operational tables
+([ADR-0020](docs/adr/0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)).
+Its durable form is the [Heartbeat], which carries it to whoever is not in that
+process. It implies nothing about [Progress], and nothing about it can be
+inferred from Progress.
 _Avoid_: uptime, availability, aliveness, worker status.
+
+### Heartbeat
+
+The beat a replica writes on a **fixed cadence** for each [Policy] it leads,
+carrying that worker's [Liveness], when it last finished a poll, and which
+replica wrote it. Fixed is the whole property: a signal that slowed down when a
+worker got busy could not tell busy from gone. It is written by a task of its own
+rather than by the worker, because a worker inside a reaction that never returns
+cannot write anything — which is the case the beat is for. A stale beat means no
+live [Leader]; a fresh beat carrying an old poll means a worker that is alive and
+not finishing polls. A [Standby] writes none: the row belongs to whoever holds the
+lock.
+_Avoid_: ping, keepalive, health check, liveness probe.
 
 ### Progress
 
@@ -380,6 +398,7 @@ it:
 [Restart budget]: #restart-budget
 [Escalation]: #escalation
 [Liveness]: #liveness
+[Heartbeat]: #heartbeat
 [Progress]: #progress
 [Caught up]: #caught-up
 [Query]: #query

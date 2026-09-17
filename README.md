@@ -2340,8 +2340,8 @@ half of the bargain either way: the worker is recorded as stopped before the hoo
 runs, so it is never silently absent, and a hook that panics is caught and logged
 rather than taking the report with it.
 
-Every escalated worker is also named by `daemon.stopped_workers()` — a poll for a
-consumer whose hook returns:
+Every escalated worker is also named by `daemon.stopped_workers()`, and reads as
+`Liveness::Stopped` — a poll for a consumer whose hook returns:
 
 ```rust,ignore
 for stopped in daemon.stopped_workers() {
@@ -2495,6 +2495,133 @@ impl From<MyAggregateError> for replay::Error {
 The simplest path is `type Error = replay::Error` (used throughout the examples
 here), which satisfies the bound with the identity conversion.
 
+### Reading each worker's liveness
+
+`daemon.liveness()` answers "is this worker running". `PolicyStatusStore` (below)
+answers "is this Policy moving". **Neither implies the other**: a standby replica
+runs and advances nothing, and a leader parked in front of a hole runs and
+advances nothing either. Liveness is known only to the process running the
+workers, so it is published from memory and never derived from the tables
+([ADR-0020](docs/adr/0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)).
+
+```rust,ignore
+use replay_persistence::Liveness;
+
+for worker in daemon.liveness() {
+    let last_poll = worker.last_polled_at.map(|at| at.elapsed());
+    match worker.liveness {
+        // Nothing is reacting for this policy, and nothing here will start it.
+        Liveness::Stopped => probe.fail(&worker.policy),
+        _ => tracing::info!(
+            policy = %worker.policy, liveness = %worker.liveness, ?last_poll, "policy worker"
+        ),
+    }
+}
+```
+
+| `Liveness` | Meaning |
+|------------|---------|
+| `Leading` | Elected for this policy and draining its feed. |
+| `StandingBy` | Running, holding no advisory lock for it — another replica leads, or none does yet. Healthy and deliberately idle. |
+| `Restarting` | Dead, inside the backoff before its next restart. |
+| `Stopped` | Down for good: budget spent, or the lock manager that elects it stopped. Already escalated. |
+| `Unknown` | Spawned and not yet at its first election. Never a guess at "stopped". |
+
+`last_polled_at` is a monotonic `Instant`, recorded when a poll **comes back**, so
+a worker held inside one long reaction reads as `Leading` with an ageing stamp —
+which is what tells it from an idle one. A `StandingBy` worker drives nothing and
+normally has none. `Liveness` has a stable `as_str()` / `Display` form for JSON/UI
+consumers.
+
+#### Reading liveness from outside the process
+
+The accessor above only sees this process's workers. For a UI, a dashboard or a
+sidecar with a connection string rather than a handle, each replica **beats** for
+the policies it leads — on a fixed cadence, independent of the poll interval and
+of what any worker is doing:
+
+```sql
+ALTER TABLE policy_cursors
+    ADD COLUMN IF NOT EXISTS last_beat_at   TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS liveness       TEXT,
+    ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS led_by         TEXT;
+```
+
+```sql
+SELECT name, liveness, led_by,
+       now() - last_beat_at   AS since_beat,
+       last_beat_at - last_polled_at AS poll_age
+FROM   policy_cursors
+ORDER  BY name;
+```
+
+| Reading | Means |
+|---------|-------|
+| `since_beat` small, `liveness = 'Leading'` | healthy leader |
+| `since_beat` small, `liveness = 'Stopped'` | the policy is down and its replica is fine — nothing reacts, and no standby takes over until that process exits |
+| `since_beat` small, `poll_age` large | alive but not finishing polls: a long batch, or a reaction that hangs |
+| `since_beat` small, `last_polled_at` null | the current leader has not completed a poll yet: it has just taken over or just started — or, if it stays null, it wedged inside its first poll |
+| `since_beat` large, or the row never beat | **no successful beat** — usually no live leader (process gone, or no replica holds the lock); check this replica's heartbeat `warn` and whether something holds the row before concluding the leader is dead |
+
+Fixed cadence is the whole point of the beat: a stamp written by the worker as it
+polls would go quiet during a restart backoff, while a reaction hangs, and while
+standing by, so staleness would mean "busy or dead" and answer nothing. The beat
+is written by a task of its own, supervised alongside the lock manager, so it
+keeps time while a worker is held inside a reaction.
+
+```rust,ignore
+let runner = PolicyRunner::builder(cqrs)
+    .register_policy(my_policy)
+    .with_heartbeat(Duration::from_secs(5))  // default: HEARTBEAT_CADENCE
+    .replica_id(std::env::var("POD_NAME")?)  // default: HOSTNAME; `led_by` in the row
+    .build();
+```
+
+The cadence is a schedule, not a sleep between beats: time spent writing is
+charged to the tick it happened in, so a slow write moves one beat rather than
+every beat after it. Cadences below `HEARTBEAT_MIN_CADENCE` (100 ms) are floored —
+that end of the range is a write loop, not a faster signal, and
+`.without_heartbeat()` is how you turn it off.
+
+Alerting:
+
+- **Page** on `last_beat_at` older than 3 beats (15 s at the default) and on
+  `liveness = 'Stopped'`. A stale beat means "no successful beat": a leader whose
+  writes keep failing looks the same from here, and says so once at `warn` in its
+  own logs.
+- **Warn, do not page**, on `last_polled_at` older than `5 × dispatch_timeout`
+  (≈2.5 min at defaults), and on a `Leading` row whose `last_polled_at` stays null
+  for that long. One hung dispatch legitimately costs `dispatch_timeout`
+  × four attempts, and the runner already handles that by parking a dead letter.
+
+`last_polled_at` describes the worker that is leading *now*, so a replica taking a
+policy over reports no poll until it completes one — it never inherits the previous
+leader's. A null is therefore normal for one poll interval after a failover or a
+start; it is only a signal once it persists, which is the case of a leader that
+wedged inside its very first poll.
+
+All of a replica's led policies are beaten in one statement, taken with
+`FOR UPDATE SKIP LOCKED`: a row somebody else is holding — an operator part-way
+through a cursor move in an open transaction — costs that one policy a beat, not
+every policy on the replica.
+
+One caveat on `led_by` and failover: the beat reports leadership, it does not
+fence it. A replica whose lock session has just dropped can write one last beat
+before its lock manager notices and revokes, so for up to a beat the row can still
+name the previous leader — the same split-brain window
+[ADR-0008](docs/adr/0008-policy-runner-shared-connection-leadership.md) bounds for
+the workers, self-healed by the new leader's next beat. The advisory lock decides
+who may act; this row only says who did.
+
+The columns are yours, not the crate's: they are written when present, and their
+absence turns the durable heartbeat off for the daemon (attempted once, reported
+once) — so the migration can be applied before or after the crate version that
+writes it. Add all four or none. Only the replica holding a policy's advisory lock
+writes its row, so a standby never overwrites a leader's beat, and the crate never
+reads any of it back. `.without_heartbeat()` turns it off entirely; liveness stays
+readable in-process.
+
 ### Monitoring policy status
 
 A running policy is otherwise opaque: its cursor and dead letters live in
@@ -2577,6 +2704,11 @@ has no `policy_cursors` row and is therefore absent from `list()`. The store onl
 *observes* — retrying or discarding a dead letter is a separate, deliberate action
 (see the triage queries above).
 
+`PolicyStatus` carries **no liveness field**, deliberately: every field here is
+derived from the operational tables, and no table can see whether a worker task
+exists. A `CaughtUp` policy whose worker died looks exactly like one that is idle
+— `daemon.liveness()` is what tells them apart.
+
 ### What a waiting policy writes to the log
 
 `PolicyStatusStore` answers "is anything behind?" only when asked. A policy that cannot
@@ -2586,7 +2718,7 @@ permanently stopped one produced byte-identical output: nothing.
 
 The feed delivers an event only once the transaction that wrote it has ended, so a write
 held open holds back everything committed after it
-([ADR-0020](docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)). That wait is
+([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)). That wait is
 the only thing that stops a policy now, and these are the lines it writes:
 
 | Level | When | Fields |

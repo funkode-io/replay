@@ -655,7 +655,7 @@ async fn a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test(
 /// running, so the in-flight write sits *behind* that start point and is never delivered —
 /// while everything committed after it is. Starting at the watermark instead would catch
 /// it, at the price of replaying every event committed while any transaction was open; no
-/// point in the order does both (ADR-0020).
+/// point in the order does both (ADR-0021).
 #[tokio::test]
 async fn a_policy_starting_now_skips_a_write_that_was_already_in_flight_postgres_test() {
     let (pool, _container) = start_postgres().await;

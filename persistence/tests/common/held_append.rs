@@ -1,7 +1,7 @@
 //! An append frozen mid-flight: the state a Policy feed has to be right about.
 //!
 //! The feed's whole order rests on what happens between a write taking its position and
-//! that write becoming visible ([ADR-0020](../../../docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)),
+//! that write becoming visible ([ADR-0021](../../../docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)),
 //! and the only way to observe that window is to stop a write inside it.
 //!
 //! The write goes through `append_event`, the store's own writer: it takes the stream
