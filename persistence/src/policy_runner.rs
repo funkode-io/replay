@@ -2152,6 +2152,11 @@ impl Delivery<'_> {
     /// that *panics* is absorbed one level out, in [`Self::react_to_event`], which
     /// is the only failure this function cannot observe.
     ///
+    /// Parking happens once the delivery settles, not as each attempt produces a
+    /// failure: a retryable command forces another attempt for its siblings too,
+    /// and a permanently failing sibling would otherwise be parked once per
+    /// attempt (funkode-io/replay#209). What is parked is the settling attempt's outcome.
+    ///
     /// Each dispatch is awaited for at most [`Delivery::dispatch_timeout`], so
     /// an event costs at most one timeout per dispatch per attempt.
     ///
@@ -2170,6 +2175,11 @@ impl Delivery<'_> {
             let dispatches = policy.react_erased(raw);
             let mut executed = 0usize;
             let mut need_retry = false;
+            // Bounded by the number of commands one reaction returns for this
+            // event — the vector `react_erased` above already materialises.
+            // Dropped with the attempt: a retry re-executes the same commands
+            // and produces its failures again.
+            let mut failures: Vec<DispatchFailure> = Vec::new();
 
             for dispatch in dispatches {
                 match self
@@ -2203,28 +2213,31 @@ impl Delivery<'_> {
                     Err(failure) => {
                         // Permanent error, or retryable (including a timeout) but
                         // retries exhausted.
-                        tracing::error!(
-                            policy          = %policy_name,
-                            event_id        = %raw.id,
-                            global_position,
-                            attempt,
-                            error           = %failure,
-                            "policy dispatch failed permanently; writing dead-letter and advancing cursor"
-                        );
-                        write_dead_letter(
-                            self.pool,
-                            policy_name,
-                            global_position,
-                            raw,
-                            &failure.error_kind(),
-                            &failure.to_string(),
-                        )
-                        .await?;
+                        failures.push(failure);
                     }
                 }
             }
 
             if !need_retry {
+                for failure in failures {
+                    tracing::error!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        global_position,
+                        attempt,
+                        error           = %failure,
+                        "policy dispatch failed permanently; writing dead-letter and advancing cursor"
+                    );
+                    write_dead_letter(
+                        self.pool,
+                        policy_name,
+                        global_position,
+                        raw,
+                        &failure.error_kind(),
+                        &failure.to_string(),
+                    )
+                    .await?;
+                }
                 return Ok(executed);
             }
 
