@@ -90,6 +90,8 @@ an operator can tell a defect in the reaction from a command the domain refused
 A reaction the runner **abandoned on its [Dispatch timeout]** is another: retried
 like any transient failure and, once the retries are exhausted, recorded as kind
 `Timeout`.
+A delivery parks what its settling attempt failed on: a command that fails
+permanently is recorded once, however many attempts a retryable sibling forces.
 Dead letters are queryable so an operator can later inspect them and either
 [Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.

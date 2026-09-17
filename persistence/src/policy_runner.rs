@@ -14,7 +14,7 @@ use std::any::{Any, TypeId};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
@@ -1783,6 +1783,60 @@ impl std::fmt::Display for DispatchFailure {
     }
 }
 
+/// What one attempt at a delivery failed on, and which attempt it was.
+#[derive(Default)]
+struct Attempt {
+    number: u32,
+    failures: Vec<DispatchFailure>,
+}
+
+/// The failures of the attempt in progress, held until the delivery settles.
+///
+/// Lives outside the `catch_unwind` in [`Delivery::react_to_event`] rather than
+/// on the attempt loop's stack: a panicking command handler settles the delivery
+/// by unwinding, and the failures its siblings produced first are parked with
+/// the panic instead of vanishing with the stack (ADR-0016).
+///
+/// `failures` is bounded by the number of commands one reaction returns for an
+/// event — the vector `react_erased` already materialises — and is emptied at
+/// the start of every attempt, so what is parked is the settling attempt's
+/// outcome and not a tally across attempts (funkode-io/replay#209).
+///
+/// The `Mutex` is what makes the type usable across the unwind boundary, not
+/// concurrency: one task pushes, and never across an `await`.
+#[derive(Default)]
+struct PendingFailures(Mutex<Attempt>);
+
+impl PendingFailures {
+    /// Start attempt `number`, discarding what the previous one failed on — a
+    /// retry re-executes the same commands and produces its own failures.
+    ///
+    /// Called before the reaction runs, not before the first dispatch: `react`
+    /// is user code and can panic, and the panic path must not park an earlier
+    /// attempt's failures as if this one had produced them.
+    fn begin(&self, number: u32) {
+        let mut attempt = self.lock();
+        attempt.number = number;
+        attempt.failures.clear();
+    }
+
+    fn push(&self, failure: DispatchFailure) {
+        self.lock().failures.push(failure);
+    }
+
+    /// Take what the attempt in progress has failed on, leaving it empty, so a
+    /// second call (the panic path after the settling path) parks nothing twice.
+    fn take(&self) -> Attempt {
+        std::mem::take(&mut *self.lock())
+    }
+
+    /// A poisoned lock carries the failures of the panic that poisoned it, which
+    /// are exactly what must still be parked.
+    fn lock(&self) -> MutexGuard<'_, Attempt> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 async fn drain_policy_once(
     cqrs: &Cqrs<PostgresEventStore>,
     pool: &Pool<Postgres>,
@@ -2110,7 +2164,8 @@ impl Delivery<'_> {
         raw: &PersistedEvent<Value>,
     ) -> Result<usize, replay::Error> {
         let policy_name = self.policy_name;
-        let reactions = self.execute_event_reactions(policy, global_position, raw);
+        let pending = PendingFailures::default();
+        let reactions = self.execute_event_reactions(policy, global_position, raw, &pending);
 
         match AssertUnwindSafe(reactions).catch_unwind().await {
             Ok(result) => result,
@@ -2124,6 +2179,10 @@ impl Delivery<'_> {
                     panic           = %message,
                     "policy reaction panicked; writing dead-letter and advancing cursor"
                 );
+                // A panic settles the delivery, so the dispatches that had
+                // already failed in this attempt are parked with it: the unwind
+                // crossed the buffer rather than carrying it off.
+                self.park(global_position, raw, pending.take()).await?;
                 write_dead_letter(
                     self.pool,
                     policy_name,
@@ -2152,6 +2211,15 @@ impl Delivery<'_> {
     /// that *panics* is absorbed one level out, in [`Self::react_to_event`], which
     /// is the only failure this function cannot observe.
     ///
+    /// Parking happens once the delivery settles, not as each attempt produces a
+    /// failure: a retryable command forces another attempt for its siblings too,
+    /// and a permanently failing sibling would otherwise be parked once per
+    /// attempt (funkode-io/replay#209). What is parked is the settling attempt's outcome.
+    /// The attempt's failures are buffered in `pending`, which belongs to
+    /// [`Self::react_to_event`]: a panic in a later dispatch settles the delivery
+    /// from out there, and the failures before it are parked rather than lost to
+    /// the unwind.
+    ///
     /// Each dispatch is awaited for at most [`Delivery::dispatch_timeout`], so
     /// an event costs at most one timeout per dispatch per attempt.
     ///
@@ -2164,9 +2232,11 @@ impl Delivery<'_> {
         policy: &dyn ErasedPolicy,
         global_position: i64,
         raw: &PersistedEvent<Value>,
+        pending: &PendingFailures,
     ) -> Result<usize, replay::Error> {
         let policy_name = self.policy_name;
         for attempt in 0..=MAX_DISPATCH_RETRIES {
+            pending.begin(attempt);
             let dispatches = policy.react_erased(raw);
             let mut executed = 0usize;
             let mut need_retry = false;
@@ -2203,28 +2273,13 @@ impl Delivery<'_> {
                     Err(failure) => {
                         // Permanent error, or retryable (including a timeout) but
                         // retries exhausted.
-                        tracing::error!(
-                            policy          = %policy_name,
-                            event_id        = %raw.id,
-                            global_position,
-                            attempt,
-                            error           = %failure,
-                            "policy dispatch failed permanently; writing dead-letter and advancing cursor"
-                        );
-                        write_dead_letter(
-                            self.pool,
-                            policy_name,
-                            global_position,
-                            raw,
-                            &failure.error_kind(),
-                            &failure.to_string(),
-                        )
-                        .await?;
+                        pending.push(failure);
                     }
                 }
             }
 
             if !need_retry {
+                self.park(global_position, raw, pending.take()).await?;
                 return Ok(executed);
             }
 
@@ -2234,6 +2289,36 @@ impl Delivery<'_> {
         }
 
         Ok(0)
+    }
+
+    /// Write a dead letter for everything an attempt failed on.
+    async fn park(
+        &self,
+        global_position: i64,
+        raw: &PersistedEvent<Value>,
+        attempt: Attempt,
+    ) -> Result<(), replay::Error> {
+        let Attempt { number, failures } = attempt;
+        for failure in failures {
+            tracing::error!(
+                policy          = %self.policy_name,
+                event_id        = %raw.id,
+                global_position,
+                attempt         = number,
+                error           = %failure,
+                "policy dispatch failed permanently; writing dead-letter and advancing cursor"
+            );
+            write_dead_letter(
+                self.pool,
+                self.policy_name,
+                global_position,
+                raw,
+                &failure.error_kind(),
+                &failure.to_string(),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Execute one dispatch, bounded in time.

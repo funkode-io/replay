@@ -107,6 +107,7 @@ define_aggregate! {
             Ping { tag: String },
             Echo { tag: String },
             Refuse { reason: String },
+            Flake { reason: String },
             Explode { reason: String },
             Sleep { millis: u64 },
         },
@@ -154,6 +155,13 @@ impl replay::Aggregate for Probe {
                 "probe refuses: {reason}"
             ))
             .with_operation("Refuse")),
+            // A command that always fails *retryably*, so a test can drive the
+            // runner's back-off loop on purpose — the sibling that forces a
+            // second attempt on a reaction whose other command is doomed.
+            ProbeCommand::Flake { reason } => Err(replay::Error::unavailable(format!(
+                "probe flakes: {reason}"
+            ))
+            .with_operation("Flake")),
             // A command that panics *inside the handler*, so a test can drive a
             // panic into the asynchronous half of the runner's per-event
             // boundary — the one a panic in `react` never reaches, because it
