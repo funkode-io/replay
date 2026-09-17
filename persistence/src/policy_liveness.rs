@@ -196,21 +196,33 @@ pub(crate) struct Beat {
 }
 
 /// Whether the consumer's schema carries the heartbeat columns, remembered for
-/// the life of the process: the answer is a property of the schema, not of one
-/// beat, and a restarted beat task must not re-ask it.
+/// the life of the daemon that asked: the answer is a property of the schema,
+/// not of one beat, so a restarted beat task must not re-ask it.
+///
+/// Scoped to the daemon rather than the process, so a consumer that stops a
+/// runner, migrates and starts another one picks the columns up. The cost of
+/// that scope is one refused statement per daemon built after a migration that
+/// never came.
 #[derive(Clone, Default)]
 pub(crate) struct HeartbeatColumns {
-    /// Set the first time Postgres says a column is not there. One-way: columns
-    /// added while the process runs are picked up on the next start, which is
-    /// when the consumer's migration ran.
+    /// Set the first time Postgres says a column is not there. One-way within a
+    /// daemon: nothing re-checks, because a migration cannot land without
+    /// somebody deploying.
     absent: Arc<AtomicBool>,
 }
 
 impl HeartbeatColumns {
-    pub(crate) fn writer(&self, replica_id: Option<String>) -> HeartbeatWriter {
+    /// A writer that gives up a tick rather than wait longer than `lock_wait`
+    /// for the cursor row.
+    pub(crate) fn writer(
+        &self,
+        replica_id: Option<String>,
+        lock_wait: Duration,
+    ) -> HeartbeatWriter {
         HeartbeatWriter {
             columns: self.clone(),
             replica_id,
+            lock_wait,
             failure_reported: false,
         }
     }
@@ -230,6 +242,8 @@ pub(crate) struct HeartbeatWriter {
     /// the process has no `HOSTNAME`: the column is then left null rather than
     /// carrying an invented identity.
     replica_id: Option<String>,
+    /// How long the beat may wait for the cursor row before giving up the tick.
+    lock_wait: Duration,
     /// Whether a failed beat has already been reported. A second line says
     /// nothing new: the database a beat goes to is the one the workers use, and
     /// a worker that is also failing says so at `error`.
@@ -285,7 +299,12 @@ impl HeartbeatWriter {
         polled_ago: &[Option<f64>],
     ) -> Result<(), sqlx::Error> {
         let mut tx = pool.begin().await?;
-        sqlx::query("SET LOCAL lock_timeout = '1s'")
+        // Derived from the cadence, not a constant: a wait longer than the gap
+        // between beats would delay the next one, which is the coupling to
+        // workload the fixed cadence exists to remove. `set_config(..., true)`
+        // is `SET LOCAL` with a bind parameter, which `SET` itself does not take.
+        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+            .bind(format!("{}ms", self.lock_wait.as_millis().max(1)))
             .execute(&mut *tx)
             .await?;
         sqlx::query(BEAT_SQL)
@@ -406,7 +425,7 @@ mod tests {
     #[test]
     fn absent_columns_stop_being_attempted() {
         let columns = HeartbeatColumns::default();
-        let mut writer = columns.writer(None);
+        let mut writer = columns.writer(None, Duration::from_millis(1));
 
         writer.report(&undefined_column());
 
@@ -415,7 +434,10 @@ mod tests {
             "a refused column turns the durable heartbeat off for the process"
         );
         assert!(
-            columns.writer(None).failure_reported || columns.absent.load(Ordering::Relaxed),
+            columns
+                .writer(None, Duration::from_millis(1))
+                .failure_reported
+                || columns.absent.load(Ordering::Relaxed),
             "a beat task started afterwards inherits the answer rather than re-asking"
         );
     }
@@ -424,7 +446,7 @@ mod tests {
     /// own errors say the same thing at a level somebody reads.
     #[test]
     fn a_failing_beat_is_reported_once() {
-        let mut writer = HeartbeatColumns::default().writer(None);
+        let mut writer = HeartbeatColumns::default().writer(None, Duration::from_millis(1));
 
         writer.report(&sqlx::Error::PoolTimedOut);
         assert!(writer.failure_reported);

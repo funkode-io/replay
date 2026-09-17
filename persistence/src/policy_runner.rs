@@ -105,6 +105,10 @@ pub const REPLAY_NOTIFY_CHANNEL: &str = "replay_events";
 /// deployment polling every 30s still wants its liveness answered in seconds.
 pub const HEARTBEAT_CADENCE: Duration = Duration::from_secs(5);
 
+/// The longest a beat waits for the cursor row before giving up the tick, when
+/// half the cadence would be longer still.
+const HEARTBEAT_LOCK_WAIT: Duration = Duration::from_secs(1);
+
 /// The `error_kind` written to `policy_dead_letters` when a reaction **panicked**
 /// rather than returning an error.
 ///
@@ -1209,6 +1213,9 @@ impl PolicyRunner {
         // hung dispatch cannot write anything — which is the case the beat is
         // there for.
         if let Some(cadence) = self.heartbeat {
+            // Half a beat: long enough to outlast a checkpoint's single UPDATE,
+            // short enough that a skipped tick is never a late one.
+            let beat_lock_wait = (cadence / 2).min(HEARTBEAT_LOCK_WAIT);
             let pool = self.pool.clone();
             let liveness = liveness.clone();
             let leadership = leadership_for_heartbeat;
@@ -1230,7 +1237,7 @@ impl PolicyRunner {
                         pool.clone(),
                         liveness.clone(),
                         Arc::clone(&leadership),
-                        columns.writer(replica_id.clone()),
+                        columns.writer(replica_id.clone(), beat_lock_wait),
                         beat_shutdown_rx.clone(),
                         cadence,
                     ))
@@ -1578,16 +1585,16 @@ async fn run_heartbeat(
         }
 
         // Bounded by the registered policies: one line each, at most.
-        let led: HashMap<&str, ()> = leadership
+        let led: std::collections::HashSet<&str> = leadership
             .iter()
             .filter(|(_, leader_rx)| *leader_rx.borrow())
-            .map(|(name, _)| (name.as_str(), ()))
+            .map(|(name, _)| name.as_str())
             .collect();
         let now = Instant::now();
         let beats: Vec<Beat> = liveness
             .snapshot()
             .into_iter()
-            .filter(|worker| led.contains_key(worker.policy.as_str()))
+            .filter(|worker| led.contains(worker.policy.as_str()))
             .map(|worker| Beat {
                 policy: worker.policy,
                 liveness: worker.liveness,
