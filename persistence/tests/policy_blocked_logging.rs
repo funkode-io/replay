@@ -20,6 +20,7 @@ use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PolicyRunner, PostgresEventStore, StartAt};
 
 mod common;
+use common::held_append::hold_an_append_open;
 use common::postgres_image::postgres_container;
 
 const POSTGRES_PORT: u16 = 5432;
@@ -103,34 +104,6 @@ async fn start_postgres() -> (
     (pool, container)
 }
 
-/// Open an append and keep it open: a transaction that has written an event row holds a
-/// transaction id, so everything committed after it is withheld until it ends.
-///
-/// The row is a copy of the event at `source`, shaped exactly like one the store
-/// appended. The transaction is returned so the caller keeps it open — dropping it ends
-/// the wait.
-///
-/// `source` must be on a stream nothing else appends to while the transaction is held:
-/// the copy takes that stream's next version, and a later append to it would block on
-/// `events_stream_and_version` until this transaction ends — waiting on the very write
-/// the test is holding open.
-async fn hold_a_write_open(
-    pool: &PgPool,
-    source: i64,
-) -> (sqlx::Transaction<'static, sqlx::Postgres>, i64) {
-    let mut holder = pool.begin().await.expect("beginning must succeed");
-    let position: i64 = sqlx::query_scalar(
-        "INSERT INTO events (id, data, metadata, stream_id, type, version, created) \
-         SELECT gen_random_uuid(), data, metadata, stream_id, type, version + 1, now() \
-         FROM events WHERE global_position = $1 RETURNING global_position",
-    )
-    .bind(source)
-    .fetch_one(&mut *holder)
-    .await
-    .expect("writing inside the held transaction must succeed");
-    (holder, position)
-}
-
 /// Lines the runner writes about a feed that is waiting, in the order it wrote them.
 fn wait_traces<'a>(lines: &[&'a str]) -> Vec<&'a str> {
     lines
@@ -196,8 +169,8 @@ async fn a_policy_waiting_on_an_open_write_says_so_in_the_log_postgres_test() {
     // ── Caught up ─────────────────────────────────────────────────────────────
     // A drained policy must stay silent, or the signal below is worthless.
     add("waiting-policy-log", 10.0).await;
-    // A second stream, so the write held open below — a copy of this event, taking the
-    // next version of its stream — cannot block the append that follows it.
+    // A second stream for the append held open below, which takes the next version of
+    // the stream it is on and holds that stream's lock until the test ends it.
     add("waiting-policy-held", 5.0).await;
     for _ in 0..4 {
         runner.drain().await.expect("drain must succeed");
@@ -217,7 +190,8 @@ async fn a_policy_waiting_on_an_open_write_says_so_in_the_log_postgres_test() {
     // A write is open and has not committed, so the event appended after it cannot be
     // delivered: it was written after a transaction that may still publish events of
     // its own. Waiting for it is the design.
-    let (_holder, held) = hold_a_write_open(&pool, 2).await;
+    let holder = hold_an_append_open(&pool, 2).await;
+    let held = holder.position;
     add("waiting-policy-log", 1.0).await;
     let withheld = held + 1;
 
@@ -337,7 +311,7 @@ async fn a_policy_waiting_on_an_open_write_says_so_in_the_log_postgres_test() {
         Ok(())
     });
 
-    _holder.commit().await.expect("committing must succeed");
+    holder.tx.commit().await.expect("committing must succeed");
     for _ in 0..3 {
         runner.drain().await.expect("drain must succeed");
     }
@@ -433,12 +407,13 @@ async fn a_correction_adopted_by_a_running_daemon_traces_no_stale_wait_postgres_
     };
 
     add("daemon-correction", 10.0).await;
-    // As above: the held write copies this second stream's event, so the append that
-    // follows it does not queue behind the transaction under test.
+    // As above: the held append is on this second stream, so the append that follows it
+    // does not queue behind the transaction under test.
     add("daemon-correction-held", 5.0).await;
     wait_for_position(2).await;
 
-    let (holder, held) = hold_a_write_open(&pool, 2).await;
+    let holder = hold_an_append_open(&pool, 2).await;
+    let held = holder.position;
     add("daemon-correction", 1.0).await;
 
     // Wait for the daemon to trace the stop. Doubles as proof that this test can see
@@ -479,6 +454,6 @@ async fn a_correction_adopted_by_a_running_daemon_traces_no_stale_wait_postgres_
         "adopting the correction must not trace a wait read from the abandoned cursor"
     );
 
-    holder.rollback().await.expect("rollback must succeed");
+    holder.tx.rollback().await.expect("rollback must succeed");
     daemon.shutdown().await;
 }

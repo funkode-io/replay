@@ -20,6 +20,7 @@ use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PolicyRunner, PostgresEventStore, StartAt};
 
 mod common;
+use common::held_append::hold_an_append_open;
 use common::postgres_image::{postgres_container, POSTGRES_PORT};
 
 const AUDIT: &str = "commit_visibility_audit";
@@ -137,24 +138,6 @@ async fn events_in_commit_order(pool: &PgPool) -> Vec<Uuid> {
         .collect()
 }
 
-/// Clone the event at `source` into `tx` as the next version of its own stream,
-/// returning the `global_position` the copy took.
-///
-/// A copy rather than a hand-written row: it is shaped exactly like an event the
-/// store appended — valid stream URN, type tag and payload — so what the Policy
-/// does with it is the Policy's real behaviour and not an artefact of the fixture.
-async fn clone_event_into(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, source: i64) -> i64 {
-    sqlx::query_scalar(
-        "INSERT INTO events (id, data, metadata, stream_id, type, version, created) \
-         SELECT gen_random_uuid(), data, metadata, stream_id, type, version + 1, now() \
-         FROM events WHERE global_position = $1 RETURNING global_position",
-    )
-    .bind(source)
-    .fetch_one(&mut **tx)
-    .await
-    .expect("cloning an event must succeed")
-}
-
 /// Burn `count` sequence values the way an aborted append does, returning the first.
 async fn burn_positions(pool: &PgPool, count: i64) -> i64 {
     // `MIN` over the whole series, not `LIMIT 1` over it: a limit would stop the
@@ -238,11 +221,11 @@ async fn a_position_that_can_never_appear_does_not_delay_a_policy_postgres_test(
     assert_eq!(polls, 1, "and on the first poll after it was appended");
 
     // ── An append rolled back ─────────────────────────────────────────────────
-    // The shape of the reported incident: a transaction inserts an event row and
-    // then rolls back, leaving the position it took gone for good.
-    let mut aborted = pool.begin().await.expect("beginning must succeed");
-    let rolled_back = clone_event_into(&mut aborted, head(&pool).await).await;
-    aborted.rollback().await.expect("rollback must succeed");
+    // The shape of the reported incident: an append starts, takes its position and
+    // rolls back, leaving that position gone for good.
+    let aborted = hold_an_append_open(&pool, head(&pool).await).await;
+    let rolled_back = aborted.position;
+    aborted.tx.rollback().await.expect("rollback must succeed");
 
     add(2.0).await;
 
@@ -336,8 +319,8 @@ async fn an_append_in_flight_is_delivered_in_its_place_when_it_commits_postgres_
 
     // An append in flight: it has written its row, so it holds a transaction id, and
     // nothing else can see it yet.
-    let mut in_flight = pool.begin().await.expect("beginning must succeed");
-    let held = clone_event_into(&mut in_flight, 2).await;
+    let in_flight = hold_an_append_open(&pool, 2).await;
+    let held = in_flight.position;
 
     // A later append commits ahead of it. Its transaction is younger, so it belongs
     // behind the one still running and cannot be delivered yet.
@@ -360,6 +343,7 @@ async fn an_append_in_flight_is_delivered_in_its_place_when_it_commits_postgres_
 
     // It commits: both events arrive, in the order the log committed them.
     in_flight
+        .tx
         .commit()
         .await
         .expect("committing the append must succeed");
@@ -572,12 +556,13 @@ async fn a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test(
     add("snapshot-held", 5.0).await;
     drain_until(&runner, &pool, 2, 4).await;
 
-    // An append in flight, holding the position it took. It has written a row, so it
+    // An append in flight, holding the position it took. It has written its event, so
+    // it
     // has a transaction id and is exactly the case a snapshot is supposed to cover.
-    let mut in_flight = pool.begin().await.expect("beginning must succeed");
-    let held = clone_event_into(&mut in_flight, 2).await;
+    let mut in_flight = hold_an_append_open(&pool, 2).await;
+    let held = in_flight.position;
     let holder_xid: i64 = sqlx::query_scalar("SELECT pg_current_xact_id()::text::bigint")
-        .fetch_one(&mut *in_flight)
+        .fetch_one(&mut *in_flight.tx)
         .await
         .expect("the holder has a transaction id");
 
@@ -636,7 +621,11 @@ async fn a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test(
         "the event the rejected rule would have lost is still to come"
     );
 
-    in_flight.commit().await.expect("committing must succeed");
+    in_flight
+        .tx
+        .commit()
+        .await
+        .expect("committing must succeed");
     drain_until(&runner, &pool, held + 1, 5).await;
     assert_eq!(
         reacted.load(Ordering::SeqCst),
@@ -678,8 +667,8 @@ async fn a_policy_starting_now_skips_a_write_that_was_already_in_flight_postgres
     add("start-now-held", 5.0).await;
 
     // In flight when the policy is registered, and committing after it.
-    let mut in_flight = pool.begin().await.expect("beginning must succeed");
-    let held = clone_event_into(&mut in_flight, 2).await;
+    let in_flight = hold_an_append_open(&pool, 2).await;
+    let held = in_flight.position;
 
     // The head the policy will start at: younger transaction, higher position.
     add("start-now-main", 1.0).await;
@@ -698,7 +687,11 @@ async fn a_policy_starting_now_skips_a_write_that_was_already_in_flight_postgres
         .build();
     runner.drain().await.expect("drain must succeed");
 
-    in_flight.commit().await.expect("committing must succeed");
+    in_flight
+        .tx
+        .commit()
+        .await
+        .expect("committing must succeed");
     add("start-now-main", 2.0).await;
     drain_until(&runner, &pool, held + 2, 5).await;
 

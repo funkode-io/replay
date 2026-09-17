@@ -4,6 +4,7 @@
 //! `mod common;` rather than as a test binary of its own.
 
 pub mod alloc;
+pub mod held_append;
 pub mod migrations;
 pub mod policy_harness;
 pub mod postgres_image;
