@@ -591,7 +591,10 @@ mod tests {
 
     /// The `55P03` a row somebody else holds raises when `lock_timeout` expires.
     fn lock_not_available() -> sqlx::Error {
-        refused(LOCK_NOT_AVAILABLE, "canceling statement due to lock timeout")
+        refused(
+            LOCK_NOT_AVAILABLE,
+            "canceling statement due to lock timeout",
+        )
     }
 
     fn refused(code: &'static str, message: &'static str) -> sqlx::Error {
