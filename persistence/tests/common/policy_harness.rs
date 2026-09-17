@@ -19,6 +19,8 @@
 //!   as the events they wrote, each carrying the causation the runner stamps.
 //! - [`PolicyDaemonHarness::cursor`] — the policy's persisted position.
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
+//! - [`PolicyDaemonHarness::archived_dead_letters`] — the parked reactions that
+//!   have left the active set, and what settled them.
 //! - [`PolicyDaemonHarness::stopped_workers`] — the workers the runner gave up
 //!   on, which is what an operator reads off the daemon in their own service.
 //! - [`PolicyDaemonHarness::escalations`] — what the consumer's escalation hook
@@ -32,6 +34,11 @@
 //!   (nothing) and what survived in the tables (everything that matters).
 //! - [`PolicyDaemonHarness::retry_parked`] — the bulk retry of everything the
 //!   policy parked, run out of band while the daemon keeps polling.
+//! - [`PolicyDaemonHarness::retry_parked_row`] /
+//!   [`PolicyDaemonHarness::discard_parked_row`] — the same controls on one row,
+//!   by the id an operator reads off the table.
+//! - [`PolicyDaemonHarness::park_without_identity`] — a row as a release before
+//!   the identity migration parked it, which running code can no longer write.
 //!
 //! Tasks, channels and in-process state are deliberately absent.
 //!
@@ -70,8 +77,8 @@ use super::postgres_image::{postgres_container, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, DeadLetterRetrySummary, Escalation, PolicyRunner, PolicyRunnerBuilder,
-    PolicyRunnerDaemon, PostgresEventStore, StoppedWorker,
+    Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, PolicyRunner,
+    PolicyRunnerBuilder, PolicyRunnerDaemon, PostgresEventStore, StoppedWorker,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -226,10 +233,33 @@ pub struct DispatchedCommand {
 /// [Dead letter], as an operator reads it out of `policy_dead_letters`.
 #[derive(Debug, Clone)]
 pub struct DeadLetter {
+    /// Row id — what an operator passes to a retry or a discard.
+    pub id: i64,
     pub global_position: i64,
     pub event_id: Uuid,
     pub error_kind: String,
     pub error_message: String,
+    /// Rust type name of the aggregate the failing command targeted. `None` for
+    /// a row with no dispatch to name: parked before the identity migration, or
+    /// parked for a panic in `react` itself.
+    pub aggregate_name: Option<String>,
+    /// URN of the aggregate instance the failing command was addressed to.
+    pub target_stream_id: Option<String>,
+    /// Rust type name of the failing command.
+    pub command_name: Option<String>,
+}
+
+/// A dead letter that has left the active set, as an operator reads it out of
+/// `discarded_dead_letters`.
+#[derive(Debug, Clone)]
+pub struct ArchivedDeadLetter {
+    /// Id the row had in `policy_dead_letters`.
+    pub dead_letter_id: i64,
+    /// Why it left: `retried` or `discarded`.
+    pub reason: String,
+    pub aggregate_name: Option<String>,
+    pub target_stream_id: Option<String>,
+    pub command_name: Option<String>,
 }
 
 /// What the consumer's escalation hook was told, recorded instead of acted on.
@@ -374,16 +404,36 @@ impl PolicyDaemonHarness {
     /// out-of-band call an operator makes against a system that is still
     /// running, which is how it is made here.
     pub async fn retry_parked(&self) -> DeadLetterRetrySummary {
-        let runner = (self.configure)(
-            PolicyRunner::builder(self.cqrs.clone()).register_services::<Probe>(()),
-            &self.policy_name,
-        )
-        .build();
-
-        runner
+        self.out_of_band_runner()
             .retry_policy_dead_letters(&self.policy_name)
             .await
             .expect("a bulk retry must return a summary rather than fail")
+    }
+
+    /// Retry one parked row, by the id an operator reads off the table.
+    pub async fn retry_parked_row(&self, id: i64) -> DeadLetterRetry {
+        self.out_of_band_runner()
+            .retry_dead_letter(id)
+            .await
+            .expect("a retry must return an outcome rather than fail")
+    }
+
+    /// Discard one parked row, by the id an operator reads off the table.
+    pub async fn discard_parked_row(&self, id: i64) -> DeadLetterDiscard {
+        self.out_of_band_runner()
+            .discard_dead_letter(id)
+            .await
+            .expect("a discard must return an outcome rather than fail")
+    }
+
+    /// A runner configured like the daemon's but never started, for the controls
+    /// an operator invokes out of band.
+    fn out_of_band_runner(&self) -> PolicyRunner {
+        (self.configure)(
+            PolicyRunner::builder(self.cqrs.clone()).register_services::<Probe>(()),
+            &self.policy_name,
+        )
+        .build()
     }
 
     /// The name the policy under test was registered under.
@@ -521,7 +571,8 @@ impl PolicyDaemonHarness {
     /// The policy's dead letters — the reactions it parked — oldest first.
     pub async fn dead_letters(&self) -> Vec<DeadLetter> {
         let rows = sqlx::query(
-            "SELECT global_position, event_id, error_kind, error_message \
+            "SELECT id, global_position, event_id, error_kind, error_message, \
+                    aggregate_name, target_stream_id, command_name \
              FROM policy_dead_letters WHERE policy_name = $1 \
              ORDER BY id ASC LIMIT $2",
         )
@@ -533,10 +584,58 @@ impl PolicyDaemonHarness {
 
         rows.into_iter()
             .map(|row| DeadLetter {
+                id: row.get("id"),
                 global_position: row.get("global_position"),
                 event_id: row.get("event_id"),
                 error_kind: row.get("error_kind"),
                 error_message: row.get("error_message"),
+                aggregate_name: row.get("aggregate_name"),
+                target_stream_id: row.get("target_stream_id"),
+                command_name: row.get("command_name"),
+            })
+            .collect()
+    }
+
+    /// Park a row the way a release before the identity migration did: the old
+    /// columns only, the new ones left null.
+    ///
+    /// The only honest way to produce the backlog an upgrade inherits — the
+    /// running code cannot write such a row any more.
+    pub async fn park_without_identity(&self, event: &AppendedEvent, message: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO policy_dead_letters \
+                 (policy_name, global_position, event_id, error_kind, error_message) \
+             VALUES ($1, $2, $3, 'Invalid Input', $4) RETURNING id",
+        )
+        .bind(&self.policy_name)
+        .bind(event.global_position)
+        .bind(event.event_id)
+        .bind(message)
+        .fetch_one(&self.pool)
+        .await
+        .expect("a pre-migration row must still be insertable")
+    }
+
+    /// The policy's archived dead letters — what left the active set, and why.
+    pub async fn archived_dead_letters(&self) -> Vec<ArchivedDeadLetter> {
+        let rows = sqlx::query(
+            "SELECT dead_letter_id, reason, aggregate_name, target_stream_id, command_name \
+             FROM discarded_dead_letters WHERE policy_name = $1 \
+             ORDER BY id ASC LIMIT $2",
+        )
+        .bind(&self.policy_name)
+        .bind(OBSERVATION_LIMIT)
+        .fetch_all(&self.pool)
+        .await
+        .expect("archive observation must be readable");
+
+        rows.into_iter()
+            .map(|row| ArchivedDeadLetter {
+                dead_letter_id: row.get("dead_letter_id"),
+                reason: row.get("reason"),
+                aggregate_name: row.get("aggregate_name"),
+                target_stream_id: row.get("target_stream_id"),
+                command_name: row.get("command_name"),
             })
             .collect()
     }
