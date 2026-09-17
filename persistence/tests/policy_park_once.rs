@@ -16,7 +16,9 @@ use std::sync::Arc;
 use common::policy_harness::{
     DeadLetter, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
 };
-use replay_persistence::{Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder, StartAt};
+use replay_persistence::{
+    Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder, StartAt, PANIC_ERROR_KIND,
+};
 
 /// Tag whose reaction returns a permanently failing command followed by a
 /// retryable one: the permanent command is re-executed on every attempt the
@@ -26,6 +28,11 @@ const MIXED: &str = "mixed";
 /// The same pair the other way round: the retryable command comes first, so on
 /// every attempt but the last it breaks out before the permanent one runs.
 const REVERSED: &str = "reversed";
+
+/// Tag whose reaction returns a permanently failing command followed by one
+/// whose *handler panics*: the panic settles the delivery from outside the
+/// attempt loop, and must not take the failure before it down with it.
+const PANIC_AFTER_PERMANENT: &str = "panic-after-permanent";
 
 /// Tag whose reaction returns two commands that both fail permanently on the
 /// first attempt — nothing forces a second one.
@@ -47,6 +54,9 @@ const RETRYABLE_REASON: &str = "transient-command";
 /// report, so each is distinguishable in the rows they park.
 const FIRST_REASON: &str = "first-command";
 const SECOND_REASON: &str = "second-command";
+
+/// The reason the panicking command's handler panics with.
+const PANIC_REASON: &str = "detonator armed";
 
 /// The `error_kind` a refused command is parked under.
 const PERMANENT_KIND: &str = "Invalid Input";
@@ -81,6 +91,15 @@ impl ParkingPolicy {
             },
         )
     }
+
+    fn explode(reason: &str) -> Dispatch {
+        Dispatch::to::<Probe>(
+            ProbeUrn::new("subject").unwrap(),
+            ProbeCommand::Explode {
+                reason: reason.to_string(),
+            },
+        )
+    }
 }
 
 impl Policy for ParkingPolicy {
@@ -109,6 +128,9 @@ impl Policy for ParkingPolicy {
                 Self::refuse(PERMANENT_REASON),
             ],
             BOTH_PERMANENT => vec![Self::refuse(FIRST_REASON), Self::refuse(SECOND_REASON)],
+            PANIC_AFTER_PERMANENT => {
+                vec![Self::refuse(PERMANENT_REASON), Self::explode(PANIC_REASON)]
+            }
             ONE_PERMANENT => vec![Self::refuse(PERMANENT_REASON)],
             ONE_RETRYABLE => vec![Self::flake(RETRYABLE_REASON)],
             tag => vec![Dispatch::to::<Probe>(
@@ -207,6 +229,40 @@ async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forc
     let next = harness.ping("subject-3", "hello").await;
     let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
     assert_eq!(dispatched.event_type, "Echoed");
+
+    harness.shutdown().await;
+}
+
+/// A panic settles the delivery too, and the failures the attempt had already
+/// produced are parked alongside it rather than lost to the unwind.
+#[tokio::test]
+async fn a_panic_parks_the_failures_the_attempt_produced_before_it_postgres_test() {
+    let reactions = Arc::new(AtomicUsize::new(0));
+    let harness =
+        PolicyDaemonHarness::start("park_panic", parking_policy(Arc::clone(&reactions))).await;
+
+    let exploded = harness.ping("subject-1", PANIC_AFTER_PERMANENT).await;
+    harness
+        .await_cursor_at_least(exploded.global_position)
+        .await;
+
+    let parked = harness.dead_letters().await;
+    let rows = parked_for(&parked, exploded.global_position);
+    assert_eq!(
+        rows.len(),
+        2,
+        "the panic must not swallow the permanent failure before it, got {rows:#?}"
+    );
+    assert_eq!(
+        rows_for(&rows, PERMANENT_KIND, PERMANENT_REASON),
+        1,
+        "the command refused before the panic must still be parked, got {rows:#?}"
+    );
+    assert_eq!(
+        rows_for(&rows, PANIC_ERROR_KIND, PANIC_REASON),
+        1,
+        "the panicking command must be parked as a panic, got {rows:#?}"
+    );
 
     harness.shutdown().await;
 }
