@@ -9,6 +9,11 @@
 //! This is **not** a Projection: it reads operational tables, not the event
 //! log, and does not use the [`crate::Query`] / [`crate::InlineProjection`]
 //! machinery.
+//!
+//! It is also the *progress* axis only — how far a Policy has got — and carries
+//! no liveness field: no table can see whether a worker task exists, so a
+//! `CaughtUp` Policy whose worker died is indistinguishable here from an idle
+//! one. [`crate::PolicyRunnerDaemon::liveness`] is what tells them apart.
 
 use std::fmt;
 
