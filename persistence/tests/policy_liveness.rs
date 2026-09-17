@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
+use common::policy_harness::{
+    PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn, DAEMON_HEARTBEAT_CADENCE,
+    PRIMARY_REPLICA,
+};
 use replay_persistence::{
     Dispatch, Liveness, PersistedEvent, Policy, StartAt, StreamFilter, WorkerSupervision,
 };
@@ -159,46 +162,202 @@ async fn a_dying_worker_reports_restarting_and_then_stopped_postgres_test() {
     harness.shutdown().await;
 }
 
-/// The Leader stamps its last poll on the cursor row, which is how a replica
-/// that leads nothing — or a UI with only a connection string — reads liveness
-/// it cannot hold in memory.
+/// The Leader beats on its own cadence: the row carries a fresh beat, the state
+/// its supervisor knows, the last completed poll and the replica that wrote it —
+/// which is everything a consumer outside the process needs.
 #[tokio::test]
-async fn the_leader_stamps_its_last_poll_on_the_cursor_row_postgres_test() {
+async fn the_leader_beats_on_the_cursor_row_postgres_test() {
     let harness = PolicyDaemonHarness::start("heartbeat", |builder, policy| {
         builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
     })
     .await;
 
     let first = harness
-        .observe("the cursor row to carry a heartbeat", || async {
-            harness.last_polled_at().await
+        .await_heartbeat("a beat carrying a completed poll", |beat| {
+            beat.last_polled_at.is_some()
         })
         .await;
+    assert_eq!(first.liveness, "Leading");
+    assert_eq!(
+        first.led_by.as_deref(),
+        Some(PRIMARY_REPLICA),
+        "the beat names the replica whose logs an operator would read"
+    );
 
-    // It keeps moving: a stamp that never advances is a worker that stopped
-    // polling, which is the whole signal.
-    let later = harness
-        .observe("the heartbeat to advance", || async {
-            harness.last_polled_at().await.filter(|at| *at > first)
-        })
+    // It keeps beating: a beat that never advances is a Leader that is gone,
+    // which is the whole signal.
+    harness
+        .await_heartbeat("the beat to advance", |beat| beat.beat_at > first.beat_at)
         .await;
-    assert!(later > first);
 
     harness.shutdown().await;
 }
 
-/// A database whose `policy_cursors` has no `last_polled_at` is a consumer who
-/// has not run that migration, not a fault: the Policy reacts, the cursor
-/// advances, and the daemon still reports the worker as leading.
+/// The beat does not stop for work. A reaction that hangs holds its worker, so a
+/// stamp written on the poll path would go silent exactly here — and a consumer
+/// would read a hang as a dead process. Instead the beat keeps arriving while
+/// `last_polled_at` ages, which is the pair that tells wedged from gone.
 #[tokio::test]
-async fn a_schema_without_the_heartbeat_column_changes_nothing_postgres_test() {
+async fn the_beat_keeps_arriving_while_a_reaction_hangs_postgres_test() {
+    let harness = PolicyDaemonHarness::start("hanging", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, |event| {
+            match &event.data {
+                // Longer than this test needs: the reaction is still running when
+                // every assertion below is made.
+                ProbeEvent::Pinged { .. } => vec![Dispatch::to::<Probe>(
+                    ProbeUrn::new("sleeper").unwrap(),
+                    ProbeCommand::Sleep { millis: 60_000 },
+                )],
+                _ => vec![],
+            }
+        })
+    })
+    .await;
+
+    harness
+        .await_heartbeat("a beat before the hang", |beat| {
+            beat.last_polled_at.is_some()
+        })
+        .await;
+
+    // From here the worker takes up a reaction that will not come back.
+    harness.ping("subject-1", "hang").await;
+
+    // The poll stamp standing still is how the hang is observable at all: beats
+    // keep coming, and the poll they carry stops moving with them. It is
+    // recomputed from an age on every beat, so it wobbles by the round trip
+    // rather than being byte-identical — what matters is that it does not keep
+    // pace with the beats.
+    let window = DAEMON_HEARTBEAT_CADENCE * 5;
+    let half_window = chrono::TimeDelta::from_std(window / 2).unwrap();
+    let (before, after) = harness
+        .observe("beats that carry no newer poll", || async {
+            let before = harness.heartbeat().await?;
+            tokio::time::sleep(window).await;
+            let after = harness.heartbeat().await?;
+            let polled_moved = after.last_polled_at? - before.last_polled_at?;
+            (after.beat_at - before.beat_at >= half_window && polled_moved < half_window)
+                .then_some((before, after))
+        })
+        .await;
+
+    assert!(
+        after.beat_at - before.beat_at >= half_window,
+        "the beat kept its cadence through the hang"
+    );
+    assert_eq!(
+        after.liveness, "Leading",
+        "a wedged worker is leading, not stopped: nothing has given up on it"
+    );
+    assert_eq!(
+        harness.cursor().await,
+        Some(0),
+        "and it really is wedged: the reaction never returned, so nothing was checkpointed"
+    );
+
+    // Nothing can join a worker that is still inside its reaction.
+    harness.abandon();
+}
+
+/// A Leader whose worker is down for good keeps beating, saying so. The replica
+/// still holds the advisory lock, so no standby takes over — `Stopped` against a
+/// fresh beat is exactly the half-dead state that went unseen in
+/// funkode-io/replay#164, and silence could not express it.
+#[tokio::test]
+async fn a_stopped_leader_keeps_beating_and_says_it_is_stopped_postgres_test() {
+    let deaths = Arc::new(AtomicUsize::new(0));
+    let staged = Arc::new(AtomicUsize::new(usize::MAX));
+
+    let harness = {
+        let deaths = Arc::clone(&deaths);
+        let staged = Arc::clone(&staged);
+        PolicyDaemonHarness::start("stopped_beat", move |builder, policy| {
+            builder
+                .with_worker_supervision(
+                    WorkerSupervision::default()
+                        .max_restarts(1)
+                        .initial_backoff(Duration::from_millis(20))
+                        .max_backoff(Duration::from_millis(20)),
+                )
+                .register_policy(DiesOutsideTheReaction {
+                    name: policy.to_string(),
+                    deaths_to_stage: Arc::clone(&staged),
+                    deaths: Arc::clone(&deaths),
+                })
+        })
+        .await
+    };
+
+    let stopped = harness
+        .await_heartbeat("a beat reporting the worker stopped", |beat| {
+            beat.liveness == "Stopped"
+        })
+        .await;
+
+    harness
+        .await_heartbeat("the beat to keep arriving after the stop", |beat| {
+            beat.beat_at > stopped.beat_at && beat.liveness == "Stopped"
+        })
+        .await;
+
+    harness.shutdown().await;
+}
+
+/// A standby writes nothing. One row per policy is shared by every replica, so a
+/// standby that beat would overwrite the leader's beat with its own idleness.
+#[tokio::test]
+async fn a_standby_replica_does_not_write_the_beat_postgres_test() {
+    let harness = PolicyDaemonHarness::start("standby_beat", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
+    })
+    .await;
+
+    harness
+        .await_heartbeat("the leader's first beat", |beat| {
+            beat.led_by.as_deref() == Some(PRIMARY_REPLICA)
+        })
+        .await;
+
+    let replica = harness.start_replica();
+    harness
+        .observe("the replica to stand by", || async {
+            replica
+                .liveness()
+                .into_iter()
+                .find(|worker| worker.liveness == Liveness::StandingBy)
+        })
+        .await;
+
+    // Several beats later, the row is still the leader's.
+    let seen = harness.heartbeat().await.expect("a beat must exist");
+    let after = harness
+        .await_heartbeat("three more beats with the replica running", |beat| {
+            beat.beat_at > seen.beat_at
+        })
+        .await;
+    assert_eq!(
+        after.led_by.as_deref(),
+        Some(PRIMARY_REPLICA),
+        "a standby must not claim a row it does not lead"
+    );
+    assert_eq!(after.liveness, "Leading");
+
+    replica.shutdown().await;
+    harness.shutdown().await;
+}
+
+/// A database whose `policy_cursors` has none of the heartbeat columns is a
+/// consumer who has not run that migration, not a fault: the Policy reacts, the
+/// cursor advances, and the daemon still reports the worker as leading.
+#[tokio::test]
+async fn a_schema_without_the_heartbeat_columns_changes_nothing_postgres_test() {
     let mut harness = PolicyDaemonHarness::start("no_heartbeat", |builder, policy| {
         builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
     })
     .await;
 
     harness.drop_heartbeat_column().await;
-    // A daemon that never saw the column, which is what the consumer runs.
+    // A daemon that never saw the columns, which is what the consumer runs.
     harness.restart().await;
 
     let ping = harness.ping("subject-1", "hello").await;
@@ -218,15 +377,15 @@ async fn a_schema_without_the_heartbeat_column_changes_nothing_postgres_test() {
                 .find(|worker| worker.last_polled_at.is_some())
         })
         .await;
-    // The in-memory poll instant is the daemon's own and owes the schema nothing.
+    // The in-memory axis is the daemon's own and owes the schema nothing.
     assert!(
         harness.dead_letters().await.is_empty(),
-        "a missing heartbeat column parks nothing: {:?}",
+        "missing heartbeat columns park nothing: {:?}",
         harness.dead_letters().await
     );
     assert!(
         harness.stopped_workers().is_empty(),
-        "nor does it stop a worker: {:?}",
+        "nor do they stop a worker: {:?}",
         harness.stopped_workers()
     );
 

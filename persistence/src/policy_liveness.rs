@@ -181,105 +181,148 @@ impl LivenessHandle {
 
 // ── The durable heartbeat ────────────────────────────────────────────────────
 
-/// Whether `policy_cursors.last_polled_at` exists, remembered for the life of
-/// the process and shared by every worker: the answer is a property of the
-/// schema, not of one Policy, and a restarted worker must not re-ask it.
+/// One Policy's line in a beat.
+///
+/// Built from the [`LivenessRegistry`] at beat time, for the Policies this
+/// process leads and no others: a row a replica does not lead is another
+/// replica's to write.
+pub(crate) struct Beat {
+    pub(crate) policy: String,
+    pub(crate) liveness: Liveness,
+    /// How long ago the worker last finished a poll, or `None` if it never has.
+    /// Sent as an age rather than an instant so the database's clock remains the
+    /// only clock in the reading.
+    pub(crate) polled_ago: Option<Duration>,
+}
+
+/// Whether the consumer's schema carries the heartbeat columns, remembered for
+/// the life of the process: the answer is a property of the schema, not of one
+/// beat, and a restarted beat task must not re-ask it.
 #[derive(Clone, Default)]
-pub(crate) struct HeartbeatColumn {
-    /// Set the first time Postgres says the column is not there. One-way: a
-    /// column added while the process runs is picked up on the next start,
-    /// which is when the consumer's migration ran.
+pub(crate) struct HeartbeatColumns {
+    /// Set the first time Postgres says a column is not there. One-way: columns
+    /// added while the process runs are picked up on the next start, which is
+    /// when the consumer's migration ran.
     absent: Arc<AtomicBool>,
 }
 
-impl HeartbeatColumn {
-    /// A writer that stamps at most once per `min_gap`.
-    pub(crate) fn writer(&self, min_gap: Duration) -> Heartbeat {
-        Heartbeat {
-            column: self.clone(),
-            min_gap,
-            next_write: None,
+impl HeartbeatColumns {
+    pub(crate) fn writer(&self, replica_id: Option<String>) -> HeartbeatWriter {
+        HeartbeatWriter {
+            columns: self.clone(),
+            replica_id,
             failure_reported: false,
         }
     }
 }
 
-/// Writes one worker's last poll to its cursor row, when the consumer's schema
-/// carries the column.
+/// Writes the beat: one statement per beat, covering every Policy this process
+/// leads.
 ///
-/// The write is rate-limited to one per `min_gap` because a poll is not a fixed
-/// cost: a `NOTIFY` wakes a worker per append, so an unthrottled stamp would add
-/// a write per event to a row the checkpoint is already updating.
-pub(crate) struct Heartbeat {
-    column: HeartbeatColumn,
-    min_gap: Duration,
-    /// Earliest instant the next write may happen; `None` before the first.
-    next_write: Option<Instant>,
-    /// Whether a failure has already been reported. No failure here is worth a
-    /// second line: the database this write went to is the one the drain uses,
-    /// and a drain that is also failing says so at `error`.
+/// `SET LOCAL lock_timeout` is the reason for the transaction. The beat updates
+/// the same row a checkpoint writes, and a beat that queued behind one would
+/// arrive late for the same reason the worker is busy — the coupling the fixed
+/// cadence exists to remove. A tick that cannot take the row is skipped instead,
+/// which costs nothing against a threshold of several beats.
+pub(crate) struct HeartbeatWriter {
+    columns: HeartbeatColumns,
+    /// What to write in `led_by`. `None` when the consumer named no replica and
+    /// the process has no `HOSTNAME`: the column is then left null rather than
+    /// carrying an invented identity.
+    replica_id: Option<String>,
+    /// Whether a failed beat has already been reported. A second line says
+    /// nothing new: the database a beat goes to is the one the workers use, and
+    /// a worker that is also failing says so at `error`.
     failure_reported: bool,
 }
 
-impl Heartbeat {
-    /// Stamp `policy`'s cursor row with the database's clock — a wall-clock
-    /// reading every replica compares the same way, unlike a local one.
-    ///
-    /// Never fails the poll it is called from: the heartbeat is a report about
-    /// the worker, and a report that could stop the work would be worse than no
-    /// report.
-    pub(crate) async fn beat(&mut self, pool: &Pool<Postgres>, policy: &str, now: Instant) {
-        if !self.due(now) {
+/// `now() - make_interval(...)` rather than a timestamp computed here: the
+/// database's clock is the one every replica and every reader compares against,
+/// and a replica whose clock has drifted must not be able to report a poll in
+/// the future. `last_beat_at - last_polled_at` is therefore the worker's exact
+/// poll age, taken from one clock.
+///
+/// The consequence is that `last_polled_at` is recomputed from an age on every
+/// beat, so a worker that has not polled since sees it wobble by the round trip
+/// rather than stand perfectly still. It carries beat-level precision, which is
+/// all a staleness threshold of several beats can use.
+const BEAT_SQL: &str = "\
+    UPDATE policy_cursors AS pc \
+       SET last_beat_at   = now(), \
+           liveness       = v.liveness, \
+           led_by         = $4, \
+           last_polled_at = COALESCE(now() - make_interval(secs => v.polled_ago), pc.last_polled_at) \
+      FROM unnest($1::text[], $2::text[], $3::float8[]) AS v(name, liveness, polled_ago) \
+     WHERE pc.name = v.name";
+
+impl HeartbeatWriter {
+    /// Write one beat. Never returns an error: a report that could stop the work
+    /// it reports on would be worse than no report.
+    pub(crate) async fn beat(&mut self, pool: &Pool<Postgres>, beats: &[Beat]) {
+        if beats.is_empty() || self.columns.absent.load(Ordering::Relaxed) {
             return;
         }
 
-        let written =
-            sqlx::query("UPDATE policy_cursors SET last_polled_at = now() WHERE name = $1")
-                .bind(policy)
-                .execute(pool)
-                .await;
-
-        let Err(error) = written else {
-            return;
-        };
-
-        if is_undefined_column(&error) {
-            // Attempted once per process, then left alone: a consumer whose
-            // schema predates the heartbeat reads liveness from the daemon, and
-            // a line per poll about a column they have not added is noise.
-            self.column.absent.store(true, Ordering::Relaxed);
+        let mut policies = Vec::with_capacity(beats.len());
+        let mut states = Vec::with_capacity(beats.len());
+        let mut polled_ago = Vec::with_capacity(beats.len());
+        for beat in beats {
+            policies.push(beat.policy.clone());
+            states.push(beat.liveness.as_str().to_string());
+            polled_ago.push(beat.polled_ago.map(|ago| ago.as_secs_f64()));
         }
-        if !self.failure_reported {
-            self.failure_reported = true;
-            tracing::debug!(
-                policy = %policy,
-                error = %error,
-                durable_heartbeat = if self.column.absent.load(Ordering::Relaxed) {
-                    "off for this process"
-                } else {
-                    "retried on the next poll"
-                },
-                "the durable heartbeat write failed; liveness is readable from the daemon \
-                 either way"
-            );
+
+        if let Err(error) = self.write(pool, &policies, &states, &polled_ago).await {
+            self.report(&error);
         }
     }
 
-    /// Whether a write is owed at `now`, charging it to the rate limit if so.
-    fn due(&mut self, now: Instant) -> bool {
-        if self.column.absent.load(Ordering::Relaxed) {
-            return false;
+    async fn write(
+        &self,
+        pool: &Pool<Postgres>,
+        policies: &[String],
+        states: &[String],
+        polled_ago: &[Option<f64>],
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(BEAT_SQL)
+            .bind(policies)
+            .bind(states)
+            .bind(polled_ago)
+            .bind(self.replica_id.as_deref())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    }
+
+    fn report(&mut self, error: &sqlx::Error) {
+        if is_undefined_column(error) {
+            // Attempted once per process, then left alone: a consumer whose
+            // schema has no heartbeat columns reads liveness from the daemon,
+            // and a line per beat about columns they have not added is noise.
+            self.columns.absent.store(true, Ordering::Relaxed);
         }
-        if self.next_write.is_some_and(|next| now < next) {
-            return false;
+        if self.failure_reported {
+            return;
         }
-        self.next_write = Some(now + self.min_gap);
-        true
+        self.failure_reported = true;
+        tracing::debug!(
+            error = %error,
+            durable_heartbeat = if self.columns.absent.load(Ordering::Relaxed) {
+                "off for this process"
+            } else {
+                "retried on the next beat"
+            },
+            "the durable heartbeat write failed; liveness is readable from the daemon either way"
+        );
     }
 }
 
-/// Whether Postgres refused the write because the column is not there, as
-/// opposed to any other reason a write can fail.
+/// Whether Postgres refused the write because a column is not there, as opposed
+/// to any other reason a write can fail.
 fn is_undefined_column(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(db) => db.code().as_deref() == Some(UNDEFINED_COLUMN),
@@ -357,39 +400,75 @@ mod tests {
         assert_eq!(registry.snapshot()[0].last_polled_at, Some(polled_at));
     }
 
-    /// The durable stamp is written at most once per gap, however often the
-    /// worker polls — a `NOTIFY` per append must not become a write per append.
+    /// A schema without the heartbeat columns costs one refused statement per
+    /// process, not one per beat — and the answer outlives the task that found
+    /// it, so a restarted beat task does not re-ask.
     #[test]
-    fn the_durable_stamp_is_rate_limited() {
-        let gap = Duration::from_secs(1);
-        let mut heartbeat = HeartbeatColumn::default().writer(gap);
-        let start = Instant::now();
+    fn absent_columns_stop_being_attempted() {
+        let columns = HeartbeatColumns::default();
+        let mut writer = columns.writer(None);
 
-        assert!(heartbeat.due(start), "the first poll owes a stamp");
+        writer.report(&undefined_column());
+
         assert!(
-            !heartbeat.due(start + gap / 2),
-            "a poll inside the gap owes nothing"
+            columns.absent.load(Ordering::Relaxed),
+            "a refused column turns the durable heartbeat off for the process"
         );
         assert!(
-            heartbeat.due(start + gap),
-            "a poll past the gap owes one again"
+            columns.writer(None).failure_reported || columns.absent.load(Ordering::Relaxed),
+            "a beat task started afterwards inherits the answer rather than re-asking"
         );
     }
 
-    /// A schema without the column costs one failed write per process, not one
-    /// per poll.
+    /// Any other failure is reported once and then left to the workers, whose
+    /// own errors say the same thing at a level somebody reads.
     #[test]
-    fn an_absent_column_stops_being_attempted() {
-        let column = HeartbeatColumn::default();
-        let mut heartbeat = column.writer(Duration::ZERO);
-        let now = Instant::now();
+    fn a_failing_beat_is_reported_once() {
+        let mut writer = HeartbeatColumns::default().writer(None);
 
-        assert!(heartbeat.due(now));
-        column.absent.store(true, Ordering::Relaxed);
-        assert!(!heartbeat.due(now));
+        writer.report(&sqlx::Error::PoolTimedOut);
+        assert!(writer.failure_reported);
 
-        // Including for a worker that started afterwards: the column is a
-        // property of the schema, and a restart re-asking would spam the log.
-        assert!(!column.writer(Duration::ZERO).due(now));
+        // Not an absent column: the next beat still tries.
+        assert!(!writer.columns.absent.load(Ordering::Relaxed));
+    }
+
+    /// The `42703` a missing column raises, as sqlx surfaces it.
+    fn undefined_column() -> sqlx::Error {
+        // sqlx has no public constructor for a DatabaseError, so the check is
+        // exercised through the one shape that matters to it: the SQLSTATE.
+        struct Refused;
+        impl std::fmt::Debug for Refused {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("column \"last_beat_at\" does not exist")
+            }
+        }
+        impl std::fmt::Display for Refused {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("column \"last_beat_at\" does not exist")
+            }
+        }
+        impl std::error::Error for Refused {}
+        impl sqlx::error::DatabaseError for Refused {
+            fn message(&self) -> &str {
+                "column \"last_beat_at\" does not exist"
+            }
+            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+                Some(std::borrow::Cow::Borrowed(UNDEFINED_COLUMN))
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+        sqlx::Error::Database(Box::new(Refused))
     }
 }

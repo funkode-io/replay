@@ -23,8 +23,8 @@
 //!   on, which is what an operator reads off the daemon in their own service.
 //! - [`PolicyDaemonHarness::liveness`] — what each worker in this process is
 //!   doing, read off the daemon the same way.
-//! - [`PolicyDaemonHarness::last_polled_at`] — the durable stamp a worker leaves
-//!   on its cursor row, which is what a replica that leads nothing can read.
+//! - [`PolicyDaemonHarness::heartbeat`] — the row the Leader's beat writes,
+//!   which is what a consumer reads from outside the process.
 //! - [`PolicyDaemonHarness::escalations`] — what the consumer's escalation hook
 //!   was told. The harness installs a recording hook in place of the default,
 //!   which exits the process: in a test that is the test runner.
@@ -37,9 +37,8 @@
 //! - [`PolicyDaemonHarness::start_replica`] — start a *second* runner against
 //!   the same database, which is how a test reaches a Standby: whichever runner
 //!   loses the advisory lock leads nothing and must say so.
-//! - [`PolicyDaemonHarness::drop_heartbeat_column`] — take
-//!   `policy_cursors.last_polled_at` away, standing in for a consumer whose
-//!   schema predates it.
+//! - [`PolicyDaemonHarness::drop_heartbeat_column`] — take the heartbeat columns
+//!   away, standing in for a consumer whose schema predates them.
 //! - [`PolicyDaemonHarness::retry_parked`] — the bulk retry of everything the
 //!   policy parked, run out of band while the daemon keeps polling.
 //!
@@ -88,6 +87,11 @@ use replay_persistence::{
 /// How often the daemon under test polls the feed. Short: these tests wait on
 /// outcomes, so the interval only bounds how long an idle poll loop dawdles.
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How often the daemon under test writes the durable heartbeat. Short for the
+/// same reason the poll interval is: these tests wait on beats arriving, not on
+/// production's cadence.
+pub const DAEMON_HEARTBEAT_CADENCE: Duration = Duration::from_millis(100);
 
 /// How long an `await_*` observation may go unsatisfied before it is a failure.
 pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -223,6 +227,21 @@ pub struct DeadLetter {
     pub error_message: String,
 }
 
+/// The durable liveness reading: one beat, as a consumer outside the process
+/// sees it.
+#[derive(Debug, Clone)]
+pub struct Heartbeat {
+    /// When the Leader's replica last beat. Stale means no live Leader.
+    pub beat_at: DateTime<Utc>,
+    /// What that replica's supervisor knows about the worker.
+    pub liveness: String,
+    /// When the worker last finished a poll. Old against a fresh beat means the
+    /// worker is alive and not finishing polls.
+    pub last_polled_at: Option<DateTime<Utc>>,
+    /// Which replica wrote the beat.
+    pub led_by: Option<String>,
+}
+
 /// What the consumer's escalation hook was told, recorded instead of acted on.
 ///
 /// Installed by the harness on every daemon it starts, because the default hook
@@ -321,7 +340,13 @@ impl PolicyDaemonHarness {
         let configure: Arc<Configure> = Arc::new(configure);
         let escalations = Escalations::default();
 
-        let daemon = spawn_daemon(&cqrs, configure.as_ref(), &policy_name, &escalations);
+        let daemon = spawn_daemon(
+            &cqrs,
+            configure.as_ref(),
+            &policy_name,
+            &escalations,
+            PRIMARY_REPLICA,
+        );
 
         Self {
             _container: container,
@@ -354,6 +379,7 @@ impl PolicyDaemonHarness {
             self.configure.as_ref(),
             &self.policy_name,
             &self.escalations,
+            PRIMARY_REPLICA,
         ));
     }
 
@@ -511,18 +537,53 @@ impl PolicyDaemonHarness {
         .flatten()
     }
 
-    /// Take `policy_cursors.last_polled_at` away: the schema of a consumer who
-    /// has not added the column, which the runner must tolerate.
-    ///
-    /// The column is the consumer's, not the crate's, so this is a schema a
-    /// deployment can genuinely be in rather than a fault injected for the test.
-    /// Call [`restart`](Self::restart) afterwards to run a daemon that never saw
-    /// it.
-    pub async fn drop_heartbeat_column(&self) {
-        sqlx::query("ALTER TABLE policy_cursors DROP COLUMN last_polled_at")
-            .execute(&self.pool)
+    /// The heartbeat the Leader's replica writes for this policy — everything a
+    /// consumer outside the process can see about it.
+    pub async fn heartbeat(&self) -> Option<Heartbeat> {
+        let row = sqlx::query(
+            "SELECT last_beat_at, liveness, last_polled_at, led_by \
+             FROM policy_cursors WHERE name = $1",
+        )
+        .bind(&self.policy_name)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("the heartbeat observation must be readable")?;
+
+        let beat_at: Option<DateTime<Utc>> = row.get("last_beat_at");
+        Some(Heartbeat {
+            beat_at: beat_at?,
+            liveness: row.get("liveness"),
+            last_polled_at: row.get("last_polled_at"),
+            led_by: row.get("led_by"),
+        })
+    }
+
+    /// Wait until a beat arrives that satisfies `holds`, and return it.
+    pub async fn await_heartbeat<F>(&self, what: &str, holds: F) -> Heartbeat
+    where
+        F: Fn(&Heartbeat) -> bool,
+    {
+        self.observe(what, || async { self.heartbeat().await.filter(&holds) })
             .await
-            .expect("dropping the heartbeat column must succeed");
+    }
+
+    /// Take the heartbeat columns away: the schema of a consumer who has not
+    /// added them, which the runner must tolerate.
+    ///
+    /// They are the consumer's, not the crate's, so this is a schema a deployment
+    /// can genuinely be in rather than a fault injected for the test. Call
+    /// [`restart`](Self::restart) afterwards to run a daemon that never saw them.
+    pub async fn drop_heartbeat_column(&self) {
+        sqlx::query(
+            "ALTER TABLE policy_cursors \
+               DROP COLUMN last_beat_at, \
+               DROP COLUMN liveness, \
+               DROP COLUMN last_polled_at, \
+               DROP COLUMN led_by",
+        )
+        .execute(&self.pool)
+        .await
+        .expect("dropping the heartbeat columns must succeed");
     }
 
     /// Start a second runner against this harness's database, registering the
@@ -539,6 +600,7 @@ impl PolicyDaemonHarness {
             self.configure.as_ref(),
             &self.policy_name,
             &escalations,
+            SECOND_REPLICA,
         );
         PolicyDaemonReplica {
             escalations,
@@ -703,6 +765,17 @@ impl PolicyDaemonHarness {
             daemon.shutdown().await;
         }
     }
+
+    /// End the test without awaiting the daemon's tasks.
+    ///
+    /// The only way to finish a test whose worker is inside a reaction that
+    /// never returns: [`shutdown`](Self::shutdown) joins every task, and a
+    /// wedged worker joins when its reaction does — which is exactly what such a
+    /// test is proving does not happen. A real process ends the same way, by
+    /// exiting with the worker still in there, and the same isolation applies:
+    /// the tasks belong to this test's runtime and die with it, against a
+    /// database no other test can see.
+    pub fn abandon(self) {}
 }
 
 /// The second runner in a test: another process's daemon, against the same
@@ -748,6 +821,13 @@ fn unique_policy_name(label: &str) -> String {
     format!("harness_{label}_{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// What the harness's own daemon writes in `led_by`.
+pub const PRIMARY_REPLICA: &str = "harness-primary";
+
+/// What a [`PolicyDaemonHarness::start_replica`] daemon writes in `led_by`, so a
+/// test can tell which of the two wrote a beat.
+pub const SECOND_REPLICA: &str = "harness-replica";
+
 /// Build the configured runner and start it polling.
 ///
 /// The daemon's tasks own everything they need, so the runner itself is free to
@@ -762,10 +842,13 @@ fn spawn_daemon(
     configure: &Configure,
     policy_name: &str,
     escalations: &Escalations,
+    replica_id: &str,
 ) -> PolicyRunnerDaemon {
     configure(
         PolicyRunner::builder(cqrs.clone())
             .register_services::<Probe>(())
+            .with_heartbeat(DAEMON_HEARTBEAT_CADENCE)
+            .replica_id(replica_id)
             .on_escalation(escalations.hook()),
         policy_name,
     )
