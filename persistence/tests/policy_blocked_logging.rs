@@ -1,14 +1,13 @@
-//! A policy that cannot advance says so in the log (funkode-io/replay#169).
+//! A Policy that cannot advance says so in the log (funkode-io/replay#169), and a
+//! healthy idle one still says nothing (funkode-io/replay#164).
 //!
-//! The wait is the design; the silence was the bug. So this test asserts on the log
-//! itself rather than on the code that writes it, through the states an operator
-//! passes: caught up, just stopped, stopped too long, still stopped, corrected.
-//!
-//! The hole here is one an append could still fill — a transaction that has taken
-//! the position and not yet ended. That is the only kind that stops a Policy at all
-//! since funkode-io/replay#170: a position no running transaction holds can never
-//! appear, and the runner crosses it instead of reporting it forever (see
-//! `policy_burned_position.rs`).
+//! What stops a Policy since funkode-io/replay#195 is a write that has not ended: the
+//! feed delivers an event only once its transaction has finished, so everything
+//! committed after a still-open write is held back until that write commits or aborts.
+//! The wait is the design — delivering past it would put those events ahead of what the
+//! open write may still publish — and the silence was the bug. So these tests assert on
+//! the log itself rather than on the code that writes it, through the states an
+//! operator passes: caught up, just stopped, stopped too long, still stopped, cleared.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -25,10 +24,10 @@ use common::postgres_image::postgres_container;
 
 const POSTGRES_PORT: u16 = 5432;
 
-/// A policy whose cursor last advanced long ago, then meets a fresh hole: the trap
-/// of measuring a blockage from the cursor instead of from the hole.
+/// A policy whose cursor last advanced long ago, then meets a fresh wait: the trap
+/// of measuring a stop from the cursor instead of from the wait.
 const AGED_CURSOR: &str = "aged_cursor_audit";
-/// A policy that was working right up to the same hole.
+/// A policy that was working right up to the same wait.
 const FRESH_CURSOR: &str = "fresh_cursor_audit";
 
 /// Escalation threshold and repeat spacing for this test, short enough to elapse.
@@ -104,53 +103,67 @@ async fn start_postgres() -> (
     (pool, container)
 }
 
-/// Take a `global_position` and keep it: an append in flight, as far as any other
-/// session can tell, and a hole the feed is right to wait at.
+/// Open an append and keep it open: a transaction that has written an event row holds a
+/// transaction id, so everything committed after it is withheld until it ends.
 ///
-/// The transaction is returned so the caller keeps it open — dropping it ends the
-/// wait.
-async fn hold_position(pool: &PgPool) -> (sqlx::Transaction<'static, sqlx::Postgres>, i64) {
+/// The row is a copy of the event at `source`, shaped exactly like one the store
+/// appended. The transaction is returned so the caller keeps it open — dropping it ends
+/// the wait.
+///
+/// `source` must be on a stream nothing else appends to while the transaction is held:
+/// the copy takes that stream's next version, and a later append to it would block on
+/// `events_stream_and_version` until this transaction ends — waiting on the very write
+/// the test is holding open.
+async fn hold_a_write_open(
+    pool: &PgPool,
+    source: i64,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i64) {
     let mut holder = pool.begin().await.expect("beginning must succeed");
-    let position: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
-        .fetch_one(&mut *holder)
-        .await
-        .expect("taking a position must succeed");
+    let position: i64 = sqlx::query_scalar(
+        "INSERT INTO events (id, data, metadata, stream_id, type, version, created) \
+         SELECT gen_random_uuid(), data, metadata, stream_id, type, version + 1, now() \
+         FROM events WHERE global_position = $1 RETURNING global_position",
+    )
+    .bind(source)
+    .fetch_one(&mut *holder)
+    .await
+    .expect("writing inside the held transaction must succeed");
     (holder, position)
 }
 
-/// Lines the runner writes about a stopped feed, in the order it wrote them.
-fn gap_traces<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+/// Lines the runner writes about a feed that is waiting, in the order it wrote them.
+fn wait_traces<'a>(lines: &[&'a str]) -> Vec<&'a str> {
     lines
         .iter()
         .copied()
-        .filter(|line| line.contains("policy feed stops at a gap"))
+        .filter(|line| line.contains("policy feed is waiting for an open write"))
         .collect()
 }
 
-/// Lines escalating a stop to an incident.
-fn blocked_warnings<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+/// Lines escalating a wait to an incident.
+fn waiting_warnings<'a>(lines: &[&'a str]) -> Vec<&'a str> {
     lines
         .iter()
         .copied()
-        .filter(|line| line.contains("policy is blocked"))
+        .filter(|line| line.contains("policy is waiting on a write that has not ended"))
         .collect()
 }
 
-/// The `blocked_for_secs` field of a warning line.
-fn blocked_for_secs(line: &str) -> u64 {
-    line.split("blocked_for_secs=")
+/// The `waiting_for_secs` field of a warning line.
+fn waiting_for_secs(line: &str) -> u64 {
+    line.split("waiting_for_secs=")
         .nth(1)
-        .expect("the warning names how long the policy has been blocked")
+        .expect("the warning names how long the policy has been waiting")
         .split_whitespace()
         .next()
         .expect("a value follows the field name")
         .parse()
-        .expect("blocked_for_secs is a number of seconds")
+        .expect("waiting_for_secs is a number of seconds")
 }
 
 #[tokio::test]
 #[traced_test]
-async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
+async fn a_policy_waiting_on_an_open_write_says_so_in_the_log_postgres_test() {
     let (pool, _container) = start_postgres().await;
 
     // Read once, at build: this binary runs one test, so nothing else sees it.
@@ -165,13 +178,11 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
         .register_policy_fn::<LedgerEvent, _>(FRESH_CURSOR, StartAt::Beginning, |_| vec![])
         .build();
 
-    let ledger = LedgerUrn::new("blocked-policy-log").unwrap();
-    let add = |amount: f64| {
+    let add = |stream: &'static str, amount: f64| {
         let cqrs = cqrs.clone();
-        let ledger = ledger.clone();
         async move {
             cqrs.execute::<Ledger>(
-                &ledger,
+                &LedgerUrn::new(stream).unwrap(),
                 replay::Metadata::default(),
                 LedgerCommand::Add { amount },
                 &(),
@@ -184,31 +195,34 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
 
     // ── Caught up ─────────────────────────────────────────────────────────────
     // A drained policy must stay silent, or the signal below is worthless.
-    add(10.0).await;
-    add(5.0).await;
+    add("waiting-policy-log", 10.0).await;
+    // A second stream, so the write held open below — a copy of this event, taking the
+    // next version of its stream — cannot block the append that follows it.
+    add("waiting-policy-held", 5.0).await;
     for _ in 0..4 {
         runner.drain().await.expect("drain must succeed");
     }
 
     logs_assert(
-        |lines| match (gap_traces(lines).len(), blocked_warnings(lines).len()) {
+        |lines| match (wait_traces(lines).len(), waiting_warnings(lines).len()) {
             (0, 0) => Ok(()),
-            (gaps, warnings) => Err(format!(
-                "a caught-up policy must say nothing, but wrote {gaps} gap traces \
+            (traces, warnings) => Err(format!(
+                "a caught-up policy must say nothing, but wrote {traces} traces \
              and {warnings} warnings"
             )),
         },
     );
 
     // ── Just stopped ──────────────────────────────────────────────────────────
-    // An append holds a position and has not committed, so the next event lands
-    // behind the hole it leaves. The runner cannot know whether that append will
-    // commit, and waiting for it is the design.
-    let (_holder, burned) = hold_position(&pool).await;
-    add(1.0).await;
+    // A write is open and has not committed, so the event appended after it cannot be
+    // delivered: it was written after a transaction that may still publish events of
+    // its own. Waiting for it is the design.
+    let (_holder, held) = hold_a_write_open(&pool, 2).await;
+    add("waiting-policy-log", 1.0).await;
+    let withheld = held + 1;
 
     // One cursor has not advanced in ten minutes — healthy idleness, not a stop.
-    // Its blockage starts now, with the hole, and must not be dated from the row.
+    // Its wait starts now, with the open write, and must not be dated from the row.
     sqlx::query(
         "UPDATE policy_cursors SET updated_at = now() - interval '10 minutes' WHERE name = $1",
     )
@@ -219,13 +233,12 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
 
     runner.drain().await.expect("drain must succeed");
 
-    let head = burned + 1;
-    let cursor = burned - 1;
+    let cursor = 2;
     logs_assert(|lines| {
-        let traces = gap_traces(lines);
+        let traces = wait_traces(lines);
         if traces.len() != 2 {
             return Err(format!(
-                "both policies stop at the hole, so both trace it: got {} traces",
+                "both policies stop behind the open write, so both trace it: got {} traces",
                 traces.len()
             ));
         }
@@ -233,40 +246,39 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
             let trace = traces
                 .iter()
                 .find(|line| line.contains(&format!("policy={policy}")))
-                .ok_or_else(|| format!("no gap trace names {policy}"))?;
+                .ok_or_else(|| format!("no trace names {policy}"))?;
             for field in [
                 "DEBUG",
                 &format!("cursor={cursor}"),
-                &format!("expected={burned}"),
-                &format!("found={head}"),
+                &format!("withheld_position={withheld}"),
             ] {
                 if !trace.contains(field) {
-                    return Err(format!("gap trace for {policy} lacks {field}: {trace}"));
+                    return Err(format!("the trace for {policy} lacks {field}: {trace}"));
                 }
             }
         }
         Ok(())
     });
 
-    // A hole this young is what an in-flight commit looks like — including for the
+    // A wait this young is what an ordinary append looks like — including for the
     // policy whose cursor has been sitting still for ten minutes.
-    logs_assert(|lines| match blocked_warnings(lines).len() {
+    logs_assert(|lines| match waiting_warnings(lines).len() {
         0 => Ok(()),
         n => Err(format!(
-            "a stop of a few milliseconds must not warn, got {n}"
+            "a wait of a few milliseconds must not warn, got {n}"
         )),
     });
 
     // ── Stopped too long ──────────────────────────────────────────────────────
-    // The hole outlives the threshold, so both policies escalate.
+    // The write stays open past the threshold, so both policies escalate.
     tokio::time::sleep(WARN_AFTER + Duration::from_millis(200)).await;
     runner.drain().await.expect("drain must succeed");
 
     logs_assert(|lines| {
-        let warnings = blocked_warnings(lines);
+        let warnings = waiting_warnings(lines);
         if warnings.len() != 2 {
             return Err(format!(
-                "both blocked policies warn once the hole persists, got {}",
+                "both waiting policies warn once the write outlives the threshold, got {}",
                 warnings.len()
             ));
         }
@@ -278,8 +290,8 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
             for field in [
                 "WARN",
                 &format!("cursor={cursor}"),
-                &format!("head={head}"),
-                &format!("missing_position={burned}"),
+                &format!("head={withheld}"),
+                &format!("withheld_position={withheld}"),
             ] {
                 if !warning.contains(field) {
                     return Err(format!("the warning for {policy} lacks {field}: {warning}"));
@@ -292,7 +304,7 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
         let aged = warnings
             .iter()
             .find(|line| line.contains(&format!("policy={AGED_CURSOR}")))
-            .map(|line| blocked_for_secs(line))
+            .map(|line| waiting_for_secs(line))
             .expect("the aged policy warned");
         if aged < 600 {
             return Err(format!(
@@ -303,34 +315,29 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
     });
 
     // ── Still stopped ─────────────────────────────────────────────────────────
-    // A blocked policy polls forever; three more polls inside the interval add
+    // A waiting policy polls forever; three more polls inside the interval add
     // nothing to the log.
     for _ in 0..3 {
         runner.drain().await.expect("drain must succeed");
     }
 
-    logs_assert(|lines| match blocked_warnings(lines).len() {
+    logs_assert(|lines| match waiting_warnings(lines).len() {
         2 => Ok(()),
         n => Err(format!(
-            "the warning must be rate-bounded while the policy stays blocked, got {n}"
+            "the warning must be rate-bounded while the policy keeps waiting, got {n}"
         )),
     });
 
-    // ── Corrected ─────────────────────────────────────────────────────────────
-    // The operator's fix from the field report: move the parked cursors past the
-    // hole. The policies advance again and go quiet.
-    sqlx::query("UPDATE policy_cursors SET position = $1, updated_at = now() WHERE position = $2")
-        .bind(burned)
-        .bind(cursor)
-        .execute(&pool)
-        .await
-        .expect("the operator's correction must succeed");
-
+    // ── Cleared ───────────────────────────────────────────────────────────────
+    // The write ends. Nothing is corrected by hand and no cursor is moved: the wait
+    // was never a fault, so it resolves itself and the policies go quiet.
     let quiet_from = AtomicUsize::new(0);
     logs_assert(|lines| {
         quiet_from.store(lines.len(), Ordering::SeqCst);
         Ok(())
     });
+
+    _holder.commit().await.expect("committing must succeed");
     for _ in 0..3 {
         runner.drain().await.expect("drain must succeed");
     }
@@ -341,16 +348,16 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
             .copied()
             .skip(quiet_from.load(Ordering::SeqCst))
             .collect();
-        match (gap_traces(&after).len(), blocked_warnings(&after).len()) {
+        match (wait_traces(&after).len(), waiting_warnings(&after).len()) {
             (0, 0) => Ok(()),
-            (gaps, warnings) => Err(format!(
-                "a recovered policy must go quiet, but wrote {gaps} gap traces \
+            (traces, warnings) => Err(format!(
+                "a policy that caught up must go quiet, but wrote {traces} traces \
                  and {warnings} warnings"
             )),
         }
     });
 
-    // Sanity: the correction is what made it quiet, not a stuck runner.
+    // Sanity: the write landing is what made it quiet, not a stuck runner.
     let positions: Vec<i64> =
         sqlx::query_scalar("SELECT position FROM policy_cursors ORDER BY name")
             .fetch_all(&pool)
@@ -358,73 +365,20 @@ async fn a_blocked_policy_says_so_in_the_log_postgres_test() {
             .expect("reading the cursors must succeed");
     assert_eq!(
         positions,
-        vec![head, head],
-        "both policies must have drained the event stranded behind the hole"
-    );
-
-    // ── Stopping mid-window ───────────────────────────────────────────────────
-    // A window with work in it *and* a hole behind that work: the policy advances
-    // over the prefix and parks at the hole, so the trace must name where it parks,
-    // not where the poll started.
-    let traces_before = AtomicUsize::new(0);
-    logs_assert(|lines| {
-        traces_before.store(gap_traces(lines).len(), Ordering::SeqCst);
-        Ok(())
-    });
-
-    add(2.0).await;
-    let (_second_holder, burned_again) = hold_position(&pool).await;
-    add(3.0).await;
-
-    runner.drain().await.expect("drain must succeed");
-
-    let parks_at = burned_again - 1;
-    logs_assert(|lines| {
-        let traces: Vec<&str> = gap_traces(lines)
-            .into_iter()
-            .skip(traces_before.load(Ordering::SeqCst))
-            .collect();
-        if traces.len() != 2 {
-            return Err(format!(
-                "both policies stop mid-window, so both trace it: got {}",
-                traces.len()
-            ));
-        }
-        for trace in traces {
-            for field in [
-                &format!("cursor={parks_at}"),
-                &format!("expected={burned_again}"),
-                &format!("found={}", burned_again + 1),
-            ] {
-                if !trace.contains(field) {
-                    return Err(format!("the trace lacks {field}: {trace}"));
-                }
-            }
-        }
-        Ok(())
-    });
-
-    let positions: Vec<i64> =
-        sqlx::query_scalar("SELECT position FROM policy_cursors ORDER BY name")
-            .fetch_all(&pool)
-            .await
-            .expect("reading the cursors must succeed");
-    assert_eq!(
-        positions,
-        vec![parks_at, parks_at],
-        "the traced cursor must be the one the policies actually parked at"
+        vec![withheld, withheld],
+        "both policies must have drained the event that was held back"
     );
 }
 
 /// A daemon keeps its cursor in memory across polls, so an operator's correction is
-/// adopted by the refresh on an empty feed — one poll *after* the read that still
-/// used the abandoned position. That read's gap belongs to a cursor that no longer
-/// exists and must not be traced as where the policy is parked.
+/// adopted by the refresh on an empty feed — one poll *after* the read that still used
+/// the abandoned position. What that read was waiting behind belongs to a cursor that no
+/// longer exists and must not be traced as where the policy is stopped.
 ///
 /// The manual drain cannot show this: it reloads the cursor every call.
 #[tokio::test]
 #[traced_test]
-async fn a_correction_adopted_by_a_running_daemon_traces_no_stale_gap_postgres_test() {
+async fn a_correction_adopted_by_a_running_daemon_traces_no_stale_wait_postgres_test() {
     let (pool, _container) = start_postgres().await;
 
     // Long enough that a poll cannot slip between the correction and the snapshot
@@ -438,13 +392,11 @@ async fn a_correction_adopted_by_a_running_daemon_traces_no_stale_gap_postgres_t
         .build();
     let daemon = runner.start_polling(poll);
 
-    let ledger = LedgerUrn::new("daemon-correction").unwrap();
-    let add = |amount: f64| {
+    let add = |stream: &'static str, amount: f64| {
         let cqrs = cqrs.clone();
-        let ledger = ledger.clone();
         async move {
             cqrs.execute::<Ledger>(
-                &ledger,
+                &LedgerUrn::new(stream).unwrap(),
                 replay::Metadata::default(),
                 LedgerCommand::Add { amount },
                 &(),
@@ -474,17 +426,20 @@ async fn a_correction_adopted_by_a_running_daemon_traces_no_stale_gap_postgres_t
     let traces_so_far = || {
         let n = AtomicUsize::new(0);
         logs_assert(|lines| {
-            n.store(gap_traces(lines).len(), Ordering::SeqCst);
+            n.store(wait_traces(lines).len(), Ordering::SeqCst);
             Ok(())
         });
         n.load(Ordering::SeqCst)
     };
 
-    add(10.0).await;
-    wait_for_position(1).await;
+    add("daemon-correction", 10.0).await;
+    // As above: the held write copies this second stream's event, so the append that
+    // follows it does not queue behind the transaction under test.
+    add("daemon-correction-held", 5.0).await;
+    wait_for_position(2).await;
 
-    let (_holder, burned) = hold_position(&pool).await;
-    add(1.0).await;
+    let (holder, held) = hold_a_write_open(&pool, 2).await;
+    add("daemon-correction", 1.0).await;
 
     // Wait for the daemon to trace the stop. Doubles as proof that this test can see
     // the daemon's records at all, so the absence asserted below means something.
@@ -500,23 +455,30 @@ async fn a_correction_adopted_by_a_running_daemon_traces_no_stale_gap_postgres_t
 
     let traces_before = traces_so_far();
     sqlx::query("UPDATE policy_cursors SET position = $1, updated_at = now() WHERE name = $2")
-        .bind(burned)
+        .bind(held + 1)
         .bind(FRESH_CURSOR)
         .execute(&pool)
         .await
         .expect("the operator's correction must succeed");
 
-    wait_for_position(burned + 1).await;
+    // Waiting on the log, not on the row: the row already holds the corrected position
+    // because this test wrote it, and the poll that adopts it is the one under test.
+    let mut adopted = false;
+    for _ in 0..100 {
+        if logs_contain("persisted cursor was moved externally") {
+            adopted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(adopted, "the daemon never adopted the correction in place");
 
     assert_eq!(
         traces_so_far(),
         traces_before,
-        "adopting the correction must not trace a gap read from the abandoned cursor"
-    );
-    assert!(
-        logs_contain("persisted cursor was moved externally"),
-        "the daemon must have adopted the correction in place"
+        "adopting the correction must not trace a wait read from the abandoned cursor"
     );
 
+    holder.rollback().await.expect("rollback must succeed");
     daemon.shutdown().await;
 }

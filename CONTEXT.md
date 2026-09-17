@@ -57,15 +57,15 @@ _Avoid_: offset, sequence number, event time.
 
 ### Policy feed
 
-The slice of the event log one [Policy] reads on a poll: every [Global position]
-past its cursor, up to its read batch size, **before** its `stream_filter` is
-applied. Contiguity is decided on those unfiltered positions; an excluded position
-advances the cursor and fires nothing, like a compaction snapshot
-([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
-`stream_filter` decides what a Policy *reacts to*, never how far it *gets*. The
-feed stops at a position it has not read, which may be an append still in flight —
-unless it is a [Burned position], which it crosses. Stepping one position at a time
-is only safe because a position is held by exactly one event.
+The slice of the event log one [Policy] reads on a poll: every event past its cursor
+whose writing transaction has ended, in `([Commit stamp], [Global position])` order, up
+to its read batch size and **before** its `stream_filter` is applied
+([ADR-0020](docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)). An excluded
+position advances the cursor and fires nothing, like a compaction snapshot: a
+`stream_filter` decides what a Policy *reacts to*, never how far it *gets*
+([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). The feed
+stops at the oldest write that has not ended, which is what delays a Policy and what
+releases it.
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation
@@ -148,17 +148,17 @@ _Avoid_: state, policy state, health check.
 
 ### Blocked policy
 
-A [Policy] whose cursor sits in front of a `global_position` that does not exist
-while a later one does, so its feed yields nothing and it reacts to nothing.
+A [Policy] whose feed yields nothing while the log has moved on, so it reacts to
+nothing: since the feed reads by commit visibility, what holds it back is a write
+that has not ended, and everything committed after that write waits with it.
 Distinct from _lagging_ (a backlog that is draining) and from `Degraded`
 (reactions parked while the Policy still advances): blocked means zero
 throughput. Whether it clears is not observable from one reading
-([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)). A
-blocked Policy is also visible without being asked: the runner traces the stop at
-`debug` and escalates to `warn` once the cursor has been parked longer than an
-in-flight append could explain. Since the runner crosses a [Burned position] on
-its own, a Policy that stays blocked is one waiting on an append that really is in
-flight.
+([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)), but it
+does clear on its own when the write commits or aborts — the wait is the design, and
+the silence was the bug. It is visible without being asked: the runner traces the wait
+at `debug` and escalates to `warn` once it has outlived what an ordinary append
+explains.
 _Avoid_: stuck, wedged, hung, stalled.
 
 ### Dispatch timeout
@@ -177,11 +177,10 @@ _Avoid_: deadline, SLA, watchdog, timeout (unqualified).
 
 A `global_position` taken from the sequence by a transaction that then aborted.
 `nextval` is not transactional, so the value is never returned to the sequence and
-no event can ever carry it: the hole it leaves in the [Policy feed] is permanent,
-unlike the one an append still in flight leaves. The two are told apart exactly,
-by whether any running transaction still holds the position, and a Policy crosses
-a burned one by itself, naming it in a `warn`
-([ADR-0015](docs/adr/0015-policy-crosses-a-position-no-transaction-can-fill.md)).
+no event can ever carry it. Since the [Policy feed] reads in [Commit stamp] order it
+is not a hole in what a Policy reads — it belongs to no event, so it is simply not in
+that order ([ADR-0020](docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)).
+It is still visible in the log's numbering, where positions are not dense.
 _Avoid_: gap, hole (as a name for the permanent kind), lost position, skipped
 position.
 
@@ -195,8 +194,9 @@ can be compared against a snapshot of transactions that have ended, whereas a
 `global_position` can be a [Burned position]. Events that predate the stamp carry the
 sentinel `0`, which orders before every real id. A [Policy]'s cursor records the stamp
 it stopped in alongside the position
-([0022](persistence/tests/migrations/0022_policy_cursor_commit_txid.sql)); the feed
-itself still reads by position (funkode-io/replay#171).
+([0022](persistence/tests/migrations/0022_policy_cursor_commit_txid.sql)), and the feed
+reads by the pair, below the watermark of transactions that have all ended
+([ADR-0020](docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)).
 _Avoid_: commit id, transaction number, xmin, sequence.
 
 ### Policy runner

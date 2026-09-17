@@ -1,6 +1,11 @@
 # A Policy's feed decides contiguity on unfiltered positions
 
-**Status:** accepted
+**Status:** accepted; the contiguity half superseded by
+[ADR-0020](0020-policy-feed-reads-below-the-commit-watermark.md)
+
+Since the feed reads in commit order below the commit watermark, there is no contiguous
+prefix to compute and no hole to stop at. What survives is the rule this ADR was written
+for: the window is read **unfiltered**, and the filter decides delivery only.
 
 A [Policy](0003-policies-as-checkpointed-background-subscribers.md)'s cursor may only
 advance across a contiguous prefix of `global_position`: a position that was not read
@@ -23,7 +28,8 @@ fires nothing, like a compaction snapshot
 
 How far the cursor may then advance is a pure function of that window — the prefix
 contiguous from `cursor + 1` — in `policy_feed`. Gap handling
-(funkode-io/replay#164) goes there.
+(funkode-io/replay#164) goes there. *(Superseded: the window is now every row past the
+cursor in commit order, all of it advanceable — ADR-0020.)*
 
 The rule rests on one event per position: a cursor that steps one position at a time
 steps *over* the second event at a shared position. Since

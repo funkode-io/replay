@@ -32,12 +32,12 @@ struct Reviewed {
 /// Every `fetch_all` in `persistence/src`, with the bound that makes it safe.
 const REVIEWED: &[Reviewed] = &[
     Reviewed {
-        file: "src/policy_runner.rs",
+        file: "src/policy_feed.rs",
         function: "read_feed",
         justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
                         (default 100). Bounded by the tunable, not by the feed — nor by \
-                        the policy's stream filter, which now selects what is delivered \
-                        from the window rather than what is read (ADR-0013).",
+                        the policy's stream filter, which selects what is delivered from \
+                        the window rather than what is read (ADR-0013).",
     },
     Reviewed {
         file: "src/policy_runner.rs",

@@ -2566,70 +2566,66 @@ dead letters outrank lag**:
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
 `"Degraded"`, `"Blocked"`) for JSON/UI consumers.
 
-An append in flight is indistinguishable from a permanent hole *in a single reading*,
-so a `Blocked` reading may clear on the next poll — either because the append landed,
-or because the runner established that nothing can land there and crossed it (see
-below). Alert on it persisting.
+`missing_position` and `Blocked` describe a position the feed stops at, which the feed
+no longer does: it reads in commit order and a missing position is not in that order at
+all. The fields are still reported and are being removed
+([#196](https://github.com/funkode-io/replay/issues/196)); what does hold a policy back
+is a write that has not committed, and the log below is where it shows.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only
 *observes* — retrying or discarding a dead letter is a separate, deliberate action
 (see the triage queries above).
 
-### What a blocked policy writes to the log
+### What a waiting policy writes to the log
 
-`PolicyStatusStore` answers "is anything blocked?" only when asked. A policy that
-stops in front of a hole also says so in the log, because in
+`PolicyStatusStore` answers "is anything behind?" only when asked. A policy that cannot
+advance also says so in the log, because in
 [#164](https://github.com/funkode-io/replay/issues/164) a healthy idle policy and a
-permanently blocked one produced byte-identical output: nothing.
+permanently stopped one produced byte-identical output: nothing.
+
+The feed delivers an event only once the transaction that wrote it has ended, so a write
+held open holds back everything committed after it
+([ADR-0020](docs/adr/0020-policy-feed-reads-below-the-commit-watermark.md)). That wait is
+the only thing that stops a policy now, and these are the lines it writes:
 
 | Level | When | Fields |
 |-------|------|--------|
-| `debug` | every poll whose feed stops at a hole | `policy`, `cursor`, `expected`, `found` |
-| `warn` | positions were crossed because no transaction can fill them | `policy`, `cursor`, `skipped_from`, `skipped_to`, `skipped`, `next_position` |
-| `warn` | the hole has persisted longer than the escalation threshold | `policy`, `cursor`, `head`, `missing_position`, `next_position`, `blocked_for_secs` |
+| `debug` | every poll whose feed is waiting on an open write | `policy`, `cursor`, `cursor_commit_txid`, `withheld_position`, `withheld_commit_txid`, `watermark` |
+| `warn` | the wait has outlived the escalation threshold | the above, plus `head` and `waiting_for_secs` |
 
 ```text
-DEBUG replay_persistence::policy_runner: policy feed stops at a gap in global_position
-      policy=price_fanout cursor=264785 expected=264786 found=264787
-WARN  replay_persistence::policy_runner: policy feed skipped global_position values
-      that can never appear: … policy=price_fanout cursor=264785
-      skipped_from=264786 skipped_to=264786 skipped=1 next_position=264787
-WARN  replay_persistence::policy_runner: policy is blocked: its feed stops at a
-      global_position that does not exist yet. A transaction still holds it …
-      policy=price_fanout cursor=264785 head=264956 missing_position=264786
-      next_position=264787 blocked_for_secs=259200
+DEBUG replay_persistence::policy_runner: policy feed is waiting for an open write to end
+      policy=price_fanout cursor=264785 cursor_commit_txid=91827 withheld_position=264786
+      withheld_commit_txid=91830 watermark=91830
+WARN  replay_persistence::policy_runner: policy is waiting on a write that has not
+      ended: … policy=price_fanout cursor=264785 head=264956 withheld_position=264786
+      withheld_commit_txid=91830 watermark=91830 waiting_for_secs=259200
 ```
 
 | Setting | Env var | Default |
 |---------|---------|---------|
-| How long a hole must persist before the first `warn`, and the minimum spacing between repeats | `REPLAY_BLOCKED_WARN_AFTER_SECS` | `30` |
+| How long a wait must persist before the first `warn`, and the minimum spacing between repeats | `REPLAY_BLOCKED_WARN_AFTER_SECS` | `30` |
 
 Alert on the `warn`. Two clocks meet in it, and they answer different questions:
 
-- **When to warn** is decided by how long *this hole* has been in front of the cursor,
-  measured in the running process. Below the threshold a missing position is an append
-  still committing, which the feed is designed to wait for, so a policy idle for an
-  hour that then waits on a commit stays silent.
-- **`blocked_for_secs`** is measured from `policy_cursors.updated_at` — the last time
-  the cursor advanced — so it survives restarts and leadership changes and reports the
-  age of the outage, not the age of the process.
+- **When to warn** is decided by how long *this wait* has lasted, measured in the running
+  process. Below the threshold it is an ordinary append taking its time, which the feed
+  is designed to wait for, so a policy idle for an hour that then waits on a commit stays
+  silent.
+- **`waiting_for_secs`** is measured from `policy_cursors.updated_at` — the last time the
+  cursor advanced — so it survives restarts and leadership changes and reports the age of
+  the outage, not the age of the process.
 
 A caught-up idle policy logs nothing at all.
 
-### Why a hole no longer stops a policy for good
+### What to do about a policy that is waiting
 
-`nextval` is not transactional: a `global_position` taken by an append that then
-aborts is burned, and no event can ever carry it. The runner tells that apart from an
-append still committing exactly, with no timeout — only a transaction that has
-already taken the position can write it, and such a transaction holds a lock on the
-sequence until it ends. A hole whose holders have all ended, and which is still
-missing when re-read afterwards, is crossed: the runner logs the `warn` above and
-moves the cursor past the whole burned run in one step
-([ADR-0015](docs/adr/0015-policy-crosses-a-position-no-transaction-can-fill.md)).
+Nothing, usually: the wait ends when the write ends, and moving the cursor past it would
+skip the events that write is about to publish. Find the open transaction instead —
+`SELECT * FROM pg_stat_activity WHERE state <> 'idle' ORDER BY xact_start` — and end it.
 
-So the second `warn` — `policy is blocked` — now reports a wait that is still
-legitimate: a long-running append, or a cursor an operator parked in front of a
-position that does not exist yet. Moving a parked cursor by hand remains supported
-and is still the tool for those; it is no longer the only way out of a burned
-position.
+Positions the log will never issue need no handling. `nextval` is not transactional, so a
+`global_position` taken by an append that aborts is burned for good; because the feed
+reads in `(commit_txid, global_position)` order, a burned number belongs to no event and
+is not a point the feed can stop at.
