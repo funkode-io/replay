@@ -663,10 +663,11 @@ impl PolicyRunner {
 
     /// Manually drain every registered policy once.
     ///
-    /// For each policy: read the gap-free prefix of events past its cursor,
-    /// `react`, execute the returned dispatches through [`Cqrs`], and advance the
-    /// cursor — one event at a time, advancing only after that event's commands
-    /// have committed (at-least-once delivery; reactions must be idempotent).
+    /// For each policy: read the events past its cursor whose writing transaction
+    /// has ended, `react`, execute the returned dispatches through [`Cqrs`], and
+    /// advance the cursor — one event at a time, advancing only after that event's
+    /// commands have committed (at-least-once delivery; reactions must be
+    /// idempotent).
     ///
     /// Returns how many dispatches **committed** across all policies — a progress
     /// signal, not an audit. A delivery that fails does not contribute its
@@ -1863,7 +1864,7 @@ async fn report_waiting(
     cursor: FeedPoint,
     waiting: &BlockedWatch,
 ) -> Result<(), replay::Error> {
-    let Some(withheld) = probe_waiting(pool, name, cursor).await? else {
+    let Some(wait) = probe_waiting(pool, name, cursor).await? else {
         // Caught up: a healthy idle policy, and it stays silent.
         waiting.cleared(name);
         return Ok(());
@@ -1873,24 +1874,24 @@ async fn report_waiting(
         policy = %name,
         cursor = cursor.position,
         cursor_commit_txid = %cursor.commit_txid,
-        withheld_position = withheld.withheld.position,
-        withheld_commit_txid = %withheld.withheld.commit_txid,
-        watermark = %withheld.watermark,
+        withheld_position = wait.withheld.position,
+        withheld_commit_txid = %wait.withheld.commit_txid,
+        watermark = %wait.watermark,
         "policy feed is waiting for an open write to end"
     );
 
-    if !waiting.poll(name, withheld.withheld.position, std::time::Instant::now()) {
+    if !waiting.poll(name, wait.withheld.position, std::time::Instant::now()) {
         return Ok(());
     }
 
     tracing::warn!(
         policy = %name,
         cursor = cursor.position,
-        head = withheld.head,
-        withheld_position = withheld.withheld.position,
-        withheld_commit_txid = %withheld.withheld.commit_txid,
-        watermark = %withheld.watermark,
-        waiting_for_secs = withheld.elapsed.as_secs(),
+        head = wait.head,
+        withheld_position = wait.withheld.position,
+        withheld_commit_txid = %wait.withheld.commit_txid,
+        watermark = %wait.watermark,
+        waiting_for_secs = wait.elapsed.as_secs(),
         "policy is waiting on a write that has not ended: every event past its cursor \
          was written at or after a transaction that is still running, and delivering \
          one now would put it ahead of events that transaction may still publish. It \
@@ -2578,6 +2579,17 @@ async fn commit_txid_at(
     })
 }
 
+/// The point a Policy registered for the first time starts from.
+///
+/// [`StartAt::Now`] is the log's head *position*, stamped with the transaction that
+/// wrote the event there. A write that is in flight at that moment is therefore not
+/// delivered: its transaction is older than the head's, so it sits behind this point in
+/// the feed's order. That is the meaning of `Now` — the history a Policy is registered
+/// not to process includes the write that is still finishing — and it is a choice, not
+/// an oversight. The alternative start point that would catch it is the watermark, and
+/// it costs the opposite mistake: every event committed while any transaction was open
+/// is then history the Policy replays, unboundedly far back for a long-running one.
+/// `Beginning` is position 0 under the sentinel stamp, which precedes every event.
 async fn bootstrap_point(
     pool: &Pool<Postgres>,
     start_at: StartAt,

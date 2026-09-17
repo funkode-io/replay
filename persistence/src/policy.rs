@@ -21,7 +21,8 @@ use crate::{PersistedEvent, StreamFilter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartAt {
     /// Start from the current global head, so only newly appended events are
-    /// processed.
+    /// processed. A write in flight when the Policy is first registered counts as
+    /// history and is not delivered: it began before the head the Policy starts at.
     #[default]
     Now,
     /// Start from position 0 and process full history once.

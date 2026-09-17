@@ -644,3 +644,70 @@ async fn a_transaction_snapshot_cannot_prove_a_position_is_burned_postgres_test(
         "and both events are delivered once it lands"
     );
 }
+
+/// What `StartAt::Now` means in this order, pinned because the order is what gives it a
+/// second reading: a write already in flight when a Policy is first registered is history
+/// it skips, not an event it is owed.
+///
+/// The head the Policy starts at was written by a younger transaction than the one still
+/// running, so the in-flight write sits *behind* that start point and is never delivered —
+/// while everything committed after it is. Starting at the watermark instead would catch
+/// it, at the price of replaying every event committed while any transaction was open; no
+/// point in the order does both (ADR-0020).
+#[tokio::test]
+async fn a_policy_starting_now_skips_a_write_that_was_already_in_flight_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let add = |stream: &'static str, amount: f64| {
+        let cqrs = cqrs.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &LedgerUrn::new(stream).unwrap(),
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    add("start-now-main", 10.0).await;
+    add("start-now-held", 5.0).await;
+
+    // In flight when the policy is registered, and committing after it.
+    let mut in_flight = pool.begin().await.expect("beginning must succeed");
+    let held = clone_event_into(&mut in_flight, 2).await;
+
+    // The head the policy will start at: younger transaction, higher position.
+    add("start-now-main", 1.0).await;
+
+    let delivered: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&delivered);
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Now, move |event| {
+            let LedgerEvent::Added { amount } = event.data;
+            recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(amount);
+            vec![]
+        })
+        .build();
+    runner.drain().await.expect("drain must succeed");
+
+    in_flight.commit().await.expect("committing must succeed");
+    add("start-now-main", 2.0).await;
+    drain_until(&runner, &pool, held + 2, 5).await;
+
+    assert_eq!(
+        delivered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+        vec![2.0],
+        "only the event appended after the policy started is delivered"
+    );
+}

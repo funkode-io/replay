@@ -53,5 +53,9 @@ ADR-0015 rejects it with a test that makes it be wrong on demand.
 - Events written before migration 0018 carry the sentinel stamp `0`, which orders before
   every real transaction, so a migrated log is read in position order at its head and a
   cursor that predates 0022 resumes where it left off.
+- `StartAt::Now` starts at the head position under the transaction that wrote it, so a
+  write in flight at that moment is history the Policy skips. Starting at the watermark
+  instead would catch it and replay every event committed while any transaction was open;
+  no point in the order does both.
 - The stable-cut API (`contiguous_high_water_mark`) is unchanged and still speaks in
   positions; rebuilding it on the watermark is a separate question.
