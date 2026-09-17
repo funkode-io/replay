@@ -44,7 +44,7 @@ enum State {
     /// At zero lag, or not yet leading. The silent state.
     CaughtUp,
     /// Draining a backlog.
-    Working {
+    Draining {
         /// Start of the poll that found the work — not the instant the record
         /// was decided. A backlog small enough for one poll is drained entirely
         /// before anything is decided, and reporting it as instant would be a
@@ -102,7 +102,7 @@ impl Narration {
         match &mut self.state {
             State::CaughtUp if events == 0 => None,
             State::CaughtUp => {
-                self.state = State::Working {
+                self.state = State::Draining {
                     since: started,
                     events,
                     worked_until: ended,
@@ -110,7 +110,7 @@ impl Narration {
                 };
                 Some(Record::Working)
             }
-            State::Working {
+            State::Draining {
                 since,
                 events: total,
                 worked_until,
@@ -123,7 +123,7 @@ impl Narration {
                 self.state = State::CaughtUp;
                 Some(record)
             }
-            State::Working {
+            State::Draining {
                 since,
                 events: total,
                 worked_until,

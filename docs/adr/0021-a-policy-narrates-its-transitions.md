@@ -84,7 +84,10 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
   process knows, and whether a Policy is moving is
   [Progress](../../CONTEXT.md#progress), already derivable by anyone with a
   connection ([ADR-0006](0006-policy-status-read-only-operational-snapshot.md)).
-  The narration's state is a log-rate decision, not a third axis.
+  The narration's state is a log-rate decision, not a third axis — which is why
+  funkode-io/replay#188 depends on
+  [ADR-0020](0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)
+  for the shape of an in-memory published state and not for the state itself.
 - **Making the progress spacing configurable.** Another knob on the builder for a
   value whose only job is to be smaller than an alerting window and larger than a
   poll. Revisit if a deployment's backlogs are routinely shorter than 30s and the
