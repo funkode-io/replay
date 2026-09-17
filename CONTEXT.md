@@ -296,6 +296,17 @@ idle, and the next appended event returns it to working. Nothing is caught up
 for a stretch of time — only at the instant it arrives.
 _Avoid_: up to date, in sync, complete, finished.
 
+### Narration
+
+What a [Policy] writes to the log: an edge, never an event. A burst is bracketed
+by a record when work appears and the [Caught up] record that ends it, with a
+bounded progress record in between while a backlog is still draining
+([ADR-0021](docs/adr/0021-a-policy-narrates-its-transitions.md)). Output is
+proportional to how often a Policy changes state, not to how much work it does,
+which is what keeps an idle Policy's silence readable as a signal. Per-dispatch
+detail exists at `debug` and is off by default.
+_Avoid_: logging, tracing, audit trail, telemetry.
+
 ### Scoped URN
 
 A stream identifier carrying its owner as a suffix:
@@ -401,6 +412,7 @@ it:
 [Heartbeat]: #heartbeat
 [Progress]: #progress
 [Caught up]: #caught-up
+[Narration]: #narration
 [Query]: #query
 [Scoped URN]: #scoped-urn
 [Live projection]: #live-projection

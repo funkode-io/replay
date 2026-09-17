@@ -37,6 +37,7 @@ use crate::policy_feed::{feed_from_window, Feed, Gap, WindowPosition};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
 };
+use crate::policy_narration::{Narration, Record, PROGRESS_EVERY};
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
 /// Erased, services-bound execution path for one aggregate type.
@@ -1289,6 +1290,7 @@ impl PolicyRunner {
             max_depth,
         )
         .await
+        .map(|polled| polled.dispatches)
     }
 }
 
@@ -1732,7 +1734,6 @@ impl PolicyWorker {
                 }
             }
 
-            tracing::info!(policy = %name, "running as leader");
             liveness.leading();
 
             // Initialize cursor from the stored checkpoint (or bootstrap).
@@ -1764,13 +1765,18 @@ impl PolicyWorker {
                 "policy worker is leading; resuming after its last checkpoint"
             );
 
+            // One election, one bracket: a burst this worker does not finish is
+            // abandoned rather than closed by whoever leads next.
+            let mut narration = Narration::new(PROGRESS_EVERY);
+
             // Leadership polling loop.
             loop {
                 if *shutdown_rx.borrow() || !*leader_rx.borrow() {
                     break;
                 }
 
-                match drain_policy_once(
+                let started = Instant::now();
+                let polled = drain_policy_once(
                     &cqrs,
                     &pool,
                     &executors,
@@ -1779,10 +1785,22 @@ impl PolicyWorker {
                     &stopped,
                     max_depth,
                 )
-                .await
-                {
-                    Ok(_) => {}
+                .await;
+                let ended = Instant::now();
+
+                match polled {
+                    // A poll's own duration is what the catch-up record is timed
+                    // from, so it is read either side of the drain rather than
+                    // when the record is decided: a backlog drained in a single
+                    // poll would otherwise report as instantaneous.
+                    Ok(Polled { events, .. }) => {
+                        if let Some(record) = narration.polled(events, started, ended) {
+                            narrate(&name, record);
+                        }
+                    }
                     Err(error) => {
+                        // Narrated as nothing: a poll that failed did not catch
+                        // up, and the error is the record.
                         tracing::error!(
                             policy = %name,
                             error = %error,
@@ -1797,7 +1815,7 @@ impl PolicyWorker {
                 // from an idle one. The heartbeat task carries it to the database;
                 // this worker never writes it, because it cannot write anything
                 // while a reaction holds it.
-                liveness.polled(Instant::now());
+                liveness.polled(ended);
 
                 // Wait for the next wakeup: NOTIFY broadcast (if enabled),
                 // poll timeout, leadership change, or shutdown — whichever
@@ -1839,6 +1857,8 @@ impl PolicyWorker {
                     }
                 }
             }
+
+            narration.stood_down();
 
             if *shutdown_rx.borrow() {
                 return Stop::Shutdown;
@@ -2119,6 +2139,44 @@ impl PendingFailures {
     }
 }
 
+/// Write the record a [`Narration`] decided on.
+///
+/// `info`, because these are the lines an operator reads to see work start and
+/// finish; there are two of them per burst and none at all while a Policy is
+/// idle. Per-dispatch detail lives at `debug`
+/// ([`Delivery::execute_dispatch_within`]) and stays off in production.
+fn narrate(policy: &str, record: Record) {
+    match record {
+        Record::Working => tracing::info!(
+            policy = %policy,
+            "policy has work to do"
+        ),
+        Record::Progress { events, elapsed } => tracing::info!(
+            policy = %policy,
+            events,
+            elapsed_ms = elapsed.as_millis(),
+            "policy is working through its backlog"
+        ),
+        Record::CaughtUp { events, elapsed } => tracing::info!(
+            policy = %policy,
+            events,
+            elapsed_ms = elapsed.as_millis(),
+            "policy is caught up"
+        ),
+    }
+}
+
+/// What one poll of a Policy's feed did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Polled {
+    /// Dispatches that committed — what [`PolicyRunner::drain`] returns.
+    dispatches: usize,
+    /// Positions the cursor advanced over, whether or not this Policy reacted to
+    /// them: a window its filter excludes entirely is still a window it worked
+    /// through, and [`Narration`] is asking whether the Policy is moving.
+    events: u64,
+}
+
 async fn drain_policy_once(
     cqrs: &Cqrs<PostgresEventStore>,
     pool: &Pool<Postgres>,
@@ -2127,7 +2185,7 @@ async fn drain_policy_once(
     cursor: &mut PolicyCursor,
     stopped: &StoppedPolicies,
     max_depth: u32,
-) -> Result<usize, replay::Error> {
+) -> Result<Polled, replay::Error> {
     let name = policy.name().to_string();
     let checkpoint_size = resolve_checkpoint_batch_size(policy);
     let read_batch = resolve_read_batch_size(policy, checkpoint_size);
@@ -2157,7 +2215,7 @@ async fn drain_policy_once(
             // The gap was read from the position the operator has just replaced:
             // reporting it would name a stop that no longer exists.
             stopped.forget(&name);
-            return Ok(0);
+            return Ok(Polled::default());
         }
 
         match gap {
@@ -2174,7 +2232,7 @@ async fn drain_policy_once(
             // Caught up: a healthy idle policy, and it stays silent.
             None => stopped.forget(&name),
         }
-        return Ok(0);
+        return Ok(Polled::default());
     }
 
     match gap {
@@ -2195,6 +2253,7 @@ async fn drain_policy_once(
     }
 
     let mut executed = 0;
+    let mut advanced = 0u64;
     let mut events_since_checkpoint = 0u32;
     for WindowPosition {
         commit_txid,
@@ -2231,6 +2290,7 @@ async fn drain_policy_once(
         // Always track in-memory position.
         cursor.advance_to(commit_txid, global_position);
         events_since_checkpoint += 1;
+        advanced += 1;
 
         // Write the persistent cursor every `checkpoint_size` events so that
         // a crash re-processes at most `checkpoint_size - 1` events rather
@@ -2239,7 +2299,10 @@ async fn drain_policy_once(
         if events_since_checkpoint >= checkpoint_size {
             if cursor.checkpoint(pool, &name).await? == Checkpoint::Superseded {
                 log_superseded(&name, cursor);
-                return Ok(executed);
+                return Ok(Polled {
+                    dispatches: executed,
+                    events: advanced,
+                });
             }
             events_since_checkpoint = 0;
         }
@@ -2252,7 +2315,10 @@ async fn drain_policy_once(
         log_superseded(&name, cursor);
     }
 
-    Ok(executed)
+    Ok(Polled {
+        dispatches: executed,
+        events: advanced,
+    })
 }
 
 /// Trace the stop: the one fact the blocked deployment in funkode-io/replay#164
@@ -2635,7 +2701,23 @@ impl Delivery<'_> {
         )
         .await
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                // The only per-dispatch record, and the reason the edge-triggered
+                // lines above can stay two per burst: an operator who needs to see
+                // every command a Policy sent turns this on for as long as they are
+                // looking. A ten-thousand-row import fans out to six figures of
+                // these, which is why it is never on by default.
+                tracing::debug!(
+                    policy          = %policy_name,
+                    event_id        = %raw.id,
+                    stream_id       = %raw.stream_id,
+                    global_position,
+                    aggregate,
+                    elapsed_ms      = started.elapsed().as_millis(),
+                    "policy dispatch committed"
+                );
+                Ok(())
+            }
             Ok(Err(error)) => Err(DispatchFailure::Returned(error)),
             Err(_) => {
                 tracing::warn!(

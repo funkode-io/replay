@@ -2622,6 +2622,35 @@ writes its row, so a standby never overwrites a leader's beat, and the crate nev
 reads any of it back. `.without_heartbeat()` turns it off entirely; liveness stays
 readable in-process.
 
+### What a policy logs
+
+A policy's output is proportional to how often it changes state, not to how many
+events it processes
+([ADR-0021](docs/adr/0021-a-policy-narrates-its-transitions.md)). A burst of work
+is bracketed by two `info` records, and a policy with nothing to do writes
+nothing at any level, however often it polls — so silence means "nothing
+happened", not "nothing is known".
+
+| Record | When | Carries |
+|--------|------|---------|
+| `policy has work to do` | a policy at zero lag finds work | the policy |
+| `policy is working through its backlog` | every 30 s while a backlog drains | events so far, elapsed |
+| `policy is caught up` | the first poll that finds the feed exhausted | events in the burst, elapsed |
+| `policy dispatch committed` | every dispatch, at `debug` | event, aggregate, elapsed |
+
+The counts are feed positions the cursor advanced over, not reactions executed: a
+policy whose `stream_filter` excludes a whole window worked through it, and is
+not caught up until the feed is empty. The elapsed time runs from the start of
+the poll that found the work to the end of the last poll that had any, so the
+idle interval before the empty poll that notices is not charged to the burst —
+which also means the catch-up record arrives up to one poll interval late.
+
+Turn `debug` on for `replay_persistence::policy_runner` to see every dispatch
+while you are looking at one policy; it is six figures of records for a large
+import, which is why it is off by default. Restarts, escalations and a policy
+parked in front of a hole are logged by the machinery that owns them (`warn` and
+`error`), not by this path.
+
 ### Monitoring policy status
 
 A running policy is otherwise opaque: its cursor and dead letters live in
