@@ -2561,8 +2561,8 @@ ORDER  BY name;
 | `since_beat` small, `liveness = 'Leading'` | healthy leader |
 | `since_beat` small, `liveness = 'Stopped'` | the policy is down and its replica is fine — nothing reacts, and no standby takes over until that process exits |
 | `since_beat` small, `poll_age` large | alive but not finishing polls: a long batch, or a reaction that hangs |
-| `since_beat` small, `last_polled_at` null | the current leader has not completed a poll yet: it has just taken over, or just started |
-| `since_beat` large, or the row never beat | **no live leader** — the process is gone, or no replica holds the lock |
+| `since_beat` small, `last_polled_at` null | the current leader has not completed a poll yet: it has just taken over or just started — or, if it stays null, it wedged inside its first poll |
+| `since_beat` large, or the row never beat | **no successful beat** — usually no live leader (process gone, or no replica holds the lock); check this replica's heartbeat `warn` and whether something holds the row before concluding the leader is dead |
 
 Fixed cadence is the whole point of the beat: a stamp written by the worker as it
 polls would go quiet during a restart backoff, while a reaction hangs, and while
@@ -2587,14 +2587,19 @@ that end of the range is a write loop, not a faster signal, and
 Alerting:
 
 - **Page** on `last_beat_at` older than 3 beats (15 s at the default) and on
-  `liveness = 'Stopped'`. Both are unambiguous.
+  `liveness = 'Stopped'`. A stale beat means "no successful beat": a leader whose
+  writes keep failing looks the same from here, and says so once at `warn` in its
+  own logs.
 - **Warn, do not page**, on `last_polled_at` older than `5 × dispatch_timeout`
-  (≈2.5 min at defaults). One hung dispatch legitimately costs `dispatch_timeout`
+  (≈2.5 min at defaults), and on a `Leading` row whose `last_polled_at` stays null
+  for that long. One hung dispatch legitimately costs `dispatch_timeout`
   × four attempts, and the runner already handles that by parking a dead letter.
 
 `last_polled_at` describes the worker that is leading *now*, so a replica taking a
 policy over reports no poll until it completes one — it never inherits the previous
-leader's. Alert on `poll_age`, not on a null.
+leader's. A null is therefore normal for one poll interval after a failover or a
+start; it is only a signal once it persists, which is the case of a leader that
+wedged inside its very first poll.
 
 All of a replica's led policies are beaten in one statement, taken with
 `FOR UPDATE SKIP LOCKED`: a row somebody else is holding — an operator part-way

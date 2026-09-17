@@ -128,10 +128,13 @@ task beats it out to the cursor row for consumers that are not in that process.
 ## Consequences
 
 - A consumer alerts on `last_beat_at` older than three beats and on
-  `liveness = 'Stopped'`; both are unambiguous. `last_polled_at` is a warning
-  channel, not a page: one hung dispatch legitimately costs `dispatch_timeout` ×
-  four attempts, so a poll stamp minutes old can be correct behaviour the runner
-  is already parking as a [Dead letter](../../CONTEXT.md#dead-letter).
+  `liveness = 'Stopped'`. A stale beat reads as "no successful beat": a Leader whose
+  writes keep failing is indistinguishable here from one that is gone, and is
+  distinguished only by the `warn` that replica logs once. `last_polled_at` is a
+  warning channel, not a page: one hung dispatch legitimately costs
+  `dispatch_timeout` × four attempts, so a poll stamp minutes old can be correct
+  behaviour the runner is already parking as a
+  [Dead letter](../../CONTEXT.md#dead-letter).
 - Liveness costs one connection and one statement per replica per cadence, and no
   work at all on the worker's path.
 - A test asserting liveness has to reach two runners against one database, because

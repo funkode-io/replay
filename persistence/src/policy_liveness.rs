@@ -230,7 +230,8 @@ impl HeartbeatColumns {
             columns: self.clone(),
             replica_id,
             lock_wait,
-            failure_reported: false,
+            expected_reported: false,
+            unexpected_reported: false,
         }
     }
 }
@@ -251,10 +252,14 @@ pub(crate) struct HeartbeatWriter {
     replica_id: Option<String>,
     /// How long the beat may wait for the cursor row before giving up the tick.
     lock_wait: Duration,
-    /// Whether a failed beat has already been reported. A second line says
-    /// nothing new: the database a beat goes to is the one the workers use, and
-    /// a worker that is also failing says so at `error`.
-    failure_reported: bool,
+    /// Whether a beat failure this design expects — absent columns, a contended
+    /// row — has already been reported. A second line says nothing new: the
+    /// database a beat goes to is the one the workers use, and a worker that is
+    /// also failing says so at `error`.
+    expected_reported: bool,
+    /// The same, counted apart, for any other failure. One flag for both would
+    /// let a skipped tick swallow the `warn` that says the durable half is off.
+    unexpected_reported: bool,
 }
 
 /// `now() - make_interval(...)` rather than a timestamp computed here: the
@@ -315,7 +320,7 @@ impl HeartbeatWriter {
         }
 
         if let Err(error) = self.write(pool, &policies, &states, &polled_ago).await {
-            self.report(&error);
+            self.report(&error, &policies);
         }
     }
 
@@ -351,7 +356,12 @@ impl HeartbeatWriter {
     /// gave up a contended row is this design working — both are `debug`. Anything
     /// else means the durable half is silently off while the README tells whoever
     /// reads it to page on staleness, so it is a `warn` naming the reason.
-    fn report(&mut self, error: &sqlx::Error) {
+    ///
+    /// The beat is one statement, so a failure it can observe is the writer's,
+    /// not a worker's: a single contended row is skipped by `FOR UPDATE SKIP
+    /// LOCKED` and raises nothing at all. The line therefore names the Policies
+    /// the failed beat carried rather than repeating itself once per worker.
+    fn report(&mut self, error: &sqlx::Error, policies: &[String]) {
         let expected = if is_undefined_column(error) {
             // Attempted once per daemon, then left alone: a consumer whose schema
             // has no heartbeat columns reads liveness from the daemon, and a line
@@ -362,14 +372,21 @@ impl HeartbeatWriter {
             is_lock_not_available(error)
         };
 
-        if self.failure_reported {
+        let reported = if expected {
+            &mut self.expected_reported
+        } else {
+            &mut self.unexpected_reported
+        };
+        if *reported {
             return;
         }
-        self.failure_reported = true;
+        *reported = true;
 
+        let policies = policies.join(", ");
         if expected {
             tracing::debug!(
                 error = %error,
+                policies = %policies,
                 durable_heartbeat = if self.columns.absent.load(Ordering::Relaxed) {
                     "off for this daemon"
                 } else {
@@ -380,6 +397,7 @@ impl HeartbeatWriter {
         } else {
             tracing::warn!(
                 error = %error,
+                policies = %policies,
                 "the durable heartbeat write failed and is not being retried per beat; \
                  anything reading policy_cursors for liveness will see it go stale while \
                  this process is healthy. Liveness stays readable from the daemon"
@@ -487,7 +505,7 @@ mod tests {
         let columns = HeartbeatColumns::default();
         let mut writer = columns.writer(None, Duration::from_millis(1));
 
-        writer.report(&undefined_column());
+        writer.report(&undefined_column(), &["policy_a".to_string()]);
 
         assert!(
             columns.absent.load(Ordering::Relaxed),
@@ -496,7 +514,7 @@ mod tests {
         assert!(
             columns
                 .writer(None, Duration::from_millis(1))
-                .failure_reported
+                .expected_reported
                 || columns.absent.load(Ordering::Relaxed),
             "a beat task started afterwards inherits the answer rather than re-asking"
         );
@@ -510,8 +528,8 @@ mod tests {
     fn an_unexpected_failure_is_warned_about_once() {
         let mut writer = HeartbeatColumns::default().writer(None, Duration::from_millis(1));
 
-        writer.report(&sqlx::Error::PoolTimedOut);
-        assert!(writer.failure_reported);
+        writer.report(&sqlx::Error::PoolTimedOut, &["policy_a".to_string()]);
+        assert!(writer.unexpected_reported);
         assert!(
             !writer.columns.absent.load(Ordering::Relaxed),
             "a failure that is not a missing column leaves the heartbeat on"
@@ -537,33 +555,69 @@ mod tests {
     #[test]
     fn an_expected_failure_stays_quiet() {
         let mut writer = HeartbeatColumns::default().writer(None, Duration::from_millis(1));
-        writer.report(&undefined_column());
+        writer.report(&undefined_column(), &["policy_a".to_string()]);
 
         assert!(!logs_contain("WARN"));
     }
 
+    /// A skipped tick must not consume the report a real fault needs: the two
+    /// are rate-limited apart, so a `55P03` first still leaves the `warn`
+    /// available for whatever comes after it.
+    #[traced_test]
+    #[test]
+    fn an_expected_failure_does_not_swallow_a_later_unexpected_one() {
+        let mut writer = HeartbeatColumns::default().writer(None, Duration::from_millis(1));
+
+        writer.report(&lock_not_available(), &["policy_a".to_string()]);
+        writer.report(&sqlx::Error::PoolTimedOut, &["policy_a".to_string()]);
+
+        assert!(logs_contain("the durable heartbeat write failed"));
+        logs_assert(|lines| {
+            match lines
+                .iter()
+                .find(|line| line.contains("the durable heartbeat write failed"))
+            {
+                Some(line) if line.contains("WARN") && line.contains("policy_a") => Ok(()),
+                Some(line) => Err(format!("the fault must warn, naming its policies: {line}")),
+                None => Err("a skipped tick swallowed the report of a real fault".to_string()),
+            }
+        });
+    }
+
     /// The `42703` a missing column raises, as sqlx surfaces it.
     fn undefined_column() -> sqlx::Error {
+        refused(UNDEFINED_COLUMN, "column \"last_beat_at\" does not exist")
+    }
+
+    /// The `55P03` a row somebody else holds raises when `lock_timeout` expires.
+    fn lock_not_available() -> sqlx::Error {
+        refused(LOCK_NOT_AVAILABLE, "canceling statement due to lock timeout")
+    }
+
+    fn refused(code: &'static str, message: &'static str) -> sqlx::Error {
         // sqlx has no public constructor for a DatabaseError, so the check is
         // exercised through the one shape that matters to it: the SQLSTATE.
-        struct Refused;
+        struct Refused {
+            code: &'static str,
+            message: &'static str,
+        }
         impl std::fmt::Debug for Refused {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("column \"last_beat_at\" does not exist")
+                f.write_str(self.message)
             }
         }
         impl std::fmt::Display for Refused {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("column \"last_beat_at\" does not exist")
+                f.write_str(self.message)
             }
         }
         impl std::error::Error for Refused {}
         impl sqlx::error::DatabaseError for Refused {
             fn message(&self) -> &str {
-                "column \"last_beat_at\" does not exist"
+                self.message
             }
             fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-                Some(std::borrow::Cow::Borrowed(UNDEFINED_COLUMN))
+                Some(std::borrow::Cow::Borrowed(self.code))
             }
             fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
                 self
@@ -578,6 +632,6 @@ mod tests {
                 sqlx::error::ErrorKind::Other
             }
         }
-        sqlx::Error::Database(Box::new(Refused))
+        sqlx::Error::Database(Box::new(Refused { code, message }))
     }
 }
