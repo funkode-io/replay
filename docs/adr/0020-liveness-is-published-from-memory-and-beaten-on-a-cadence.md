@@ -96,6 +96,23 @@ task beats it out to the cursor row for consumers that are not in that process.
   (100ms): below that the beat is a write loop against the row the checkpoint
   uses, and turning it off is `without_heartbeat()`.
 
+- **One statement, but not one failure domain.** Every led Policy is written in one
+  `UPDATE`, so a row another transaction holds would abort the whole beat and make
+  the replica look leaderless for Policies that are fine. The rows are taken with
+  `FOR UPDATE SKIP LOCKED`: the contended row is skipped, its Policy misses a beat,
+  and the rest are written. The `lock_timeout` stays as the bound on the narrow
+  race between taking the locks and writing.
+
+- **A new Leader inherits the row, never the poll.** `last_polled_at` is written
+  from this replica's own registry and set to `null` when that worker has completed
+  no poll. Keeping the previous Leader's value would attribute a poll to a worker
+  that never made one, and would hide a new Leader wedging on its first.
+
+- **A failed beat is reported at the level its cause deserves.** A schema without
+  the columns and a skipped contended row are the design working — `debug`. Anything
+  else means the durable half is silently off while consumers are told to page on
+  staleness, so it is a `warn`, once.
+
 - **The beat reports leadership; it does not fence it.** It is read from the same
   channels the workers are elected by, so it is exactly as current as the election
   that drives the work — and a replica whose pinned lock session has just dropped

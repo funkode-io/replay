@@ -582,11 +582,16 @@ impl PolicyDaemonHarness {
     /// The heartbeat the Leader's replica writes for this policy — everything a
     /// consumer outside the process can see about it.
     pub async fn heartbeat(&self) -> Option<Heartbeat> {
+        self.heartbeat_for(&self.policy_name).await
+    }
+
+    /// The same, for any policy registered through this harness.
+    pub async fn heartbeat_for(&self, policy: &str) -> Option<Heartbeat> {
         let row = sqlx::query(
             "SELECT last_beat_at, liveness, last_polled_at, led_by \
              FROM policy_cursors WHERE name = $1",
         )
-        .bind(&self.policy_name)
+        .bind(policy)
         .fetch_optional(&self.pool)
         .await
         .expect("the heartbeat observation must be readable")?;
@@ -607,6 +612,28 @@ impl PolicyDaemonHarness {
     {
         self.observe(what, || async { self.heartbeat().await.filter(&holds) })
             .await
+    }
+
+    /// Hold the row lock on `policy`'s cursor row until the returned guard is
+    /// released — an operator part-way through a [Cursor move], sitting at a psql
+    /// prompt they have not typed `COMMIT` into.
+    ///
+    /// The row is locked, not changed: what a test asks with it is what the lock
+    /// alone costs the policies next door.
+    ///
+    /// [Cursor move]: ../../CONTEXT.md#cursor-move
+    pub async fn hold_cursor_row(&self, policy: &str) -> HeldCursorRow {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .expect("holding the cursor row must be possible");
+        sqlx::query("SELECT name FROM policy_cursors WHERE name = $1 FOR UPDATE")
+            .bind(policy)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the cursor row must exist before it can be held");
+        HeldCursorRow(tx)
     }
 
     /// Take the heartbeat columns away: the schema of a consumer who has not
@@ -854,6 +881,17 @@ impl PolicyDaemonReplica {
         if let Some(daemon) = self.daemon.take() {
             daemon.shutdown().await;
         }
+    }
+}
+
+/// Somebody else's open transaction on a cursor row. Dropping it rolls back, so
+/// a test that panics releases the row with its runtime.
+pub struct HeldCursorRow(sqlx::Transaction<'static, sqlx::Postgres>);
+
+impl HeldCursorRow {
+    /// Let the row go, without having changed it.
+    pub async fn release(self) {
+        let _ = self.0.rollback().await;
     }
 }
 

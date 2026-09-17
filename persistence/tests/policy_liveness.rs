@@ -392,6 +392,109 @@ async fn a_schema_without_the_heartbeat_columns_changes_nothing_postgres_test() 
     harness.shutdown().await;
 }
 
+/// One policy's contended row does not silence the rest. Every led policy is
+/// beaten in one statement, so a row somebody else holds — an operator part-way
+/// through a cursor move — would abort the lot and make this replica look
+/// leaderless for every policy it runs. The held row is skipped instead.
+#[tokio::test]
+async fn a_row_somebody_else_holds_costs_only_that_policy_a_beat_postgres_test() {
+    let harness = PolicyDaemonHarness::start("contended", |builder, policy| {
+        builder
+            .register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
+            .register_policy_fn::<ProbeEvent, _>(neighbour_of(policy), StartAt::Beginning, echo)
+    })
+    .await;
+    let neighbour = neighbour_of(harness.policy_name());
+
+    // Both are beating before anything is held.
+    harness
+        .await_heartbeat("the contended policy's first beat", |beat| {
+            beat.led_by.as_deref() == Some(PRIMARY_REPLICA)
+        })
+        .await;
+    let neighbour_before = harness
+        .observe("the neighbour's first beat", || async {
+            harness.heartbeat_for(&neighbour).await
+        })
+        .await;
+
+    let held = harness.hold_cursor_row(harness.policy_name()).await;
+
+    let neighbour_after = harness
+        .observe(
+            "the neighbour to beat while the other row is held",
+            || async {
+                harness
+                    .heartbeat_for(&neighbour)
+                    .await
+                    .filter(|beat| beat.beat_at > neighbour_before.beat_at)
+            },
+        )
+        .await;
+    assert_eq!(neighbour_after.liveness, "Leading");
+    assert_eq!(neighbour_after.led_by.as_deref(), Some(PRIMARY_REPLICA));
+
+    held.release().await;
+
+    // And the skipped policy comes back on its own, with no restart and no
+    // intervention.
+    harness
+        .await_heartbeat("the held policy to beat again once released", |beat| {
+            beat.beat_at > neighbour_after.beat_at
+        })
+        .await;
+
+    harness.shutdown().await;
+}
+
+/// A replica that takes over a policy does not inherit the previous leader's
+/// poll. The row describes the worker that is leading now, so until that worker
+/// completes a poll it reports none — "leading, nothing finished yet" rather than
+/// a poll it never made.
+#[tokio::test]
+async fn a_new_leader_reports_no_poll_until_it_makes_one_postgres_test() {
+    let mut harness = PolicyDaemonHarness::start("failover_poll", |builder, policy| {
+        // Slow enough that a beat lands between taking leadership and finishing
+        // the first poll, which is the window under test.
+        builder
+            .register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
+            .without_notifications()
+    })
+    .await;
+
+    let led = harness
+        .await_heartbeat("a beat carrying a completed poll", |beat| {
+            beat.last_polled_at.is_some()
+        })
+        .await;
+    assert_eq!(led.led_by.as_deref(), Some(PRIMARY_REPLICA));
+
+    // A restart is a new process as far as the registry is concerned: the
+    // worker that comes back has completed no poll of its own.
+    harness.restart().await;
+
+    let after = harness
+        .observe("a beat from the daemon that took over", || async {
+            harness
+                .heartbeat()
+                .await
+                .filter(|beat| beat.beat_at > led.beat_at)
+        })
+        .await;
+    assert!(
+        after.last_polled_at.is_none() || after.last_polled_at > led.last_polled_at,
+        "a new leader reports its own poll or none, never the one it inherited: {after:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The name of the second policy a test registers alongside the one the harness
+/// names, derived so the test can observe it after the fact.
+fn neighbour_of(policy: &str) -> String {
+    format!("{policy}_neighbour")
+}
+
 /// A policy whose worker dies from *outside* the reaction — a panic as it
 /// prepares its read of the feed, the shape of a panic in cursor I/O or the feed
 /// read. The reaction itself is ordinary.

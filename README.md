@@ -2561,6 +2561,7 @@ ORDER  BY name;
 | `since_beat` small, `liveness = 'Leading'` | healthy leader |
 | `since_beat` small, `liveness = 'Stopped'` | the policy is down and its replica is fine — nothing reacts, and no standby takes over until that process exits |
 | `since_beat` small, `poll_age` large | alive but not finishing polls: a long batch, or a reaction that hangs |
+| `since_beat` small, `last_polled_at` null | the current leader has not completed a poll yet: it has just taken over, or just started |
 | `since_beat` large, or the row never beat | **no live leader** — the process is gone, or no replica holds the lock |
 
 Fixed cadence is the whole point of the beat: a stamp written by the worker as it
@@ -2590,6 +2591,15 @@ Alerting:
 - **Warn, do not page**, on `last_polled_at` older than `5 × dispatch_timeout`
   (≈2.5 min at defaults). One hung dispatch legitimately costs `dispatch_timeout`
   × four attempts, and the runner already handles that by parking a dead letter.
+
+`last_polled_at` describes the worker that is leading *now*, so a replica taking a
+policy over reports no poll until it completes one — it never inherits the previous
+leader's. Alert on `poll_age`, not on a null.
+
+All of a replica's led policies are beaten in one statement, taken with
+`FOR UPDATE SKIP LOCKED`: a row somebody else is holding — an operator part-way
+through a cursor move in an open transaction — costs that one policy a beat, not
+every policy on the replica.
 
 One caveat on `led_by` and failover: the beat reports leadership, it does not
 fence it. A replica whose lock session has just dropped can write one last beat

@@ -30,6 +30,10 @@ use sqlx::{Pool, Postgres};
 /// Postgres `undefined_column`: the consumer's schema has no `last_polled_at`.
 const UNDEFINED_COLUMN: &str = "42703";
 
+/// Postgres `lock_not_available`: the beat's `lock_timeout` expired on a row
+/// somebody else holds.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
 // ── Liveness ─────────────────────────────────────────────────────────────────
 
 /// What one Policy's worker is doing in this process.
@@ -263,14 +267,35 @@ pub(crate) struct HeartbeatWriter {
 /// beat, so a worker that has not polled since sees it wobble by the round trip
 /// rather than stand perfectly still. It carries beat-level precision, which is
 /// all a staleness threshold of several beats can use.
+///
+/// A worker with no poll to report writes `null` rather than keeping what was
+/// there: the row describes *this* replica's worker, and a fresh Leader that
+/// inherited a row must not inherit a poll it never made. `null` says "leading,
+/// nothing completed yet", which is the truth for the first poll interval after a
+/// failover.
+///
+/// `FOR UPDATE SKIP LOCKED` is what keeps one Policy's contention from silencing
+/// the rest: every led Policy is written in one statement, so a single row held
+/// by somebody else — an operator part-way through a [Cursor move] in an open
+/// transaction, say — would otherwise abort the whole beat and make every Policy
+/// on this replica look leaderless. The contended row is skipped; its Policy
+/// misses a beat, and nobody else does.
+///
+/// [Cursor move]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#cursor-move
 const BEAT_SQL: &str = "\
+    WITH beatable AS ( \
+        SELECT name FROM policy_cursors \
+         WHERE name = ANY($1::text[]) \
+           FOR UPDATE SKIP LOCKED \
+    ) \
     UPDATE policy_cursors AS pc \
        SET last_beat_at   = now(), \
            liveness       = v.liveness, \
            led_by         = $4, \
-           last_polled_at = COALESCE(now() - make_interval(secs => v.polled_ago), pc.last_polled_at) \
+           last_polled_at = now() - make_interval(secs => v.polled_ago) \
       FROM unnest($1::text[], $2::text[], $3::float8[]) AS v(name, liveness, polled_ago) \
-     WHERE pc.name = v.name";
+     WHERE pc.name = v.name \
+       AND pc.name IN (SELECT name FROM beatable)";
 
 impl HeartbeatWriter {
     /// Write one beat. Never returns an error: a report that could stop the work
@@ -320,34 +345,64 @@ impl HeartbeatWriter {
         tx.commit().await
     }
 
+    /// Report a failed beat once, at the level its cause deserves.
+    ///
+    /// A schema without the columns is a choice the consumer made, and a beat that
+    /// gave up a contended row is this design working — both are `debug`. Anything
+    /// else means the durable half is silently off while the README tells whoever
+    /// reads it to page on staleness, so it is a `warn` naming the reason.
     fn report(&mut self, error: &sqlx::Error) {
-        if is_undefined_column(error) {
-            // Attempted once per process, then left alone: a consumer whose
-            // schema has no heartbeat columns reads liveness from the daemon,
-            // and a line per beat about columns they have not added is noise.
+        let expected = if is_undefined_column(error) {
+            // Attempted once per daemon, then left alone: a consumer whose schema
+            // has no heartbeat columns reads liveness from the daemon, and a line
+            // per beat about columns they have not added is noise.
             self.columns.absent.store(true, Ordering::Relaxed);
-        }
+            true
+        } else {
+            is_lock_not_available(error)
+        };
+
         if self.failure_reported {
             return;
         }
         self.failure_reported = true;
-        tracing::debug!(
-            error = %error,
-            durable_heartbeat = if self.columns.absent.load(Ordering::Relaxed) {
-                "off for this process"
-            } else {
-                "retried on the next beat"
-            },
-            "the durable heartbeat write failed; liveness is readable from the daemon either way"
-        );
+
+        if expected {
+            tracing::debug!(
+                error = %error,
+                durable_heartbeat = if self.columns.absent.load(Ordering::Relaxed) {
+                    "off for this daemon"
+                } else {
+                    "retried on the next beat"
+                },
+                "the durable heartbeat was not written"
+            );
+        } else {
+            tracing::warn!(
+                error = %error,
+                "the durable heartbeat write failed and is not being retried per beat; \
+                 anything reading policy_cursors for liveness will see it go stale while \
+                 this process is healthy. Liveness stays readable from the daemon"
+            );
+        }
     }
 }
 
 /// Whether Postgres refused the write because a column is not there, as opposed
 /// to any other reason a write can fail.
 fn is_undefined_column(error: &sqlx::Error) -> bool {
+    has_code(error, UNDEFINED_COLUMN)
+}
+
+/// Whether the beat gave up waiting for a row somebody else holds — the tick it
+/// is designed to skip, not a fault.
+fn is_lock_not_available(error: &sqlx::Error) -> bool {
+    has_code(error, LOCK_NOT_AVAILABLE)
+}
+
+fn has_code(error: &sqlx::Error, code: &str) -> bool {
     match error {
-        sqlx::Error::Database(db) => db.code().as_deref() == Some(UNDEFINED_COLUMN),
+        sqlx::Error::Database(db) => db.code().as_deref() == Some(code),
         _ => false,
     }
 }
@@ -356,6 +411,8 @@ fn is_undefined_column(error: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tracing_test::traced_test;
+
     use super::*;
 
     /// A registered worker is reported before it has run, and every state it
@@ -445,17 +502,44 @@ mod tests {
         );
     }
 
-    /// Any other failure is reported once and then left to the workers, whose
-    /// own errors say the same thing at a level somebody reads.
+    /// Any other failure is reported once and then left alone — at `warn`, because
+    /// the durable half being off while a consumer is told to page on staleness is
+    /// not something to find out by reading `debug`.
+    #[traced_test]
     #[test]
-    fn a_failing_beat_is_reported_once() {
+    fn an_unexpected_failure_is_warned_about_once() {
         let mut writer = HeartbeatColumns::default().writer(None, Duration::from_millis(1));
 
         writer.report(&sqlx::Error::PoolTimedOut);
         assert!(writer.failure_reported);
+        assert!(
+            !writer.columns.absent.load(Ordering::Relaxed),
+            "a failure that is not a missing column leaves the heartbeat on"
+        );
+        assert!(logs_contain("the durable heartbeat write failed"));
+        logs_assert(|lines| {
+            match lines
+                .iter()
+                .find(|line| line.contains("the durable heartbeat write failed"))
+            {
+                Some(line) if line.contains("WARN") => Ok(()),
+                Some(line) => Err(format!(
+                    "an unexpected failure must not hide at debug: {line}"
+                )),
+                None => Err("nothing was reported at all".to_string()),
+            }
+        });
+    }
 
-        // Not an absent column: the next beat still tries.
-        assert!(!writer.columns.absent.load(Ordering::Relaxed));
+    /// The two causes a beat expects — a schema without the columns, and a row
+    /// somebody else holds — are this design working, and stay at `debug`.
+    #[traced_test]
+    #[test]
+    fn an_expected_failure_stays_quiet() {
+        let mut writer = HeartbeatColumns::default().writer(None, Duration::from_millis(1));
+        writer.report(&undefined_column());
+
+        assert!(!logs_contain("WARN"));
     }
 
     /// The `42703` a missing column raises, as sqlx surfaces it.
