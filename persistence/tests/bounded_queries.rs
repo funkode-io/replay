@@ -41,10 +41,12 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/policy_runner.rs",
-        function: "retry_policy_dead_letters",
-        justification: "Reads i64 ids only, for one policy's dead letters. Grows with a \
-                        policy's recorded failures — 8 bytes each, and an operator \
-                        retrying them is an explicit act on a set they can see.",
+        function: "dead_letter_page",
+        justification: "SQL carries LIMIT $page, bound by DEAD_LETTER_RETRY_PAGE (100). \
+                        retry_policy_dead_letters walks a backlog of any size through \
+                        this one page at a time, resuming on (created_at, id); the \
+                        previous version materialised every id first, which grew with \
+                        the failures a policy had recorded.",
     },
     Reviewed {
         file: "src/policy_status.rs",

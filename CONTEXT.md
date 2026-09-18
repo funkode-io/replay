@@ -58,9 +58,13 @@ _Avoid_: offset, sequence number, event time.
 ### Policy feed
 
 The slice of the event log one [Policy] reads on a poll: every event past its cursor
-whose writing transaction has ended, in `([Commit stamp], [Global position])` order, up
+written below the **commit watermark**, in `([Commit stamp], [Global position])` order, up
 to its read batch size and **before** its `stream_filter` is applied
-([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)). An excluded
+([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)). The watermark
+is `pg_snapshot_xmin`, the oldest transaction still running **anywhere in the instance** —
+so an event whose own transaction has committed stays withheld while any older
+xid-bearing write is open, including one in another database
+([#214](https://github.com/funkode-io/replay/issues/214)). An excluded
 position advances the cursor and fires nothing, like a compaction snapshot: a
 `stream_filter` decides what a Policy *reacts to*, never how far it *gets*
 ([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). The feed

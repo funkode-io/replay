@@ -71,7 +71,7 @@ pub(crate) fn names_a_feed_point(stored: FeedPoint, at_position: Option<CommitSt
 /// both, so the point derived from it is the greatest one that still delivers every event
 /// past that position:
 ///
-/// - `first_past_position`, the earliest transaction holding such an event, when the feed
+/// - `first_past_commit_txid`, the earliest transaction holding such an event, when the feed
 ///   can already see one;
 /// - otherwise one below `watermark`, because an event that is still to appear was
 ///   written by a transaction that is still running, and those sit at or above it.
@@ -82,11 +82,11 @@ pub(crate) fn names_a_feed_point(stored: FeedPoint, at_position: Option<CommitSt
 /// permanent.
 pub(crate) fn conservative_point(
     stored: FeedPoint,
-    first_past_position: Option<CommitStamp>,
+    first_past_commit_txid: Option<CommitStamp>,
     watermark: CommitStamp,
 ) -> FeedPoint {
     FeedPoint {
-        commit_txid: first_past_position.unwrap_or_else(|| watermark.previous()),
+        commit_txid: first_past_commit_txid.unwrap_or_else(|| watermark.previous()),
         position: stored.position,
     }
 }

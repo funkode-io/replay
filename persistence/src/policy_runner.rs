@@ -38,6 +38,46 @@ use crate::policy_liveness::{
 };
 use crate::{Cqrs, PersistedEvent, PostgresEventStore};
 
+/// Where a parked dead letter sits in the order its Policy delivered it: when it was
+/// parked, and which row it was when two land in the same transaction's `now()`.
+type ParkedAt = (chrono::DateTime<chrono::Utc>, i64);
+
+/// How many parked dead letters [`PolicyRunner::retry_policy_dead_letters`] enumerates
+/// per round trip. The bound on that call's memory: a backlog of any size is retried a
+/// page at a time.
+const DEAD_LETTER_RETRY_PAGE: i64 = 100;
+
+/// One page of a Policy's parked dead letters in parking order, resuming after `after`.
+///
+/// The row comparison is the resume, in the same shape the Policy feed uses. It reads
+/// `idx_dead_letters_policy (policy_name, created_at DESC)` backwards; `id` orders only
+/// the rows sharing a `created_at`, which is one parking transaction's worth.
+async fn dead_letter_page(
+    pool: &Pool<Postgres>,
+    policy_name: &str,
+    after: Option<ParkedAt>,
+    page: i64,
+) -> Result<Vec<ParkedAt>, replay::Error> {
+    let (after_created_at, after_id) = match after {
+        Some((created_at, id)) => (Some(created_at), Some(id)),
+        None => (None, None),
+    };
+
+    sqlx::query_as::<_, ParkedAt>(
+        "SELECT created_at, id FROM policy_dead_letters \
+         WHERE policy_name = $1 \
+           AND ($2::timestamptz IS NULL OR (created_at, id) > ($2, $3)) \
+         ORDER BY created_at ASC, id ASC LIMIT $4",
+    )
+    .bind(policy_name)
+    .bind(after_created_at)
+    .bind(after_id)
+    .bind(page)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)
+}
+
 /// Erased, services-bound execution path for one aggregate type.
 ///
 /// Registered via [`PolicyRunnerBuilder::register_services`], which captures the
@@ -1003,29 +1043,36 @@ impl PolicyRunner {
     /// `still_failing == 0`. A policy with no parked dead letters is a clean
     /// no-op (a zero summary). Rows removed concurrently (e.g. by
     /// [`discard_dead_letter`](Self::discard_dead_letter)) are skipped.
+    ///
+    /// Read in [`DEAD_LETTER_RETRY_PAGE`]-row keyset pages, so a backlog of any size
+    /// costs the same memory: a Policy that parked a million reactions is exactly the
+    /// caller this exists for, and materialising its ids would put that backlog on the
+    /// heap. The keyset advances past every row it selected, resolved or not — a row that
+    /// fails again keeps its `id` and `created_at`, so paging on "the page after the last
+    /// row seen" terminates where paging on "the first N still parked" would loop.
     pub async fn retry_policy_dead_letters(
         &self,
         policy_name: &str,
     ) -> Result<DeadLetterRetrySummary, replay::Error> {
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM policy_dead_letters \
-             WHERE policy_name = $1 \
-             ORDER BY created_at ASC, id ASC",
-        )
-        .bind(policy_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(crate::db_error)?;
-
         let mut summary = DeadLetterRetrySummary::default();
-        for id in ids {
-            match self.retry_dead_letter(id).await? {
-                DeadLetterRetry::Resolved => summary.resolved += 1,
-                DeadLetterRetry::StillFailing => summary.still_failing += 1,
-                DeadLetterRetry::NotFound => {}
+        let mut after: Option<ParkedAt> = None;
+
+        loop {
+            let page =
+                dead_letter_page(&self.pool, policy_name, after, DEAD_LETTER_RETRY_PAGE).await?;
+            let Some(last) = page.last().copied() else {
+                return Ok(summary);
+            };
+            after = Some(last);
+
+            for (_, id) in page {
+                match self.retry_dead_letter(id).await? {
+                    DeadLetterRetry::Resolved => summary.resolved += 1,
+                    DeadLetterRetry::StillFailing => summary.still_failing += 1,
+                    DeadLetterRetry::NotFound => {}
+                }
             }
         }
-        Ok(summary)
     }
 
     /// Start one long-lived worker task per registered policy, backed by two
@@ -2811,9 +2858,9 @@ impl PolicyCursor {
             // indexed lookup and no scan.
             at_position if names_a_feed_point(stored, at_position) => stored,
             _ => {
-                let (first_past_position, watermark) =
+                let (first_past_commit_txid, watermark) =
                     conservative_inputs(pool, stored.position).await?;
-                conservative_point(stored, first_past_position, watermark)
+                conservative_point(stored, first_past_commit_txid, watermark)
             }
         };
 
@@ -2980,7 +3027,7 @@ async fn conservative_inputs(
 ) -> Result<(Option<CommitStamp>, CommitStamp), replay::Error> {
     let row = sqlx::query(
         "SELECT (SELECT MIN(commit_txid::text::numeric)::text FROM events \
-           WHERE global_position > $1 AND commit_txid < w.watermark) AS first_past_position, \
+           WHERE global_position > $1 AND commit_txid < w.watermark) AS first_past_commit_txid, \
          w.watermark::text AS watermark \
          FROM (SELECT pg_snapshot_xmin(pg_current_snapshot()) AS watermark) w",
     )
@@ -2989,13 +3036,13 @@ async fn conservative_inputs(
     .await
     .map_err(crate::db_error)?;
 
-    let first_past_position = row
-        .get::<Option<String>, _>("first_past_position")
+    let first_past_commit_txid = row
+        .get::<Option<String>, _>("first_past_commit_txid")
         .map(|text| CommitStamp::parse(text.as_str()))
         .transpose()?;
 
     Ok((
-        first_past_position,
+        first_past_commit_txid,
         CommitStamp::from_row(&row, "watermark")?,
     ))
 }
@@ -4635,6 +4682,135 @@ mod cursor_tests {
             stored(&pool).await,
             expected,
             "and the row is left alone: there is nothing to complete"
+        );
+    }
+}
+
+/// The keyset [`PolicyRunner::retry_policy_dead_letters`] walks a backlog with.
+///
+/// Driven against the rows rather than through a retry, because what has to hold is a
+/// property of the enumeration alone: every parked row is handed back exactly once, in
+/// the order its Policy parked them, however many pages that takes.
+#[cfg(test)]
+mod dead_letter_page_tests {
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::PgPool;
+    use testcontainers_modules::postgres;
+    use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
+
+    use super::{dead_letter_page, ParkedAt};
+
+    const POLICY: &str = "paged_policy";
+
+    /// As `cursor_tests` pins it: `xid8` needs PostgreSQL 13, and this module cannot
+    /// reach the suite's shared image file.
+    const POSTGRES_TAG: &str = "13-alpine";
+
+    async fn start_postgres() -> (PgPool, ContainerAsync<postgres::Postgres>) {
+        let container = postgres::Postgres::default()
+            .with_tag(POSTGRES_TAG)
+            .start()
+            .await
+            .expect("failed to start the postgres container");
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to read the container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to read the container port");
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&format!(
+                "postgres://postgres:postgres@{host}:{port}/postgres"
+            ))
+            .await
+            .expect("failed to create the postgres pool");
+
+        sqlx::migrate!("./tests/migrations")
+            .run(&pool)
+            .await
+            .expect("migrations must succeed");
+
+        (pool, container)
+    }
+
+    /// Park `count` rows for `POLICY`, the first `tied` of them sharing one `created_at`
+    /// — what a page boundary landing inside one parking transaction looks like.
+    async fn park(pool: &PgPool, count: usize, tied: usize) {
+        for nth in 0..count {
+            let age = if nth < tied { 0 } else { nth as i32 };
+            sqlx::query(
+                "INSERT INTO policy_dead_letters \
+                 (policy_name, global_position, event_id, error_kind, error_message, created_at) \
+                 VALUES ($1, $2, gen_random_uuid(), 'Permanent', 'parked', \
+                         now() + make_interval(secs => $3))",
+            )
+            .bind(POLICY)
+            .bind(nth as i64)
+            .bind(f64::from(age))
+            .execute(pool)
+            .await
+            .expect("parking a dead letter must succeed");
+        }
+    }
+
+    /// Walk every page the way the retry does, and report the ids in the order it would
+    /// have retried them.
+    async fn walk(pool: &PgPool, page: i64) -> Vec<i64> {
+        let mut walked = Vec::new();
+        let mut after: Option<ParkedAt> = None;
+        loop {
+            let rows = dead_letter_page(pool, POLICY, after, page)
+                .await
+                .expect("reading a page must succeed");
+            let Some(last) = rows.last().copied() else {
+                return walked;
+            };
+            after = Some(last);
+            walked.extend(rows.into_iter().map(|(_, id)| id));
+        }
+    }
+
+    /// The property the bound rests on: pages that tile the backlog exactly, including
+    /// across a boundary that falls inside one `created_at`, where `id` is the only thing
+    /// separating the rows.
+    #[tokio::test]
+    async fn pages_hand_back_every_parked_row_once_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        park(&pool, 7, 3).await;
+
+        let whole = walk(&pool, 100).await;
+        assert_eq!(whole.len(), 7, "one page covers the backlog: {whole:?}");
+
+        for page in [1, 2, 3, 7] {
+            assert_eq!(
+                walk(&pool, page).await,
+                whole,
+                "a backlog walked {page} rows at a time is the same walk"
+            );
+        }
+    }
+
+    /// A row that fails again keeps its `id` and `created_at`, so the keyset must move
+    /// past it: a page asked for "the first N still parked" would hand back the same
+    /// failing row forever.
+    #[tokio::test]
+    async fn a_page_resumes_past_a_row_that_is_still_parked_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        park(&pool, 3, 0).await;
+
+        let first = dead_letter_page(&pool, POLICY, None, 1)
+            .await
+            .expect("reading a page must succeed");
+        let again = dead_letter_page(&pool, POLICY, first.last().copied(), 1)
+            .await
+            .expect("reading a page must succeed");
+
+        assert_ne!(
+            first[0].1, again[0].1,
+            "nothing was retried, and the next page is still the next row"
         );
     }
 }

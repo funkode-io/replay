@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool, Row};
+use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 use tracing_test::traced_test;
 use uuid::Uuid;
@@ -72,7 +73,18 @@ async fn start_postgres() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres_container().start().await.unwrap();
+    start_postgres_with(postgres_container()).await
+}
+
+/// The same, on a server the caller has configured — two-phase commit is off by
+/// default, so the prepared-transaction case has to bring its own.
+async fn start_postgres_with(
+    request: testcontainers_modules::testcontainers::ContainerRequest<postgres::Postgres>,
+) -> (
+    PgPool,
+    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
+) {
+    let container = request.start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -869,5 +881,113 @@ async fn a_policy_starting_now_skips_a_committed_event_whose_transaction_is_youn
             .clone(),
         vec![1.0],
         "only the event appended after the policy started is delivered"
+    );
+}
+
+/// A prepared append is the one holder that outlives its session: `PREPARE TRANSACTION`
+/// keeps the transaction's id alive with no backend behind it, so it pins the watermark
+/// until `COMMIT PREPARED` or `ROLLBACK PREPARED` decides its fate — possibly after a
+/// server restart.
+///
+/// Its coverage came with the burned-position suite this PR deletes, where what mattered
+/// was that the sequence lock had no `pid`. Under commit visibility the holder's identity
+/// stops mattering and only its xid does, which is why the case is re-pinned rather than
+/// dropped: the feed must withhold the prepared write *and everything committed after
+/// it*, then deliver both in order once it lands. The runbook sends operators to
+/// `pg_prepared_xacts` for exactly this stall.
+///
+/// Two-phase commit is off by default, so this test runs its own server with it on.
+#[tokio::test]
+async fn a_prepared_append_withholds_the_feed_until_it_is_committed_postgres_test() {
+    let (pool, _container) = start_postgres_with(postgres_container().with_cmd([
+        "postgres",
+        "-c",
+        "max_prepared_transactions=5",
+    ]))
+    .await;
+
+    let reacted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reacted);
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Beginning, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        })
+        .build();
+
+    let add = |stream: &'static str, amount: f64| {
+        let cqrs = cqrs.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &LedgerUrn::new(stream).unwrap(),
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    add("prepared-main", 10.0).await;
+    add("prepared-held", 5.0).await;
+    drain_until(&runner, &pool, 2, 4).await;
+    assert_eq!(reacted.load(Ordering::SeqCst), 2);
+
+    // An append that has written its event and been prepared: its session is gone, and
+    // only `COMMIT PREPARED` or `ROLLBACK PREPARED` decides what happens to it.
+    let in_flight = hold_an_append_open(&pool, 2).await;
+    let held = in_flight.position;
+    let mut tx = in_flight.tx;
+    sqlx::query("PREPARE TRANSACTION 'held-append'")
+        .execute(&mut *tx)
+        .await
+        .expect("preparing the append must succeed");
+    drop(tx);
+
+    // What the runbook tells an operator to look for, and what `pg_stat_activity` alone
+    // would miss: an xid holder with no session.
+    let prepared: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'held-append'")
+            .fetch_one(&pool)
+            .await
+            .expect("reading the prepared transactions must succeed");
+    assert_eq!(
+        prepared, 1,
+        "the prepared append still holds its transaction"
+    );
+
+    // A later append commits normally. It is behind the prepared one in feed order, so
+    // it is withheld too — the property that makes a stale beat mean "nothing is moving"
+    // rather than "one write is slow".
+    add("prepared-main", 1.0).await;
+
+    for _ in 0..5 {
+        runner.drain().await.expect("drain must succeed");
+    }
+    assert_eq!(
+        stored_cursor(&pool, AUDIT).await,
+        held - 1,
+        "a prepared write holds the watermark exactly as an open session does"
+    );
+    assert_eq!(
+        reacted.load(Ordering::SeqCst),
+        2,
+        "and nothing committed after it may be delivered before it"
+    );
+
+    // It commits, long after its session is gone.
+    sqlx::query("COMMIT PREPARED 'held-append'")
+        .execute(&pool)
+        .await
+        .expect("committing the prepared append must succeed");
+
+    drain_until(&runner, &pool, held + 1, 5).await;
+    assert_eq!(
+        reacted.load(Ordering::SeqCst),
+        4,
+        "the prepared event and the one behind it are both delivered, in order"
     );
 }
