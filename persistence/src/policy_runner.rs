@@ -1056,12 +1056,25 @@ impl PolicyRunner {
     ) -> Result<Vec<(i64, DeadLetterRetry)>, replay::Error> {
         let mut replay = replay;
         let mut settled = Vec::with_capacity(rows.len());
+        // How many rows name each row's identity, read before any of them is
+        // settled: what tells a group of indistinguishable dispatches from a
+        // dispatch that parked no row at all.
+        let naming: Vec<usize> = rows
+            .iter()
+            .map(|row| match row.identity.as_ref() {
+                Some(identity) => rows
+                    .iter()
+                    .filter(|other| other.identity.as_ref() == Some(identity))
+                    .count(),
+                None => 0,
+            })
+            .collect();
 
-        for row in rows {
+        for (row, rows_naming_it) in rows.into_iter().zip(naming) {
             let outcome = match row.identity.as_ref() {
                 // The command this row was parked for ran again: its own
                 // outcome settles it.
-                Some(identity) => replay.settlement_for(identity),
+                Some(identity) => replay.settlement_for(identity, rows_naming_it),
                 // The row names no command, so only the replay as a whole can
                 // settle it.
                 None => replay.verdict(),
@@ -2278,6 +2291,7 @@ struct ParkedRow {
 /// The stored counterpart of [`DispatchIdentity`], which is what a live
 /// `Dispatch` carries; the two are compared to match a row to the command a
 /// replay just ran.
+#[derive(PartialEq, Eq)]
 struct ParkedIdentity {
     aggregate_name: String,
     target_stream_id: String,
@@ -2287,9 +2301,12 @@ struct ParkedIdentity {
 impl ParkedIdentity {
     /// Whether this row is about `dispatch`.
     ///
-    /// The command's variant and payload are not recorded, so two identical
-    /// dispatches to the same stream are indistinguishable here; they are
-    /// claimed in production order, which is the order they were parked in.
+    /// The command's *variant* and payload are not recorded and
+    /// `Dispatch::to::<A>` records `A::Command` — the command enum, not the
+    /// variant — so this is in practice "the same command type at the same
+    /// instance": any two dispatches of one reaction to one aggregate instance
+    /// are indistinguishable here. What settles a row when they are is
+    /// [`Replay::settlement_for`].
     fn names(&self, dispatch: &DispatchIdentity) -> bool {
         self.aggregate_name == dispatch.aggregate_name
             && self.target_stream_id == dispatch.target_stream_id
@@ -2352,21 +2369,56 @@ enum Replay {
 }
 
 impl Replay {
-    /// What settles a row naming `identity`.
+    /// What settles a row naming `identity`, given how many rows of the group
+    /// name it.
     ///
-    /// The dispatch it names, if the replay ran one whose turn has not been
-    /// taken; failing that the last dispatch of the same identity, because a
-    /// second row naming a command the replay produced only once is another
-    /// delivery's copy of it (funkode-io/replay#220) and the command concluded
-    /// once, for both; failing that, the replay as a whole.
-    fn settlement_for(&mut self, identity: &ParkedIdentity) -> Option<Settlement> {
-        if let Some(outcome) = self.claim(identity) {
-            return outcome;
-        }
-        if let Some(outcome) = self.repeated(identity) {
+    /// Matching a row to a dispatch by position is only honest when the two
+    /// counts line up. They do not when a dispatch of that identity concluded
+    /// without ever parking a row — the reaction sent two commands to one
+    /// instance and only the later failed — or when a redelivery parked a
+    /// second copy of one row (funkode-io/replay#220). Taking position on faith
+    /// there archives a row whose command has just failed again, which is the
+    /// one outcome a retry must never produce.
+    ///
+    /// So: counts aligned, settle in production order; counts apart, every row
+    /// of that identity takes the same verdict — a failure among those
+    /// dispatches re-parks it, all of them resolving archives it. The rows are
+    /// indistinguishable by construction, so a shared error is what the table
+    /// can honestly say about them.
+    ///
+    /// A panicked replay is matched in order regardless: the dispatches it never
+    /// reached concluded nothing to count, and what did conclude must still
+    /// settle its own row rather than be pinned by a sibling that panics every
+    /// time (ADR-0016).
+    fn settlement_for(
+        &mut self,
+        identity: &ParkedIdentity,
+        rows_naming_it: usize,
+    ) -> Option<Settlement> {
+        if self.aligns_with(identity, rows_naming_it) {
+            if let Some(outcome) = self.claim(identity) {
+                return outcome;
+            }
+        } else if let Some(outcome) = self.verdict_on(identity) {
             return outcome;
         }
         self.unmatched()
+    }
+
+    /// Whether this replay ran exactly as many dispatches of `identity` as the
+    /// group has rows naming it. Always, for a panicked replay: see
+    /// [`settlement_for`](Self::settlement_for).
+    fn aligns_with(&self, identity: &ParkedIdentity, rows_naming_it: usize) -> bool {
+        match self {
+            Self::Panicked { .. } => true,
+            Self::Ran(concluded) => {
+                concluded
+                    .iter()
+                    .filter(|dispatch| identity.names(&dispatch.identity))
+                    .count()
+                    == rows_naming_it
+            }
+        }
     }
 
     /// Claim the dispatch `identity` names, if this replay ran one: `Some(None)`
@@ -2381,26 +2433,24 @@ impl Replay {
         Some(dispatch.failure.as_ref().map(Settlement::of))
     }
 
-    /// What the last dispatch of this identity concluded, claimed or not.
-    ///
-    /// A reaction emitting the command twice parks two rows and settles them in
-    /// order through [`claim`](Self::claim); a row left over after every such
-    /// dispatch is spoken for is not a third dispatch, it is the same command
-    /// parked again by another delivery. Archiving it as resolved would say the
-    /// command recovered when the replay just watched it fail.
-    ///
-    /// Only a replay that ran to completion can say this. A panicked one never
-    /// reached the dispatches after the panic, so a left-over row may be one of
-    /// *those* rather than a duplicate — and what the replay knows about a
-    /// command it did not reach is only that it panicked.
-    fn repeated(&self, identity: &ParkedIdentity) -> Option<Option<Settlement>> {
+    /// What every row naming `identity` concluded together: the first failure
+    /// among the replay's dispatches of that identity, or resolution when none
+    /// of them failed. `None` when the replay produced no such dispatch — there
+    /// is nothing to share a verdict from.
+    fn verdict_on(&self, identity: &ParkedIdentity) -> Option<Option<Settlement>> {
         let Self::Ran(concluded) = self else {
             return None;
         };
-        let dispatch = concluded
+        let mut matched = concluded
             .iter()
-            .rfind(|dispatch| identity.names(&dispatch.identity))?;
-        Some(dispatch.failure.as_ref().map(Settlement::of))
+            .filter(|dispatch| identity.names(&dispatch.identity))
+            .peekable();
+        matched.peek()?;
+        Some(
+            matched
+                .find_map(|dispatch| dispatch.failure.as_ref())
+                .map(Settlement::of),
+        )
     }
 
     /// What settles a row naming a command this replay did not produce.

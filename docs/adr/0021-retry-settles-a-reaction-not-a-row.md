@@ -51,11 +51,15 @@ What changes is what a retry is *for* — one reaction, not one row.
   resolves (`Ok` or `BusinessRuleViolation`) is archived with reason `retried`; a
   row whose command fails again is updated in place with **its own** error. Two
   identical dispatches to the same stream are indistinguishable — the command's
-  variant and payload are not recorded — so they settle the two rows in
-  production order. A row left over once every dispatch of its identity is spoken
-  for is a *second delivery's copy* of one of them (funkode-io/replay#220), not a
-  command the reaction stopped emitting: it takes the same verdict as the last
-  dispatch of that identity rather than being archived as resolved.
+  variant and payload are not recorded, and the recorded command type is the
+  aggregate's command *enum* — so they settle the two rows in production order.
+  In order only while the counts line up: when the replay ran more dispatches of
+  an identity than the group has rows naming it (the reaction sent two commands
+  to one instance and only the later failed) or fewer (a second delivery parked a
+  copy of one row, funkode-io/replay#220), every row of that identity takes one
+  shared verdict — a failure among those dispatches re-parks it, all of them
+  resolving archives it. Matching by position there would archive a row whose
+  command had just failed again.
 
 - **A row the replay ran no command for is settled by what the replay can say
   about it.** A row naming a command the reaction no longer emits is resolved:
@@ -116,6 +120,14 @@ What changes is what a retry is *for* — one reaction, not one row.
   units.** Rows in the gauge, reactions in the summary. Stated in both names, and
   the alternative — moving the gauge to reactions — would silently change the
   meaning of a number services already alert on.
+
+- **A reaction sending two commands to one instance settles its rows more
+  coarsely.** The identity a row records cannot tell those dispatches apart, so
+  when they do not line up one-to-one with the rows, the rows share a verdict
+  instead of each carrying its own error. Recording which dispatch of the
+  reaction a row was parked for — an ordinal — would settle them exactly; it is
+  another column and another migration, and two commands to one instance from one
+  reaction is a shape worth questioning before it is worth optimising for.
 
 - **A row parked before the identity migration is settled more coarsely than its
   neighbours**: all-or-nothing on the whole replay, since it names no command.

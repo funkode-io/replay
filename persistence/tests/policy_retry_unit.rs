@@ -45,6 +45,10 @@ const PANIC_AFTER: &str = "panic-after";
 /// settled by the panic.
 const PANIC_SAME_TARGET: &str = "panic-same-target";
 
+/// Tag whose reaction sends two commands to the **same** instance where the
+/// first always succeeds: at park time only the second has a row.
+const SHIFTED: &str = "shifted";
+
 /// Tag whose reaction dispatches one command, for tests that care about how many
 /// reactions there are rather than what each parks.
 const ONE_COMMAND: &str = "one-command";
@@ -137,6 +141,15 @@ impl Policy for TwoCommandPolicy {
             ],
             PANIC_AFTER => vec![first(), Self::explode(SECOND_SUBJECT)],
             PANIC_SAME_TARGET => vec![first(), Self::explode(FIRST_SUBJECT)],
+            SHIFTED => vec![
+                Dispatch::to::<Probe>(
+                    ProbeUrn::new(FIRST_SUBJECT).unwrap(),
+                    ProbeCommand::Echo {
+                        tag: "always-succeeds".to_string(),
+                    },
+                ),
+                Self::dispatch(FIRST_SUBJECT, &self.second_recovered, SECOND_FAILURE),
+            ],
             ONE_COMMAND => vec![first()],
             _ => return vec![],
         };
@@ -771,6 +784,69 @@ async fn a_row_the_panic_cut_short_is_not_settled_by_its_concluded_twin_postgres
         archived_ids(&harness.archived_dead_letters().await),
         vec![(parked[0].id, "retried")],
         "only the command that actually concluded resolves its row"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A row whose command is not the *first* dispatch of its identity is settled by
+/// what that identity concluded, not by whichever dispatch came first.
+///
+/// A reaction sending two commands to one instance produces two dispatches a row
+/// cannot tell apart, and when only the later one fails, the reaction parks one
+/// row. Claiming in production order would hand that row the first dispatch's
+/// success and archive it while its command still fails — a parked reaction
+/// leaving the table because a *different* command of the same reaction worked.
+#[tokio::test]
+async fn a_row_is_not_settled_by_a_dispatch_that_parked_nothing_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_shifted", reaction.policy()).await;
+
+    harness.ping("subject-1", SHIFTED).await;
+    let parked = harness.await_dead_letters(1).await;
+    assert_eq!(
+        parked.len(),
+        1,
+        "the first command succeeds, so only the second parks a row, got {parked:#?}"
+    );
+
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        },
+        "the reaction still fails: one of its commands is still refused"
+    );
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        after.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![parked[0].id],
+        "the row stays parked, got {after:#?}"
+    );
+    assert!(
+        after[0].error_message.contains(SECOND_FAILURE),
+        "carrying the failure of the identity it names, got {after:#?}"
+    );
+    assert!(
+        harness.archived_dead_letters().await.is_empty(),
+        "and nothing is archived as though the command had recovered"
+    );
+
+    // When that command recovers, the row clears — the shared verdict resolves
+    // as readily as it re-parks.
+    reaction.second_recovered.store(true, Ordering::SeqCst);
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 1,
+            reactions_still_failing: 0,
+        }
+    );
+    assert!(harness.dead_letters().await.is_empty());
+    assert_eq!(
+        archived_ids(&harness.archived_dead_letters().await),
+        vec![(parked[0].id, "retried")]
     );
 
     harness.shutdown().await;
