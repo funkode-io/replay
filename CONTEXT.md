@@ -262,9 +262,25 @@ _Avoid_: alert, failover, panic, giving up.
 The axis reporting whether a [Policy]'s worker exists and is running — leading,
 standing by, restarting, stopped or unknown. Only the process running the
 [Policy runner] knows it, so it is published from memory and never derived from
-the operational tables. It implies nothing about [Progress], and nothing about
-it can be inferred from Progress.
+the operational tables
+([ADR-0020](docs/adr/0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)).
+Its durable form is the [Heartbeat], which carries it to whoever is not in that
+process. It implies nothing about [Progress], and nothing about it can be
+inferred from Progress.
 _Avoid_: uptime, availability, aliveness, worker status.
+
+### Heartbeat
+
+The beat a replica writes on a **fixed cadence** for each [Policy] it leads,
+carrying that worker's [Liveness], when it last finished a poll, and which
+replica wrote it. Fixed is the whole property: a signal that slowed down when a
+worker got busy could not tell busy from gone. It is written by a task of its own
+rather than by the worker, because a worker inside a reaction that never returns
+cannot write anything — which is the case the beat is for. A stale beat means no
+live [Leader]; a fresh beat carrying an old poll means a worker that is alive and
+not finishing polls. A [Standby] writes none: the row belongs to whoever holds the
+lock.
+_Avoid_: ping, keepalive, health check, liveness probe.
 
 ### Progress
 
@@ -388,6 +404,7 @@ it:
 [Restart budget]: #restart-budget
 [Escalation]: #escalation
 [Liveness]: #liveness
+[Heartbeat]: #heartbeat
 [Progress]: #progress
 [Caught up]: #caught-up
 [Query]: #query

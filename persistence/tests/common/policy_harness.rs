@@ -23,6 +23,10 @@
 //!   have left the active set, and what settled them.
 //! - [`PolicyDaemonHarness::stopped_workers`] — the workers the runner gave up
 //!   on, which is what an operator reads off the daemon in their own service.
+//! - [`PolicyDaemonHarness::liveness`] — what each worker in this process is
+//!   doing, read off the daemon the same way.
+//! - [`PolicyDaemonHarness::heartbeat`] — the row the Leader's beat writes,
+//!   which is what a consumer reads from outside the process.
 //! - [`PolicyDaemonHarness::escalations`] — what the consumer's escalation hook
 //!   was told. The harness installs a recording hook in place of the default,
 //!   which exits the process: in a test that is the test runner.
@@ -32,6 +36,11 @@
 //! - [`PolicyDaemonHarness::restart`] — stop the daemon and start an identical
 //!   one against the same database, so a test can ask what survived in memory
 //!   (nothing) and what survived in the tables (everything that matters).
+//! - [`PolicyDaemonHarness::start_replica`] — start a *second* runner against
+//!   the same database, which is how a test reaches a Standby: whichever runner
+//!   loses the advisory lock leads nothing and must say so.
+//! - [`PolicyDaemonHarness::drop_heartbeat_column`] — take the heartbeat columns
+//!   away, standing in for a consumer whose schema predates them.
 //! - [`PolicyDaemonHarness::retry_parked`] — the bulk retry of everything the
 //!   policy parked, run out of band while the daemon keeps polling.
 //! - [`PolicyDaemonHarness::retry_parked_row`] /
@@ -67,6 +76,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use testcontainers_modules::postgres;
@@ -77,13 +87,19 @@ use super::postgres_image::{postgres_container, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, PolicyRunner,
-    PolicyRunnerBuilder, PolicyRunnerDaemon, PostgresEventStore, StoppedWorker,
+    Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, Liveness,
+    PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PostgresEventStore, StoppedWorker,
+    WorkerLiveness,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
 /// outcomes, so the interval only bounds how long an idle poll loop dawdles.
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How often the daemon under test writes the durable heartbeat: the floor the
+/// crate allows, for the same reason the poll interval is short — these tests
+/// wait on beats arriving, not on production's cadence.
+pub const DAEMON_HEARTBEAT_CADENCE: Duration = replay_persistence::HEARTBEAT_MIN_CADENCE;
 
 /// How long an `await_*` observation may go unsatisfied before it is a failure.
 pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -262,6 +278,21 @@ pub struct ArchivedDeadLetter {
     pub command_name: Option<String>,
 }
 
+/// The durable liveness reading: one beat, as a consumer outside the process
+/// sees it.
+#[derive(Debug, Clone)]
+pub struct Heartbeat {
+    /// When the Leader's replica last beat. Stale means no live Leader.
+    pub beat_at: DateTime<Utc>,
+    /// What that replica's supervisor knows about the worker.
+    pub liveness: String,
+    /// When the worker last finished a poll. Old against a fresh beat means the
+    /// worker is alive and not finishing polls.
+    pub last_polled_at: Option<DateTime<Utc>>,
+    /// Which replica wrote the beat.
+    pub led_by: Option<String>,
+}
+
 /// What the consumer's escalation hook was told, recorded instead of acted on.
 ///
 /// Installed by the harness on every daemon it starts, because the default hook
@@ -360,7 +391,13 @@ impl PolicyDaemonHarness {
         let configure: Arc<Configure> = Arc::new(configure);
         let escalations = Escalations::default();
 
-        let daemon = spawn_daemon(&cqrs, configure.as_ref(), &policy_name, &escalations);
+        let daemon = spawn_daemon(
+            &cqrs,
+            configure.as_ref(),
+            &policy_name,
+            &escalations,
+            PRIMARY_REPLICA,
+        );
 
         Self {
             _container: container,
@@ -393,6 +430,7 @@ impl PolicyDaemonHarness {
             self.configure.as_ref(),
             &self.policy_name,
             &self.escalations,
+            PRIMARY_REPLICA,
         ));
     }
 
@@ -566,6 +604,136 @@ impl PolicyDaemonHarness {
             .as_ref()
             .expect("the daemon is only taken by shutdown")
             .stopped_workers()
+    }
+
+    /// What every worker in this daemon is doing, and when each last polled.
+    pub fn liveness(&self) -> Vec<WorkerLiveness> {
+        self.daemon
+            .as_ref()
+            .expect("the daemon is only taken by shutdown")
+            .liveness()
+    }
+
+    /// Wait until this daemon reports `policy` as `expected`, and return the
+    /// whole reading — the last poll included.
+    pub async fn await_liveness(&self, policy: &str, expected: Liveness) -> WorkerLiveness {
+        self.observe(&format!("{policy} to report {expected}"), || async {
+            self.liveness()
+                .into_iter()
+                .find(|worker| worker.policy == policy && worker.liveness == expected)
+        })
+        .await
+    }
+
+    /// The durable stamp on the policy's cursor row: when its Leader last
+    /// polled, as any replica can read it.
+    pub async fn last_polled_at(&self) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT last_polled_at FROM policy_cursors WHERE name = $1",
+        )
+        .bind(&self.policy_name)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("the heartbeat observation must be readable")
+        .flatten()
+    }
+
+    /// The heartbeat the Leader's replica writes for this policy — everything a
+    /// consumer outside the process can see about it.
+    pub async fn heartbeat(&self) -> Option<Heartbeat> {
+        self.heartbeat_for(&self.policy_name).await
+    }
+
+    /// The same, for any policy registered through this harness.
+    pub async fn heartbeat_for(&self, policy: &str) -> Option<Heartbeat> {
+        let row = sqlx::query(
+            "SELECT last_beat_at, liveness, last_polled_at, led_by \
+             FROM policy_cursors WHERE name = $1",
+        )
+        .bind(policy)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("the heartbeat observation must be readable")?;
+
+        let beat_at: Option<DateTime<Utc>> = row.get("last_beat_at");
+        Some(Heartbeat {
+            beat_at: beat_at?,
+            liveness: row.get("liveness"),
+            last_polled_at: row.get("last_polled_at"),
+            led_by: row.get("led_by"),
+        })
+    }
+
+    /// Wait until a beat arrives that satisfies `holds`, and return it.
+    pub async fn await_heartbeat<F>(&self, what: &str, holds: F) -> Heartbeat
+    where
+        F: Fn(&Heartbeat) -> bool,
+    {
+        self.observe(what, || async { self.heartbeat().await.filter(&holds) })
+            .await
+    }
+
+    /// Hold the row lock on `policy`'s cursor row until the returned guard is
+    /// released — an operator part-way through a [Cursor move], sitting at a psql
+    /// prompt they have not typed `COMMIT` into.
+    ///
+    /// The row is locked, not changed: what a test asks with it is what the lock
+    /// alone costs the policies next door.
+    ///
+    /// [Cursor move]: ../../CONTEXT.md#cursor-move
+    pub async fn hold_cursor_row(&self, policy: &str) -> HeldCursorRow {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .expect("holding the cursor row must be possible");
+        sqlx::query("SELECT name FROM policy_cursors WHERE name = $1 FOR UPDATE")
+            .bind(policy)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the cursor row must exist before it can be held");
+        HeldCursorRow(tx)
+    }
+
+    /// Take the heartbeat columns away: the schema of a consumer who has not
+    /// added them, which the runner must tolerate.
+    ///
+    /// They are the consumer's, not the crate's, so this is a schema a deployment
+    /// can genuinely be in rather than a fault injected for the test. Call
+    /// [`restart`](Self::restart) afterwards to run a daemon that never saw them.
+    pub async fn drop_heartbeat_column(&self) {
+        sqlx::query(
+            "ALTER TABLE policy_cursors \
+               DROP COLUMN last_beat_at, \
+               DROP COLUMN liveness, \
+               DROP COLUMN last_polled_at, \
+               DROP COLUMN led_by",
+        )
+        .execute(&self.pool)
+        .await
+        .expect("dropping the heartbeat columns must succeed");
+    }
+
+    /// Start a second runner against this harness's database, registering the
+    /// same policy under the same name — the other replica.
+    ///
+    /// Both compete for the one advisory lock that elects the policy's Leader,
+    /// and the runner already polling holds it, so the replica stands by. It is
+    /// a separate daemon with its own liveness, which is the point: a Standby
+    /// must report itself from its own process.
+    pub fn start_replica(&self) -> PolicyDaemonReplica {
+        let escalations = Escalations::default();
+        let daemon = spawn_daemon(
+            &self.cqrs,
+            self.configure.as_ref(),
+            &self.policy_name,
+            &escalations,
+            SECOND_REPLICA,
+        );
+        PolicyDaemonReplica {
+            escalations,
+            daemon: Some(daemon),
+        }
     }
 
     /// The policy's dead letters — the reactions it parked — oldest first.
@@ -774,6 +942,65 @@ impl PolicyDaemonHarness {
             daemon.shutdown().await;
         }
     }
+
+    /// End the test without awaiting the daemon's tasks.
+    ///
+    /// The only way to finish a test whose worker is inside a reaction that
+    /// never returns: [`shutdown`](Self::shutdown) joins every task, and a
+    /// wedged worker joins when its reaction does — which is exactly what such a
+    /// test is proving does not happen. A real process ends the same way, by
+    /// exiting with the worker still in there, and the same isolation applies:
+    /// the tasks belong to this test's runtime and die with it, against a
+    /// database no other test can see.
+    pub fn abandon(self) {}
+}
+
+/// The second runner in a test: another process's daemon, against the same
+/// database and the same policy name.
+///
+/// It exposes what a replica can be asked about itself — its own workers'
+/// liveness — and nothing else. Everything in the database is already readable
+/// through the harness that owns it, and reading it twice would only invite a
+/// test to assert the same row from two places.
+pub struct PolicyDaemonReplica {
+    escalations: Escalations,
+    daemon: Option<PolicyRunnerDaemon>,
+}
+
+impl PolicyDaemonReplica {
+    /// What every worker in this replica is doing.
+    pub fn liveness(&self) -> Vec<WorkerLiveness> {
+        self.daemon
+            .as_ref()
+            .expect("the daemon is only taken by shutdown")
+            .liveness()
+    }
+
+    /// What this replica's escalation hook was told — a Standby that escalates
+    /// is the false alarm the liveness axis exists to prevent, so a test says so
+    /// rather than only checking the state.
+    pub fn escalations(&self) -> Vec<Escalation> {
+        self.escalations.recorded()
+    }
+
+    /// Stop this replica and await every task it spawned, releasing any advisory
+    /// lock it managed to take.
+    pub async fn shutdown(mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.shutdown().await;
+        }
+    }
+}
+
+/// Somebody else's open transaction on a cursor row. Dropping it rolls back, so
+/// a test that panics releases the row with its runtime.
+pub struct HeldCursorRow(sqlx::Transaction<'static, sqlx::Postgres>);
+
+impl HeldCursorRow {
+    /// Let the row go, without having changed it.
+    pub async fn release(self) {
+        let _ = self.0.rollback().await;
+    }
 }
 
 /// A policy name no other harness in this process can be using.
@@ -781,6 +1008,13 @@ fn unique_policy_name(label: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!("harness_{label}_{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
+
+/// What the harness's own daemon writes in `led_by`.
+pub const PRIMARY_REPLICA: &str = "harness-primary";
+
+/// What a [`PolicyDaemonHarness::start_replica`] daemon writes in `led_by`, so a
+/// test can tell which of the two wrote a beat.
+pub const SECOND_REPLICA: &str = "harness-replica";
 
 /// Build the configured runner and start it polling.
 ///
@@ -796,10 +1030,13 @@ fn spawn_daemon(
     configure: &Configure,
     policy_name: &str,
     escalations: &Escalations,
+    replica_id: &str,
 ) -> PolicyRunnerDaemon {
     configure(
         PolicyRunner::builder(cqrs.clone())
             .register_services::<Probe>(())
+            .with_heartbeat(DAEMON_HEARTBEAT_CADENCE)
+            .replica_id(replica_id)
             .on_escalation(escalations.hook()),
         policy_name,
     )
