@@ -653,3 +653,64 @@ async fn a_bulk_retry_pages_a_backlog_settling_each_reaction_once_postgres_test(
 
     harness.shutdown().await;
 }
+
+/// A second copy of a parked row — what a redelivery of its event leaves — is
+/// settled by the command it names, not archived as though it had resolved.
+///
+/// The replay ran that command once and two rows name it. The first takes its
+/// turn; the second is not a dispatch the reaction stopped emitting, it is the
+/// same command parked twice (funkode-io/replay#220), so it carries the same
+/// verdict. Archiving it as `retried` would report a recovery the replay just
+/// watched fail, and the duplicate rows outlive their cause.
+#[tokio::test]
+async fn a_redeliverys_duplicate_row_is_settled_by_the_command_it_names_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_duplicate", reaction.policy()).await;
+
+    harness.ping("subject-1", ONE_COMMAND).await;
+    let parked = harness.await_dead_letters(1).await;
+    let duplicate = harness.park_again(parked[0].id).await;
+
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        },
+        "one reaction, however many rows it has parked over its deliveries"
+    );
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        after.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![parked[0].id, duplicate],
+        "both rows name a command that failed again, so both stay parked, got {after:#?}"
+    );
+    assert!(
+        after
+            .iter()
+            .all(|row| row.error_message.contains(FIRST_FAILURE) && row.retry_count == 1),
+        "and both carry that command's fresh error, got {after:#?}"
+    );
+    assert!(
+        harness.archived_dead_letters().await.is_empty(),
+        "nothing resolved, so nothing is archived as retried"
+    );
+
+    // And when the command does resolve, the duplicate leaves with the row it
+    // duplicates: one replay, one verdict, every row that names it settled.
+    reaction.first_recovered.store(true, Ordering::SeqCst);
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 1,
+            reactions_still_failing: 0,
+        }
+    );
+    assert!(harness.dead_letters().await.is_empty());
+    assert_eq!(
+        archived_ids(&harness.archived_dead_letters().await),
+        vec![(parked[0].id, "retried"), (duplicate, "retried")]
+    );
+
+    harness.shutdown().await;
+}

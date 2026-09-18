@@ -52,7 +52,10 @@ What changes is what a retry is *for* — one reaction, not one row.
   row whose command fails again is updated in place with **its own** error. Two
   identical dispatches to the same stream are indistinguishable — the command's
   variant and payload are not recorded — so they settle the two rows in
-  production order.
+  production order. A row left over once every dispatch of its identity is spoken
+  for is a *second delivery's copy* of one of them (funkode-io/replay#220), not a
+  command the reaction stopped emitting: it takes the same verdict as the last
+  dispatch of that identity rather than being archived as resolved.
 
 - **A row the replay ran no command for is settled by what the replay can say
   about it.** A row naming a command the reaction no longer emits is resolved:

@@ -1061,7 +1061,7 @@ impl PolicyRunner {
             let outcome = match row.identity.as_ref() {
                 // The command this row was parked for ran again: its own
                 // outcome settles it.
-                Some(identity) => replay.claim(identity).unwrap_or_else(|| replay.unmatched()),
+                Some(identity) => replay.settlement_for(identity),
                 // The row names no command, so only the replay as a whole can
                 // settle it.
                 None => replay.verdict(),
@@ -2352,17 +2352,47 @@ enum Replay {
 }
 
 impl Replay {
+    /// What settles a row naming `identity`.
+    ///
+    /// The dispatch it names, if the replay ran one whose turn has not been
+    /// taken; failing that the last dispatch of the same identity, because a
+    /// second row naming a command the replay produced only once is another
+    /// delivery's copy of it (funkode-io/replay#220) and the command concluded
+    /// once, for both; failing that, the replay as a whole.
+    fn settlement_for(&mut self, identity: &ParkedIdentity) -> Option<Settlement> {
+        if let Some(outcome) = self.claim(identity) {
+            return outcome;
+        }
+        if let Some(outcome) = self.repeated(identity) {
+            return outcome;
+        }
+        self.unmatched()
+    }
+
     /// Claim the dispatch `identity` names, if this replay ran one: `Some(None)`
     /// when it resolved, `Some(Some(_))` when it failed again, `None` when the
-    /// replay produced no such dispatch.
+    /// replay produced no such dispatch, or none whose turn is still to come.
     fn claim(&mut self, identity: &ParkedIdentity) -> Option<Option<Settlement>> {
-        let concluded = match self {
-            Self::Ran(concluded) | Self::Panicked { concluded, .. } => concluded,
-        };
-        let dispatch = concluded
+        let dispatch = self
+            .concluded_mut()
             .iter_mut()
             .find(|dispatch| !dispatch.claimed && identity.names(&dispatch.identity))?;
         dispatch.claimed = true;
+        Some(dispatch.failure.as_ref().map(Settlement::of))
+    }
+
+    /// What the last dispatch of this identity concluded, claimed or not.
+    ///
+    /// A reaction emitting the command twice parks two rows and settles them in
+    /// order through [`claim`](Self::claim); a row left over after every such
+    /// dispatch is spoken for is not a third dispatch, it is the same command
+    /// parked again by another delivery. Archiving it as resolved would say the
+    /// command recovered when the replay just watched it fail.
+    fn repeated(&self, identity: &ParkedIdentity) -> Option<Option<Settlement>> {
+        let dispatch = self
+            .concluded()
+            .iter()
+            .rfind(|dispatch| identity.names(&dispatch.identity))?;
         Some(dispatch.failure.as_ref().map(Settlement::of))
     }
 
@@ -2387,6 +2417,18 @@ impl Replay {
                 .iter()
                 .find_map(|dispatch| dispatch.failure.as_ref())
                 .map(Settlement::of),
+        }
+    }
+
+    fn concluded(&self) -> &[ReplayedDispatch] {
+        match self {
+            Self::Ran(concluded) | Self::Panicked { concluded, .. } => concluded,
+        }
+    }
+
+    fn concluded_mut(&mut self) -> &mut Vec<ReplayedDispatch> {
+        match self {
+            Self::Ran(concluded) | Self::Panicked { concluded, .. } => concluded,
         }
     }
 }

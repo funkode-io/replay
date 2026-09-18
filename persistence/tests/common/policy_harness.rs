@@ -48,6 +48,8 @@
 //!   by the id an operator reads off the table.
 //! - [`PolicyDaemonHarness::park_without_identity`] — a row as a release before
 //!   the identity migration parked it, which running code can no longer write.
+//! - [`PolicyDaemonHarness::park_again`] — the second copy of a parked row that a
+//!   redelivery leaves, the one thing about it a test cannot cause on demand.
 //!
 //! Tasks, channels and in-process state are deliberately absent.
 //!
@@ -793,6 +795,28 @@ impl PolicyDaemonHarness {
         .fetch_one(&self.pool)
         .await
         .expect("a pre-migration row must still be insertable")
+    }
+
+    /// Park a second copy of `id`, the way a redelivery of its event does.
+    ///
+    /// A dead letter is written before the batched cursor checkpoint, so a crash
+    /// in between — or an operator rewinding the cursor — parks the reaction's
+    /// rows again (funkode-io/replay#220). Copying the row is the one way to put
+    /// a test in front of that backlog: crashing a worker inside that window on
+    /// demand is not something an operator can do either.
+    pub async fn park_again(&self, id: i64) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO policy_dead_letters \
+                 (policy_name, global_position, event_id, error_kind, error_message, \
+                  aggregate_name, target_stream_id, command_name) \
+             SELECT policy_name, global_position, event_id, error_kind, error_message, \
+                    aggregate_name, target_stream_id, command_name \
+             FROM policy_dead_letters WHERE id = $1 RETURNING id",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .expect("a redelivery's duplicate must be insertable")
     }
 
     /// The policy's archived dead letters — what left the active set, and why.
