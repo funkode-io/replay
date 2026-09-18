@@ -118,9 +118,10 @@ impl Narration {
     /// Hear what a read of the feed found, and return the record it earns, if
     /// any.
     ///
-    /// A poll that *failed* is not an observation: the caller reports the error
-    /// and says nothing here, so a database outage cannot be narrated as a
-    /// catch-up.
+    /// A failure is not an observation: the caller reports the error and tells
+    /// nothing here, so no outage can be narrated as a catch-up. It does not
+    /// retract what the same poll told earlier — a window it opened on, positions
+    /// it advanced over — because that happened.
     pub(crate) fn polled(&mut self, poll: Poll) -> Option<Record> {
         match (&mut self.state, poll) {
             (_, Poll::Stalled) => None,
