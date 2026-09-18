@@ -945,6 +945,15 @@ impl PolicyRunner {
             event_id,
         } = reaction;
 
+        // The group, before anything is re-executed: a reaction whose every row
+        // was discarded between the caller's read and this one has nothing left
+        // to settle, and replaying it would dispatch commands on behalf of rows
+        // an operator has just retired.
+        let rows = load_parked_reaction(&self.pool, &policy_name, event_id).await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let policy = self
             .policies
             .iter()
@@ -965,8 +974,6 @@ impl PolicyRunner {
                     .with_context("policy", &policy_name)
                     .with_context("event_id", event_id)
             })?;
-
-        let rows = load_parked_reaction(&self.pool, &policy_name, event_id).await?;
 
         // Reproduce and execute every dispatch the reaction now yields, carrying
         // on past a failure exactly as the forward drain does: stopping at the
@@ -1124,8 +1131,8 @@ impl PolicyRunner {
     /// every row was archived is resolved, one with any row still parked is
     /// still failing. The policy has fully recovered when
     /// `reactions_still_failing == 0`. A policy with no parked dead letters is a
-    /// clean no-op (a zero summary). Rows removed concurrently (e.g. by
-    /// [`discard_dead_letter`](Self::discard_dead_letter)) are skipped.
+    /// clean no-op (a zero summary), and so is a reaction whose rows were all
+    /// discarded concurrently: it is skipped without being replayed.
     pub async fn retry_policy_dead_letters(
         &self,
         policy_name: &str,

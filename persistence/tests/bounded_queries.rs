@@ -41,13 +41,6 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/policy_runner.rs",
-        function: "retry_policy_dead_letters",
-        justification: "Reads one row per parked *reaction* — a uuid and a position — for \
-                        one policy. Grows with a policy's recorded failures, and an \
-                        operator retrying them is an explicit act on a set they can see.",
-    },
-    Reviewed {
-        file: "src/policy_runner.rs",
         function: "load_parked_reaction",
         justification: "One reaction's rows: at most one per dispatch the reaction returns, \
                         which is the vector `react_erased` already materialises. Bounded by \
@@ -60,6 +53,14 @@ const REVIEWED: &[Reviewed] = &[
                         them, not by data.",
     },
     // ── Known unbounded ──────────────────────────────────────────────────────
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "retry_policy_dead_letters",
+        justification: "UNBOUNDED — one row per parked *reaction* (a uuid and a position) for \
+                        one policy, with no LIMIT. Tracked by funkode-io/replay#218, which \
+                        pages the enumeration; this entry moves up to a real bound then, \
+                        rather than being amended.",
+    },
     Reviewed {
         file: "src/infrastructure/postgres.rs",
         function: "load_events_for_replay",

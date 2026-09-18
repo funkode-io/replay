@@ -123,5 +123,10 @@ What changes is what a retry is *for* — one reaction, not one row.
   existing ones — but "carry on past the failure, park what failed with its own
   error" is one rule stated twice rather than two rules.
 
+- **Enumerating a policy's parked reactions is still unbounded.** One row per
+  parked event rather than per parked row, which is fewer, but a bulk retry still
+  reads the set before it replays any of it (funkode-io/replay#218). The group a
+  replay settles is bounded, by the commands the reaction returns.
+
 [Dead letter]: ../../CONTEXT.md#dead-letter
 [Retry]: ../../CONTEXT.md#retry
