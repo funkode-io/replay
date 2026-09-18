@@ -133,7 +133,7 @@ pub(crate) struct Waiting {
     /// nothing else. It is not the feed's head and not a backlog: the feed advances in
     /// `(commit_txid, global_position)` order, where a later point can hold a lower
     /// position, so the arithmetic distance from a cursor to this number means nothing
-    /// (ADR-0021). Logged as `log_max_position` so an incident cannot read it as one.
+    /// (ADR-0022). Logged as `log_max_position` so an incident cannot read it as one.
     pub(crate) log_max_position: i64,
     /// The oldest event the watermark holds back, and the transaction that wrote it.
     pub(crate) withheld: FeedPoint,

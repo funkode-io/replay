@@ -60,7 +60,7 @@ _Avoid_: offset, sequence number, event time.
 The slice of the event log one [Policy] reads on a poll: every event past its cursor
 written below the **commit watermark**, in `([Commit stamp], [Global position])` order, up
 to its read batch size and **before** its `stream_filter` is applied
-([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)). The watermark
+([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)). The watermark
 is `pg_snapshot_xmin`, the oldest transaction still running **anywhere in the instance** —
 so an event whose own transaction has committed stays withheld while any older
 xid-bearing write is open, including one in another database
@@ -96,6 +96,12 @@ like any transient failure and, once the retries are exhausted, recorded as kind
 `Timeout`.
 A delivery parks what its settling attempt failed on: a command that fails
 permanently is recorded once, however many attempts a retryable sibling forces.
+A row names the dispatch it is about — the [Aggregate] type, the URN of the
+instance the command was addressed to, and the command's **type** (its variant
+and payload are not recorded, as `Aggregate::Command` carries no `Debug` or
+`Serialize` bound) — so "which customer is stuck" is answerable from the table.
+A reaction that panicked before building a dispatch has nothing to name, and its
+identity columns are null.
 Dead letters are queryable so an operator can later inspect them and either
 [Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.
@@ -185,7 +191,7 @@ A `global_position` taken from the sequence by a transaction that then aborted.
 `nextval` is not transactional, so the value is never returned to the sequence and
 no event can ever carry it. Since the [Policy feed] reads in [Commit stamp] order it
 is not a hole in what a Policy reads — it belongs to no event, so it is simply not in
-that order ([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)).
+that order ([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)).
 It is still visible in the log's numbering, where positions are not dense.
 _Avoid_: gap, hole (as a name for the permanent kind), lost position, skipped
 position.
@@ -202,7 +208,7 @@ sentinel `0`, which orders before every real id. A [Policy]'s cursor records the
 it stopped in alongside the position
 ([0022](persistence/tests/migrations/0022_policy_cursor_commit_txid.sql)), and the feed
 reads by the pair, below the watermark of transactions that have all ended
-([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)).
+([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)).
 _Avoid_: commit id, transaction number, xmin, sequence.
 
 ### Policy runner
@@ -299,6 +305,17 @@ long. It is not a terminal state: a Policy that remains at zero lag is simply
 idle, and the next appended event returns it to working. Nothing is caught up
 for a stretch of time — only at the instant it arrives.
 _Avoid_: up to date, in sync, complete, finished.
+
+### Narration
+
+What a [Policy] writes to the log: an edge, never an event. A burst is bracketed
+by a record when work appears and the [Caught up] record that ends it, with a
+bounded progress record in between while a backlog is still draining
+([ADR-0021](docs/adr/0021-a-policy-narrates-its-transitions.md)). Output is
+proportional to how often a Policy changes state, not to how much work it does,
+which is what keeps an idle Policy's silence readable as a signal. Per-dispatch
+detail exists at `debug` and is off by default.
+_Avoid_: logging, tracing, audit trail, telemetry.
 
 ### Scoped URN
 
@@ -405,6 +422,7 @@ it:
 [Heartbeat]: #heartbeat
 [Progress]: #progress
 [Caught up]: #caught-up
+[Narration]: #narration
 [Query]: #query
 [Scoped URN]: #scoped-urn
 [Live projection]: #live-projection

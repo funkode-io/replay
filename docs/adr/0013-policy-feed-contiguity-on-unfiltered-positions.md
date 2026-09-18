@@ -1,7 +1,7 @@
 # A Policy's feed decides contiguity on unfiltered positions
 
 **Status:** the filtering decision is accepted and current; the contiguity decision is
-superseded by [ADR-0021](0021-policy-feed-reads-below-the-commit-watermark.md)
+superseded by [ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md)
 
 **Still in force:** the window a Policy's cursor walks is read **unfiltered**, and the
 `stream_filter` decides delivery only. An excluded row advances the cursor and fires
@@ -37,7 +37,7 @@ fires nothing, like a compaction snapshot.
 How far the cursor could then advance was a pure function of that window — the prefix
 contiguous from `cursor + 1` — in `policy_feed`, and gap handling
 (funkode-io/replay#164) went there. Both are gone: the window is now every row past the
-cursor in commit order, all of it advanceable (ADR-0021).
+cursor in commit order, all of it advanceable (ADR-0022).
 
 The rule rested on one event per position: a cursor that steps one position at a time
 steps *over* the second event at a shared position. Since

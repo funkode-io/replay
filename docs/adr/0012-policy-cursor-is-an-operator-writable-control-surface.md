@@ -1,7 +1,7 @@
 # The persisted policy cursor is an operator-writable control surface
 
 **Status:** accepted; the derivation of the transaction half is amended by
-[ADR-0021](0021-policy-feed-reads-below-the-commit-watermark.md), which changed what a
+[ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md), which changed what a
 position can mean. The control surface itself is unchanged: an operator writes a
 position.
 
@@ -42,7 +42,7 @@ the daemon runs, and the in-memory position is a lease on it.
   completed pair back, so the row shows the point the Policy resumes from rather than
   the half-instruction it was given. The compare-and-set covers both halves.
 
-  **Amended by ADR-0021.** The completion was "the transaction that wrote the last event
+  **Amended by ADR-0022.** The completion was "the transaction that wrote the last event
   at or before the position". Once the feed reads in `(commit_txid, global_position)`
   order that is unsafe: an event past the position can belong to an *older* transaction,
   and completing this way sorts it behind the cursor and loses it. The position is now
@@ -85,7 +85,7 @@ the daemon runs, and the in-memory position is a lease on it.
 
 - **Honouring a transaction half an operator writes by hand.** Rejected here on the
   grounds that it could not be told apart from the stale one a position-only move leaves
-  in the row. **ADR-0021 supplies the test that was missing**: a pair is honoured exactly
+  in the row. **ADR-0022 supplies the test that was missing**: a pair is honoured exactly
   when the event at `position` carries that `commit_txid`, which a stale half does not,
   and which a row the runner wrote always does. The runner must honour such a pair — its
   own rows are indistinguishable from an operator's, and re-deriving them would rewind a

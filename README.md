@@ -2449,12 +2449,23 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
     event_id         UUID        NOT NULL,   -- UUID of the triggering event
     error_kind       TEXT        NOT NULL,   -- ErrorKind text, or "Panic" / "Timeout"
     error_message    TEXT        NOT NULL,   -- human-readable detail for triage
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    aggregate_name   TEXT,                   -- Rust type name of the target aggregate
+    target_stream_id TEXT,                   -- URN of the instance the command was sent to
+    command_name     TEXT                    -- Rust type name of the command
 );
 
 CREATE INDEX IF NOT EXISTS idx_dead_letters_policy
     ON policy_dead_letters (policy_name, created_at DESC);
 ```
+
+The three identity columns are captured on the `Dispatch` itself, so a policy
+needs no change to get them. They are nullable for the two cases with no
+dispatch to name: a row parked before the identity migration
+([0024](persistence/tests/migrations/0024_dead_letter_identity.sql)), and a panic
+in `react` itself, which fails before it has built a dispatch. The command's
+*variant* and payload are not recorded — `Aggregate::Command` carries no `Debug`
+or `Serialize` bound.
 
 **Triage queries:**
 
@@ -2464,6 +2475,10 @@ SELECT * FROM policy_dead_letters
 WHERE  policy_name = 'deposit_fee'
 ORDER  BY created_at DESC
 LIMIT  20;
+
+-- Everything parked against one aggregate instance: "which customer is stuck"
+SELECT * FROM policy_dead_letters
+WHERE  target_stream_id = 'urn:bank-account:42';
 
 -- Look up the original event for manual replay
 SELECT * FROM events WHERE id = '<event_id from dead letter>';
@@ -2524,7 +2539,10 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
     error_message    TEXT        NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL,   -- when the dead letter was written
     reason           TEXT        NOT NULL,   -- 'retried' | 'discarded'
-    discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    aggregate_name   TEXT,                   -- identity the row carried, kept as-is
+    target_stream_id TEXT,
+    command_name     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy
@@ -2679,6 +2697,45 @@ writes its row, so a standby never overwrites a leader's beat, and the crate nev
 reads any of it back. `.without_heartbeat()` turns it off entirely; liveness stays
 readable in-process.
 
+### What a policy logs
+
+A policy's output is proportional to how often it changes state, not to how many
+events it processes
+([ADR-0021](docs/adr/0021-a-policy-narrates-its-transitions.md)). A burst of work
+is bracketed by two `info` records, and a policy with nothing to do writes
+nothing at any level, however often it polls — so silence means "nothing
+happened", not "nothing is known".
+
+| Record | When | Carries |
+|--------|------|---------|
+| `policy has work to do` | a poll reads a non-empty window, before any of it is dispatched | the policy |
+| `policy is working through its backlog` | the first cursor advance at least 30 s after the previous record | events so far, elapsed |
+| `policy is caught up` | the first poll that finds the feed exhausted | events in the burst, elapsed |
+| `policy dispatch committed` | every dispatch that commits, at `debug` | event, aggregate, elapsed |
+
+The counts are feed positions the cursor advanced over, not reactions executed: a
+policy whose `stream_filter` excludes a whole window worked through it, and is
+not caught up until the feed is empty. The elapsed time runs from the read that
+found the work to the last position the burst advanced over, so the idle interval
+before the empty poll that notices is not charged to it — which also means the
+catch-up record arrives up to one poll interval late.
+
+Records are written as the cursor moves, not when a poll returns, so a batch
+whose dispatches take minutes still reports progress while it runs — and the
+opening record precedes the first reaction, so everything that reaction logs
+falls inside the bracket. A policy that
+stops in front of a hole is **not** caught up and does not say it is: the bracket
+stays open, and the blocked record (`warn`) is what names the stop. A worker held
+inside a single reaction narrates nothing at all — that is the liveness axis's
+question, and the heartbeat answers it from a task of its own.
+
+Turn `debug` on for `replay_persistence::policy_runner` to see each dispatch that
+commits while you are looking at one policy; it is six figures of records for a
+large import, which is why it is off by default. A dispatch that is declined,
+retried or parked reports at its own level, and restarts, escalations and a
+policy parked in front of a hole are logged by the machinery that owns them
+(`warn` and `error`), not by this path.
+
 ### Monitoring policy status
 
 A running policy is otherwise opaque: its cursor and dead letters live in
@@ -2775,7 +2832,7 @@ permanently stopped one produced byte-identical output: nothing.
 
 The feed delivers an event only once the transaction that wrote it has ended, so a write
 held open holds back everything committed after it
-([ADR-0021](docs/adr/0021-policy-feed-reads-below-the-commit-watermark.md)). That wait is
+([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)). That wait is
 the only thing that stops a policy now, and these are the lines it writes:
 
 | Level | When | Fields |

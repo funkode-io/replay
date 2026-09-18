@@ -10,6 +10,7 @@ mod policy;
 mod policy_blocked;
 mod policy_feed;
 mod policy_liveness;
+mod policy_narration;
 mod policy_runner;
 mod policy_status;
 mod query;
