@@ -40,6 +40,11 @@ const SAME_TARGET: &str = "same-target";
 /// panics inside its handler.
 const PANIC_AFTER: &str = "panic-after";
 
+/// The same, both at the **same** instance: the concluded command and the
+/// panicking one are indistinguishable to a row, so the second row can only be
+/// settled by the panic.
+const PANIC_SAME_TARGET: &str = "panic-same-target";
+
 /// Tag whose reaction dispatches one command, for tests that care about how many
 /// reactions there are rather than what each parks.
 const ONE_COMMAND: &str = "one-command";
@@ -93,6 +98,16 @@ impl TwoCommandPolicy {
         };
         Dispatch::to::<Probe>(ProbeUrn::new(stream).unwrap(), command)
     }
+
+    /// A dispatch that panics inside the command handler.
+    fn explode(stream: &str) -> Dispatch {
+        Dispatch::to::<Probe>(
+            ProbeUrn::new(stream).unwrap(),
+            ProbeCommand::Explode {
+                reason: PANIC_REASON.to_string(),
+            },
+        )
+    }
 }
 
 impl Policy for TwoCommandPolicy {
@@ -120,15 +135,8 @@ impl Policy for TwoCommandPolicy {
                 first(),
                 Self::dispatch(FIRST_SUBJECT, &self.second_recovered, SECOND_FAILURE),
             ],
-            PANIC_AFTER => vec![
-                first(),
-                Dispatch::to::<Probe>(
-                    ProbeUrn::new(SECOND_SUBJECT).unwrap(),
-                    ProbeCommand::Explode {
-                        reason: PANIC_REASON.to_string(),
-                    },
-                ),
-            ],
+            PANIC_AFTER => vec![first(), Self::explode(SECOND_SUBJECT)],
+            PANIC_SAME_TARGET => vec![first(), Self::explode(FIRST_SUBJECT)],
             ONE_COMMAND => vec![first()],
             _ => return vec![],
         };
@@ -710,6 +718,59 @@ async fn a_redeliverys_duplicate_row_is_settled_by_the_command_it_names_postgres
     assert_eq!(
         archived_ids(&harness.archived_dead_letters().await),
         vec![(parked[0].id, "retried"), (duplicate, "retried")]
+    );
+
+    harness.shutdown().await;
+}
+
+/// A row the replay never reached carries the panic, even when a *concluded*
+/// dispatch shares its identity.
+///
+/// The two dispatches are indistinguishable to a row — same aggregate, same
+/// URN, same command type — so once the first has taken its turn, the second row
+/// looks exactly like a redelivery's duplicate of it. It is not: the reaction
+/// panicked before saying anything about the command that row was parked for,
+/// and only a replay that ran to completion can settle a left-over row from a
+/// dispatch of the same identity.
+#[tokio::test]
+async fn a_row_the_panic_cut_short_is_not_settled_by_its_concluded_twin_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_panic_twin", reaction.policy()).await;
+
+    harness.ping("subject-1", PANIC_SAME_TARGET).await;
+    let parked = harness.await_dead_letters(2).await;
+    assert_eq!(
+        parked
+            .iter()
+            .map(|row| row.target_stream_id.clone())
+            .collect::<Vec<_>>(),
+        vec![Some(urn_of(FIRST_SUBJECT)); 2],
+        "the fixture is only a test of this if both rows name the same target"
+    );
+    assert_eq!(parked[1].error_kind, PANIC_KIND);
+
+    // The first command resolves this time; the second still panics.
+    reaction.first_recovered.store(true, Ordering::SeqCst);
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        }
+    );
+
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        after.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![parked[1].id],
+        "the row the panic cut short stays parked, got {after:#?}"
+    );
+    assert_eq!(after[0].error_kind, PANIC_KIND);
+    assert!(after[0].error_message.contains(PANIC_REASON));
+    assert_eq!(
+        archived_ids(&harness.archived_dead_letters().await),
+        vec![(parked[0].id, "retried")],
+        "only the command that actually concluded resolves its row"
     );
 
     harness.shutdown().await;

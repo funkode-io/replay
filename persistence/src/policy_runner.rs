@@ -2388,9 +2388,16 @@ impl Replay {
     /// dispatch is spoken for is not a third dispatch, it is the same command
     /// parked again by another delivery. Archiving it as resolved would say the
     /// command recovered when the replay just watched it fail.
+    ///
+    /// Only a replay that ran to completion can say this. A panicked one never
+    /// reached the dispatches after the panic, so a left-over row may be one of
+    /// *those* rather than a duplicate — and what the replay knows about a
+    /// command it did not reach is only that it panicked.
     fn repeated(&self, identity: &ParkedIdentity) -> Option<Option<Settlement>> {
-        let dispatch = self
-            .concluded()
+        let Self::Ran(concluded) = self else {
+            return None;
+        };
+        let dispatch = concluded
             .iter()
             .rfind(|dispatch| identity.names(&dispatch.identity))?;
         Some(dispatch.failure.as_ref().map(Settlement::of))
@@ -2417,12 +2424,6 @@ impl Replay {
                 .iter()
                 .find_map(|dispatch| dispatch.failure.as_ref())
                 .map(Settlement::of),
-        }
-    }
-
-    fn concluded(&self) -> &[ReplayedDispatch] {
-        match self {
-            Self::Ran(concluded) | Self::Panicked { concluded, .. } => concluded,
         }
     }
 
