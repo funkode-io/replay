@@ -2069,7 +2069,35 @@ impl std::fmt::Display for DispatchFailure {
 #[derive(Default)]
 struct Attempt {
     number: u32,
-    failures: Vec<DispatchFailure>,
+    failures: Vec<FailedDispatch>,
+    /// The dispatch being awaited right now, if any. What names the failure when
+    /// the delivery ends by unwinding out of a command handler instead of
+    /// returning an error.
+    in_flight: Option<DispatchIdentity>,
+}
+
+/// A dispatch that failed, and which dispatch it was.
+struct FailedDispatch {
+    identity: DispatchIdentity,
+    failure: DispatchFailure,
+}
+
+/// What a parked row names, read off a [`Dispatch`] before it is executed.
+#[derive(Clone)]
+struct DispatchIdentity {
+    aggregate_name: &'static str,
+    target_stream_id: String,
+    command_name: &'static str,
+}
+
+impl DispatchIdentity {
+    fn of(dispatch: &Dispatch) -> Self {
+        Self {
+            aggregate_name: dispatch.aggregate_name(),
+            target_stream_id: dispatch.target_stream_id().to_string(),
+            command_name: dispatch.command_name(),
+        }
+    }
 }
 
 /// The failures of the attempt in progress, held until the delivery settles.
@@ -2100,10 +2128,24 @@ impl PendingFailures {
         let mut attempt = self.lock();
         attempt.number = number;
         attempt.failures.clear();
+        attempt.in_flight = None;
     }
 
-    fn push(&self, failure: DispatchFailure) {
-        self.lock().failures.push(failure);
+    /// Record the dispatch about to be awaited, so a panic in its handler is
+    /// parked naming it. Cleared by [`Self::returned`] whatever the outcome, so
+    /// what an unwind finds here is the dispatch it unwound out of.
+    fn dispatching(&self, identity: DispatchIdentity) {
+        self.lock().in_flight = Some(identity);
+    }
+
+    fn returned(&self) {
+        self.lock().in_flight = None;
+    }
+
+    fn push(&self, identity: DispatchIdentity, failure: DispatchFailure) {
+        self.lock()
+            .failures
+            .push(FailedDispatch { identity, failure });
     }
 
     /// Take what the attempt in progress has failed on, leaving it empty, so a
@@ -2464,12 +2506,18 @@ impl Delivery<'_> {
                 // A panic settles the delivery, so the dispatches that had
                 // already failed in this attempt are parked with it: the unwind
                 // crossed the buffer rather than carrying it off.
-                self.park(global_position, raw, pending.take()).await?;
+                let attempt = pending.take();
+                // The dispatch the unwind came out of, when it came out of one:
+                // a panic in `react` itself has none, and its row says so with
+                // null identity columns rather than with a guess.
+                let in_flight = attempt.in_flight.clone();
+                self.park(global_position, raw, attempt).await?;
                 write_dead_letter(
                     self.pool,
                     policy_name,
                     global_position,
                     raw,
+                    in_flight.as_ref(),
                     PANIC_ERROR_KIND,
                     &message,
                 )
@@ -2524,10 +2572,14 @@ impl Delivery<'_> {
             let mut need_retry = false;
 
             for dispatch in dispatches {
-                match self
+                let identity = DispatchIdentity::of(&dispatch);
+                pending.dispatching(identity.clone());
+                let outcome = self
                     .execute_dispatch_within(global_position, raw, dispatch)
-                    .await
-                {
+                    .await;
+                pending.returned();
+
+                match outcome {
                     Ok(()) => {
                         executed += 1;
                     }
@@ -2536,6 +2588,8 @@ impl Delivery<'_> {
                             policy          = %policy_name,
                             event_id        = %raw.id,
                             global_position,
+                            aggregate       = identity.aggregate_name,
+                            target          = %identity.target_stream_id,
                             error           = %failure,
                             "policy dispatch declined by aggregate business rule; advancing cursor"
                         );
@@ -2546,6 +2600,8 @@ impl Delivery<'_> {
                             event_id        = %raw.id,
                             global_position,
                             attempt,
+                            aggregate       = identity.aggregate_name,
+                            target          = %identity.target_stream_id,
                             error           = %failure,
                             "policy dispatch failed with retryable error; backing off before retry"
                         );
@@ -2555,7 +2611,7 @@ impl Delivery<'_> {
                     Err(failure) => {
                         // Permanent error, or retryable (including a timeout) but
                         // retries exhausted.
-                        pending.push(failure);
+                        pending.push(identity, failure);
                     }
                 }
             }
@@ -2573,20 +2629,26 @@ impl Delivery<'_> {
         Ok(0)
     }
 
-    /// Write a dead letter for everything an attempt failed on.
+    /// Write a dead letter for everything an attempt failed on, each row naming
+    /// the dispatch it is about.
     async fn park(
         &self,
         global_position: i64,
         raw: &PersistedEvent<Value>,
         attempt: Attempt,
     ) -> Result<(), replay::Error> {
-        let Attempt { number, failures } = attempt;
-        for failure in failures {
+        let Attempt {
+            number, failures, ..
+        } = attempt;
+        for FailedDispatch { identity, failure } in failures {
             tracing::error!(
                 policy          = %self.policy_name,
                 event_id        = %raw.id,
                 global_position,
                 attempt         = number,
+                aggregate       = identity.aggregate_name,
+                target          = %identity.target_stream_id,
+                command         = identity.command_name,
                 error           = %failure,
                 "policy dispatch failed permanently; writing dead-letter and advancing cursor"
             );
@@ -2595,6 +2657,7 @@ impl Delivery<'_> {
                 self.policy_name,
                 global_position,
                 raw,
+                Some(&identity),
                 &failure.error_kind(),
                 &failure.to_string(),
             )
@@ -2673,24 +2736,33 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 ///
 /// `error_kind` is the [`replay::ErrorKind`] of a returned error, or
 /// [`PANIC_ERROR_KIND`] when the reaction panicked.
+///
+/// `identity` names the dispatch that failed. `None` only where there is no
+/// dispatch to name — a panic in `react` itself, which fails before it has built
+/// one — and the row's identity columns stay null.
 async fn write_dead_letter(
     pool: &Pool<Postgres>,
     policy_name: &str,
     global_position: i64,
     raw: &PersistedEvent<Value>,
+    identity: Option<&DispatchIdentity>,
     error_kind: &str,
     error_message: &str,
 ) -> Result<(), replay::Error> {
     sqlx::query(
         "INSERT INTO policy_dead_letters \
-         (policy_name, global_position, event_id, error_kind, error_message) \
-         VALUES ($1, $2, $3, $4, $5)",
+         (policy_name, global_position, event_id, error_kind, error_message, \
+          aggregate_name, target_stream_id, command_name) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(policy_name)
     .bind(global_position)
     .bind(raw.id)
     .bind(error_kind)
     .bind(error_message)
+    .bind(identity.map(|i| i.aggregate_name))
+    .bind(identity.map(|i| i.target_stream_id.as_str()))
+    .bind(identity.map(|i| i.command_name))
     .execute(pool)
     .await
     .map_err(crate::db_error)?;
@@ -2736,13 +2808,16 @@ async fn move_dead_letter_to_archive(
              DELETE FROM policy_dead_letters \
              WHERE id = $1 \
              RETURNING id, policy_name, global_position, event_id, error_kind, \
-                       error_message, created_at \
+                       error_message, created_at, aggregate_name, target_stream_id, \
+                       command_name \
          ) \
          INSERT INTO discarded_dead_letters \
              (dead_letter_id, policy_name, global_position, event_id, error_kind, \
-              error_message, created_at, reason) \
+              error_message, created_at, reason, aggregate_name, target_stream_id, \
+              command_name) \
          SELECT id, policy_name, global_position, event_id, error_kind, \
-                error_message, created_at, $2 \
+                error_message, created_at, $2, aggregate_name, target_stream_id, \
+                command_name \
          FROM moved",
     )
     .bind(id)

@@ -12,6 +12,7 @@ use std::any::{Any, TypeId};
 use std::time::Duration;
 
 use serde::Deserialize;
+use urn::Urn;
 
 use replay::{Aggregate, Event, Metadata};
 
@@ -36,9 +37,17 @@ pub enum StartAt {
 /// concrete aggregate via `register_services::<A>` — downcasts the payload and
 /// runs it through `Cqrs::execute`. Crucially this struct names no Postgres or
 /// tokio types, so it stays WASM-ready.
+///
+/// It also carries, in the open, the identity a parked [dead letter] is read by:
+/// the target stream's URN and the command's type name. Both are legible only
+/// here — past this point the pair is an opaque `Any`.
+///
+/// [dead letter]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#dead-letter
 pub struct Dispatch {
     pub(crate) target: TypeId,
     pub(crate) aggregate_name: &'static str,
+    pub(crate) target_stream_id: Urn,
+    pub(crate) command_name: &'static str,
     pub(crate) payload: Box<dyn Any + Send>,
     pub(crate) expected_version: Option<i64>,
     pub(crate) metadata: Option<Metadata>,
@@ -60,6 +69,10 @@ impl Dispatch {
         Dispatch {
             target: TypeId::of::<A>(),
             aggregate_name: std::any::type_name::<A>(),
+            // Legible only here: past this point the pair is an opaque `Any`
+            // (funkode-io/replay#210).
+            target_stream_id: id.clone().into(),
+            command_name: std::any::type_name::<A::Command>(),
             payload: Box::new((id, command)),
             expected_version: None,
             metadata: None,
@@ -83,6 +96,19 @@ impl Dispatch {
     /// The Rust type name of the target aggregate (diagnostics only).
     pub fn aggregate_name(&self) -> &'static str {
         self.aggregate_name
+    }
+
+    /// The URN of the aggregate instance this command is addressed to.
+    pub fn target_stream_id(&self) -> &Urn {
+        &self.target_stream_id
+    }
+
+    /// The Rust type name of the command (diagnostics only).
+    ///
+    /// The type, not the variant: `Aggregate::Command` carries no `Debug` or
+    /// `Serialize` bound, and adding one would break every consumer.
+    pub fn command_name(&self) -> &'static str {
+        self.command_name
     }
 }
 
@@ -407,6 +433,14 @@ mod tests {
             "matching payload must produce one command"
         );
         assert_eq!(dispatches[0].target(), TypeId::of::<Account>());
+
+        // The identity a parked dead letter is read by, taken from the id and
+        // the command type before either is erased.
+        assert_eq!(dispatches[0].target_stream_id(), &raw.stream_id);
+        assert_eq!(
+            dispatches[0].command_name(),
+            std::any::type_name::<<Account as Aggregate>::Command>()
+        );
 
         // The command was built from the deserialized payload and the borrowed
         // envelope's stream id, so both survived the erasure.

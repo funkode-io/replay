@@ -2392,12 +2392,23 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
     event_id         UUID        NOT NULL,   -- UUID of the triggering event
     error_kind       TEXT        NOT NULL,   -- ErrorKind text, or "Panic" / "Timeout"
     error_message    TEXT        NOT NULL,   -- human-readable detail for triage
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    aggregate_name   TEXT,                   -- Rust type name of the target aggregate
+    target_stream_id TEXT,                   -- URN of the instance the command was sent to
+    command_name     TEXT                    -- Rust type name of the command
 );
 
 CREATE INDEX IF NOT EXISTS idx_dead_letters_policy
     ON policy_dead_letters (policy_name, created_at DESC);
 ```
+
+The three identity columns are captured on the `Dispatch` itself, so a policy
+needs no change to get them. They are nullable for the two cases with no
+dispatch to name: a row parked before the identity migration
+([0024](persistence/tests/migrations/0024_dead_letter_identity.sql)), and a panic
+in `react` itself, which fails before it has built a dispatch. The command's
+*variant* and payload are not recorded — `Aggregate::Command` carries no `Debug`
+or `Serialize` bound.
 
 **Triage queries:**
 
@@ -2407,6 +2418,10 @@ SELECT * FROM policy_dead_letters
 WHERE  policy_name = 'deposit_fee'
 ORDER  BY created_at DESC
 LIMIT  20;
+
+-- Everything parked against one aggregate instance: "which customer is stuck"
+SELECT * FROM policy_dead_letters
+WHERE  target_stream_id = 'urn:bank-account:42';
 
 -- Look up the original event for manual replay
 SELECT * FROM events WHERE id = '<event_id from dead letter>';
@@ -2467,7 +2482,10 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
     error_message    TEXT        NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL,   -- when the dead letter was written
     reason           TEXT        NOT NULL,   -- 'retried' | 'discarded'
-    discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    aggregate_name   TEXT,                   -- identity the row carried, kept as-is
+    target_stream_id TEXT,
+    command_name     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy

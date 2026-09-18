@@ -92,6 +92,12 @@ like any transient failure and, once the retries are exhausted, recorded as kind
 `Timeout`.
 A delivery parks what its settling attempt failed on: a command that fails
 permanently is recorded once, however many attempts a retryable sibling forces.
+A row names the dispatch it is about — the [Aggregate] type, the URN of the
+instance the command was addressed to, and the command's **type** (its variant
+and payload are not recorded, as `Aggregate::Command` carries no `Debug` or
+`Serialize` bound) — so "which customer is stuck" is answerable from the table.
+A reaction that panicked before building a dispatch has nothing to name, and its
+identity columns are null.
 Dead letters are queryable so an operator can later inspect them and either
 [Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.
