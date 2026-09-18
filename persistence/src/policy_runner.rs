@@ -1133,6 +1133,10 @@ impl PolicyRunner {
     /// `reactions_still_failing == 0`. A policy with no parked dead letters is a
     /// clean no-op (a zero summary), and so is a reaction whose rows were all
     /// discarded concurrently: it is skipped without being replayed.
+    ///
+    /// The enumeration carries no `LIMIT`: it holds one `(uuid, i64)` per parked
+    /// reaction of this policy, unbounded by anything but the policy's recorded
+    /// failures. funkode-io/replay#218 pages it.
     pub async fn retry_policy_dead_letters(
         &self,
         policy_name: &str,
