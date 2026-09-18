@@ -49,9 +49,9 @@ enum State {
     CaughtUp,
     /// Draining a backlog.
     Draining {
-        /// Start of the poll that opened the burst, which precedes its first
-        /// advance: a backlog drained inside one poll would otherwise be timed
-        /// from after the work.
+        /// When the window that opened the burst was read, which precedes its
+        /// first reaction: a burst is timed from the work appearing, not from
+        /// the first of it finishing.
         since: Instant,
         /// Positions advanced over since `since`.
         events: u64,
@@ -82,18 +82,18 @@ pub(crate) struct Narration {
 /// that a Policy parked in front of a hole has reached the end of its feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Poll {
-    /// The cursor advanced over `events` positions, in a poll that started at
-    /// `started` and had got this far by `ended` — told as the cursor moves, so
-    /// a batch that takes ten minutes of dispatches reports while it runs.
+    /// A non-empty window was read at `at`: there is work, before any of it has
+    /// been done. Opens the bracket, so the first reaction of a burst runs
+    /// inside it rather than before it.
+    Found { at: Instant },
+    /// The cursor advanced over `events` positions, as of `at` — told as the
+    /// cursor moves, so a batch that takes ten minutes of dispatches reports
+    /// while it runs.
     ///
     /// `events` counts positions advanced over rather than reactions executed:
     /// a window a Policy's filter excludes entirely, and one whose reactions all
     /// park, are both work.
-    Advanced {
-        events: u64,
-        started: Instant,
-        ended: Instant,
-    },
+    Advanced { events: u64, at: Instant },
     /// The feed ended: nothing to read, and nothing in the way of reading more.
     /// The only observation that closes a burst.
     Exhausted,
@@ -125,19 +125,27 @@ impl Narration {
         match (&mut self.state, poll) {
             (_, Poll::Stalled) => None,
             (State::CaughtUp, Poll::Exhausted) => None,
-            (
-                State::CaughtUp,
-                Poll::Advanced {
-                    events,
-                    started,
-                    ended,
-                },
-            ) => {
+            // A window read while a burst is open is that burst carrying on:
+            // the bracket is already where it belongs.
+            (State::Draining { .. }, Poll::Found { .. }) => None,
+            (State::CaughtUp, Poll::Found { at }) => {
                 self.state = State::Draining {
-                    since: started,
+                    since: at,
+                    events: 0,
+                    worked_until: at,
+                    reported: at,
+                };
+                Some(Record::Working)
+            }
+            // Unreachable through the runner, which reads a window before it can
+            // advance over it. Opening here rather than dropping the edge keeps
+            // the bracket balanced for any other caller.
+            (State::CaughtUp, Poll::Advanced { events, at }) => {
+                self.state = State::Draining {
+                    since: at,
                     events,
-                    worked_until: ended,
-                    reported: ended,
+                    worked_until: at,
+                    reported: at,
                 };
                 Some(Record::Working)
             }
@@ -164,17 +172,17 @@ impl Narration {
                     worked_until,
                     reported,
                 },
-                Poll::Advanced { events, ended, .. },
+                Poll::Advanced { events, at },
             ) => {
                 *total = total.saturating_add(events);
-                *worked_until = ended;
-                if ended.saturating_duration_since(*reported) < self.progress_every {
+                *worked_until = at;
+                if at.saturating_duration_since(*reported) < self.progress_every {
                     return None;
                 }
-                *reported = ended;
+                *reported = at;
                 Some(Record::Progress {
                     events: *total,
-                    elapsed: ended.saturating_duration_since(*since),
+                    elapsed: at.saturating_duration_since(*since),
                 })
             }
         }
@@ -195,24 +203,68 @@ impl Narration {
 mod tests {
     use super::*;
 
-    /// A poll, as the worker times one: it takes `took`, starting `after` the
-    /// reference instant, and either advances or finds the feed exhausted.
+    /// One whole poll, as the worker performs it: a window read `after` the
+    /// reference instant, advanced over by `took` later. `events == 0` is the
+    /// poll that finds the feed exhausted, and the records are whatever that
+    /// poll earned.
     fn poll(
         narration: &mut Narration,
         start: Instant,
         after: Duration,
         took: Duration,
         events: u64,
-    ) -> Option<Record> {
-        narration.polled(if events == 0 {
-            Poll::Exhausted
-        } else {
-            Poll::Advanced {
+    ) -> Vec<Record> {
+        if events == 0 {
+            return narration.polled(Poll::Exhausted).into_iter().collect();
+        }
+        [
+            narration.polled(Poll::Found { at: start + after }),
+            narration.polled(Poll::Advanced {
                 events,
-                started: start + after,
-                ended: start + after + took,
-            }
-        })
+                at: start + after + took,
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// A slow first reaction must not hold the opening record behind it: the
+    /// bracket is opened by the window, so everything the burst does — including
+    /// the dead letter a hung first dispatch parks — falls inside it.
+    #[test]
+    fn the_bracket_opens_when_the_work_is_found_not_when_the_first_reaction_returns() {
+        let mut narration = Narration::new(PROGRESS_EVERY);
+        let start = Instant::now();
+
+        assert_eq!(
+            narration.polled(Poll::Found { at: start }),
+            Some(Record::Working)
+        );
+        assert_eq!(
+            narration.polled(Poll::Advanced {
+                events: 1,
+                at: start + Duration::from_secs(150),
+            }),
+            Some(Record::Progress {
+                events: 1,
+                elapsed: Duration::from_secs(150),
+            }),
+            "two and a half minutes on one event is the burst moving slowly, \
+             which is the record for it"
+        );
+    }
+
+    /// A window read while a burst is open is that burst carrying on, not a
+    /// second one.
+    #[test]
+    fn a_window_read_mid_burst_does_not_open_a_second_bracket() {
+        let mut narration = Narration::new(PROGRESS_EVERY);
+        let start = Instant::now();
+
+        poll(&mut narration, start, Duration::ZERO, Duration::ZERO, 10);
+
+        assert_eq!(narration.polled(Poll::Found { at: start }), None);
     }
 
     /// A burst is not closed by a poll that read nothing because something is in
@@ -242,10 +294,10 @@ mod tests {
                 Duration::ZERO,
                 300
             ),
-            Some(Record::Progress {
+            vec![Record::Progress {
                 events: 1_000,
                 elapsed: Duration::from_secs(600),
-            }),
+            }],
             "the hole filled and the same burst carries on — a progress record, \
              because the spacing has long since elapsed, and never a second bracket"
         );
@@ -257,10 +309,10 @@ mod tests {
                 Duration::ZERO,
                 0
             ),
-            Some(Record::CaughtUp {
+            vec![Record::CaughtUp {
                 events: 1_000,
                 elapsed: Duration::from_secs(600),
-            })
+            }]
         );
     }
 
@@ -283,15 +335,15 @@ mod tests {
         let started = Instant::now();
         let advanced = |at: Duration| Poll::Advanced {
             events: 1,
-            started,
-            ended: started + at,
+            at: started + at,
         };
 
         assert_eq!(
-            narration.polled(advanced(Duration::ZERO)),
+            narration.polled(Poll::Found { at: started }),
             Some(Record::Working),
-            "the first position of a long batch opens the bracket, not its last"
+            "the window opens the bracket, before any of it has been dispatched"
         );
+        assert_eq!(narration.polled(advanced(Duration::ZERO)), None);
         assert_eq!(narration.polled(advanced(Duration::from_secs(20))), None);
         assert_eq!(
             narration.polled(advanced(PROGRESS_EVERY)),
@@ -318,7 +370,7 @@ mod tests {
                     Duration::from_millis(1),
                     0
                 ),
-                None,
+                Vec::new(),
                 "an empty poll an hour into idling still says nothing"
             );
         }
@@ -332,7 +384,7 @@ mod tests {
 
         assert_eq!(
             poll(&mut narration, start, Duration::ZERO, Duration::ZERO, 0),
-            None
+            Vec::new()
         );
         assert_eq!(
             poll(
@@ -342,7 +394,7 @@ mod tests {
                 Duration::from_secs(2),
                 500
             ),
-            Some(Record::Working)
+            vec![Record::Working]
         );
         assert_eq!(
             poll(
@@ -352,10 +404,10 @@ mod tests {
                 Duration::from_millis(1),
                 0
             ),
-            Some(Record::CaughtUp {
+            vec![Record::CaughtUp {
                 events: 500,
                 elapsed: Duration::from_secs(2),
-            }),
+            }],
             "the burst is timed from the poll that found the work to the poll that \
              finished it, not to the empty poll that noticed"
         );
@@ -384,10 +436,10 @@ mod tests {
                 Duration::ZERO,
                 0
             ),
-            Some(Record::CaughtUp {
+            vec![Record::CaughtUp {
                 events: 4_231,
                 elapsed: Duration::from_secs(9),
-            })
+            }]
         );
     }
 
@@ -399,7 +451,7 @@ mod tests {
 
         assert_eq!(
             poll(&mut narration, start, Duration::ZERO, Duration::ZERO, 1_000),
-            Some(Record::Working)
+            vec![Record::Working]
         );
         for poll_number in 1..5 {
             assert_eq!(
@@ -410,7 +462,7 @@ mod tests {
                     Duration::ZERO,
                     1_000
                 ),
-                None,
+                Vec::new(),
                 "work in progress is not an edge"
             );
         }
@@ -423,10 +475,10 @@ mod tests {
                 Duration::ZERO,
                 0
             ),
-            Some(Record::CaughtUp {
+            vec![Record::CaughtUp {
                 events: 5_000,
                 elapsed: Duration::from_secs(4),
-            })
+            }]
         );
     }
 
@@ -447,15 +499,15 @@ mod tests {
                 Duration::ZERO,
                 1_000
             ),
-            None,
+            Vec::new(),
             "a record before the spacing has elapsed would be a flood"
         );
         assert_eq!(
             poll(&mut narration, start, PROGRESS_EVERY, Duration::ZERO, 1_000),
-            Some(Record::Progress {
+            vec![Record::Progress {
                 events: 3_000,
                 elapsed: PROGRESS_EVERY,
-            })
+            }]
         );
         assert_eq!(
             poll(
@@ -465,7 +517,7 @@ mod tests {
                 Duration::ZERO,
                 1_000
             ),
-            None,
+            Vec::new(),
             "the spacing restarts from the record, not from the burst"
         );
         assert_eq!(
@@ -476,10 +528,10 @@ mod tests {
                 Duration::ZERO,
                 1_000
             ),
-            Some(Record::Progress {
+            vec![Record::Progress {
                 events: 5_000,
                 elapsed: PROGRESS_EVERY + PROGRESS_EVERY,
-            })
+            }]
         );
     }
 
@@ -502,10 +554,10 @@ mod tests {
                 Duration::ZERO,
                 0
             ),
-            Some(Record::CaughtUp {
+            vec![Record::CaughtUp {
                 events: 2_000,
                 elapsed: PROGRESS_EVERY,
-            })
+            }]
         );
     }
 
@@ -533,7 +585,7 @@ mod tests {
                 Duration::ZERO,
                 3
             ),
-            Some(Record::Working),
+            vec![Record::Working],
             "an hour of silence between bursts is an hour of nothing to say"
         );
         assert_eq!(
@@ -544,10 +596,10 @@ mod tests {
                 Duration::ZERO,
                 0
             ),
-            Some(Record::CaughtUp {
+            vec![Record::CaughtUp {
                 events: 3,
                 elapsed: Duration::ZERO,
-            }),
+            }],
             "the second burst carries its own count, not the first one's"
         );
     }
@@ -570,7 +622,7 @@ mod tests {
                 Duration::ZERO,
                 0
             ),
-            None,
+            Vec::new(),
             "the abandoned burst is not closed by the next election's first empty poll"
         );
         assert_eq!(
@@ -581,7 +633,7 @@ mod tests {
                 Duration::ZERO,
                 100
             ),
-            Some(Record::Working)
+            vec![Record::Working]
         );
         assert_eq!(
             poll(
@@ -591,10 +643,10 @@ mod tests {
                 Duration::ZERO,
                 0
             ),
-            Some(Record::CaughtUp {
+            vec![Record::CaughtUp {
                 events: 100,
                 elapsed: Duration::ZERO,
-            }),
+            }],
             "the new burst counts only its own events"
         );
     }
@@ -607,10 +659,12 @@ mod tests {
         let mut narration = Narration::new(PROGRESS_EVERY);
         let start = Instant::now();
 
+        narration.polled(Poll::Found {
+            at: start + Duration::from_secs(10),
+        });
         narration.polled(Poll::Advanced {
             events: 5,
-            started: start + Duration::from_secs(10),
-            ended: start,
+            at: start,
         });
 
         assert_eq!(

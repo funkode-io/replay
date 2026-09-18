@@ -2633,7 +2633,7 @@ happened", not "nothing is known".
 
 | Record | When | Carries |
 |--------|------|---------|
-| `policy has work to do` | a policy at zero lag finds work | the policy |
+| `policy has work to do` | a poll reads a non-empty window, before any of it is dispatched | the policy |
 | `policy is working through its backlog` | the first cursor advance at least 30 s after the previous record | events so far, elapsed |
 | `policy is caught up` | the first poll that finds the feed exhausted | events in the burst, elapsed |
 | `policy dispatch committed` | every dispatch, at `debug` | event, aggregate, elapsed |
@@ -2646,7 +2646,9 @@ idle interval before the empty poll that notices is not charged to the burst —
 which also means the catch-up record arrives up to one poll interval late.
 
 Records are written as the cursor moves, not when a poll returns, so a batch
-whose dispatches take minutes still reports progress while it runs. A policy that
+whose dispatches take minutes still reports progress while it runs — and the
+opening record precedes the first reaction, so everything that reaction logs
+falls inside the bracket. A policy that
 stops in front of a hole is **not** caught up and does not say it is: the bracket
 stays open, and the blocked record (`warn`) is what names the stop. A worker held
 inside a single reaction narrates nothing at all — that is the liveness axis's

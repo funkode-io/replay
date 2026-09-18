@@ -2261,6 +2261,10 @@ async fn drain_policy_once(
         return Ok(0);
     }
 
+    // The window is work, before any of it is done: a first reaction that takes
+    // minutes must run inside the bracket rather than before it.
+    reporting.tell(&name, Poll::Found { at: started });
+
     match gap {
         // A truncated window: the policy advances over the prefix now and parks at
         // the hole. The hole is as old as this poll even though this poll had work,
@@ -2323,8 +2327,7 @@ async fn drain_policy_once(
             &name,
             Poll::Advanced {
                 events: 1,
-                started,
-                ended: Instant::now(),
+                at: Instant::now(),
             },
         );
         // Write the persistent cursor every `checkpoint_size` events so that

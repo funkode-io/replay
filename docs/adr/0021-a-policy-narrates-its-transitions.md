@@ -30,14 +30,18 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
   that stops advancing stops writing them — which is the distinction the record
   exists to draw.
 
-- **Records are earned as the cursor moves, not when a poll returns.** One poll's
-  batch is dispatched event by event, each bounded only by the
+- **Records are earned as the cursor moves, not when a poll returns**, and the
+  bracket is opened by the window rather than by the first reaction in it. One
+  poll's batch is dispatched event by event, each bounded only by the
   [Dispatch timeout](../../CONTEXT.md#dispatch-timeout) and its retries, so a
-  single poll can outlast the progress cadence several times over; a decision
-  taken between polls would be paced by the work rather than by the clock. What
-  this still cannot see is a worker held inside one reaction — the narration runs
-  on the worker's own thread of control. That is the question
-  [Liveness](../../CONTEXT.md#liveness) answers, from a task of its own
+  single poll can outlast the progress cadence several times over and its first
+  event alone can cost minutes; a decision taken between polls would be paced by
+  the work rather than by the clock, and one taken after the first reaction would
+  put that reaction's own records — including a dead letter — outside the bracket
+  that is supposed to contain them. What this still cannot see is a worker held
+  inside one reaction — the narration runs on the worker's own thread of control.
+  That is the question [Liveness](../../CONTEXT.md#liveness) answers, from a task
+  of its own
   ([ADR-0020](0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)).
 
 - **Only an exhausted feed closes a burst.** A poll that read nothing has either
