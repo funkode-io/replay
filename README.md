@@ -2125,6 +2125,16 @@ to `start_at()`:
 | `StartAt::Now` (default) | Cursor begins at the head of the feed's order — the greatest `(commit_txid, global_position)` among visible events — so only what sorts after it is processed. Safe when you don't want to fire commands retroactively across existing history. The cut is a point in the log's order, not an instant: a write already in flight is delivered if its transaction is younger than the head's and skipped if it is older. |
 | `StartAt::Beginning` | Cursor begins at position 0; the full event history is drained once, then the policy follows live appends. Use this for backfill or projections derived from audit events. |
 
+`start_at` is consulted **once in a policy's lifetime** — on the first registration that
+finds no `policy_cursors` row. Every later start, replica and rolling deploy reads the
+stored row instead. So `Now` is decided on the deploy that introduces the policy, which
+is usually a live system under load: a write in flight at that instant whose transaction
+is older than the head's is history the policy never sees. Long writes are the exposure
+— a running import or a batch append, not ordinary sub-millisecond commands. If a
+specific policy must not start on a coin toss, pre-seed its cursor row before deploying
+(see [Moving a cursor on a running system](#moving-a-cursor-on-a-running-system)); with
+a row present, `start_at` is never consulted.
+
 The cursor is written to Postgres **at least every `checkpoint_batch_size` events**
 and unconditionally at the end of every drain pass. A crash after a command is
 executed but before the cursor is saved will re-deliver the triggering event.
@@ -2138,14 +2148,19 @@ runner state: you can reposition a policy against a live deployment with plain
 SQL, without restarting a process or dropping leadership.
 
 ```sql
--- skip a position that can never be delivered, or rewind to re-deliver events
+-- reposition a policy: forward to pass events, backward to re-deliver them
 UPDATE policy_cursors SET position = 264786, updated_at = now()
 WHERE name = 'price_fanout';
 ```
 
+(There is no longer a "skip a position that can never be delivered" repair. A burned
+position belongs to no event, so it is not a point the feed can stop at — see the
+runbook below.)
+
 The row also records the transaction that wrote the event the policy stopped at
-(`commit_txid`), which is the half the feed is ordered by. You never write it: the
-runner derives it, so the instruction stays the one column it has always been.
+(`commit_txid`), which is the half the feed is ordered by. **Writing the position alone
+is the instruction**, exactly as before: the runner derives the transaction half, and
+you need supply only one column.
 
 What it derives is the *conservative* reading of your position, because a position is
 not a cut in `(commit_txid, global_position)` order — an event past it may have been
@@ -2155,12 +2170,30 @@ that still delivers every event past P: the earliest transaction holding one, or
 below the commit watermark when none is readable yet. The row keeps the position you
 wrote and shows the derived transaction beside it.
 
-The consequence to expect: a handful of events at or before P, written by transactions
-younger than the resume point, may be delivered again. That is the direction the
-ambiguity is resolved in — the same idempotency contract that covers crash re-delivery
-covers this, while the other direction would skip an event silently and permanently.
-To place a policy exactly, write both columns: a row whose `commit_txid` is the one on
-the event at `position` names a point, and the runner takes it as written.
+The consequence to expect: **events at or before P are delivered again if a transaction
+younger than the resume point wrote them.** That set is not bounded by a small constant
+— one old transaction holding the first event past P puts every younger transaction's
+work at or before P back on the feed — so size it as "everything written concurrently
+around P", not "a few". That is the direction the ambiguity is resolved in: the same
+idempotency contract that covers crash re-delivery covers this, while the other
+direction would skip an event silently and permanently.
+
+To place a policy at an exact point with no replay, write **both** columns with a pair
+that names a real event:
+
+```sql
+-- the transaction that wrote the event at the position you are aiming at
+SELECT commit_txid FROM events WHERE global_position = 264786;
+
+UPDATE policy_cursors SET position = 264786, commit_txid = '91827'::xid8, updated_at = now()
+WHERE name = 'price_fanout';
+```
+
+The runner honours a pair whose `commit_txid` is the one on the event at `position`,
+because such a row is indistinguishable from one it wrote itself; anything else is read
+as a position and derived from. The same trick pre-seeds a policy before its code ever
+ships — `INSERT` the row and `StartAt` is never consulted
+([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
 
 The leader picks the new position up **the next time its feed comes back empty**
 — within one poll `interval` for an idle or stuck policy, and after it has caught
@@ -2775,15 +2808,27 @@ it. Transaction ids are instance-wide, so the culprit may be in another database
 xid, and the oldest xid is the one holding the watermark:
 
 ```sql
-SELECT pid, datname, usename, state, backend_xid,
+-- sessions holding an xid, oldest transaction first
+SELECT 'session' AS kind, pid::text AS id, datname, usename, state,
+       backend_xid AS xid, age(backend_xid) AS xid_age,
        now() - xact_start AS open_for, query
 FROM pg_stat_activity
 WHERE backend_xid IS NOT NULL
-ORDER BY age(backend_xid) DESC;
+UNION ALL
+-- prepared transactions: they hold an xid with no session behind them
+SELECT 'prepared', gid, database, owner, '2pc',
+       transaction, age(transaction), now() - prepared, NULL
+FROM pg_prepared_xacts
+ORDER BY xid_age DESC;
 ```
 
-The first row is the transaction every waiting Policy is behind. `idle_in_transaction_session_timeout`
-bounds the accidental version of this; see
+The first row — the **greatest `xid_age`** — is the transaction every waiting Policy is
+behind. Both halves are needed: a prepared transaction keeps its xid and pins the
+watermark, but has no row in `pg_stat_activity`, so a `pg_stat_activity`-only query can
+name the wrong session or return nothing at all while every Policy stays blocked. Resolve
+a prepared one with `COMMIT PREPARED`/`ROLLBACK PREPARED` on its `gid`.
+`idle_in_transaction_session_timeout` bounds the accidental version of the session case
+(and does nothing for the prepared case); see
 [#214](https://github.com/funkode-io/replay/issues/214) for the scope of the stall.
 
 Positions the log will never issue need no handling. `nextval` is not transactional, so a

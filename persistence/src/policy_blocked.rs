@@ -39,20 +39,21 @@ pub(crate) fn resolve_blocked_warn_after() -> Duration {
         .map_or(DEFAULT_BLOCKED_WARN_AFTER, Duration::from_secs)
 }
 
-/// One Policy's history behind one withheld event.
+/// One Policy's current wait.
 struct Sighting {
-    /// The oldest event being held back. A different one is a different wait.
-    withheld_position: i64,
-    /// First poll that saw it.
+    /// First poll of this wait. It survives a change of withheld row: while the feed
+    /// is waiting the Policy has not moved, and the row reported as earliest can
+    /// change under it — a transaction that committed above the watermark sorts ahead
+    /// of the one reported before it — so restarting the clock there would let
+    /// staggered commits push the warning past its threshold indefinitely.
     first_seen: Instant,
     /// Last poll that reported it.
     reported: Option<Instant>,
 }
 
 impl Sighting {
-    fn new(withheld_position: i64, first_seen: Instant) -> Self {
+    fn new(first_seen: Instant) -> Self {
         Self {
-            withheld_position,
             first_seen,
             reported: None,
         }
@@ -65,6 +66,10 @@ impl Sighting {
 /// and the last record must be at least `interval` old. The first is why an append
 /// committing in the next millisecond stays silent; the second is why a Policy behind a
 /// write held open for three days does not write three days of log.
+///
+/// The clock belongs to the wait, not to the row being waited on: it starts when the
+/// Policy first reads nothing and runs until [`cleared`](Self::cleared) — which the drain
+/// calls the moment the feed moves or the Policy is caught up.
 ///
 /// One entry per Policy, so memory is bounded by the code that registers them.
 pub(crate) struct BlockedWatch {
@@ -80,21 +85,17 @@ impl BlockedWatch {
         }
     }
 
-    /// Record a poll that found `policy` waiting behind `withheld_position`, and
-    /// return whether this poll reports it.
+    /// Record a poll that found `policy` waiting, and return whether this poll
+    /// reports it.
     ///
     /// Decides and claims under one lock, so concurrent drains of the same Policy
     /// cannot both report. `now` is read before the lock, so two of them can arrive
     /// out of order; ages saturate, and the older one then skips a poll.
-    pub(crate) fn poll(&self, policy: &str, withheld_position: i64, now: Instant) -> bool {
+    pub(crate) fn poll(&self, policy: &str, now: Instant) -> bool {
         let mut seen = self.lock();
-        let is_new_wait = seen
-            .get(policy)
-            .is_none_or(|sighting| sighting.withheld_position != withheld_position);
-        if is_new_wait {
-            seen.insert(policy.to_owned(), Sighting::new(withheld_position, now));
-        }
-        let sighting = seen.get_mut(policy).expect("present or just inserted");
+        let sighting = seen
+            .entry(policy.to_owned())
+            .or_insert_with(|| Sighting::new(now));
 
         if now.saturating_duration_since(sighting.first_seen) < self.interval {
             return false;
@@ -203,8 +204,8 @@ mod tests {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(!watch.poll("import_started", 42, start + Duration::from_secs(29)));
+        assert!(!watch.poll("import_started", start));
+        assert!(!watch.poll("import_started", start + Duration::from_secs(29)));
     }
 
     #[test]
@@ -212,8 +213,8 @@ mod tests {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(watch.poll("import_started", 42, start + INTERVAL));
+        assert!(!watch.poll("import_started", start));
+        assert!(watch.poll("import_started", start + INTERVAL));
     }
 
     /// A waiting Policy polls forever and must not write a record per poll.
@@ -222,32 +223,27 @@ mod tests {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(watch.poll("import_started", 42, start + INTERVAL));
+        assert!(!watch.poll("import_started", start));
+        assert!(watch.poll("import_started", start + INTERVAL));
 
-        assert!(!watch.poll(
-            "import_started",
-            42,
-            start + INTERVAL + Duration::from_secs(1)
-        ));
-        assert!(!watch.poll(
-            "import_started",
-            42,
-            start + INTERVAL + Duration::from_secs(29)
-        ));
-        assert!(watch.poll("import_started", 42, start + INTERVAL + INTERVAL));
+        assert!(!watch.poll("import_started", start + INTERVAL + Duration::from_secs(1)));
+        assert!(!watch.poll("import_started", start + INTERVAL + Duration::from_secs(29)));
+        assert!(watch.poll("import_started", start + INTERVAL + INTERVAL));
     }
 
-    /// The clock runs from the wait, not from the Policy: a cursor idle for an hour
-    /// that then waits on an open write must stay silent.
+    /// The row reported as earliest changes while the wait goes on — a transaction
+    /// that committed above the watermark sorts ahead of the one reported before it —
+    /// and the clock must not restart with it. Staggered commits behind one long
+    /// transaction would otherwise postpone the warning for as long as they kept
+    /// arriving, which is exactly the outage it exists to name.
     #[test]
-    fn a_different_wait_restarts_the_clock() {
+    fn a_new_earliest_withheld_row_does_not_restart_the_clock() {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(!watch.poll("import_started", 99, start + INTERVAL));
-        assert!(watch.poll("import_started", 99, start + INTERVAL + INTERVAL));
+        // Poll 1 is behind position 42; poll 2, still waiting, is behind 99.
+        assert!(!watch.poll("import_started", start));
+        assert!(watch.poll("import_started", start + INTERVAL));
     }
 
     /// Nineteen policies stopped behind the same write in the incident; each is its
@@ -257,26 +253,24 @@ mod tests {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(watch.poll("import_started", 42, start + INTERVAL));
+        assert!(!watch.poll("import_started", start));
+        assert!(watch.poll("import_started", start + INTERVAL));
 
-        assert!(!watch.poll("price_fanout", 42, start + INTERVAL));
+        assert!(!watch.poll("price_fanout", start + INTERVAL));
     }
 
+    /// The clock runs from the wait, not from the Policy: a cursor idle for an hour
+    /// that then waits on an open write must stay silent until the wait itself is old.
     #[test]
     fn a_policy_that_advanced_starts_its_next_wait_from_scratch() {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
+        assert!(!watch.poll("import_started", start));
         watch.cleared("import_started");
 
-        assert!(!watch.poll("import_started", 42, start + Duration::from_secs(29)));
-        assert!(watch.poll(
-            "import_started",
-            42,
-            start + Duration::from_secs(29) + INTERVAL
-        ));
+        assert!(!watch.poll("import_started", start + Duration::from_secs(29)));
+        assert!(watch.poll("import_started", start + Duration::from_secs(29) + INTERVAL));
     }
 
     #[test]
@@ -285,7 +279,7 @@ mod tests {
 
         watch.cleared("never_ran");
 
-        assert!(!watch.poll("never_ran", 42, Instant::now()));
+        assert!(!watch.poll("never_ran", Instant::now()));
     }
 
     /// Two drains can read the clock in one order and reach the lock in the other.
@@ -295,9 +289,9 @@ mod tests {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start + INTERVAL));
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(watch.poll("import_started", 42, start + INTERVAL + INTERVAL));
+        assert!(!watch.poll("import_started", start + INTERVAL));
+        assert!(!watch.poll("import_started", start));
+        assert!(watch.poll("import_started", start + INTERVAL + INTERVAL));
     }
 
     #[test]

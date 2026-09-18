@@ -30,7 +30,9 @@ use replay::{Aggregate, Metadata};
 use crate::commit_stamp::CommitStamp;
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
 use crate::policy_blocked::{probe_waiting, resolve_blocked_warn_after, BlockedWatch};
-use crate::policy_feed::{read_feed, resume_point, FeedPoint, ResumeInputs, WindowPosition};
+use crate::policy_feed::{
+    conservative_point, names_a_feed_point, read_feed, FeedPoint, WindowPosition,
+};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
 };
@@ -980,8 +982,8 @@ impl PolicyRunner {
 
     /// Bulk-retry every parked dead letter for `policy_name`, oldest-first.
     ///
-    /// Enumerates the policy's parked dead letters in ascending
-    /// `global_position` (then `created_at`) order and applies
+    /// Enumerates the policy's parked dead letters in the order they were parked
+    /// (`created_at`, then `id`) and applies
     /// [`retry_dead_letter`](Self::retry_dead_letter) to each — the
     /// bulk-recovery convenience for replaying a backlog that piled up while a
     /// downstream dependency was down. Every row resolves or re-parks exactly
@@ -989,6 +991,12 @@ impl PolicyRunner {
     /// ordering, delegating all per-row behaviour (causation guard, optimistic
     /// concurrency, archive-on-resolve) to the primitive. It takes no advisory
     /// lock and never touches `policy_cursors`.
+    ///
+    /// Parking order rather than `global_position`: a row is parked as the Policy
+    /// delivers it, so it *is* the order the Policy saw those events in, and since
+    /// funkode-io/replay#195 that order is `(commit_txid, global_position)` — replaying
+    /// by position would run reactions in an order the live feed never produced. It also
+    /// survives an event the log no longer has, which a join back to `events` would not.
     ///
     /// Returns a [`DeadLetterRetrySummary`] counting how many rows resolved and
     /// how many failed again; the policy has fully recovered when
@@ -1002,7 +1010,7 @@ impl PolicyRunner {
         let ids: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM policy_dead_letters \
              WHERE policy_name = $1 \
-             ORDER BY global_position ASC, created_at ASC, id ASC",
+             ORDER BY created_at ASC, id ASC",
         )
         .bind(policy_name)
         .fetch_all(&self.pool)
@@ -2216,7 +2224,7 @@ async fn report_waiting(
         "policy feed is waiting for an open write to end"
     );
 
-    if !waiting.poll(name, wait.withheld.position, std::time::Instant::now()) {
+    if !waiting.poll(name, std::time::Instant::now()) {
         return Ok(());
     }
 
@@ -2779,9 +2787,9 @@ impl PolicyCursor {
     ///
     /// The operator's instruction is a position — that is the control surface ADR-0012
     /// documents, and it stays one column wide — and so is the row migration 0022 leaves
-    /// behind. Neither is a point in the feed's order, so [`resume_point`] derives one
-    /// that delivers every event past that position; a row that already names an event is
-    /// left as it is.
+    /// behind. Neither is a point in the feed's order, so [`conservative_point`] derives
+    /// one that delivers every event past that position; a row that already names an
+    /// event ([`names_a_feed_point`]) is left as it is, and costs one indexed lookup.
     ///
     /// The completion is written back, so the row shows the point the Policy resumes
     /// from rather than the half-instruction it was given — position untouched, and
@@ -2795,7 +2803,17 @@ impl PolicyCursor {
         stored: FeedPoint,
     ) -> Result<(), replay::Error> {
         self.persisted = stored;
-        self.point = resume_point(stored, resume_inputs(pool, stored.position).await?);
+        self.point = match commit_txid_at(pool, stored.position).await? {
+            // The common path, and the one that must stay cheap: every election and
+            // every manual drain of a Policy this process left where it is pays one
+            // indexed lookup and no scan.
+            at_position if names_a_feed_point(stored, at_position) => stored,
+            _ => {
+                let (first_past_position, watermark) =
+                    conservative_inputs(pool, stored.position).await?;
+                conservative_point(stored, first_past_position, watermark)
+            }
+        };
 
         if self.point != self.persisted
             && complete_commit_txid(pool, name, self.persisted, self.point.commit_txid).await?
@@ -2919,24 +2937,47 @@ async fn complete_commit_txid(
     Ok(updated.rows_affected() > 0)
 }
 
-/// What the log says about the position a stored cursor row carries: the transaction at
-/// it, the earliest readable one past it, and the watermark — the three facts
-/// [`resume_point`] decides on, read in one statement so they describe one instant.
+/// The transaction that wrote the event at `position`, or `None` when no event is there.
+///
+/// One lookup on the unique index over `global_position` (migration 0015), which is what
+/// decides whether a stored row is already a point and the rest of the derivation can be
+/// skipped.
+async fn commit_txid_at(
+    pool: &Pool<Postgres>,
+    position: i64,
+) -> Result<Option<CommitStamp>, replay::Error> {
+    let stamp = sqlx::query_scalar::<_, String>(
+        "SELECT commit_txid::text FROM events WHERE global_position = $1",
+    )
+    .bind(position)
+    .fetch_optional(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    stamp
+        .map(|stamp| CommitStamp::parse(stamp.as_str()))
+        .transpose()
+}
+
+/// The two facts [`conservative_point`] derives from: the earliest transaction holding a
+/// readable event past `position`, and the watermark — read in one statement, so they
+/// cannot describe different instants.
 ///
 /// The scan past the position is over `global_position`, not over the feed's own index:
 /// the rows past a cursor are the ones it has yet to deliver, so a cursor near the head
 /// reads a handful whatever the log's size, while ordering by `commit_txid` would walk
 /// the whole log below the watermark to discover there is nothing past the cursor at all.
+/// It runs only for a row that names no event, which is the upgrade and the operator's
+/// move — never the steady state.
+///
 /// `MIN` over `xid8` goes through `numeric`, which has one: the type has comparison
 /// operators but no aggregates.
-async fn resume_inputs(
+async fn conservative_inputs(
     pool: &Pool<Postgres>,
     position: i64,
-) -> Result<ResumeInputs, replay::Error> {
+) -> Result<(Option<CommitStamp>, CommitStamp), replay::Error> {
     let row = sqlx::query(
-        "SELECT (SELECT commit_txid::text FROM events WHERE global_position = $1) \
-           AS at_position, \
-         (SELECT MIN(commit_txid::text::numeric)::text FROM events \
+        "SELECT (SELECT MIN(commit_txid::text::numeric)::text FROM events \
            WHERE global_position > $1 AND commit_txid < w.watermark) AS first_past_position, \
          w.watermark::text AS watermark \
          FROM (SELECT pg_snapshot_xmin(pg_current_snapshot()) AS watermark) w",
@@ -2946,17 +2987,15 @@ async fn resume_inputs(
     .await
     .map_err(crate::db_error)?;
 
-    let stamp = |column: &str| -> Result<Option<CommitStamp>, replay::Error> {
-        row.get::<Option<String>, _>(column)
-            .map(|text| CommitStamp::parse(text.as_str()))
-            .transpose()
-    };
+    let first_past_position = row
+        .get::<Option<String>, _>("first_past_position")
+        .map(|text| CommitStamp::parse(text.as_str()))
+        .transpose()?;
 
-    Ok(ResumeInputs {
-        at_position: stamp("at_position")?,
-        first_past_position: stamp("first_past_position")?,
-        watermark: CommitStamp::from_row(&row, "watermark")?,
-    })
+    Ok((
+        first_past_position,
+        CommitStamp::from_row(&row, "watermark")?,
+    ))
 }
 
 /// The point a Policy registered for the first time starts from.

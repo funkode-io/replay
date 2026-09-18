@@ -47,56 +47,46 @@ pub(crate) struct FeedPoint {
     pub(crate) position: i64,
 }
 
-/// What the log says about the position a stored cursor row carries, read in one
-/// statement by [`crate::policy_runner`] and turned into a point by [`resume_point`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResumeInputs {
-    /// The transaction that wrote the event at that position, when an event is there.
-    pub(crate) at_position: Option<CommitStamp>,
-    /// The earliest transaction, in feed order, that wrote an event past that position
-    /// and is already readable.
-    pub(crate) first_past_position: Option<CommitStamp>,
-    /// `pg_snapshot_xmin`: every transaction below it has ended, so every event still to
-    /// appear was written at or above it.
-    pub(crate) watermark: CommitStamp,
+/// Whether a stored cursor row is already a point in the feed's order.
+///
+/// It is one when the event at its position carries its transaction — which is every row
+/// this crate wrote — and when it is the sentinel at position 0, where a Policy that has
+/// processed nothing sits, already behind every transaction.
+///
+/// The check is what keeps a restart free: [`conservative_point`] would derive a point
+/// *behind* a running Policy, because the events past its position include the ones it
+/// walked over to get there.
+pub(crate) fn names_a_feed_point(stored: FeedPoint, at_position: Option<CommitStamp>) -> bool {
+    at_position == Some(stored.commit_txid)
+        || (stored.position == 0 && stored.commit_txid == CommitStamp::SENTINEL)
 }
 
-/// The point a Policy resumes from, given the row `policy_cursors` holds.
+/// The point a Policy resumes from when its row names no event — a row that predates
+/// migration 0022 and carries the sentinel, or the one-column move ADR-0012 gives an
+/// operator.
 ///
-/// A row this crate wrote names an event: the event at `position` carries exactly
-/// `commit_txid`, and the pair is a point in the feed's order. It is taken as written.
-///
-/// Anything else is a position without a point behind it — a row that predates migration
-/// 0022 and carries the sentinel, or the one-column move ADR-0012 gives an operator — and
-/// a position is not a cut in `(commit_txid, global_position)` order: the events past it
+/// A position is not a cut in `(commit_txid, global_position)` order: the events past it
 /// may have been written by transactions older than the one at it. Reading such a row as
 /// "processed everything at or before this position" is the only reading that is true of
 /// both, so the point derived from it is the greatest one that still delivers every event
 /// past that position:
 ///
-/// - the earliest transaction holding such an event, when the feed can already see one;
-/// - otherwise one below the watermark, because an event that is still to appear cannot
-///   have been written below it.
+/// - `first_past_position`, the earliest transaction holding such an event, when the feed
+///   can already see one;
+/// - otherwise one below `watermark`, because an event that is still to appear was
+///   written by a transaction that is still running, and those sit at or above it.
 ///
 /// Both may re-deliver: an event at or before `position` written by a younger transaction
 /// sorts after the derived point. That is the direction the ambiguity is resolved in —
 /// delivery is at-least-once and a rewind is visible, while a skip is silent and
 /// permanent.
-pub(crate) fn resume_point(stored: FeedPoint, log: ResumeInputs) -> FeedPoint {
-    if log.at_position == Some(stored.commit_txid) {
-        return stored;
-    }
-
-    // Position 0 under the sentinel is not an instruction to complete: it is where a
-    // Policy that has processed nothing sits, already behind every transaction.
-    if stored.position == 0 && stored.commit_txid == CommitStamp::SENTINEL {
-        return stored;
-    }
-
+pub(crate) fn conservative_point(
+    stored: FeedPoint,
+    first_past_position: Option<CommitStamp>,
+    watermark: CommitStamp,
+) -> FeedPoint {
     FeedPoint {
-        commit_txid: log
-            .first_past_position
-            .unwrap_or_else(|| log.watermark.previous()),
+        commit_txid: first_past_position.unwrap_or_else(|| watermark.previous()),
         position: stored.position,
     }
 }
@@ -167,7 +157,7 @@ pub(crate) async fn read_feed(
 
 #[cfg(test)]
 mod tests {
-    use super::{resume_point, FeedPoint, ResumeInputs};
+    use super::{conservative_point, names_a_feed_point, FeedPoint};
     use crate::commit_stamp::CommitStamp;
 
     fn point(commit_txid: &str, position: i64) -> FeedPoint {
@@ -181,51 +171,57 @@ mod tests {
         CommitStamp::parse(commit_txid).expect("a plain counter parses")
     }
 
-    /// A log with nothing past the stored position and nothing running near it.
-    fn log(at_position: Option<&str>, first_past_position: Option<&str>) -> ResumeInputs {
-        ResumeInputs {
-            at_position: at_position.map(stamp),
-            first_past_position: first_past_position.map(stamp),
-            watermark: stamp("100"),
-        }
-    }
-
     /// A row this crate wrote names an event, and resuming from it is what makes a
-    /// restart cost nothing: deriving a point for it would rewind the Policy on every
-    /// election, because the events past its position include the ones it walked over to
-    /// get there.
+    /// restart cost nothing: deriving a point for it would rewind the Policy, because
+    /// the events past its position include the ones it walked over to get there.
     #[test]
     fn a_pair_that_names_an_event_is_resumed_as_written() {
-        let stored = point("12", 2);
-
-        assert_eq!(
-            resume_point(stored, log(Some("12"), Some("11"))),
-            stored,
-            "the event at position 2 was written by transaction 12, so the row is a point"
-        );
+        assert!(names_a_feed_point(point("12", 2), Some(stamp("12"))));
     }
 
     /// The upgrade this rule exists for: a cursor written before the transaction half
-    /// existed sits at a position, and the events past that position may belong to older
-    /// transactions than the one at it. Completing it to the transaction *at* the
-    /// position would sort those events behind the cursor and lose them for good.
+    /// existed sits at a position under the sentinel, and the event there was written by
+    /// a real transaction.
     #[test]
-    fn a_position_whose_events_are_not_all_behind_it_resumes_before_them() {
-        assert_eq!(
-            resume_point(point("0", 2), log(Some("12"), Some("11"))),
-            point("11", 2),
-            "resuming just inside transaction 11 delivers what it wrote past position 2"
-        );
+    fn a_sentinel_row_over_a_stamped_event_names_nothing() {
+        assert!(!names_a_feed_point(point("0", 2), Some(stamp("12"))));
     }
 
-    /// An operator's position, against a log whose unprocessed events are all younger
-    /// than the one at it. The derived point is still the earliest of them: it costs
-    /// nothing, since every transaction below it wrote only events the position covers.
+    /// An operator's move: the position is new, the transaction half is whatever the row
+    /// happened to hold.
     #[test]
-    fn an_operators_position_resumes_at_the_earliest_transaction_past_it() {
+    fn a_stale_transaction_half_names_nothing() {
+        assert!(!names_a_feed_point(point("7", 40), Some(stamp("12"))));
+    }
+
+    /// The #164 recovery moves past a burned position, where there is no event at all.
+    #[test]
+    fn a_position_no_event_carries_names_nothing() {
+        assert!(!names_a_feed_point(point("7", 500), None));
+    }
+
+    /// `StartAt::Beginning` before the first poll: the sentinel at position 0 is where a
+    /// Policy that has processed nothing sits, and it already precedes every transaction.
+    /// Deriving a point for it would move it forward for no reason.
+    #[test]
+    fn a_policy_that_has_processed_nothing_is_already_a_point() {
+        assert!(names_a_feed_point(
+            FeedPoint {
+                commit_txid: CommitStamp::SENTINEL,
+                position: 0,
+            },
+            None
+        ));
+    }
+
+    /// The derivation resumes just inside the earliest transaction holding an event past
+    /// the position: what that transaction wrote past it is delivered, and every
+    /// transaction below it wrote only events the position covers.
+    #[test]
+    fn a_position_resumes_at_the_earliest_transaction_past_it() {
         assert_eq!(
-            resume_point(point("7", 40), log(Some("12"), Some("13"))),
-            point("13", 40)
+            conservative_point(point("0", 2), Some(stamp("11")), stamp("100")),
+            point("11", 2)
         );
     }
 
@@ -236,35 +232,9 @@ mod tests {
     #[test]
     fn a_position_with_nothing_readable_past_it_resumes_below_the_watermark() {
         assert_eq!(
-            resume_point(point("0", 264_786), log(Some("12"), None)),
+            conservative_point(point("0", 264_786), None, stamp("100")),
             point("99", 264_786),
             "an append in flight holds a transaction at or above 100, so 99 precedes it"
-        );
-    }
-
-    /// A position no event carries names no pair at all, so it is completed like any
-    /// other instruction rather than refused.
-    #[test]
-    fn a_position_no_event_carries_is_completed_too() {
-        assert_eq!(
-            resume_point(point("7", 500), log(None, None)),
-            point("99", 500)
-        );
-    }
-
-    /// `StartAt::Beginning` before the first poll: the sentinel at position 0 is where a
-    /// Policy that has processed nothing sits, and it already precedes every transaction.
-    /// Deriving a point for it would move it forward for no reason.
-    #[test]
-    fn a_policy_that_has_processed_nothing_stays_at_the_sentinel() {
-        let nothing_processed = FeedPoint {
-            commit_txid: CommitStamp::SENTINEL,
-            position: 0,
-        };
-
-        assert_eq!(
-            resume_point(nothing_processed, log(None, Some("11"))),
-            nothing_processed
         );
     }
 
