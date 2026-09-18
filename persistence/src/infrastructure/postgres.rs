@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStream, TryStreamExt};
@@ -29,7 +30,6 @@ impl<T> PostgresInlineProjection for T where T: InlineProjection<Exec = sqlx::Pg
 /// Built-in default for how many appended events are held before being flushed to the
 /// registered inline projections.
 const DEFAULT_PROJECTION_FLUSH_SIZE: usize = 500;
-
 /// Environment variable that overrides the projection-flush default.
 const PROJECTION_FLUSH_SIZE_ENV_VAR: &str = "REPLAY_PROJECTION_FLUSH_SIZE";
 
@@ -53,6 +53,94 @@ fn resolve_flush_size(store_override: Option<usize>, env: Option<String>) -> usi
         return n.max(1);
     }
     DEFAULT_PROJECTION_FLUSH_SIZE
+}
+
+/// Built-in default for how long a transaction of this library waits for a stream's
+/// row lock before the server abandons it.
+///
+/// Matched to `REPLAY_DISPATCH_TIMEOUT_MS`'s default so the server releases the row at
+/// roughly the moment the runner walks away from the dispatch: the strand is then
+/// bounded by one timeout rather than by whoever holds the row.
+const DEFAULT_STREAM_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Environment variable overriding the stream-lock wait, in milliseconds.
+const STREAM_LOCK_WAIT_ENV_VAR: &str = "REPLAY_STREAM_LOCK_WAIT_MS";
+
+/// Postgres `lock_not_available`: a `lock_timeout` expired on a row somebody else holds.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// Resolve how long this library's transactions wait for a stream row.
+///
+/// Precedence: per-store override → `REPLAY_STREAM_LOCK_WAIT_MS` → 30s.
+fn resolve_stream_lock_wait(store_override: Option<Duration>) -> Duration {
+    stream_lock_wait_or_default(store_override, std::env::var(STREAM_LOCK_WAIT_ENV_VAR).ok())
+}
+
+/// The precedence itself, over values rather than the process environment.
+///
+/// Zero is **disabled**, not unset: it is passed verbatim to `lock_timeout`, where zero
+/// already means "wait forever", and it is how a consumer asks for the behaviour this
+/// bound replaced. `REPLAY_DISPATCH_TIMEOUT_MS` reads its zero the other way, as unset,
+/// because that value goes to a tokio timer rather than to Postgres.
+///
+/// A negative or unparseable env var is a typo, and a typo must not silently disable a
+/// bound: it falls back to the default.
+fn stream_lock_wait_or_default(declared: Option<Duration>, env: Option<String>) -> Duration {
+    if let Some(wait) = declared {
+        return wait;
+    }
+    env.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_STREAM_LOCK_WAIT, Duration::from_millis)
+}
+
+/// Bound how long `tx` waits for a row lock, for the length of that transaction.
+///
+/// `SET LOCAL`, so a connection returned to the pool carries nothing into its next use,
+/// and `set_config(…, true)` rather than `SET` because only the former takes a bind
+/// parameter. A wait of zero is Postgres's own "no limit", so nothing is set at all and
+/// the statement is not even sent.
+async fn bound_lock_wait(tx: &mut sqlx::PgConnection, wait: Duration) -> Result<(), replay::Error> {
+    if wait.is_zero() {
+        return Ok(());
+    }
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(format!("{}ms", wait.as_millis().max(1)))
+        .execute(tx)
+        .await
+        .map_err(crate::db_error)?;
+    Ok(())
+}
+
+/// Map a failure from a statement that takes the stream row.
+///
+/// A `55P03` is [`replay::ErrorKind::Unavailable`] rather than a conflict: this
+/// codebase's conflict is optimistic concurrency and arrives carrying an expected and an
+/// actual version, and a lock wait that ran out says nothing about versions. Both are
+/// temporary and take the same retry path, so the runner is unaffected; what changes is
+/// what a consumer matching on `kind()` concludes.
+fn stream_lock_error(
+    error: sqlx::Error,
+    stream_id: &str,
+    wait: Duration,
+    operation: &'static str,
+) -> replay::Error {
+    if !is_lock_not_available(&error) {
+        return crate::db_error(error);
+    }
+    replay::Error::unavailable(format!(
+        "waited {}ms for the stream row lock without getting it",
+        wait.as_millis()
+    ))
+    .with_operation(operation)
+    .with_context("stream_id", stream_id)
+    .with_context("stream_lock_wait_ms", wait.as_millis())
+}
+
+fn is_lock_not_available(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(db) => db.code().as_deref() == Some(LOCK_NOT_AVAILABLE),
+        _ => false,
+    }
 }
 
 type BoxedPostgresEventHandler<E> = Box<
@@ -114,6 +202,10 @@ pub struct PostgresEventStore {
     /// projections. Bounds the memory a streamed append holds; see
     /// [`resolve_projection_flush_size`].
     projection_flush_size: usize,
+    /// How long a transaction of this store waits for a stream's row lock before the
+    /// server abandons it. [`Duration::ZERO`] waits forever; see
+    /// [`resolve_stream_lock_wait`].
+    stream_lock_wait: Duration,
 }
 
 impl PostgresEventStore {
@@ -122,6 +214,7 @@ impl PostgresEventStore {
             pool,
             projections: Arc::new(Vec::new()),
             projection_flush_size: resolve_projection_flush_size(None),
+            stream_lock_wait: resolve_stream_lock_wait(None),
         }
     }
 
@@ -134,6 +227,7 @@ impl PostgresEventStore {
             pool,
             projections: Vec::new(),
             projection_flush_size: None,
+            stream_lock_wait: None,
         }
     }
 
@@ -270,6 +364,7 @@ pub struct PostgresEventStoreBuilder {
     pool: Pool<Postgres>,
     projections: Vec<Box<dyn ErasedInlineProjection<Exec = sqlx::PgConnection>>>,
     projection_flush_size: Option<usize>,
+    stream_lock_wait: Option<Duration>,
 }
 
 impl PostgresEventStoreBuilder {
@@ -283,6 +378,23 @@ impl PostgresEventStoreBuilder {
     /// registration or version drift: it is paged through in chunks of this many events.
     pub fn projection_flush_size(mut self, events: usize) -> Self {
         self.projection_flush_size = Some(events);
+        self
+    }
+
+    /// Bound how long this store's transactions wait for a stream's row lock.
+    ///
+    /// The append transaction and `compact` take the same row, and a wait that exceeds
+    /// this fails on the server — which is what ends the transaction and returns its
+    /// connection to the pool, rather than stranding it until whoever holds the row is
+    /// done ([ADR-0022](https://github.com/funkode-io/replay/blob/main/docs/adr/0022-a-stream-lock-wait-is-bounded-on-the-server.md)).
+    ///
+    /// Overrides `REPLAY_STREAM_LOCK_WAIT_MS` and the built-in default of 30s.
+    /// [`Duration::ZERO`] disables the bound and waits forever, which is the behaviour
+    /// this replaced. The lower bound on a useful value is the longest *honest* hold,
+    /// and in this library that is `compact`: it holds the row for a fold over the whole
+    /// stream, so a value below that parks work that was only slow.
+    pub fn stream_lock_wait(mut self, wait: Duration) -> Self {
+        self.stream_lock_wait = Some(wait);
         self
     }
     /// Register a new Postgres inline projection.
@@ -485,6 +597,7 @@ impl PostgresEventStoreBuilder {
             pool: self.pool,
             projections: Arc::new(registered),
             projection_flush_size: resolve_projection_flush_size(self.projection_flush_size),
+            stream_lock_wait: resolve_stream_lock_wait(self.stream_lock_wait),
         })
     }
 
@@ -636,6 +749,12 @@ impl EventStore for PostgresEventStore {
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
 
+        // `append_event` takes the stream row with `SELECT ... FOR UPDATE` and holds it
+        // for the rest of this transaction. Bounding the wait here is what lets an
+        // abandoned append end on the server and hand its connection back, instead of
+        // holding one for as long as the blocker lasts (funkode-io/replay#205).
+        bound_lock_wait(&mut transaction, self.stream_lock_wait).await?;
+
         // Metadata is constant for the whole append, so its JSON is built once here
         // rather than once per event; each event then shares the document behind the
         // cheap `Metadata` handle.
@@ -681,7 +800,14 @@ impl EventStore for PostgresEventStore {
             .bind(expected)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(crate::db_error)?;
+            .map_err(|error| {
+                stream_lock_error(
+                    error,
+                    stream_id.as_ref(),
+                    self.stream_lock_wait,
+                    "store_events",
+                )
+            })?;
 
             // No row means an optimistic-concurrency mismatch in `append_event` (only
             // possible on the first append). Surface it as a concurrency_error and let the
@@ -831,6 +957,10 @@ impl EventStore for PostgresEventStore {
 
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
 
+        // The same bound as the append path, on the same row: a compaction queued behind
+        // an append is stranded exactly as an append queued behind a compaction is.
+        bound_lock_wait(&mut tx, self.stream_lock_wait).await?;
+
         // 1. Lock the stream row for the duration of this transaction.
         //    Any concurrent `append_event` call that updates (or inserts into) this stream
         //    will block on this lock and only proceed after we commit, so no events can
@@ -841,7 +971,9 @@ impl EventStore for PostgresEventStore {
             .bind(&stream_id_str)
             .execute(&mut *tx)
             .await
-            .map_err(crate::db_error)?;
+            .map_err(|error| {
+                stream_lock_error(error, &stream_id_str, self.stream_lock_wait, "compact")
+            })?;
 
         if lock_result.rows_affected() == 0 {
             return Err(replay::Error::not_found("Stream not found")
@@ -957,6 +1089,7 @@ impl Clone for PostgresEventStore {
             pool: self.pool.clone(),
             projections: self.projections.clone(),
             projection_flush_size: self.projection_flush_size,
+            stream_lock_wait: self.stream_lock_wait,
         }
     }
 }
@@ -1010,7 +1143,12 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_flush_size, DEFAULT_PROJECTION_FLUSH_SIZE};
+    use std::time::Duration;
+
+    use super::{
+        resolve_flush_size, stream_lock_wait_or_default, DEFAULT_PROJECTION_FLUSH_SIZE,
+        DEFAULT_STREAM_LOCK_WAIT,
+    };
 
     #[test]
     fn flush_size_falls_back_to_the_built_in_default() {
@@ -1042,5 +1180,56 @@ mod tests {
     fn zero_is_clamped_to_one_so_a_flush_always_makes_progress() {
         assert_eq!(resolve_flush_size(Some(0), None), 1);
         assert_eq!(resolve_flush_size(None, Some("0".into())), 1);
+    }
+
+    #[test]
+    fn the_stream_lock_wait_falls_back_to_the_built_in_default() {
+        assert_eq!(
+            stream_lock_wait_or_default(None, None),
+            DEFAULT_STREAM_LOCK_WAIT
+        );
+    }
+
+    #[test]
+    fn the_stream_lock_wait_reads_the_env_var_in_milliseconds() {
+        assert_eq!(
+            stream_lock_wait_or_default(None, Some("1500".into())),
+            Duration::from_millis(1_500)
+        );
+    }
+
+    #[test]
+    fn a_store_override_beats_the_env_var_for_the_stream_lock_wait() {
+        assert_eq!(
+            stream_lock_wait_or_default(Some(Duration::from_secs(5)), Some("1500".into())),
+            Duration::from_secs(5)
+        );
+    }
+
+    /// Zero is the documented opt-out, from either source: it is passed to
+    /// `lock_timeout`, where zero already means "wait forever".
+    #[test]
+    fn zero_disables_the_stream_lock_wait_rather_than_reading_as_unset() {
+        assert_eq!(
+            stream_lock_wait_or_default(Some(Duration::ZERO), None),
+            Duration::ZERO
+        );
+        assert_eq!(
+            stream_lock_wait_or_default(None, Some("0".into())),
+            Duration::ZERO
+        );
+    }
+
+    /// A typo must not silently remove a bound, which is what parsing it as zero
+    /// would do.
+    #[test]
+    fn an_unparseable_or_negative_stream_lock_wait_falls_back_to_the_default() {
+        for env in ["not-a-number", "-1", "30s", ""] {
+            assert_eq!(
+                stream_lock_wait_or_default(None, Some(env.into())),
+                DEFAULT_STREAM_LOCK_WAIT,
+                "{env:?} must not disable the bound"
+            );
+        }
     }
 }
