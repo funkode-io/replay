@@ -2137,8 +2137,8 @@ impl PendingFailures {
 /// Write the record a [`Narration`] decided on.
 ///
 /// `info`, because these are the lines an operator reads to see work start and
-/// finish; there are two of them per burst and none at all while a Policy is
-/// idle. Per-dispatch detail lives at `debug`
+/// finish: two per burst, plus one while it lasts per [`PROGRESS_EVERY`], and
+/// none at all while a Policy is idle. Per-dispatch detail lives at `debug`
 /// ([`Delivery::execute_dispatch_within`]) and stays off in production.
 fn narrate(policy: &str, record: Record) {
     match record {

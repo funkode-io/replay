@@ -4,8 +4,7 @@
 //! much work it does: a burst is bracketed by the record that starts it and the
 //! [Caught up] record that ends it, however many events fell in between. An idle
 //! Policy at zero lag writes nothing at any level, which is what keeps silence
-//! worth reading — the property a line per dispatch would destroy, at over a
-//! hundred thousand lines for one import.
+//! worth reading (ADR-0021).
 //!
 //! This module holds only the decision. What the records say, and at what level,
 //! belongs to the caller ([`crate::PolicyRunner`]), so wording stays free to
@@ -19,11 +18,11 @@
 
 use std::time::{Duration, Instant};
 
-/// How much of a backlog a Policy may work through between progress records.
+/// The floor on the spacing between progress records: the first cursor advance
+/// at least this long after the previous record writes the next one.
 ///
-/// Small enough that "moving slowly" and "not moving" are distinguishable within
-/// one alerting window, large enough that the whole backlog costs a handful of
-/// lines: an import that takes an hour writes two records a minute at worst.
+/// Inside any alerting window, so "moving slowly" separates from "not moving"
+/// within one; and two records a minute is a rate an hour-long backlog can carry.
 pub(crate) const PROGRESS_EVERY: Duration = Duration::from_secs(30);
 
 /// What the narration decides is worth a record.
@@ -34,11 +33,12 @@ pub(crate) const PROGRESS_EVERY: Duration = Duration::from_secs(30);
 pub(crate) enum Record {
     /// A Policy at zero lag found work. Opens the bracket.
     Working,
-    /// Still working, `PROGRESS_EVERY` later. The only record that repeats, and
-    /// the only evidence that a long backlog is moving at all.
+    /// Still working: the first advance at least [`PROGRESS_EVERY`] after the
+    /// previous record. The only record that repeats, and the only evidence that
+    /// a long backlog is moving at all.
     Progress { events: u64, elapsed: Duration },
-    /// The feed came back empty after work: the cursor has reached the end of
-    /// it. Closes the bracket, and carries what the burst cost.
+    /// The feed ended after work: the cursor has reached the end of it. Closes
+    /// the bracket, and carries what the burst cost.
     CaughtUp { events: u64, elapsed: Duration },
 }
 
@@ -49,19 +49,17 @@ enum State {
     CaughtUp,
     /// Draining a backlog.
     Draining {
-        /// Start of the poll that found the work — not the instant the record
-        /// was decided. A backlog small enough for one poll is drained entirely
-        /// before anything is decided, and reporting it as instant would be a
-        /// lie about the only measurement in the record.
+        /// Start of the poll that opened the burst, which precedes its first
+        /// advance: a backlog drained inside one poll would otherwise be timed
+        /// from after the work.
         since: Instant,
         /// Positions advanced over since `since`.
         events: u64,
-        /// End of the last poll that had work. The gap before the empty poll
-        /// that discovers the catch-up is the poll interval, which the Policy
-        /// spent idle and must not be charged for.
+        /// The last advance. The wait before the empty poll that discovers the
+        /// catch-up is idle time, and is not charged to the burst.
         worked_until: Instant,
-        /// End of the last poll that wrote a record, which paces the progress
-        /// records against wall-clock time rather than against poll count.
+        /// The advance that wrote the last record, which paces the progress
+        /// records against the clock rather than against the work.
         reported: Instant,
     },
 }
@@ -85,17 +83,12 @@ pub(crate) struct Narration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Poll {
     /// The cursor advanced over `events` positions, in a poll that started at
-    /// `started` and had got this far by `ended`.
+    /// `started` and had got this far by `ended` — told as the cursor moves, so
+    /// a batch that takes ten minutes of dispatches reports while it runs.
     ///
-    /// Reported as the cursor moves rather than when the poll returns: a poll
-    /// whose batch takes ten minutes of dispatches is working throughout, and a
-    /// progress record that could only be written between polls would be paced
-    /// by the work rather than by the clock.
-    ///
-    /// `events` counts positions advanced over rather than reactions executed: a
-    /// Policy chewing through a window its filter excludes entirely is working,
-    /// and one whose reactions all park is working too. Both are "moving", which
-    /// is the question these records answer.
+    /// `events` counts positions advanced over rather than reactions executed:
+    /// a window a Policy's filter excludes entirely, and one whose reactions all
+    /// park, are both work.
     Advanced {
         events: u64,
         started: Instant,
@@ -189,14 +182,10 @@ impl Narration {
 
     /// The worker stopped leading — a lost lock, a shutdown, a restart.
     ///
-    /// Silent by design: the burst it was in the middle of is not finished, and
-    /// saying "caught up" would be false. Leaving it open would be worse, since
-    /// the next election would close somebody else's bracket with a duration
-    /// measured across the gap.
-    ///
+    /// Silent: the burst it was in the middle of is not finished, and the next
+    /// election must not close it with a duration measured across the gap.
     /// Reached between polls, which is where a worker sees a revocation: a
-    /// demoted worker finishes the batch it is inside, and narrates it, exactly
-    /// as it finishes dispatching it.
+    /// demoted worker narrates the batch it is inside as it finishes it.
     pub(crate) fn stood_down(&mut self) {
         self.state = State::CaughtUp;
     }
