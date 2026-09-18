@@ -2640,6 +2640,45 @@ writes its row, so a standby never overwrites a leader's beat, and the crate nev
 reads any of it back. `.without_heartbeat()` turns it off entirely; liveness stays
 readable in-process.
 
+### What a policy logs
+
+A policy's output is proportional to how often it changes state, not to how many
+events it processes
+([ADR-0021](docs/adr/0021-a-policy-narrates-its-transitions.md)). A burst of work
+is bracketed by two `info` records, and a policy with nothing to do writes
+nothing at any level, however often it polls — so silence means "nothing
+happened", not "nothing is known".
+
+| Record | When | Carries |
+|--------|------|---------|
+| `policy has work to do` | a poll reads a non-empty window, before any of it is dispatched | the policy |
+| `policy is working through its backlog` | the first cursor advance at least 30 s after the previous record | events so far, elapsed |
+| `policy is caught up` | the first poll that finds the feed exhausted | events in the burst, elapsed |
+| `policy dispatch committed` | every dispatch that commits, at `debug` | event, aggregate, elapsed |
+
+The counts are feed positions the cursor advanced over, not reactions executed: a
+policy whose `stream_filter` excludes a whole window worked through it, and is
+not caught up until the feed is empty. The elapsed time runs from the read that
+found the work to the last position the burst advanced over, so the idle interval
+before the empty poll that notices is not charged to it — which also means the
+catch-up record arrives up to one poll interval late.
+
+Records are written as the cursor moves, not when a poll returns, so a batch
+whose dispatches take minutes still reports progress while it runs — and the
+opening record precedes the first reaction, so everything that reaction logs
+falls inside the bracket. A policy that
+stops in front of a hole is **not** caught up and does not say it is: the bracket
+stays open, and the blocked record (`warn`) is what names the stop. A worker held
+inside a single reaction narrates nothing at all — that is the liveness axis's
+question, and the heartbeat answers it from a task of its own.
+
+Turn `debug` on for `replay_persistence::policy_runner` to see each dispatch that
+commits while you are looking at one policy; it is six figures of records for a
+large import, which is why it is off by default. A dispatch that is declined,
+retried or parked reports at its own level, and restarts, escalations and a
+policy parked in front of a hole are logged by the machinery that owns them
+(`warn` and `error`), not by this path.
+
 ### Monitoring policy status
 
 A running policy is otherwise opaque: its cursor and dead letters live in
