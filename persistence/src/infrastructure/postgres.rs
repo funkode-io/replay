@@ -66,9 +66,6 @@ const DEFAULT_STREAM_LOCK_WAIT: Duration = Duration::from_secs(30);
 /// Environment variable overriding the stream-lock wait, in milliseconds.
 const STREAM_LOCK_WAIT_ENV_VAR: &str = "REPLAY_STREAM_LOCK_WAIT_MS";
 
-/// Postgres `lock_not_available`: a `lock_timeout` expired on a row somebody else holds.
-const LOCK_NOT_AVAILABLE: &str = "55P03";
-
 /// Resolve how long this library's transactions wait for a stream row.
 ///
 /// Precedence: per-store override → `REPLAY_STREAM_LOCK_WAIT_MS` → 30s.
@@ -93,24 +90,6 @@ fn stream_lock_wait_or_default(declared: Option<Duration>, env: Option<String>) 
         .map_or(DEFAULT_STREAM_LOCK_WAIT, Duration::from_millis)
 }
 
-/// Bound how long `tx` waits for a row lock, for the length of that transaction.
-///
-/// `SET LOCAL`, so a connection returned to the pool carries nothing into its next use,
-/// and `set_config(…, true)` rather than `SET` because only the former takes a bind
-/// parameter. A wait of zero is Postgres's own "no limit", so nothing is set at all and
-/// the statement is not even sent.
-async fn bound_lock_wait(tx: &mut sqlx::PgConnection, wait: Duration) -> Result<(), replay::Error> {
-    if wait.is_zero() {
-        return Ok(());
-    }
-    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-        .bind(format!("{}ms", wait.as_millis().max(1)))
-        .execute(tx)
-        .await
-        .map_err(crate::db_error)?;
-    Ok(())
-}
-
 /// Map a failure from a statement that takes the stream row.
 ///
 /// A `55P03` is [`replay::ErrorKind::Unavailable`] rather than a conflict: this
@@ -124,7 +103,7 @@ fn stream_lock_error(
     wait: Duration,
     operation: &'static str,
 ) -> replay::Error {
-    if !is_lock_not_available(&error) {
+    if !crate::lock_wait::is_lock_not_available(&error) {
         return crate::db_error(error);
     }
     replay::Error::unavailable(format!(
@@ -134,13 +113,6 @@ fn stream_lock_error(
     .with_operation(operation)
     .with_context("stream_id", stream_id)
     .with_context("stream_lock_wait_ms", wait.as_millis())
-}
-
-fn is_lock_not_available(error: &sqlx::Error) -> bool {
-    match error {
-        sqlx::Error::Database(db) => db.code().as_deref() == Some(LOCK_NOT_AVAILABLE),
-        _ => false,
-    }
 }
 
 type BoxedPostgresEventHandler<E> = Box<
@@ -753,7 +725,9 @@ impl EventStore for PostgresEventStore {
         // for the rest of this transaction. Bounding the wait here is what lets an
         // abandoned append end on the server and hand its connection back, instead of
         // holding one for as long as the blocker lasts (funkode-io/replay#205).
-        bound_lock_wait(&mut transaction, self.stream_lock_wait).await?;
+        crate::lock_wait::bound(&mut transaction, self.stream_lock_wait)
+            .await
+            .map_err(crate::db_error)?;
 
         // Metadata is constant for the whole append, so its JSON is built once here
         // rather than once per event; each event then shares the document behind the
@@ -959,7 +933,9 @@ impl EventStore for PostgresEventStore {
 
         // The same bound as the append path, on the same row: a compaction queued behind
         // an append is stranded exactly as an append queued behind a compaction is.
-        bound_lock_wait(&mut tx, self.stream_lock_wait).await?;
+        crate::lock_wait::bound(&mut tx, self.stream_lock_wait)
+            .await
+            .map_err(crate::db_error)?;
 
         // 1. Lock the stream row for the duration of this transaction.
         //    Any concurrent `append_event` call that updates (or inserts into) this stream
