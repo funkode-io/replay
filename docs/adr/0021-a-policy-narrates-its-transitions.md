@@ -60,11 +60,12 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
   a backlog measure, not an audit of what reacted — the cursor and the dead
   letters answer that.
 
-- **A burst is timed from the start of the poll that found the work**, not from
-  when the record was decided. A backlog small enough for one poll is entirely
-  drained before anything is decided, and the only measurement in the record
-  would read as instantaneous. It ends at the last poll that had work, so the
-  idle poll interval before the empty poll that notices is not charged to it.
+- **A burst is timed from the read that found the work to the last position it
+  advanced over.** The clock starts before the feed read, not when a record is
+  decided — otherwise a backlog drained inside one poll would be timed from after
+  the work and read as instantaneous. It stops at the last advance, so neither the
+  checkpoint that follows the last event nor the idle interval before the empty
+  poll that notices the catch-up is charged to the work.
 
 - **The narration belongs to one election.** A worker that loses its lock
   mid-backlog abandons its bracket silently: it has not caught up, and leaving it

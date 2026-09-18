@@ -2640,10 +2640,10 @@ happened", not "nothing is known".
 
 The counts are feed positions the cursor advanced over, not reactions executed: a
 policy whose `stream_filter` excludes a whole window worked through it, and is
-not caught up until the feed is empty. The elapsed time runs from the start of
-the poll that found the work to the end of the last poll that had any, so the
-idle interval before the empty poll that notices is not charged to the burst —
-which also means the catch-up record arrives up to one poll interval late.
+not caught up until the feed is empty. The elapsed time runs from the read that
+found the work to the last position the burst advanced over, so the idle interval
+before the empty poll that notices is not charged to it — which also means the
+catch-up record arrives up to one poll interval late.
 
 Records are written as the cursor moves, not when a poll returns, so a batch
 whose dispatches take minutes still reports progress while it runs — and the
