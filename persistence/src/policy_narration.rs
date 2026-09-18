@@ -193,6 +193,10 @@ impl Narration {
     /// saying "caught up" would be false. Leaving it open would be worse, since
     /// the next election would close somebody else's bracket with a duration
     /// measured across the gap.
+    ///
+    /// Reached between polls, which is where a worker sees a revocation: a
+    /// demoted worker finishes the batch it is inside, and narrates it, exactly
+    /// as it finishes dispatching it.
     pub(crate) fn stood_down(&mut self) {
         self.state = State::CaughtUp;
     }

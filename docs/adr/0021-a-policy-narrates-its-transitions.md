@@ -16,15 +16,19 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
 
 - **A burst is bracketed by two records.** One when a Policy at zero lag finds
   work, one when it reaches [Caught up](../../CONTEXT.md#caught-up), naming how
-  many events it took and how long. A ten-thousand-event import costs two lines
-  and an idle Policy costs none, so silence keeps meaning "nothing happened"
-  rather than "nothing is known".
+  many events it took and how long. A ten-thousand-event import costs those two
+  plus one progress record per `PROGRESS_EVERY` it lasts — four lines for a
+  ninety-second import — and an idle Policy costs none, so silence keeps meaning
+  "nothing happened" rather than "nothing is known".
 
 - **A long backlog emits a bounded progress record**, spaced by wall-clock time
   (`PROGRESS_EVERY`, 30s) rather than by poll or event count, because the
   question it answers — moving slowly, or not moving? — is a question about
   time. It is the only record that repeats while a Policy is doing what it
-  should.
+  should. The spacing is a floor, not a schedule: the record is written by the
+  first cursor advance at least that long after the previous one, so a Policy
+  that stops advancing stops writing them — which is the distinction the record
+  exists to draw.
 
 - **Records are earned as the cursor moves, not when a poll returns.** One poll's
   batch is dispatched event by event, each bounded only by the
@@ -61,7 +65,14 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
 - **The narration belongs to one election.** A worker that loses its lock
   mid-backlog abandons its bracket silently: it has not caught up, and leaving it
   open would let the next Leader close somebody else's burst with a duration
-  measured across the gap. Restart and escalation records belong to supervision
+  measured across the gap. The boundary is the one
+  [ADR-0008](0008-policy-runner-shared-connection-leadership.md) already draws,
+  not a tighter one: a demoted worker finishes the batch it is inside before it
+  sees the revocation, so for that window its records overlap the new Leader's.
+  They are true — it did that work, and the checkpoint it then attempts is
+  refused as superseded — and the alternative, cutting the narration off
+  mid-batch, would hide work that happened rather than prevent it. Restart and
+  escalation records belong to supervision
   ([ADR-0017](0017-dead-policy-worker-restarted-on-a-budget.md),
   [ADR-0019](0019-escalation-is-a-consumer-hook-that-exits-by-default.md)) and are
   not repeated here.

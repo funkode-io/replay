@@ -2634,7 +2634,7 @@ happened", not "nothing is known".
 | Record | When | Carries |
 |--------|------|---------|
 | `policy has work to do` | a policy at zero lag finds work | the policy |
-| `policy is working through its backlog` | every 30 s while a backlog drains | events so far, elapsed |
+| `policy is working through its backlog` | the first cursor advance at least 30 s after the previous record | events so far, elapsed |
 | `policy is caught up` | the first poll that finds the feed exhausted | events in the burst, elapsed |
 | `policy dispatch committed` | every dispatch, at `debug` | event, aggregate, elapsed |
 
