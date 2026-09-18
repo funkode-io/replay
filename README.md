@@ -2645,6 +2645,13 @@ the poll that found the work to the end of the last poll that had any, so the
 idle interval before the empty poll that notices is not charged to the burst —
 which also means the catch-up record arrives up to one poll interval late.
 
+Records are written as the cursor moves, not when a poll returns, so a batch
+whose dispatches take minutes still reports progress while it runs. A policy that
+stops in front of a hole is **not** caught up and does not say it is: the bracket
+stays open, and the blocked record (`warn`) is what names the stop. A worker held
+inside a single reaction narrates nothing at all — that is the liveness axis's
+question, and the heartbeat answers it from a task of its own.
+
 Turn `debug` on for `replay_persistence::policy_runner` to see every dispatch
 while you are looking at one policy; it is six figures of records for a large
 import, which is why it is off by default. Restarts, escalations and a policy

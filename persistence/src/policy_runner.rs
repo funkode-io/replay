@@ -37,7 +37,7 @@ use crate::policy_feed::{feed_from_window, Feed, Gap, WindowPosition};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
 };
-use crate::policy_narration::{Narration, Record, PROGRESS_EVERY};
+use crate::policy_narration::{Narration, Poll, Record, PROGRESS_EVERY};
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
 /// Erased, services-bound execution path for one aggregate type.
@@ -1286,11 +1286,13 @@ impl PolicyRunner {
             &self.executors,
             policy,
             &mut cursor,
-            &self.stopped,
             max_depth,
+            &mut Reporting {
+                stopped: &self.stopped,
+                narration: None,
+            },
         )
         .await
-        .map(|polled| polled.dispatches)
     }
 }
 
@@ -1775,38 +1777,31 @@ impl PolicyWorker {
                     break;
                 }
 
-                let started = Instant::now();
-                let polled = drain_policy_once(
+                // Narrated from inside the drain, as the cursor moves: a batch
+                // whose dispatches take minutes is working throughout, and a
+                // record earned only when the poll returns would be paced by the
+                // work rather than by the clock.
+                if let Err(error) = drain_policy_once(
                     &cqrs,
                     &pool,
                     &executors,
                     policy.as_ref(),
                     &mut cursor,
-                    &stopped,
                     max_depth,
+                    &mut Reporting {
+                        stopped: &stopped,
+                        narration: Some(&mut narration),
+                    },
                 )
-                .await;
-                let ended = Instant::now();
-
-                match polled {
-                    // A poll's own duration is what the catch-up record is timed
-                    // from, so it is read either side of the drain rather than
-                    // when the record is decided: a backlog drained in a single
-                    // poll would otherwise report as instantaneous.
-                    Ok(Polled { events, .. }) => {
-                        if let Some(record) = narration.polled(events, started, ended) {
-                            narrate(&name, record);
-                        }
-                    }
-                    Err(error) => {
-                        // Narrated as nothing: a poll that failed did not catch
-                        // up, and the error is the record.
-                        tracing::error!(
-                            policy = %name,
-                            error = %error,
-                            "policy polling iteration failed"
-                        );
-                    }
+                .await
+                {
+                    // Narrated as nothing: a poll that failed did not catch up,
+                    // and the error is the record.
+                    tracing::error!(
+                        policy = %name,
+                        error = %error,
+                        "policy polling iteration failed"
+                    );
                 }
 
                 // Published after the drain rather than before it, so the stamp
@@ -1815,7 +1810,7 @@ impl PolicyWorker {
                 // from an idle one. The heartbeat task carries it to the database;
                 // this worker never writes it, because it cannot write anything
                 // while a reaction holds it.
-                liveness.polled(ended);
+                liveness.polled(Instant::now());
 
                 // Wait for the next wakeup: NOTIFY broadcast (if enabled),
                 // poll timeout, leadership change, or shutdown — whichever
@@ -2166,15 +2161,33 @@ fn narrate(policy: &str, record: Record) {
     }
 }
 
-/// What one poll of a Policy's feed did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Polled {
-    /// Dispatches that committed — what [`PolicyRunner::drain`] returns.
-    dispatches: usize,
-    /// Positions the cursor advanced over, whether or not this Policy reacted to
-    /// them: a window its filter excludes entirely is still a window it worked
-    /// through, and [`Narration`] is asking whether the Policy is moving.
-    events: u64,
+/// Where one poll reports what it saw.
+///
+/// The two axes a poll feeds, carried together because a poll speaks to both at
+/// the same moments: what stopped the feed ([Progress]) and what the worker is
+/// doing about it ([Narration]).
+///
+/// [Progress]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#progress
+/// [Narration]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#narration
+struct Reporting<'a> {
+    /// Where a feed that stops is remembered, and how often it is reported.
+    stopped: &'a StoppedPolicies,
+    /// The bracket around a burst of work. `None` for [`PolicyRunner::drain`],
+    /// which polls once on the caller's command: a manual drain that opened a
+    /// burst would leave a bracket nothing ever closes.
+    narration: Option<&'a mut Narration>,
+}
+
+impl Reporting<'_> {
+    /// Tell the narration what a read of the feed found, and write whatever
+    /// record it earns.
+    fn tell(&mut self, policy: &str, poll: Poll) {
+        if let Some(narration) = self.narration.as_deref_mut() {
+            if let Some(record) = narration.polled(poll) {
+                narrate(policy, record);
+            }
+        }
+    }
 }
 
 async fn drain_policy_once(
@@ -2183,9 +2196,10 @@ async fn drain_policy_once(
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     policy: &dyn ErasedPolicy,
     cursor: &mut PolicyCursor,
-    stopped: &StoppedPolicies,
     max_depth: u32,
-) -> Result<Polled, replay::Error> {
+    reporting: &mut Reporting<'_>,
+) -> Result<usize, replay::Error> {
+    let started = Instant::now();
     let name = policy.name().to_string();
     let checkpoint_size = resolve_checkpoint_batch_size(policy);
     let read_batch = resolve_read_batch_size(policy, checkpoint_size);
@@ -2214,8 +2228,11 @@ async fn drain_policy_once(
             );
             // The gap was read from the position the operator has just replaced:
             // reporting it would name a stop that no longer exists.
-            stopped.forget(&name);
-            return Ok(Polled::default());
+            reporting.stopped.forget(&name);
+            // Not a catch-up: this poll read nothing and proved nothing about
+            // the feed, which now starts somewhere else entirely.
+            reporting.tell(&name, Poll::Stalled);
+            return Ok(0);
         }
 
         match gap {
@@ -2225,14 +2242,23 @@ async fn drain_policy_once(
                 // A hole no running transaction can fill is crossed here; anything
                 // else is an append the feed is right to wait for, and waiting is
                 // what gets reported.
-                if !skip_burned_positions(pool, &name, cursor, gap, stopped).await? {
-                    report_blocked(pool, &name, gap, &stopped.blocked).await?;
+                if !skip_burned_positions(pool, &name, cursor, gap, reporting.stopped).await? {
+                    report_blocked(pool, &name, gap, &reporting.stopped.blocked).await?;
                 }
+                // A Policy stopped in front of a hole has not reached the end of
+                // its feed, whatever this poll read. Reporting it as caught up
+                // would say the opposite of what happened, and the block has a
+                // record of its own.
+                reporting.tell(&name, Poll::Stalled);
             }
-            // Caught up: a healthy idle policy, and it stays silent.
-            None => stopped.forget(&name),
+            // Caught up: a healthy idle policy, and it stays silent unless this
+            // is the poll that closes a burst.
+            None => {
+                reporting.stopped.forget(&name);
+                reporting.tell(&name, Poll::Exhausted);
+            }
         }
-        return Ok(Polled::default());
+        return Ok(0);
     }
 
     match gap {
@@ -2246,14 +2272,13 @@ async fn drain_policy_once(
         // The delay is one poll, and the positions are no less burned for it.
         Some(gap) => {
             trace_gap(&name, gap);
-            stopped.sighted(&name, gap);
+            reporting.stopped.sighted(&name, gap);
         }
         // Advancing with nothing in the way.
-        None => stopped.forget(&name),
+        None => reporting.stopped.forget(&name),
     }
 
     let mut executed = 0;
-    let mut advanced = 0u64;
     let mut events_since_checkpoint = 0u32;
     for WindowPosition {
         commit_txid,
@@ -2290,8 +2315,18 @@ async fn drain_policy_once(
         // Always track in-memory position.
         cursor.advance_to(commit_txid, global_position);
         events_since_checkpoint += 1;
-        advanced += 1;
-
+        // Told as the cursor moves rather than when the poll returns: one poll's
+        // batch is dispatched event by event, each bounded only by the dispatch
+        // timeout and its retries, so a poll can outlast the progress cadence
+        // several times over.
+        reporting.tell(
+            &name,
+            Poll::Advanced {
+                events: 1,
+                started,
+                ended: Instant::now(),
+            },
+        );
         // Write the persistent cursor every `checkpoint_size` events so that
         // a crash re-processes at most `checkpoint_size - 1` events rather
         // than the full drain batch (skip-safety: the cursor only advances
@@ -2299,10 +2334,7 @@ async fn drain_policy_once(
         if events_since_checkpoint >= checkpoint_size {
             if cursor.checkpoint(pool, &name).await? == Checkpoint::Superseded {
                 log_superseded(&name, cursor);
-                return Ok(Polled {
-                    dispatches: executed,
-                    events: advanced,
-                });
+                return Ok(executed);
             }
             events_since_checkpoint = 0;
         }
@@ -2315,10 +2347,7 @@ async fn drain_policy_once(
         log_superseded(&name, cursor);
     }
 
-    Ok(Polled {
-        dispatches: executed,
-        events: advanced,
-    })
+    Ok(executed)
 }
 
 /// Trace the stop: the one fact the blocked deployment in funkode-io/replay#164

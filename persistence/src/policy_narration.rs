@@ -11,6 +11,10 @@
 //! belongs to the caller ([`crate::PolicyRunner`]), so wording stays free to
 //! change without touching a test.
 //!
+//! What it cannot see is a worker held inside one reaction: the narration runs on
+//! the worker's own thread of control, so a hung dispatch stops it along with
+//! everything else. That is the question [`crate::Liveness`] answers.
+//!
 //! [Caught up]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#caught-up
 
 use std::time::{Duration, Instant};
@@ -73,6 +77,41 @@ pub(crate) struct Narration {
     state: State,
 }
 
+/// What one read of the feed found, as the narration needs to hear it.
+///
+/// The distinction that matters is between the two ways a poll can advance
+/// nothing. Only one of them is a catch-up, and conflating them would announce
+/// that a Policy parked in front of a hole has reached the end of its feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Poll {
+    /// The cursor advanced over `events` positions, in a poll that started at
+    /// `started` and had got this far by `ended`.
+    ///
+    /// Reported as the cursor moves rather than when the poll returns: a poll
+    /// whose batch takes ten minutes of dispatches is working throughout, and a
+    /// progress record that could only be written between polls would be paced
+    /// by the work rather than by the clock.
+    ///
+    /// `events` counts positions advanced over rather than reactions executed: a
+    /// Policy chewing through a window its filter excludes entirely is working,
+    /// and one whose reactions all park is working too. Both are "moving", which
+    /// is the question these records answer.
+    Advanced {
+        events: u64,
+        started: Instant,
+        ended: Instant,
+    },
+    /// The feed ended: nothing to read, and nothing in the way of reading more.
+    /// The only observation that closes a burst.
+    Exhausted,
+    /// Nothing advanced, and the feed did not end — it stops at a hole, or the
+    /// cursor was moved under the poll. No edge either way: a
+    /// [Blocked policy](https://github.com/funkode-io/replay/blob/main/CONTEXT.md#blocked-policy)
+    /// has not caught up, and its own record says so
+    /// ([`crate::policy_blocked`]).
+    Stalled,
+}
+
 impl Narration {
     /// A worker starts caught up, not working: a Policy elected with nothing to
     /// do must reach its first poll without having said anything.
@@ -83,25 +122,24 @@ impl Narration {
         }
     }
 
-    /// A poll that ran from `started` to `ended` advanced over `events`
-    /// positions. Returns the record it earns, if any.
+    /// Hear what a read of the feed found, and return the record it earns, if
+    /// any.
     ///
-    /// `events` counts positions the cursor advanced over rather than reactions
-    /// executed: a Policy chewing through a window its filter excludes entirely
-    /// is working, and one whose reactions all park is working too. Both are
-    /// "moving", which is the question these records answer.
-    ///
-    /// A poll that failed is not a poll: the caller reports the error and says
-    /// nothing here, so a database outage cannot be narrated as a catch-up.
-    pub(crate) fn polled(
-        &mut self,
-        events: u64,
-        started: Instant,
-        ended: Instant,
-    ) -> Option<Record> {
-        match &mut self.state {
-            State::CaughtUp if events == 0 => None,
-            State::CaughtUp => {
+    /// A poll that *failed* is not an observation: the caller reports the error
+    /// and says nothing here, so a database outage cannot be narrated as a
+    /// catch-up.
+    pub(crate) fn polled(&mut self, poll: Poll) -> Option<Record> {
+        match (&mut self.state, poll) {
+            (_, Poll::Stalled) => None,
+            (State::CaughtUp, Poll::Exhausted) => None,
+            (
+                State::CaughtUp,
+                Poll::Advanced {
+                    events,
+                    started,
+                    ended,
+                },
+            ) => {
                 self.state = State::Draining {
                     since: started,
                     events,
@@ -110,12 +148,15 @@ impl Narration {
                 };
                 Some(Record::Working)
             }
-            State::Draining {
-                since,
-                events: total,
-                worked_until,
-                ..
-            } if events == 0 => {
+            (
+                State::Draining {
+                    since,
+                    events: total,
+                    worked_until,
+                    ..
+                },
+                Poll::Exhausted,
+            ) => {
                 let record = Record::CaughtUp {
                     events: *total,
                     elapsed: worked_until.saturating_duration_since(*since),
@@ -123,12 +164,15 @@ impl Narration {
                 self.state = State::CaughtUp;
                 Some(record)
             }
-            State::Draining {
-                since,
-                events: total,
-                worked_until,
-                reported,
-            } => {
+            (
+                State::Draining {
+                    since,
+                    events: total,
+                    worked_until,
+                    reported,
+                },
+                Poll::Advanced { events, ended, .. },
+            ) => {
                 *total = total.saturating_add(events);
                 *worked_until = ended;
                 if ended.saturating_duration_since(*reported) < self.progress_every {
@@ -159,7 +203,7 @@ mod tests {
     use super::*;
 
     /// A poll, as the worker times one: it takes `took`, starting `after` the
-    /// reference instant.
+    /// reference instant, and either advances or finds the feed exhausted.
     fn poll(
         narration: &mut Narration,
         start: Instant,
@@ -167,7 +211,102 @@ mod tests {
         took: Duration,
         events: u64,
     ) -> Option<Record> {
-        narration.polled(events, start + after, start + after + took)
+        narration.polled(if events == 0 {
+            Poll::Exhausted
+        } else {
+            Poll::Advanced {
+                events,
+                started: start + after,
+                ended: start + after + took,
+            }
+        })
+    }
+
+    /// A burst is not closed by a poll that read nothing because something is in
+    /// the way: a Policy parked in front of a hole has not reached the end of its
+    /// feed, and announcing a catch-up would say the opposite of what happened.
+    #[test]
+    fn a_stalled_poll_leaves_the_burst_open() {
+        let mut narration = Narration::new(PROGRESS_EVERY);
+        let start = Instant::now();
+
+        poll(&mut narration, start, Duration::ZERO, Duration::ZERO, 700);
+
+        for minute in 1..10 {
+            assert_eq!(
+                narration.polled(Poll::Stalled),
+                None,
+                "nothing is earned by a poll that advanced nothing and ended nothing, \
+                 at minute {minute} of the block"
+            );
+        }
+
+        assert_eq!(
+            poll(
+                &mut narration,
+                start,
+                Duration::from_secs(600),
+                Duration::ZERO,
+                300
+            ),
+            Some(Record::Progress {
+                events: 1_000,
+                elapsed: Duration::from_secs(600),
+            }),
+            "the hole filled and the same burst carries on — a progress record, \
+             because the spacing has long since elapsed, and never a second bracket"
+        );
+        assert_eq!(
+            poll(
+                &mut narration,
+                start,
+                Duration::from_secs(601),
+                Duration::ZERO,
+                0
+            ),
+            Some(Record::CaughtUp {
+                events: 1_000,
+                elapsed: Duration::from_secs(600),
+            })
+        );
+    }
+
+    /// A Policy that was already quiet stays quiet in front of a hole: the block
+    /// is reported on the progress axis, by the record that knows how old it is.
+    #[test]
+    fn a_stalled_poll_says_nothing_about_an_idle_policy() {
+        let mut narration = Narration::new(PROGRESS_EVERY);
+
+        assert_eq!(narration.polled(Poll::Stalled), None);
+    }
+
+    /// One poll can run for minutes — a batch is dispatched event by event, each
+    /// dispatch bounded only by its timeout and its retries. Records are earned
+    /// as the cursor moves, so a slow batch is distinguishable from a wedged one
+    /// while it is still running rather than after it returns.
+    #[test]
+    fn a_long_poll_reports_while_it_is_still_running() {
+        let mut narration = Narration::new(PROGRESS_EVERY);
+        let started = Instant::now();
+        let advanced = |at: Duration| Poll::Advanced {
+            events: 1,
+            started,
+            ended: started + at,
+        };
+
+        assert_eq!(
+            narration.polled(advanced(Duration::ZERO)),
+            Some(Record::Working),
+            "the first position of a long batch opens the bracket, not its last"
+        );
+        assert_eq!(narration.polled(advanced(Duration::from_secs(20))), None);
+        assert_eq!(
+            narration.polled(advanced(PROGRESS_EVERY)),
+            Some(Record::Progress {
+                events: 3,
+                elapsed: PROGRESS_EVERY,
+            })
+        );
     }
 
     /// The property the whole module exists for: a Policy at zero lag polls
@@ -475,10 +614,14 @@ mod tests {
         let mut narration = Narration::new(PROGRESS_EVERY);
         let start = Instant::now();
 
-        narration.polled(5, start + Duration::from_secs(10), start);
+        narration.polled(Poll::Advanced {
+            events: 5,
+            started: start + Duration::from_secs(10),
+            ended: start,
+        });
 
         assert_eq!(
-            narration.polled(0, start, start),
+            narration.polled(Poll::Exhausted),
             Some(Record::CaughtUp {
                 events: 5,
                 elapsed: Duration::ZERO,

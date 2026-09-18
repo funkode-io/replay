@@ -26,6 +26,25 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
   time. It is the only record that repeats while a Policy is doing what it
   should.
 
+- **Records are earned as the cursor moves, not when a poll returns.** One poll's
+  batch is dispatched event by event, each bounded only by the
+  [Dispatch timeout](../../CONTEXT.md#dispatch-timeout) and its retries, so a
+  single poll can outlast the progress cadence several times over; a decision
+  taken between polls would be paced by the work rather than by the clock. What
+  this still cannot see is a worker held inside one reaction — the narration runs
+  on the worker's own thread of control. That is the question
+  [Liveness](../../CONTEXT.md#liveness) answers, from a task of its own
+  ([ADR-0020](0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)).
+
+- **Only an exhausted feed closes a burst.** A poll that read nothing has either
+  reached the end of the feed or stopped in front of something: a hole
+  ([ADR-0013](0013-policy-feed-contiguity-on-unfiltered-positions.md)), or a
+  cursor an operator moved under it. Both read as zero events, and conflating
+  them would announce that a [Blocked policy](../../CONTEXT.md#blocked-policy)
+  had caught up — the opposite of what happened, in the one state
+  funkode-io/replay#164 was about. A stalled poll is no edge at all: the bracket
+  stays open until the feed genuinely ends, and the block has a record of its own.
+
 - **The edge is computed from positions the cursor advanced over, not from
   dispatches executed.** A window a Policy's filter excludes entirely, and one
   whose reactions all park, are both work: a Policy that read them is moving, and
@@ -67,10 +86,10 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
 - The catch-up record lags the actual catch-up by up to one poll interval: it is
   written by the first empty poll, which is what proves the feed is exhausted.
   The duration it reports excludes that wait.
-- A Policy polling into a hole is silent on this axis and reported on the other
-  one, by the blocked record ([ADR-0013](0013-policy-feed-contiguity-on-unfiltered-positions.md)
-  and `policy_blocked`): an empty feed closes a burst here exactly once, however
-  long the block lasts.
+- A Policy that stops in front of a hole never writes a catch-up record for that
+  burst, which is correct and means a bracket can stay open for as long as the
+  block lasts. The progress record keeps arriving once it moves again, and the
+  block itself is reported by `policy_blocked`.
 
 ## Rejected
 
