@@ -1719,15 +1719,17 @@ impl PolicyWorker {
                 }
             };
 
-            // Where this worker picks up, once per election. It is the only
-            // line a process killed from outside leaves: the same
-            // `next_position` on every restart names a poison event
-            // (`SELECT * FROM events WHERE global_position = <next_position>`), a
-            // position that advances means the process is leaking instead.
+            // Where this worker picks up, once per election. It is the only line a
+            // process killed from outside leaves: the same pair on every restart names
+            // an event the worker cannot survive, a pair that advances means the process
+            // is leaking instead. The event itself is the first row past the pair —
+            // `SELECT * FROM events WHERE (commit_txid, global_position) > (<txid>, <pos>)
+            // ORDER BY commit_txid, global_position LIMIT 1` — because the successor in
+            // this order is not `position + 1` and may hold a lower position entirely.
             tracing::info!(
                 policy = %name,
                 resuming_after = cursor.position(),
-                next_position = cursor.position() + 1,
+                resuming_after_commit_txid = %cursor.point().commit_txid,
                 "policy worker is leading; resuming after its last checkpoint"
             );
 
@@ -2232,7 +2234,7 @@ async fn report_waiting(
         policy = %name,
         cursor = cursor.position,
         cursor_commit_txid = %cursor.commit_txid,
-        head = wait.head,
+        log_max_position = wait.log_max_position,
         withheld_position = wait.withheld.position,
         withheld_commit_txid = %wait.withheld.commit_txid,
         watermark = %wait.watermark,
@@ -4456,6 +4458,86 @@ mod cursor_tests {
                 .await
                 .contains(&first[0].position),
             "and the log below the cursor's position is not replayed to get there"
+        );
+    }
+
+    /// The instruction and the point are two different writes, and the sentinel is what
+    /// tells them apart.
+    ///
+    /// A position alone is ambiguous by construction: a row carries a transaction half
+    /// whatever the operator does, and if the old cursor and the target event came from
+    /// the same transaction that half still names the event at the new position — a
+    /// genuine point, honoured as written. Honouring it loses nothing (everything below a
+    /// cursor the runner wrote has been delivered) but it rewinds in *feed* order, so an
+    /// event past the position written by an older transaction is not replayed.
+    ///
+    /// Writing the sentinel says "this is an instruction, not a point" in the one column
+    /// the surface has, and gets the conservative reading every time.
+    #[tokio::test]
+    async fn a_position_only_move_says_so_with_the_sentinel_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+
+        // A transaction that takes its id first and appends last: its event sits at the
+        // highest position under the *lowest* transaction, so it is the first thing the
+        // feed delivers and the last thing a position-ordered rewind would reach.
+        let mut older = pool.begin().await.expect("beginning must succeed");
+        sqlx::query_scalar::<_, String>("SELECT pg_current_xact_id()::text")
+            .fetch_one(&mut *older)
+            .await
+            .expect("taking a transaction id must succeed");
+
+        let events = append_events(&pool, 3).await;
+        let older_position = append_inside(&mut older, "urn:probe:older").await;
+        older.commit().await.expect("committing must succeed");
+
+        // The pair an operator's move leaves behind when the target event belongs to the
+        // transaction the cursor already named.
+        sqlx::query(
+            "INSERT INTO policy_cursors (name, position, commit_txid) VALUES ($1, $2, $3::xid8)",
+        )
+        .bind(POLICY)
+        .bind(events[1].position)
+        .bind(events[1].commit_txid.to_string())
+        .execute(&pool)
+        .await
+        .expect("staging the operator's move must succeed");
+
+        let as_a_point = PolicyCursor::load(&pool, POLICY, StartAt::Now)
+            .await
+            .expect("loading must succeed");
+        assert_eq!(
+            as_a_point.point, events[1],
+            "a pair that names an event is resumed from as written"
+        );
+        assert!(
+            !feed_from(&pool, as_a_point.point)
+                .await
+                .contains(&older_position),
+            "which rewinds in feed order: the older transaction's event is behind it"
+        );
+
+        // The same instruction, written as an instruction.
+        sqlx::query(
+            "UPDATE policy_cursors SET position = $2, commit_txid = '0'::xid8 WHERE name = $1",
+        )
+        .bind(POLICY)
+        .bind(events[1].position)
+        .execute(&pool)
+        .await
+        .expect("the operator's move must succeed");
+
+        let as_an_instruction = PolicyCursor::load(&pool, POLICY, StartAt::Now)
+            .await
+            .expect("loading must succeed");
+        assert_eq!(
+            as_an_instruction.point.position, events[1].position,
+            "the position is still the operator's"
+        );
+        assert!(
+            feed_from(&pool, as_an_instruction.point)
+                .await
+                .contains(&older_position),
+            "and every event past it is delivered, whatever transaction wrote it"
         );
     }
 

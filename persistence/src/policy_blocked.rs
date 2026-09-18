@@ -127,8 +127,14 @@ impl BlockedWatch {
 /// What the database says about a Policy that read nothing while the log has moved on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Waiting {
-    /// `MAX(global_position)`: how much of the log is stranded behind the open write.
-    pub(crate) head: i64,
+    /// `MAX(global_position)`: the highest number the log has issued.
+    ///
+    /// Reported as evidence that the log is moving while this Policy is not, and for
+    /// nothing else. It is not the feed's head and not a backlog: the feed advances in
+    /// `(commit_txid, global_position)` order, where a later point can hold a lower
+    /// position, so the arithmetic distance from a cursor to this number means nothing
+    /// (ADR-0021). Logged as `log_max_position` so an incident cannot read it as one.
+    pub(crate) log_max_position: i64,
     /// The oldest event the watermark holds back, and the transaction that wrote it.
     pub(crate) withheld: FeedPoint,
     /// `pg_snapshot_xmin`: the oldest transaction still running. Everything below it
@@ -156,7 +162,7 @@ pub(crate) async fn probe_waiting(
     cursor: FeedPoint,
 ) -> Result<Option<Waiting>, replay::Error> {
     let row = sqlx::query(
-        "SELECT COALESCE((SELECT MAX(global_position) FROM events), 0) AS head, \
+        "SELECT COALESCE((SELECT MAX(global_position) FROM events), 0) AS log_max_position, \
          pg_snapshot_xmin(pg_current_snapshot())::text AS watermark, \
          w.global_position AS withheld_position, \
          w.commit_txid::text AS withheld_commit_txid, \
@@ -179,7 +185,7 @@ pub(crate) async fn probe_waiting(
 
     row.map(|row| {
         Ok(Waiting {
-            head: row.get("head"),
+            log_max_position: row.get("log_max_position"),
             withheld: FeedPoint {
                 commit_txid: CommitStamp::from_row(&row, "withheld_commit_txid")?,
                 position: row.get("withheld_position"),

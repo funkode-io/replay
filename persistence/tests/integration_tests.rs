@@ -5311,6 +5311,71 @@ async fn retry_policy_dead_letters_resolves_all_oldest_first_postgres_test() {
     );
 }
 
+/// Replay follows the order the Policy parked the rows in, not their numeric positions.
+///
+/// Since funkode-io/replay#195 the feed delivers in `(commit_txid, global_position)`
+/// order, so an event at a lower position can be parked *after* one at a higher position
+/// — a transaction that takes its id early and appends late puts its events at the head
+/// of the feed and the tail of the log. Retrying by position would then run reactions in
+/// an order the Policy never saw; the serial fixture above cannot tell the two apart,
+/// because there the two orders agree.
+///
+/// Staged on the parked rows themselves rather than by manufacturing the transaction-id
+/// inversion: what the retry must honour is the record of what this Policy did, and that
+/// record is `created_at`.
+#[tokio::test]
+async fn retry_policy_dead_letters_replays_in_parking_order_postgres_test() {
+    let target = OrderedPickyAccountUrn::new("bulk-parking-order").unwrap();
+    let (_container, pg_pool, cqrs) = manufacture_dead_letters(
+        OrderedPickyPolicy {
+            target: target.clone(),
+        },
+        &[10.0, 20.0], // both even → both resolve
+    )
+    .await;
+
+    // Invert parking order against position order: the row at the higher position was
+    // parked first, which is what feed-order delivery of an inverted log produces.
+    sqlx::query(
+        "UPDATE policy_dead_letters SET created_at = now() - interval '1 minute' \
+         WHERE policy_name = 'ordered_picky_policy' \
+           AND global_position = (SELECT MAX(global_position) FROM policy_dead_letters \
+                                  WHERE policy_name = 'ordered_picky_policy')",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("staging the parking order must succeed");
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<OrderedPickyAccount>(())
+        .register_policy(OrderedPickyPolicy {
+            target: target.clone(),
+        })
+        .build();
+
+    let summary = runner
+        .retry_policy_dead_letters("ordered_picky_policy")
+        .await
+        .expect("bulk retry must not error");
+    assert_eq!(
+        summary,
+        replay_persistence::DeadLetterRetrySummary {
+            resolved: 2,
+            still_failing: 0,
+        }
+    );
+
+    let account = cqrs
+        .fetch_aggregate::<OrderedPickyAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        account.applied,
+        vec![20, 10],
+        "the row parked first is replayed first, though its position is the higher one"
+    );
+}
+
 /// Bulk retry with a mix of resolvable and still-failing rows: exactly the
 /// unresolved rows remain (each updated in place, not duplicated) and the
 /// policy stays `Degraded` while any remain.

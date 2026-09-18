@@ -2148,8 +2148,9 @@ runner state: you can reposition a policy against a live deployment with plain
 SQL, without restarting a process or dropping leadership.
 
 ```sql
--- reposition a policy: forward to pass events, backward to re-deliver them
-UPDATE policy_cursors SET position = 264786, updated_at = now()
+-- reposition a policy: forward to pass events, backward to re-deliver them.
+-- The sentinel is the instruction marker: "a position, not a point".
+UPDATE policy_cursors SET position = 264786, commit_txid = '0'::xid8, updated_at = now()
 WHERE name = 'price_fanout';
 ```
 
@@ -2158,9 +2159,18 @@ position belongs to no event, so it is not a point the feed can stop at — see 
 runbook below.)
 
 The row also records the transaction that wrote the event the policy stopped at
-(`commit_txid`), which is the half the feed is ordered by. **Writing the position alone
-is the instruction**, exactly as before: the runner derives the transaction half, and
-you need supply only one column.
+(`commit_txid`), which is the half the feed is ordered by. **The position is still the
+whole instruction**; `commit_txid = '0'::xid8` is how you say so. The sentinel orders
+before every real transaction and names no event, so the runner reads the row as an
+instruction and derives the transaction half itself.
+
+Write it even though the position alone usually suffices: a row always carries *some*
+transaction half, and if the old cursor and the event at your new position came from the
+same transaction, the leftover half names a real event — a point, which the runner then
+resumes from verbatim. Nothing is lost when that happens (everything below a cursor the
+runner wrote has already been delivered), but the rewind is in feed order, so an event
+past your position written by an *older* transaction is not replayed. The sentinel makes
+the instruction unambiguous whatever the log looks like.
 
 What it derives is the *conservative* reading of your position, because a position is
 not a cut in `(commit_txid, global_position)` order — an event past it may have been
@@ -2771,14 +2781,15 @@ the only thing that stops a policy now, and these are the lines it writes:
 | Level | When | Fields |
 |-------|------|--------|
 | `debug` | every poll whose feed is waiting on an open write | `policy`, `cursor`, `cursor_commit_txid`, `withheld_position`, `withheld_commit_txid`, `watermark` |
-| `warn` | the wait has outlived the escalation threshold | the above, plus `head` and `waiting_for_secs` |
+| `warn` | the wait has outlived the escalation threshold | the above, plus `log_max_position` and `waiting_for_secs` |
 
 ```text
 DEBUG replay_persistence::policy_runner: policy feed is waiting for an open write to end
       policy=price_fanout cursor=264785 cursor_commit_txid=91827 withheld_position=264786
       withheld_commit_txid=91830 watermark=91830
 WARN  replay_persistence::policy_runner: policy is waiting on a write that has not
-      ended: … policy=price_fanout cursor=264785 cursor_commit_txid=91827 head=264956
+      ended: … policy=price_fanout cursor=264785 cursor_commit_txid=91827
+      log_max_position=264956
       withheld_position=264786 withheld_commit_txid=91830 watermark=91830
       waiting_for_secs=259200
 ```
@@ -2796,6 +2807,11 @@ Alert on the `warn`. Two clocks meet in it, and they answer different questions:
 - **`waiting_for_secs`** is measured from `policy_cursors.updated_at` — the last time the
   cursor advanced — so it survives restarts and leadership changes and reports the age of
   the outage, not the age of the process.
+
+`log_max_position` is `MAX(global_position)`, reported as evidence that the log is
+moving while this policy is not. It is **not** a backlog: the feed advances in
+`(commit_txid, global_position)` order, so the arithmetic distance from `cursor` to it
+is not a count of anything, and a cursor an operator moved can sit above it.
 
 A caught-up idle policy logs nothing at all.
 

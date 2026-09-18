@@ -51,6 +51,12 @@ the daemon runs, and the in-memory position is a lease on it.
   below the commit watermark when none is readable. It re-delivers rather than skips,
   which is the side at-least-once delivery already covers.
 
+  **The sentinel is the instruction marker.** A row always carries a transaction half, so
+  "position only" needs a way to say itself: `commit_txid = '0'::xid8` names no event and
+  orders before every transaction, so the runner reads it as an instruction. Without it,
+  a leftover half that happens to name the event at the new position is a point, and is
+  honoured — the same rewind, but in feed order rather than position order.
+
 - **The cursor may move in either direction.** Nothing clamps the adopted value
   to be greater than the in-memory one. Moving forward skips events (the #164
   recovery); moving backward re-delivers them, which the at-least-once contract

@@ -264,7 +264,7 @@ async fn a_policy_waiting_on_an_open_write_says_so_in_the_log_postgres_test() {
             for field in [
                 "WARN",
                 &format!("cursor={cursor}"),
-                &format!("head={withheld}"),
+                &format!("log_max_position={withheld}"),
                 &format!("withheld_position={withheld}"),
             ] {
                 if !warning.contains(field) {
