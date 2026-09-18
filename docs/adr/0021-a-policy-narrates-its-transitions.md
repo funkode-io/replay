@@ -17,9 +17,9 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
 - **A burst is bracketed by two records.** One when a Policy at zero lag finds
   work, one when it reaches [Caught up](../../CONTEXT.md#caught-up), naming how
   many events it took and how long. A ten-thousand-event import costs those two
-  plus one progress record per `PROGRESS_EVERY` it lasts — four lines for a
-  ninety-second import — and an idle Policy costs none, so silence keeps meaning
-  "nothing happened" rather than "nothing is known".
+  plus one progress record per `PROGRESS_EVERY` it lasts, whatever its size, and
+  an idle Policy costs none, so silence keeps meaning "nothing happened" rather
+  than "nothing is known".
 
 - **A long backlog emits a bounded progress record**, spaced by wall-clock time
   (`PROGRESS_EVERY`, 30s) rather than by poll or event count, because the
