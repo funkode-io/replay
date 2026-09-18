@@ -82,12 +82,17 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
   [ADR-0019](0019-escalation-is-a-consumer-hook-that-exits-by-default.md)) and are
   not repeated here.
 
-- **A failed poll narrates nothing.** It did not catch up and it is not evidence
-  of work; the error it already logs is the record.
+- **A failure earns no record of its own.** A poll that failed did not catch up,
+  and the error it already logs is the record. What it had already observed — the
+  window it opened on, the positions it advanced over — keeps its records: that
+  work happened, and a failure afterwards does not unhappen it. Only a feed read
+  that fails outright leaves the poll silent, having observed nothing.
 
-- **Per-dispatch detail is a `debug` record, off by default.** It is what an
-  operator turns on for as long as they are looking at one Policy, and the reason
-  the `info` path can stay at two lines per burst.
+- **Per-dispatch detail is a `debug` record, off by default.** One record per
+  dispatch that commits — a declined, retried or parked one already has a record
+  at its own level. It is what an operator turns on for as long as they are
+  looking at one Policy, and the reason the `info` path can stay at two lines per
+  burst.
 
 - **The state machine decides; the caller writes.** `policy_narration` returns a
   record and holds no `tracing` call, so what the lines say stays free to change

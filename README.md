@@ -2636,7 +2636,7 @@ happened", not "nothing is known".
 | `policy has work to do` | a poll reads a non-empty window, before any of it is dispatched | the policy |
 | `policy is working through its backlog` | the first cursor advance at least 30 s after the previous record | events so far, elapsed |
 | `policy is caught up` | the first poll that finds the feed exhausted | events in the burst, elapsed |
-| `policy dispatch committed` | every dispatch, at `debug` | event, aggregate, elapsed |
+| `policy dispatch committed` | every dispatch that commits, at `debug` | event, aggregate, elapsed |
 
 The counts are feed positions the cursor advanced over, not reactions executed: a
 policy whose `stream_filter` excludes a whole window worked through it, and is
@@ -2654,11 +2654,12 @@ stays open, and the blocked record (`warn`) is what names the stop. A worker hel
 inside a single reaction narrates nothing at all — that is the liveness axis's
 question, and the heartbeat answers it from a task of its own.
 
-Turn `debug` on for `replay_persistence::policy_runner` to see every dispatch
-while you are looking at one policy; it is six figures of records for a large
-import, which is why it is off by default. Restarts, escalations and a policy
-parked in front of a hole are logged by the machinery that owns them (`warn` and
-`error`), not by this path.
+Turn `debug` on for `replay_persistence::policy_runner` to see each dispatch that
+commits while you are looking at one policy; it is six figures of records for a
+large import, which is why it is off by default. A dispatch that is declined,
+retried or parked reports at its own level, and restarts, escalations and a
+policy parked in front of a hole are logged by the machinery that owns them
+(`warn` and `error`), not by this path.
 
 ### Monitoring policy status
 

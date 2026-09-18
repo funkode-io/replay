@@ -1795,8 +1795,11 @@ impl PolicyWorker {
                 )
                 .await
                 {
-                    // Narrated as nothing: a poll that failed did not catch up,
-                    // and the error is the record.
+                    // The failure earns no record of its own: it did not catch
+                    // up, and the error below is what says so. Whatever the poll
+                    // observed before failing — the window it opened on, the
+                    // positions it advanced over — happened, and its records
+                    // stand.
                     tracing::error!(
                         policy = %name,
                         error = %error,
@@ -2138,8 +2141,9 @@ impl PendingFailures {
 ///
 /// `info`, because these are the lines an operator reads to see work start and
 /// finish: two per burst, plus one while it lasts per [`PROGRESS_EVERY`], and
-/// none at all while a Policy is idle. Per-dispatch detail lives at `debug`
-/// ([`Delivery::execute_dispatch_within`]) and stays off in production.
+/// none at all while a Policy is idle. A dispatch that commits is a `debug`
+/// record ([`Delivery::execute_dispatch_within`]) and stays off in production;
+/// one that is declined, retried or parked already says so at its own level.
 fn narrate(policy: &str, record: Record) {
     match record {
         Record::Working => tracing::info!(
