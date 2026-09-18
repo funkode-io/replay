@@ -42,9 +42,21 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "load_parked_reaction",
-        justification: "One reaction's rows: at most one per dispatch the reaction returns, \
-                        which is the vector `react_erased` already materialises. Bounded by \
-                        the Policy's code, not by the table.",
+        justification: "One reaction's rows: the commands it dispatches (the vector \
+                        `react_erased` already materialises) times the number of times \
+                        that event was delivered \u{2014} a dead letter is written before the \
+                        batched cursor checkpoint, so a crash in between re-parks the \
+                        reaction. A delivery is a crash or an operator's rewind, not a \
+                        row of data: bounded by the Policy's code and the process's \
+                        restarts, not by the table. The duplicate rows are their own \
+                        defect, funkode-io/replay#220.",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "load_parked_reactions",
+        justification: "SQL carries LIMIT RETRY_PAGE_SIZE (100). One page of a bulk \
+                        retry's keyset walk over a policy's parked reactions, settled \
+                        before the next is read.",
     },
     Reviewed {
         file: "src/policy_status.rs",
@@ -53,14 +65,6 @@ const REVIEWED: &[Reviewed] = &[
                         them, not by data.",
     },
     // ── Known unbounded ──────────────────────────────────────────────────────
-    Reviewed {
-        file: "src/policy_runner.rs",
-        function: "retry_policy_dead_letters",
-        justification: "UNBOUNDED — one row per parked *reaction* (a uuid and a position) for \
-                        one policy, with no LIMIT. Tracked by funkode-io/replay#218, which \
-                        pages the enumeration; this entry moves up to a real bound then, \
-                        rather than being amended.",
-    },
     Reviewed {
         file: "src/infrastructure/postgres.rs",
         function: "load_events_for_replay",

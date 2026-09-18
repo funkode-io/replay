@@ -282,6 +282,8 @@ pub struct ArchivedDeadLetter {
     pub command_name: Option<String>,
     /// Retries made on the row, the settlement that archived it included.
     pub retry_count: i32,
+    /// When the last of them was made. `None` for a row no retry ever settled.
+    pub last_retried_at: Option<DateTime<Utc>>,
 }
 
 /// The durable liveness reading: one beat, as a consumer outside the process
@@ -797,7 +799,7 @@ impl PolicyDaemonHarness {
     pub async fn archived_dead_letters(&self) -> Vec<ArchivedDeadLetter> {
         let rows = sqlx::query(
             "SELECT dead_letter_id, reason, aggregate_name, target_stream_id, command_name, \
-                    retry_count \
+                    retry_count, last_retried_at \
              FROM discarded_dead_letters WHERE policy_name = $1 \
              ORDER BY id ASC LIMIT $2",
         )
@@ -815,6 +817,7 @@ impl PolicyDaemonHarness {
                 target_stream_id: row.get("target_stream_id"),
                 command_name: row.get("command_name"),
                 retry_count: row.get("retry_count"),
+                last_retried_at: row.get("last_retried_at"),
             })
             .collect()
     }

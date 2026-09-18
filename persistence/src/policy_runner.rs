@@ -939,20 +939,20 @@ impl PolicyRunner {
         reaction: ParkedReaction,
         operation: &'static str,
     ) -> Result<Vec<(i64, DeadLetterRetry)>, replay::Error> {
+        // The group, before anything is re-executed: a reaction whose every row
+        // was discarded between the caller's read and this one has nothing left
+        // to settle, and replaying it would dispatch commands on behalf of rows
+        // an operator has just retired.
+        let rows = load_parked_reaction(&self.pool, &reaction).await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let ParkedReaction {
             policy_name,
             global_position,
             event_id,
         } = reaction;
-
-        // The group, before anything is re-executed: a reaction whose every row
-        // was discarded between the caller's read and this one has nothing left
-        // to settle, and replaying it would dispatch commands on behalf of rows
-        // an operator has just retired.
-        let rows = load_parked_reaction(&self.pool, &policy_name, event_id).await?;
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let policy = self
             .policies
@@ -1082,8 +1082,14 @@ impl PolicyRunner {
                     error_kind,
                     error_message,
                 }) => {
-                    re_park_dead_letter(&self.pool, row.id, &error_kind, &error_message).await?;
-                    DeadLetterRetry::StillFailing
+                    if re_park_dead_letter(&self.pool, row.id, &error_kind, &error_message).await? {
+                        DeadLetterRetry::StillFailing
+                    } else {
+                        // Same concurrent discard as the archive branch, from
+                        // the other side: there is no row left to re-park, so
+                        // there is no reaction still failing to report.
+                        DeadLetterRetry::NotFound
+                    }
                 }
             };
             settled.push((row.id, settlement));
@@ -1134,58 +1140,47 @@ impl PolicyRunner {
     /// clean no-op (a zero summary), and so is a reaction whose rows were all
     /// discarded concurrently: it is skipped without being replayed.
     ///
-    /// The enumeration carries no `LIMIT`: it holds one `(uuid, i64)` per parked
-    /// reaction of this policy, unbounded by anything but the policy's recorded
-    /// failures. funkode-io/replay#218 pages it.
+    /// The backlog this drains is the one an outage leaves — one parked reaction
+    /// per event the downstream refused — so the enumeration is **paged**:
+    /// [`RETRY_PAGE_SIZE`] reactions are read at a time, settled, and the next
+    /// page read from the last `(global_position, event_id)` of the previous
+    /// one. Nothing here grows with the size of the backlog. A page settles
+    /// before the next is read, so a reaction re-parked by this run is behind
+    /// the keyset and is not replayed twice.
     pub async fn retry_policy_dead_letters(
         &self,
         policy_name: &str,
     ) -> Result<DeadLetterRetrySummary, replay::Error> {
         const OPERATION: &str = "retry_policy_dead_letters";
 
-        // The reactions to replay, not the rows to settle: one entry per parked
-        // event rather than per parked command, and each group is read as it is
-        // replayed.
-        let reactions = sqlx::query(
-            "SELECT event_id, MIN(global_position) AS global_position \
-             FROM policy_dead_letters \
-             WHERE policy_name = $1 \
-             GROUP BY event_id \
-             ORDER BY global_position ASC, event_id ASC",
-        )
-        .bind(policy_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(crate::db_error)?;
-
         let mut summary = DeadLetterRetrySummary::default();
-        for row in reactions {
-            let settled = self
-                .retry_reaction(
-                    ParkedReaction {
-                        policy_name: policy_name.to_string(),
-                        global_position: row.get("global_position"),
-                        event_id: row.get("event_id"),
-                    },
-                    OPERATION,
-                )
-                .await?;
+        let mut after = ReactionKeyset::start();
 
-            if settled
-                .iter()
-                .any(|(_, outcome)| *outcome == DeadLetterRetry::StillFailing)
-            {
-                summary.reactions_still_failing += 1;
-            } else if settled
-                .iter()
-                .any(|(_, outcome)| *outcome == DeadLetterRetry::Resolved)
-            {
-                summary.reactions_resolved += 1;
+        loop {
+            let page = load_parked_reactions(&self.pool, policy_name, after).await?;
+            let Some(last) = page.last().map(ReactionKeyset::after) else {
+                return Ok(summary);
+            };
+            after = last;
+
+            for reaction in page {
+                let settled = self.retry_reaction(reaction, OPERATION).await?;
+
+                if settled
+                    .iter()
+                    .any(|(_, outcome)| *outcome == DeadLetterRetry::StillFailing)
+                {
+                    summary.reactions_still_failing += 1;
+                } else if settled
+                    .iter()
+                    .any(|(_, outcome)| *outcome == DeadLetterRetry::Resolved)
+                {
+                    summary.reactions_resolved += 1;
+                }
+                // A group whose every row was taken concurrently settled
+                // nothing: there is no reaction left to count either way.
             }
-            // A group whose every row was taken concurrently settled nothing:
-            // there is no reaction left to count either way.
         }
-        Ok(summary)
     }
 
     /// Start one long-lived worker task per registered policy, backed by two
@@ -2239,6 +2234,35 @@ struct ParkedReaction {
     event_id: uuid::Uuid,
 }
 
+/// Where a page of parked reactions resumes: the last one the previous page
+/// settled, exclusive.
+///
+/// `(global_position, event_id)` rather than an offset, so rows leaving the
+/// table as they settle cannot make a page skip what it has not seen.
+#[derive(Clone, Copy)]
+struct ReactionKeyset {
+    global_position: i64,
+    event_id: uuid::Uuid,
+}
+
+impl ReactionKeyset {
+    /// Before every reaction: `global_position` is a sequence value, so the
+    /// lowest one a row can carry is 1.
+    fn start() -> Self {
+        Self {
+            global_position: 0,
+            event_id: uuid::Uuid::nil(),
+        }
+    }
+
+    fn after(reaction: &ParkedReaction) -> Self {
+        Self {
+            global_position: reaction.global_position,
+            event_id: reaction.event_id,
+        }
+    }
+}
+
 /// One parked row, as the retry path needs it: which row, and which dispatch it
 /// was parked for.
 struct ParkedRow {
@@ -3065,13 +3089,16 @@ async fn write_dead_letter(
 /// The row stays **retryable**: what makes another retry worth making is a
 /// change outside the library, which the library cannot observe.
 /// [`PolicyRunner::discard_dead_letter`] is what takes a row out of play.
+///
+/// Returns whether a row was still there to re-park: a concurrent discard
+/// leaves nothing to update, which is not a reaction still failing.
 async fn re_park_dead_letter(
     pool: &Pool<Postgres>,
     id: i64,
     error_kind: &str,
     error_message: &str,
-) -> Result<(), replay::Error> {
-    sqlx::query(
+) -> Result<bool, replay::Error> {
+    let result = sqlx::query(
         "UPDATE policy_dead_letters \
          SET error_kind = $2, error_message = $3, \
              retry_count = retry_count + 1, last_retried_at = now() \
@@ -3083,26 +3110,73 @@ async fn re_park_dead_letter(
     .execute(pool)
     .await
     .map_err(crate::db_error)?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
+}
+
+/// One page of the reactions a policy has parked, in the order they happened,
+/// starting after `after`.
+///
+/// Bounded by [`RETRY_PAGE_SIZE`]. An outage parks one reaction per event it
+/// refused, so the set this walks is the size of the outage: reading it whole
+/// would hold a backlog's worth of rows for as long as the bulk retry runs,
+/// which is the shape that OOM-killed a consumer in funkode-io/replay#146.
+async fn load_parked_reactions(
+    pool: &Pool<Postgres>,
+    policy_name: &str,
+    after: ReactionKeyset,
+) -> Result<Vec<ParkedReaction>, replay::Error> {
+    let rows = sqlx::query(
+        "SELECT global_position, event_id \
+         FROM policy_dead_letters \
+         WHERE policy_name = $1 AND (global_position, event_id) > ($2, $3) \
+         GROUP BY global_position, event_id \
+         ORDER BY global_position ASC, event_id ASC \
+         LIMIT $4",
+    )
+    .bind(policy_name)
+    .bind(after.global_position)
+    .bind(after.event_id)
+    .bind(RETRY_PAGE_SIZE)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ParkedReaction {
+            policy_name: policy_name.to_string(),
+            global_position: row.get("global_position"),
+            event_id: row.get("event_id"),
+        })
+        .collect())
 }
 
 /// The rows one reaction parked, oldest first.
 ///
-/// Bounded by the number of commands one reaction returns: the drain parks at
-/// most one row per failing dispatch per delivery (funkode-io/replay#209).
+/// Bounded by the commands one reaction dispatches — the vector `react_erased`
+/// already materialises — times the number of times that event was delivered:
+/// the dead letter is written before the batched cursor checkpoint, so a crash
+/// in between (or an operator rewinding the cursor) parks the reaction's rows
+/// again. A delivery is a crash or a rewind, not a row of data, so this cannot
+/// grow with the table; the duplicate rows are their own defect
+/// (funkode-io/replay#220).
+///
+/// `global_position` is redundant with `event_id` — one event has one position —
+/// and is in the filter to make it a prefix match on
+/// `idx_dead_letters_policy_reaction`.
 async fn load_parked_reaction(
     pool: &Pool<Postgres>,
-    policy_name: &str,
-    event_id: uuid::Uuid,
+    reaction: &ParkedReaction,
 ) -> Result<Vec<ParkedRow>, replay::Error> {
     let rows = sqlx::query(
         "SELECT id, aggregate_name, target_stream_id, command_name \
          FROM policy_dead_letters \
-         WHERE policy_name = $1 AND event_id = $2 \
+         WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
          ORDER BY id ASC",
     )
-    .bind(policy_name)
-    .bind(event_id)
+    .bind(&reaction.policy_name)
+    .bind(reaction.global_position)
+    .bind(reaction.event_id)
     .fetch_all(pool)
     .await
     .map_err(crate::db_error)?;
@@ -3678,6 +3752,13 @@ const DEFAULT_READ_BATCH_SIZE: u32 = 100;
 
 /// Built-in default for the number of events between cursor persistence writes.
 const DEFAULT_CHECKPOINT_BATCH_SIZE: u32 = 100;
+
+/// Reactions read per page by [`PolicyRunner::retry_policy_dead_letters`].
+///
+/// Not a tunable: it bounds a buffer, and the buffer is two scalars per entry.
+/// Raising it would buy nothing an operator can measure, and the round trip it
+/// saves is dwarfed by the replays each page performs.
+const RETRY_PAGE_SIZE: i64 = 100;
 
 /// Environment variable that overrides the read-batch default.
 const READ_BATCH_SIZE_ENV_VAR: &str = "REPLAY_READ_BATCH_SIZE";

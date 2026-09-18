@@ -2402,6 +2402,9 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
 
 CREATE INDEX IF NOT EXISTS idx_dead_letters_policy
     ON policy_dead_letters (policy_name, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_dead_letters_policy_reaction
+    ON policy_dead_letters (policy_name, global_position, event_id, id);
 ```
 
 The three identity columns are captured on the `Dispatch` itself, so a policy
@@ -2416,6 +2419,11 @@ or `Serialize` bound.
 ([0025](persistence/tests/migrations/0025_dead_letter_retry_bookkeeping.sql)) are
 written by every settlement a retry makes — archiving a row that resolved as
 much as re-parking one that did not — and never by a discard.
+
+`idx_dead_letters_policy_reaction`
+([0026](persistence/tests/migrations/0026_dead_letter_reaction_index.sql)) is the
+access path a retry uses: `(policy_name, created_at DESC)` answers "what failed
+recently", not "which rows belong to this reaction".
 
 **Triage queries:**
 

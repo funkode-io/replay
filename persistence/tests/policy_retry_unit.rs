@@ -30,6 +30,25 @@ use replay_persistence::{
 /// Tag whose reaction dispatches two commands, each to its own instance.
 const TWO_COMMANDS: &str = "two-commands";
 
+/// Tag whose reaction dispatches those same two commands at the **same**
+/// instance, so both rows name the same identity: the aggregate type, the target
+/// URN and the command *type* is all a row records, and `ProbeCommand` is one
+/// type whatever variant it carries.
+const SAME_TARGET: &str = "same-target";
+
+/// Tag whose reaction dispatches a command that concludes and then one that
+/// panics inside its handler.
+const PANIC_AFTER: &str = "panic-after";
+
+/// Tag whose reaction dispatches one command, for tests that care about how many
+/// reactions there are rather than what each parks.
+const ONE_COMMAND: &str = "one-command";
+
+/// Reactions a bulk retry parks in [`a_bulk_retry_pages_a_backlog_no_page_holds`]:
+/// one more than the page the runner reads, so the walk must fetch a second one
+/// and must not re-read the first.
+const MORE_THAN_A_PAGE: usize = 101;
+
 /// The instances the two commands are addressed to. Distinct, because the
 /// identity a row is matched by is the aggregate type, the target URN and the
 /// command *type* — and both commands are a `ProbeCommand` on a `Probe`.
@@ -43,6 +62,10 @@ const SECOND_FAILURE: &str = "second-command-failed";
 
 /// The `error_kind` a refused command is parked under.
 const PERMANENT_KIND: &str = "Invalid Input";
+
+/// What the panicking command panics with, and the `error_kind` its row carries.
+const PANIC_REASON: &str = "handler-exploded";
+const PANIC_KIND: &str = "Panic";
 
 /// A Policy whose reaction dispatches two commands, each refused until the test
 /// says that command's dependency is back.
@@ -87,14 +110,30 @@ impl Policy for TwoCommandPolicy {
         let ProbeEvent::Pinged { tag } = &event.data else {
             return vec![];
         };
-        if tag != TWO_COMMANDS {
-            return vec![];
-        }
+        let first = || Self::dispatch(FIRST_SUBJECT, &self.first_recovered, FIRST_FAILURE);
+        let dispatches = match tag.as_str() {
+            TWO_COMMANDS => vec![
+                first(),
+                Self::dispatch(SECOND_SUBJECT, &self.second_recovered, SECOND_FAILURE),
+            ],
+            SAME_TARGET => vec![
+                first(),
+                Self::dispatch(FIRST_SUBJECT, &self.second_recovered, SECOND_FAILURE),
+            ],
+            PANIC_AFTER => vec![
+                first(),
+                Dispatch::to::<Probe>(
+                    ProbeUrn::new(SECOND_SUBJECT).unwrap(),
+                    ProbeCommand::Explode {
+                        reason: PANIC_REASON.to_string(),
+                    },
+                ),
+            ],
+            ONE_COMMAND => vec![first()],
+            _ => return vec![],
+        };
         self.reactions.fetch_add(1, Ordering::SeqCst);
-        vec![
-            Self::dispatch(FIRST_SUBJECT, &self.first_recovered, FIRST_FAILURE),
-            Self::dispatch(SECOND_SUBJECT, &self.second_recovered, SECOND_FAILURE),
-        ]
+        dispatches
     }
 }
 
@@ -455,6 +494,161 @@ async fn a_row_with_no_identity_is_settled_by_the_whole_replay_postgres_test() {
             (second.id, "retried"),
             (legacy, "retried")
         ]
+    );
+
+    harness.shutdown().await;
+}
+
+/// Two dispatches a row cannot tell apart — same aggregate type, same target
+/// URN, same command type — settle the rows they parked in **production order**.
+///
+/// The identity a row records is all three of those and nothing else: the
+/// command's variant and payload are not stored, so the only thing that can
+/// distinguish these two rows is the order the reaction produced them in.
+#[tokio::test]
+async fn identical_dispatches_settle_their_rows_in_production_order_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_same_target", reaction.policy()).await;
+
+    harness.ping("subject-1", SAME_TARGET).await;
+    let parked = harness.await_dead_letters(2).await;
+    assert_eq!(
+        parked
+            .iter()
+            .map(|row| row.target_stream_id.clone())
+            .collect::<Vec<_>>(),
+        vec![Some(urn_of(FIRST_SUBJECT)); 2],
+        "the fixture is only a test of ordering if both rows name the same target"
+    );
+
+    // Neither row can be told from the other by what it records, so each must
+    // take the outcome of the dispatch at its own position.
+    harness.retry_parked().await;
+    let after = harness.dead_letters().await;
+    assert!(
+        after[0].error_message.contains(FIRST_FAILURE)
+            && after[1].error_message.contains(SECOND_FAILURE),
+        "each row keeps the error of the dispatch at its own position, got {after:#?}"
+    );
+
+    // And when the *first* of the two resolves, it is the first row that leaves.
+    reaction.first_recovered.store(true, Ordering::SeqCst);
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        }
+    );
+    let left = harness.dead_letters().await;
+    assert_eq!(
+        left.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![parked[1].id],
+        "the row of the dispatch that resolved leaves; the other stays, got {left:#?}"
+    );
+    assert!(left[0].error_message.contains(SECOND_FAILURE));
+    assert_eq!(
+        archived_ids(&harness.archived_dead_letters().await),
+        vec![(parked[0].id, "retried")]
+    );
+
+    harness.shutdown().await;
+}
+
+/// A dispatch that concludes before a later one panics keeps **its own**
+/// outcome; the rows the replay never reached carry the panic.
+///
+/// The dispatches are recorded outside the `catch_unwind` for exactly this
+/// (ADR-0016): unwinding must not take what its siblings already concluded with
+/// it, or a panic in the last command would re-park every row of the reaction
+/// under `Panic` and lose the rest.
+#[tokio::test]
+async fn a_panic_mid_replay_leaves_what_concluded_before_it_intact_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_panic_after", reaction.policy()).await;
+
+    harness.ping("subject-1", PANIC_AFTER).await;
+    let parked = harness.await_dead_letters(2).await;
+    let refused = row_for(&parked, FIRST_SUBJECT);
+    let exploded = row_for(&parked, SECOND_SUBJECT);
+    assert_eq!(exploded.error_kind, PANIC_KIND);
+
+    // The refused command's dependency is back; the panicking one is a defect,
+    // so it panics again.
+    reaction.first_recovered.store(true, Ordering::SeqCst);
+    let before = reaction.replays();
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        },
+        "a reaction that panics is one reaction still failing, and the panic \
+         must not reach the caller"
+    );
+    assert_eq!(reaction.replays() - before, 1);
+
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        after.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![exploded.id],
+        "the command that concluded before the panic settled its own row, got {after:#?}"
+    );
+    assert_eq!(after[0].error_kind, PANIC_KIND);
+    assert!(
+        after[0].error_message.contains(PANIC_REASON),
+        "the panicking row carries the panic's message, got {after:#?}"
+    );
+    assert_eq!(after[0].retry_count, 1);
+
+    let archived = harness.archived_dead_letters().await;
+    assert_eq!(archived_ids(&archived), vec![(refused.id, "retried")]);
+    assert!(
+        archived[0].last_retried_at.is_some(),
+        "an archived settlement records when it was retried, got {archived:#?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A backlog larger than one page is walked a page at a time, and every
+/// reaction in it is settled exactly once.
+///
+/// The backlog a bulk retry drains is the size of the outage that made it — one
+/// parked reaction per event the downstream refused — so the enumeration is
+/// keyset-paged rather than read whole. What that must not do is skip a page or
+/// replay one twice, which is what the replay count and the per-row retry count
+/// say here.
+#[tokio::test]
+async fn a_bulk_retry_pages_a_backlog_settling_each_reaction_once_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_paging", reaction.policy()).await;
+
+    for _ in 0..MORE_THAN_A_PAGE {
+        harness.ping("subject-1", ONE_COMMAND).await;
+    }
+    let parked = harness.await_dead_letters(MORE_THAN_A_PAGE).await;
+    assert_eq!(parked.len(), MORE_THAN_A_PAGE);
+
+    let before = reaction.replays();
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: MORE_THAN_A_PAGE,
+        },
+        "every reaction of the backlog is counted, not only the first page"
+    );
+    assert_eq!(
+        reaction.replays() - before,
+        MORE_THAN_A_PAGE,
+        "one replay per reaction: a page must not be re-read after its rows are settled"
+    );
+
+    let after = harness.dead_letters().await;
+    assert!(
+        after.iter().all(|row| row.retry_count == 1),
+        "every reaction is settled exactly once: no page re-read, none skipped, got {after:#?}"
     );
 
     harness.shutdown().await;

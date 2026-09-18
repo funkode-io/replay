@@ -123,10 +123,21 @@ What changes is what a retry is *for* — one reaction, not one row.
   existing ones — but "carry on past the failure, park what failed with its own
   error" is one rule stated twice rather than two rules.
 
-- **Enumerating a policy's parked reactions is still unbounded.** One row per
-  parked event rather than per parked row, which is fewer, but a bulk retry still
-  reads the set before it replays any of it (funkode-io/replay#218). The group a
-  replay settles is bounded, by the commands the reaction returns.
+- **A bulk retry holds one page of reactions, never the backlog.** The set it
+  drains is the size of the outage that made it, so it is walked by keyset —
+  `(global_position, event_id)` after the last reaction settled — a page at a
+  time. A reaction re-parked by the run is behind the keyset and is not replayed
+  twice. The group a replay settles is bounded by the commands the reaction
+  returns, times the deliveries of that event: a dead letter is written before
+  the batched cursor checkpoint, so a crash in between parks the reaction again
+  (funkode-io/replay#220).
+
+- **The retry's access path needed its own index.** `(policy_name, created_at)`
+  answers "what failed recently", not "which rows belong to this reaction", so
+  reading a group would have rescanned the policy's backlog once per reaction —
+  quadratic in the thing a bulk retry exists to drain. One index,
+  `(policy_name, global_position, event_id, id)`, serves both the page's keyset
+  and the group's lookup.
 
 [Dead letter]: ../../CONTEXT.md#dead-letter
 [Retry]: ../../CONTEXT.md#retry
