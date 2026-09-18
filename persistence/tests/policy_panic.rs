@@ -192,9 +192,12 @@ async fn retrying_a_parked_panic_re_parks_it_rather_than_unwinding_the_retry_pos
     harness.await_dead_letters(1).await;
 
     let summary = harness.retry_parked().await;
-    assert_eq!(summary.resolved, 0, "a panicking reaction cannot resolve");
     assert_eq!(
-        summary.still_failing, 1,
+        summary.reactions_resolved, 0,
+        "a panicking reaction cannot resolve"
+    );
+    assert_eq!(
+        summary.reactions_still_failing, 1,
         "the row that panicked again must be reported as still failing"
     );
 

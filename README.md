@@ -2395,7 +2395,9 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     aggregate_name   TEXT,                   -- Rust type name of the target aggregate
     target_stream_id TEXT,                   -- URN of the instance the command was sent to
-    command_name     TEXT                    -- Rust type name of the command
+    command_name     TEXT,                   -- Rust type name of the command
+    retry_count      INTEGER     NOT NULL DEFAULT 0,  -- settlements a retry has made on this row
+    last_retried_at  TIMESTAMPTZ             -- when the last of them was made
 );
 
 CREATE INDEX IF NOT EXISTS idx_dead_letters_policy
@@ -2409,6 +2411,11 @@ dispatch to name: a row parked before the identity migration
 in `react` itself, which fails before it has built a dispatch. The command's
 *variant* and payload are not recorded — `Aggregate::Command` carries no `Debug`
 or `Serialize` bound.
+
+`retry_count` and `last_retried_at`
+([0025](persistence/tests/migrations/0025_dead_letter_retry_bookkeeping.sql)) are
+written by every settlement a retry makes — archiving a row that resolved as
+much as re-parking one that did not — and never by a discard.
 
 **Triage queries:**
 
@@ -2431,6 +2438,11 @@ SELECT * FROM policy_dead_letters WHERE error_kind = 'Panic';
 
 -- Reactions that never came back: look at what the command was waiting for
 SELECT * FROM policy_dead_letters WHERE error_kind = 'Timeout';
+
+-- What has already been tried, and when: a row nobody has retried says 0 / NULL
+SELECT policy_name, target_stream_id, retry_count, last_retried_at, error_message
+FROM   policy_dead_letters
+ORDER  BY retry_count DESC;
 ```
 
 #### Retrying and discarding dead letters
@@ -2440,21 +2452,34 @@ band. None take an advisory lock or move the policy cursor:
 
 | Method | Reaction | Outcome |
 |--------|----------|---------|
-| `retry_dead_letter(id)` | Re-runs the policy's reaction against **current** aggregate state through the same `Cqrs` path the live drain uses. | `Resolved` (succeeded, or now declined with a `BusinessRuleViolation`), `StillFailing` (re-parked in place with the fresh error, or with the panic it raised again), or `NotFound`. |
+| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), or `NotFound`. |
 | `discard_dead_letter(id)` | None — pure bookkeeping: no `react`, no command, no new event. | `Discarded` or `NotFound`. |
-| `retry_policy_dead_letters(name)` | Bulk: applies `retry_dead_letter` to every parked row for the policy, **oldest-first**. | `DeadLetterRetrySummary { resolved, still_failing }`. |
+| `retry_policy_dead_letters(name)` | Bulk: groups the policy's parked rows by the reaction they came from and replays each **once**, oldest-first. | `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing }`. |
+
+The unit of a retry is the **reaction** — one Policy's reaction to one event —
+not the row ([ADR-0021](docs/adr/0021-retry-settles-a-reaction-not-a-row.md)). A
+reaction that dispatched three commands and parked all three costs **one**
+replay, the replay carries on past a failure the way the drain does, and each
+row is settled by its own command: the ones that now succeed are archived, the
+ones that still fail keep their own error and stay retryable. Every settlement
+bumps the row's `retry_count` and stamps `last_retried_at`, the archived copy
+included.
+
+The summary counts reactions; `PolicyStatus::dead_letter_count` keeps counting
+**rows** (parked commands), so one broken two-command reaction reads as
+`dead_letter_count = 2`, `reactions_still_failing = 1`.
 
 ```rust,ignore
 use replay_persistence::{DeadLetterRetry, DeadLetterDiscard};
 
 // Give a parked failure another chance against today's state.
 match runner.retry_dead_letter(id).await? {
-    DeadLetterRetry::Resolved => { /* recovered: no longer Degraded */ }
-    DeadLetterRetry::StillFailing => { /* updated in place, stays Degraded */ }
+    DeadLetterRetry::Resolved => { /* this row's command resolved: archived */ }
+    DeadLetterRetry::StillFailing => { /* updated in place, still retryable */ }
     DeadLetterRetry::NotFound => { /* nothing matched the id */ }
 }
 
-// Or give up on it permanently.
+// Or give up on it permanently — the only way a row leaves for good.
 match runner.discard_dead_letter(id).await? {
     DeadLetterDiscard::Discarded => { /* archived */ }
     DeadLetterDiscard::NotFound => { /* nothing matched the id */ }
@@ -2462,7 +2487,10 @@ match runner.discard_dead_letter(id).await? {
 
 // Replay a whole backlog after a downstream outage, oldest-first.
 let summary = runner.retry_policy_dead_letters("deposit_fee").await?;
-println!("resolved {}, still failing {}", summary.resolved, summary.still_failing);
+println!(
+    "resolved {} reaction(s), {} still failing",
+    summary.reactions_resolved, summary.reactions_still_failing
+);
 ```
 
 Neither method destroys data. When a dead letter leaves the active set —
@@ -2485,7 +2513,9 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
     discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     aggregate_name   TEXT,                   -- identity the row carried, kept as-is
     target_stream_id TEXT,
-    command_name     TEXT
+    command_name     TEXT,
+    retry_count      INTEGER     NOT NULL DEFAULT 0,  -- retries made, the settling one included
+    last_retried_at  TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy

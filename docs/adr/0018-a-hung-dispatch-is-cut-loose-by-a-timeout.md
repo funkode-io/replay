@@ -33,7 +33,8 @@ timeout is how a hang becomes one.
   row cannot carry, and the difference between "wedged" and "just over the line".
 
 - **The operator's retry is bounded too,** so a bulk retry of rows parked for a
-  hang returns instead of wedging the operator's own process on the first row.
+  hang returns instead of wedging the operator's own process on the first
+  reaction.
 
 ## Rejected alternatives
 
@@ -54,8 +55,9 @@ timeout is how a hang becomes one.
   it, which can each time out in turn. An event's worst case scales with how many
   dispatches the reaction returns and where the hung one sits in the list.
 - A hung reaction parks one row **per failing dispatch** — as it already does for
-  returned permanent errors — and retrying any of them replays the whole reaction
-  (funkode-io/replay#204).
+  returned permanent errors — and a retry replays the whole reaction once,
+  settling every one of its rows from that replay
+  ([ADR-0021](0021-retry-settles-a-reaction-not-a-row.md)).
 - The timeout cannot interrupt work the reaction moved onto another task; see
   `CONTEXT.md`'s non-guarantees.
 - An abandoned dispatch is cancelled mid-command: its transaction rolls back and

@@ -42,9 +42,16 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "retry_policy_dead_letters",
-        justification: "Reads i64 ids only, for one policy's dead letters. Grows with a \
-                        policy's recorded failures — 8 bytes each, and an operator \
-                        retrying them is an explicit act on a set they can see.",
+        justification: "Reads one row per parked *reaction* — a uuid and a position — for \
+                        one policy. Grows with a policy's recorded failures, and an \
+                        operator retrying them is an explicit act on a set they can see.",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "load_parked_reaction",
+        justification: "One reaction's rows: at most one per dispatch the reaction returns, \
+                        which is the vector `react_erased` already materialises. Bounded by \
+                        the Policy's code, not by the table.",
     },
     Reviewed {
         file: "src/policy_status.rs",

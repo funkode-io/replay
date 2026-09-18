@@ -1,6 +1,9 @@
 # Dead-letter retry reproduces the reaction from the triggering event
 
-**Status:** accepted
+**Status:** accepted; the retry unit and the row lifecycle superseded by
+[ADR-0021](0021-retry-settles-a-reaction-not-a-row.md), which makes the
+**reaction** the unit of retry and settles each of its rows with its own
+command's outcome. Everything else below stands.
 
 Policies dead-letter-and-advance: when a reaction fails permanently the runner
 records a [`policy_dead_letters`](../../persistence/tests/migrations/0010_policy_dead_letters.sql)
@@ -71,6 +74,8 @@ they may no longer hold.
   delete optimistically before executing. Because every row op is a single
   primary-key-scoped `DELETE`/`UPDATE`, concurrent retries of the same row are
   idempotent and commutative.
+  *(ADR-0021: the row op is unchanged, but one replay now performs it for every row
+  of the reaction, each with that row's own outcome.)*
 
 - **Discard ships paired with retry.** An operator who judges a reaction permanently
   unrecoverable can **discard** the dead letter — drop the row without re-executing.
@@ -83,12 +88,14 @@ they may no longer hold.
   the runner controls. The surface is a `retry_dead_letter(id)` primitive, a
   `retry_policy_dead_letters(name)` convenience built on it, and their `discard`
   counterparts.
+  *(ADR-0021: the two retry entry points share one replay-and-settle path rather
+  than the bulk one looping over the by-id one.)*
 
 ## Consequences
 
 - **No schema change.** The feature is built entirely on the existing
   `policy_dead_letters` columns; retry is a read of the pinned event plus a
-  PK-scoped row mutation.
+  PK-scoped row mutation. *(ADR-0021 adds `retry_count` and `last_retried_at`.)*
 
 - Retry is **not** a verbatim reuse of the drain path: the drain *inserts* a dead
   letter on failure, whereas retry must *update in place*, so it is a sibling
