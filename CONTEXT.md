@@ -98,6 +98,8 @@ and payload are not recorded, as `Aggregate::Command` carries no `Debug` or
 `Serialize` bound) — so "which customer is stuck" is answerable from the table.
 A reaction that panicked before building a dispatch has nothing to name, and its
 identity columns are null.
+A row also records what has been tried on it: how many times a [Retry] has
+settled it, and when the last one did.
 Dead letters are queryable so an operator can later inspect them and either
 [Retry] or [Discard] them.
 _Avoid_: poison message, failed event, error queue.
@@ -106,13 +108,21 @@ _Avoid_: poison message, failed event, error queue.
 
 The _controlling_ act of re-running a parked [Policy] reaction: the triggering
 event recorded by a [Dead letter] is re-evaluated through the Policy **as it is
-defined now** and the command it raises is re-executed, judged against **current**
-[Aggregate] state. A retry reaches back to a single parked event out of band and
-never moves the Policy's cursor. Because it re-runs against today's state, a
-reaction that is now stale or no longer valid is legitimately declined rather than
-replayed blindly — guarding order-sensitive side effects is the target Aggregate's
-responsibility, not the runner's. Distinct from a [Rebuild], which resets and
-replays a whole [Projection].
+defined now** and the commands it raises are re-executed, judged against
+**current** [Aggregate] state. A retry reaches back to a single parked event out
+of band and never moves the Policy's cursor. Because it re-runs against today's
+state, a reaction that is now stale or no longer valid is legitimately declined
+rather than replayed blindly — guarding order-sensitive side effects is the
+target Aggregate's responsibility, not the runner's.
+Its unit is the **reaction**, not the row: the reaction — identified by the
+Policy and the event it reacted to — is replayed **once** however many of its
+commands are parked, the replay carries on past a failure as the forward drain
+does, and each row is settled by its own command's outcome, resolved rows
+archived and still-failing ones left retryable with their own error
+([ADR-0021](docs/adr/0021-retry-settles-a-reaction-not-a-row.md)). A retry
+summary therefore counts reactions where `dead_letter_count` counts parked
+commands.
+Distinct from a [Rebuild], which resets and replays a whole [Projection].
 _Avoid_: reprocess, requeue, redrive.
 
 ### Discard
@@ -120,7 +130,10 @@ _Avoid_: reprocess, requeue, redrive.
 The _controlling_ act of an operator judging a [Dead letter]'s reaction
 permanently unrecoverable and retiring the record from the active set
 **without** re-executing it. The record is archived rather than destroyed, so
-the failure history is never lost. The counterpart to [Retry]; together they are
+the failure history is never lost. The only way a row leaves the active set for
+good on purpose: a failed [Retry] always leaves it retryable, because what makes
+another attempt worth making is a change outside the library.
+The counterpart to [Retry]; together they are
 the controlling actions over a Policy's failures that [Policy status] only
 observes.
 _Avoid_: dismiss, drop, ignore.
