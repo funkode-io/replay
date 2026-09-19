@@ -56,6 +56,15 @@ pub(crate) struct FeedPoint {
 /// The check is what keeps a restart free: [`conservative_point`] would derive a point
 /// *behind* a running Policy, because the events past its position include the ones it
 /// walked over to get there.
+///
+/// An operator's position-only instruction carries [`CommitStamp::SENTINEL`], and on a
+/// log with sentinel-stamped events — every event older than migration 0018, and every
+/// event a restore rebased — the two can meet: the instruction names one of those events
+/// and is taken as an exact point. It cannot cost an event. Those stamps are a
+/// *position-prefix* of the log (0018 backfills the constant and switches the default to
+/// `pg_current_xact_id()` in one transaction), so the derivation returns the same point:
+/// the first stamp past that position is the sentinel again. Where the prefix is broken,
+/// the exact point is the lower of the two and the difference is re-delivery.
 pub(crate) fn names_a_feed_point(stored: FeedPoint, at_position: Option<CommitStamp>) -> bool {
     at_position == Some(stored.commit_txid)
         || (stored.position == 0 && stored.commit_txid == CommitStamp::SENTINEL)
@@ -157,6 +166,31 @@ pub(crate) async fn read_feed(
 
 #[cfg(test)]
 mod tests {
+    /// A sentinel cursor on a sentinel-stamped log takes the exact-point branch instead
+    /// of the conservative one. On the log migration 0018 leaves — and the one a restore
+    /// is rebased to — the two branches agree, so the branch cannot skip an event.
+    #[test]
+    fn on_a_sentinel_stamped_log_both_branches_name_the_same_point() {
+        let instruction = super::FeedPoint {
+            commit_txid: crate::commit_stamp::CommitStamp::SENTINEL,
+            position: 7,
+        };
+
+        assert!(super::names_a_feed_point(
+            instruction,
+            Some(crate::commit_stamp::CommitStamp::SENTINEL)
+        ));
+        assert_eq!(
+            super::conservative_point(
+                instruction,
+                // The next event in the prefix carries the sentinel too.
+                Some(crate::commit_stamp::CommitStamp::SENTINEL),
+                crate::commit_stamp::CommitStamp::parse("500").unwrap(),
+            ),
+            instruction
+        );
+    }
+
     use super::{conservative_point, names_a_feed_point, FeedPoint};
     use crate::commit_stamp::CommitStamp;
 

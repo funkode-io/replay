@@ -2917,3 +2917,34 @@ Positions the log will never issue need no handling. `nextval` is not transactio
 `global_position` taken by an append that aborts is burned for good; because the feed
 reads in `(commit_txid, global_position)` order, a burned number belongs to no event and
 is not a point the feed can stop at.
+
+### After restoring the database into a different cluster
+
+`commit_txid` is an `xid8`, a counter owned by one PostgreSQL cluster. **Physical**
+restores carry it: PITR, promoting a replica, an in-place `pg_upgrade`. **Logical** ones do
+not — `pg_dump`/`pg_restore` into a fresh cluster, or logical replication, including the
+blue/green upgrades managed services build on it. The restored rows then carry ids the new
+cluster has not issued, and its own counter starts again from the beginning.
+
+The runner refuses to read such a log, naming the policy and logging the repair, because
+the failure it prevents is silent: a **caught-up** cursor stamped `50000` sorts above every
+event the new cluster appends, so the feed comes back empty, the policy reports itself idle,
+and every reaction is dropped until the counter climbs past the restored value.
+
+With the daemon stopped, rebase the stamps:
+
+```sql
+UPDATE events SET commit_txid = '0'::xid8
+WHERE commit_txid >= pg_snapshot_xmax(pg_current_snapshot());
+
+UPDATE policy_cursors SET commit_txid = '0'::xid8
+WHERE commit_txid >= pg_snapshot_xmax(pg_current_snapshot());
+```
+
+Every restored event is committed — there is no open transaction left in a cluster that no
+longer exists — so the sentinel is the honest stamp for all of them: it orders below every
+id the new cluster will issue, and the restored events keep the `global_position` order they
+already have. This is the same state migration 0018 leaves for events older than itself. The
+`events` update rewrites the table; on a large log, run it in batches. Each cursor lands on a
+position-only point and is completed on the next poll, so a policy resumes where it was
+without replaying what it had already done.

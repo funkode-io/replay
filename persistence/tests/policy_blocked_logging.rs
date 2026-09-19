@@ -122,16 +122,16 @@ fn waiting_warnings<'a>(lines: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-/// The `waiting_for_secs` field of a warning line.
-fn waiting_for_secs(line: &str) -> u64 {
-    line.split("waiting_for_secs=")
+/// The `cursor_stale_for_secs` field of a warning line.
+fn cursor_stale_for_secs(line: &str) -> u64 {
+    line.split("cursor_stale_for_secs=")
         .nth(1)
-        .expect("the warning names how long the policy has been waiting")
+        .expect("the warning names how long the cursor has stood still")
         .split_whitespace()
         .next()
         .expect("a value follows the field name")
         .parse()
-        .expect("waiting_for_secs is a number of seconds")
+        .expect("cursor_stale_for_secs is a number of seconds")
 }
 
 #[tokio::test]
@@ -273,12 +273,14 @@ async fn a_policy_waiting_on_an_open_write_says_so_in_the_log_postgres_test() {
             }
         }
 
-        // The reported duration is the cursor's, so it survives restarts and
-        // leadership changes: ten minutes for the aged row, seconds for the other.
+        // The reported duration is the cursor's own, not this wait's: it survives
+        // restarts and leadership changes, and it bounds how long the write can have
+        // been open. Ten minutes for the aged row, seconds for the other — which is why
+        // the field is not called `waiting_for_secs`.
         let aged = warnings
             .iter()
             .find(|line| line.contains(&format!("policy={AGED_CURSOR}")))
-            .map(|line| waiting_for_secs(line))
+            .map(|line| cursor_stale_for_secs(line))
             .expect("the aged policy warned");
         if aged < 600 {
             return Err(format!(

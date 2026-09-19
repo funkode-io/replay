@@ -991,3 +991,251 @@ async fn a_prepared_append_withholds_the_feed_until_it_is_committed_postgres_tes
         "the prepared event and the one behind it are both delivered, in order"
     );
 }
+
+/// The twin of the commit case: an append that *aborts* releases what it was holding.
+///
+/// A committed event sitting behind an open append is withheld, because the open write
+/// may still publish events that belong in front of it. When that write rolls back it
+/// publishes nothing, and the event must be delivered on the next poll rather than
+/// waiting for something else to move. Nothing in the feed detects the rollback: the
+/// transaction simply leaves the watermark's snapshot, which is the whole point of
+/// reading by commit visibility.
+#[tokio::test]
+async fn an_event_withheld_behind_an_append_that_aborts_is_delivered_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+
+    let reacted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reacted);
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Beginning, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        })
+        .build();
+
+    let add = |stream: &'static str, amount: f64| {
+        let cqrs = cqrs.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &LedgerUrn::new(stream).unwrap(),
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    add("aborted-main", 10.0).await;
+    add("aborted-held", 5.0).await;
+    drain_until(&runner, &pool, 2, 4).await;
+    assert_eq!(reacted.load(Ordering::SeqCst), 2);
+
+    let aborting = hold_an_append_open(&pool, 2).await;
+    let held = aborting.position;
+
+    // Committed, and behind the open write in the feed's order.
+    add("aborted-main", 1.0).await;
+    let committed = head(&pool).await;
+
+    for _ in 0..3 {
+        runner.drain().await.expect("drain must succeed");
+    }
+    assert_eq!(
+        reacted.load(Ordering::SeqCst),
+        2,
+        "a committed event behind an open append waits for it"
+    );
+
+    aborting.tx.rollback().await.expect("rollback must succeed");
+
+    let polls = drain_until(&runner, &pool, committed, 3).await;
+    assert_eq!(
+        reacted.load(Ordering::SeqCst),
+        3,
+        "and is delivered once that append can publish nothing"
+    );
+    assert_eq!(polls, 1, "on the first poll after the rollback");
+    assert!(
+        stored_cursor(&pool, AUDIT).await >= held,
+        "the cursor moves past the position the aborted append burned"
+    );
+}
+
+/// A log restored into a fresh cluster stops its policies instead of silently skipping.
+///
+/// `xid8` is a counter one PostgreSQL cluster owns. A logical restore (`pg_dump` /
+/// `pg_restore`, or logical replication) copies the stamps into a cluster whose counter
+/// starts again from the beginning, and then the cursor of a *caught-up* policy sits
+/// above every event that cluster will append: the feed comes back empty, the policy
+/// reports itself idle, and every reaction is lost until the counter climbs past the
+/// restored value. That is the one failure this library does not allow itself, so it is
+/// refused, by policy name, with the repair in the log.
+///
+/// Staged the way the condition is defined — a stamp at or above this cluster's next
+/// transaction id — because a test cannot wind the counter back.
+#[tokio::test]
+#[traced_test]
+async fn a_cursor_stamped_by_another_cluster_stops_the_policy_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+
+    let reacted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reacted);
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(AUDIT, StartAt::Beginning, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        })
+        .build();
+
+    let ledger = LedgerUrn::new("restored-cluster").unwrap();
+    let add = |amount: f64| {
+        let cqrs = cqrs.clone();
+        let ledger = ledger.clone();
+        async move {
+            cqrs.execute::<Ledger>(
+                &ledger,
+                replay::Metadata::default(),
+                LedgerCommand::Add { amount },
+                &(),
+                None,
+            )
+            .await
+            .expect("append must succeed");
+        }
+    };
+
+    add(10.0).await;
+    drain_until(&runner, &pool, 1, 4).await;
+    assert_eq!(reacted.load(Ordering::SeqCst), 1);
+
+    // ── The restore ───────────────────────────────────────────────────────────
+    restamp_from_another_cluster(&pool, Restored::Cursors).await;
+
+    let refused = runner
+        .drain()
+        .await
+        .expect_err("a cursor from another cluster cannot be read");
+    assert_eq!(
+        reacted.load(Ordering::SeqCst),
+        1,
+        "and nothing is delivered from it: {refused:?}"
+    );
+    assert!(
+        logs_contain("pg_dump/pg_restore") && logs_contain(AUDIT),
+        "the log names the policy and the cause"
+    );
+    assert!(
+        logs_contain("UPDATE events SET commit_txid = '0'::xid8"),
+        "and carries the statement that repairs it"
+    );
+
+    // ── The repair, which is the state migration 0018 already leaves ──────────
+    rebase_restored_stamps(&pool).await;
+    add(2.0).await;
+
+    drain_until(&runner, &pool, head(&pool).await, 4).await;
+    assert_eq!(
+        reacted.load(Ordering::SeqCst),
+        2,
+        "once the stamps are rebased the feed resumes, without replaying what was done"
+    );
+}
+
+/// An event whose stamp came from another cluster is named as such, not reported as a
+/// write somebody is about to commit.
+///
+/// This half is loud either way — a stamp from a dead cluster is never below this one's
+/// watermark, so the feed stalls rather than skipping — but "waiting for an open
+/// transaction" would send an incident to `pg_stat_activity`, where there is nothing to
+/// find.
+#[tokio::test]
+#[traced_test]
+async fn an_event_stamped_by_another_cluster_is_not_reported_as_an_open_write_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+
+    // Its own policy name: the diagnosis is written once per policy per process, so a
+    // test that shared a name with another would assert on a log the other consumed.
+    const RESTORED_EVENT_AUDIT: &str = "commit_visibility_restored_event_audit";
+
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let runner = PolicyRunner::builder(cqrs.clone())
+        .register_policy_fn::<LedgerEvent, _>(
+            RESTORED_EVENT_AUDIT,
+            StartAt::Beginning,
+            move |_| vec![],
+        )
+        .build();
+
+    let ledger = LedgerUrn::new("restored-event").unwrap();
+    cqrs.execute::<Ledger>(
+        &ledger,
+        replay::Metadata::default(),
+        LedgerCommand::Add { amount: 10.0 },
+        &(),
+        None,
+    )
+    .await
+    .expect("append must succeed");
+    for _ in 0..4 {
+        runner.drain().await.expect("drain must succeed");
+    }
+
+    restamp_from_another_cluster(&pool, Restored::Events).await;
+
+    let refused = runner
+        .drain()
+        .await
+        .expect_err("an event from another cluster cannot be read");
+
+    assert!(
+        logs_contain("pg_dump/pg_restore"),
+        "the withheld event is diagnosed as a restore: {refused:?}"
+    );
+}
+
+/// Stamp every row of `table` with an id this cluster has not issued — what a logical
+/// restore leaves behind, and the only way to produce it without a second cluster.
+async fn restamp_from_another_cluster(pool: &PgPool, table: Restored) {
+    let statement = match table {
+        Restored::Cursors => {
+            "UPDATE policy_cursors SET commit_txid = \
+             ((pg_snapshot_xmax(pg_current_snapshot())::text::bigint) + 50000)::text::xid8"
+        }
+        Restored::Events => {
+            "UPDATE events SET commit_txid = \
+             ((pg_snapshot_xmax(pg_current_snapshot())::text::bigint) + 50000)::text::xid8"
+        }
+    };
+
+    sqlx::query(statement)
+        .execute(pool)
+        .await
+        .expect("restamping must succeed");
+}
+
+/// Which half of a restored log carries the foreign stamps in a given test.
+enum Restored {
+    Cursors,
+    Events,
+}
+
+/// The documented repair: restored rows are committed by definition, so the sentinel is
+/// the honest stamp for them.
+async fn rebase_restored_stamps(pool: &PgPool) {
+    for statement in [
+        "UPDATE events SET commit_txid = '0'::xid8 \
+         WHERE commit_txid >= pg_snapshot_xmax(pg_current_snapshot())",
+        "UPDATE policy_cursors SET commit_txid = '0'::xid8 \
+         WHERE commit_txid >= pg_snapshot_xmax(pg_current_snapshot())",
+    ] {
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .expect("rebasing must succeed");
+    }
+}

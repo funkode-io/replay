@@ -54,13 +54,31 @@ ADR-0015 rejects it with a test that makes it be wrong on demand.
   Anything reading `policy_cursors.position` as progress, `PolicyStatus` included, is reading
   one half of a pair (#196).
 - A Policy is no longer stopped by a position, so there is nothing to detect, nothing to
-  prove and nothing to skip: the gap machinery, the sequence-lock probe and the skip
-  warning have no subject (#197).
+  prove and nothing to skip. The gap machinery, the sequence-lock probe and the skip
+  warning go with this change rather than after it (#197): their only input was the
+  contiguous-prefix scan removed here, so keeping them would mean shipping code that
+  cannot run. What survives into #196 is the *reporting* of a hole — `PolicyStatus`'s
+  `missing_position` and its `Blocked` condition — which is a public field and an enum
+  variant, and belongs in its own review.
 - Reads are a forward scan of `idx_events_commit_txid_position` (migration 0019) stopped
   by the `LIMIT`, resumed by a row comparison on the cursor pair. Written as two `AND`ed
   comparisons it would be neither the same set nor an index scan.
 - Events written before migration 0018 carry the sentinel stamp `0`, which orders before
-  every real transaction, so a migrated log is read in position order at its head.
+  every real transaction, so a migrated log is read in position order at its head. An
+  operator's position-only instruction carries the same sentinel, so on such a log the
+  two meet and the instruction is taken as an exact point. It cannot skip an event: those
+  stamps are a position-prefix, so the conservative derivation returns the same point.
+- **`xid8` belongs to one cluster, and a logical restore carries it into another.** After a
+  `pg_dump`/`pg_restore` or logical replication into a fresh cluster, restored stamps sit
+  above every id that cluster will issue: restored events never fall below its watermark,
+  and — the silent half — a caught-up cursor sorts above everything appended next, so the
+  Policy reads an empty feed and looks idle while every reaction is lost. Physical restores
+  (PITR, replica promotion, in-place `pg_upgrade`) carry the counter and are unaffected. The
+  runner refuses to read a stamp at or above `pg_snapshot_xmax(pg_current_snapshot())`, which
+  no transaction of this cluster can hold, and logs the repair: rebase the restored stamps
+  to the sentinel, which is the state migration 0018 already leaves for events older than
+  itself. We rejected an application-owned ordering stamp, which reintroduces the gap
+  between assignment and commit that this decision exists to close.
 - A cursor row that names no event — one that predates 0022 and carries the sentinel, or
   the one-column move ADR-0012 gives an operator — is read as "everything at or before
   this position is processed" and completed to the greatest point that still delivers
