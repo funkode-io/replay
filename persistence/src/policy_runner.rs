@@ -1035,7 +1035,8 @@ impl PolicyRunner {
                     event_id = %event_id,
                     global_position,
                     panic    = %message,
-                    "retried policy reaction panicked; its dead letters stay parked"
+                    "retried policy reaction panicked; every dead letter it did not \
+                     resolve first stays parked"
                 );
                 Replay::Panicked {
                     concluded: concluded.take(),

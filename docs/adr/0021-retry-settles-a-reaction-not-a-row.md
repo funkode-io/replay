@@ -124,10 +124,15 @@ What changes is what a retry is *for* — one reaction, not one row.
 - **A reaction sending two commands to one instance settles its rows more
   coarsely.** The identity a row records cannot tell those dispatches apart, so
   when they do not line up one-to-one with the rows, the rows share a verdict
-  instead of each carrying its own error. Recording which dispatch of the
-  reaction a row was parked for — an ordinal — would settle them exactly; it is
-  another column and another migration, and two commands to one instance from one
-  reaction is a shape worth questioning before it is worth optimising for.
+  instead of each carrying its own error. What survives either way is the
+  invariant: matching is a bijection when the counts line up and a shared verdict
+  when they do not, so a command that fails again always leaves a parked row.
+  What the coarseness costs is *which* row — a duplicate of a shifted row
+  (funkode-io/replay#220) can be archived `retried` while its twin carries the
+  failure. Recording which dispatch of the reaction a row was parked for — an
+  ordinal — would settle them exactly; it is another column and another
+  migration, and two commands to one instance from one reaction is a shape worth
+  questioning before it is worth optimising for.
 
 - **A row parked before the identity migration is settled more coarsely than its
   neighbours**: all-or-nothing on the whole replay, since it names no command.

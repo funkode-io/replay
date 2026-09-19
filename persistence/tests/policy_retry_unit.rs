@@ -851,3 +851,52 @@ async fn a_row_is_not_settled_by_a_dispatch_that_parked_nothing_postgres_test() 
 
     harness.shutdown().await;
 }
+
+/// A command that fails again always leaves a parked row — including where the
+/// rows and the dispatches line up only by accident.
+///
+/// A redelivery's duplicate of a shifted row (funkode-io/replay#220) makes two
+/// rows for one command while the replay runs two dispatches of their shared
+/// identity, so the counts align and the rows are settled in order although
+/// neither is the first dispatch's. Matching is a bijection, so each dispatch's
+/// outcome still lands on exactly one row and the failure keeps a row of its
+/// own; what the accident costs is *which* row, so the duplicate is archived
+/// `retried` when it never resolved. An ordinal recorded at park time would
+/// settle them exactly (ADR-0021); removing the duplicates removes the
+/// ambiguity, which is what #220 is for.
+#[tokio::test]
+async fn a_failing_command_keeps_a_row_even_when_a_duplicate_aligns_the_counts_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_shift_dup", reaction.policy()).await;
+
+    harness.ping("subject-1", SHIFTED).await;
+    let parked = harness.await_dead_letters(1).await;
+    let duplicate = harness.park_again(parked[0].id).await;
+
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        },
+        "the reaction still fails, so the retry says so"
+    );
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        after.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![duplicate],
+        "the failing command keeps a row, got {after:#?}"
+    );
+    assert!(after[0].error_message.contains(SECOND_FAILURE));
+
+    // And once it recovers, the row it kept leaves too: nothing is stranded.
+    reaction.second_recovered.store(true, Ordering::SeqCst);
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 1,
+            reactions_still_failing: 0,
+        }
+    );
+    assert!(harness.dead_letters().await.is_empty());
+}
