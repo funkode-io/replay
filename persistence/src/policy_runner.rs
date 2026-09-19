@@ -1006,7 +1006,8 @@ impl PolicyRunner {
                 }
 
                 let identity = DispatchIdentity::of(&dispatch);
-                let failure = match delivery
+                concluded.dispatching(identity.clone());
+                let outcome = match delivery
                     .execute_dispatch_within(global_position, &raw, dispatch)
                     .await
                 {
@@ -1014,9 +1015,9 @@ impl PolicyRunner {
                     // Stale reaction: the aggregate now declines it. A clean
                     // resolution, so the row it belongs to is archived.
                     Err(declined) if declined.declined() => None,
-                    Err(failure) => Some(failure),
+                    Err(failure) => Some(Settlement::of(&failure)),
                 };
-                concluded.push(identity, failure);
+                concluded.push(identity, outcome);
             }
             Ok(())
         })
@@ -1026,7 +1027,7 @@ impl PolicyRunner {
         let replay = match attempt {
             Ok(result) => {
                 result?;
-                Replay::Ran(concluded.take())
+                Replay::Ran(concluded.take(None))
             }
             Err(payload) => {
                 let message = panic_message(&*payload);
@@ -1039,7 +1040,7 @@ impl PolicyRunner {
                      resolve first stays parked"
                 );
                 Replay::Panicked {
-                    concluded: concluded.take(),
+                    concluded: concluded.take(Some(&message)),
                     message,
                 }
             }
@@ -1161,6 +1162,11 @@ impl PolicyRunner {
     /// one. Nothing here grows with the size of the backlog. A page settles
     /// before the next is read, so a reaction re-parked by this run is behind
     /// the keyset and is not replayed twice.
+    /// The walk is bounded at both ends: a page at a time, and never past the
+    /// last reaction parked when the call began. Retries take no advisory lock,
+    /// so the policy's worker keeps parking reactions *above* the keyset while
+    /// this runs — without a high-water mark an operator's call would chase a
+    /// failing policy indefinitely instead of draining what they asked it to.
     pub async fn retry_policy_dead_letters(
         &self,
         policy_name: &str,
@@ -1168,10 +1174,13 @@ impl PolicyRunner {
         const OPERATION: &str = "retry_policy_dead_letters";
 
         let mut summary = DeadLetterRetrySummary::default();
+        let Some(backlog) = last_parked_position(&self.pool, policy_name).await? else {
+            return Ok(summary);
+        };
         let mut after = ReactionKeyset::start();
 
         loop {
-            let page = load_parked_reactions(&self.pool, policy_name, after).await?;
+            let page = load_parked_reactions(&self.pool, policy_name, after, backlog).await?;
             let Some(last) = page.last().map(ReactionKeyset::after) else {
                 return Ok(summary);
             };
@@ -2319,7 +2328,7 @@ impl ParkedIdentity {
 struct ReplayedDispatch {
     identity: DispatchIdentity,
     /// `None` when it succeeded or was declined — both resolve the row.
-    failure: Option<DispatchFailure>,
+    outcome: Option<Settlement>,
     /// Whether a row has already been settled from it, so a reaction emitting
     /// two identical dispatches settles two rows rather than one twice.
     claimed: bool,
@@ -2335,24 +2344,54 @@ struct ReplayedDispatch {
 /// Bounded by the number of commands one reaction returns — the vector
 /// `react_erased` already materialises.
 #[derive(Default)]
-struct ReplayedDispatches(Mutex<Vec<ReplayedDispatch>>);
+struct ReplayedDispatches(Mutex<ReplayInProgress>);
+
+/// What the replay has concluded, and what it is in the middle of.
+#[derive(Default)]
+struct ReplayInProgress {
+    concluded: Vec<ReplayedDispatch>,
+    /// The dispatch being awaited right now. What names the panic when the
+    /// replay ends by unwinding out of a command handler, exactly as the
+    /// drain's [`Attempt::in_flight`] does.
+    in_flight: Option<DispatchIdentity>,
+}
 
 impl ReplayedDispatches {
-    fn push(&self, identity: DispatchIdentity, failure: Option<DispatchFailure>) {
-        self.lock().push(ReplayedDispatch {
+    /// Record the dispatch about to be awaited, so a panic in its handler is a
+    /// dispatch that concluded *with* that panic rather than one the replay
+    /// never reached.
+    fn dispatching(&self, identity: DispatchIdentity) {
+        self.lock().in_flight = Some(identity);
+    }
+
+    fn push(&self, identity: DispatchIdentity, outcome: Option<Settlement>) {
+        let mut replay = self.lock();
+        replay.in_flight = None;
+        replay.concluded.push(ReplayedDispatch {
             identity,
-            failure,
+            outcome,
             claimed: false,
         });
     }
 
-    fn take(&self) -> Vec<ReplayedDispatch> {
-        std::mem::take(&mut *self.lock())
+    /// Everything the replay concluded, the dispatch it unwound out of
+    /// included, settled by `panic`.
+    fn take(&self, panic: Option<&str>) -> Vec<ReplayedDispatch> {
+        let mut replay = self.lock();
+        let mut concluded = std::mem::take(&mut replay.concluded);
+        if let (Some(identity), Some(message)) = (replay.in_flight.take(), panic) {
+            concluded.push(ReplayedDispatch {
+                identity,
+                outcome: Some(Settlement::panicked(message)),
+                claimed: false,
+            });
+        }
+        concluded
     }
 
     /// A poisoned lock carries the dispatches concluded before the panic that
     /// poisoned it, which are exactly the ones that must still settle rows.
-    fn lock(&self) -> MutexGuard<'_, Vec<ReplayedDispatch>> {
+    fn lock(&self) -> MutexGuard<'_, ReplayInProgress> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -2387,10 +2426,10 @@ impl Replay {
     /// indistinguishable by construction, so a shared error is what the table
     /// can honestly say about them.
     ///
-    /// A panicked replay is matched in order regardless: the dispatches it never
-    /// reached concluded nothing to count, and what did conclude must still
-    /// settle its own row rather than be pinned by a sibling that panics every
-    /// time (ADR-0016).
+    /// A panicked replay is matched the same way: the dispatch it unwound out
+    /// of is one of its conclusions, carrying the panic, so only the dispatches
+    /// it never reached are missing — and a row naming one of those falls
+    /// through to [`unmatched`](Self::unmatched).
     fn settlement_for(
         &mut self,
         identity: &ParkedIdentity,
@@ -2407,19 +2446,13 @@ impl Replay {
     }
 
     /// Whether this replay ran exactly as many dispatches of `identity` as the
-    /// group has rows naming it. Always, for a panicked replay: see
-    /// [`settlement_for`](Self::settlement_for).
+    /// group has rows naming it.
     fn aligns_with(&self, identity: &ParkedIdentity, rows_naming_it: usize) -> bool {
-        match self {
-            Self::Panicked { .. } => true,
-            Self::Ran(concluded) => {
-                concluded
-                    .iter()
-                    .filter(|dispatch| identity.names(&dispatch.identity))
-                    .count()
-                    == rows_naming_it
-            }
-        }
+        self.concluded()
+            .iter()
+            .filter(|dispatch| identity.names(&dispatch.identity))
+            .count()
+            == rows_naming_it
     }
 
     /// Claim the dispatch `identity` names, if this replay ran one: `Some(None)`
@@ -2431,7 +2464,7 @@ impl Replay {
             .iter_mut()
             .find(|dispatch| !dispatch.claimed && identity.names(&dispatch.identity))?;
         dispatch.claimed = true;
-        Some(dispatch.failure.as_ref().map(Settlement::of))
+        Some(dispatch.outcome.clone())
     }
 
     /// What every row naming `identity` concluded together: the first failure
@@ -2439,19 +2472,13 @@ impl Replay {
     /// of them failed. `None` when the replay produced no such dispatch — there
     /// is nothing to share a verdict from.
     fn verdict_on(&self, identity: &ParkedIdentity) -> Option<Option<Settlement>> {
-        let Self::Ran(concluded) = self else {
-            return None;
-        };
-        let mut matched = concluded
+        let mut matched = self
+            .concluded()
             .iter()
             .filter(|dispatch| identity.names(&dispatch.identity))
             .peekable();
         matched.peek()?;
-        Some(
-            matched
-                .find_map(|dispatch| dispatch.failure.as_ref())
-                .map(Settlement::of),
-        )
+        Some(matched.find_map(|dispatch| dispatch.outcome.clone()))
     }
 
     /// What settles a row naming a command this replay did not produce.
@@ -2473,8 +2500,13 @@ impl Replay {
             Self::Panicked { message, .. } => Some(Settlement::panicked(message)),
             Self::Ran(concluded) => concluded
                 .iter()
-                .find_map(|dispatch| dispatch.failure.as_ref())
-                .map(Settlement::of),
+                .find_map(|dispatch| dispatch.outcome.clone()),
+        }
+    }
+
+    fn concluded(&self) -> &[ReplayedDispatch] {
+        match self {
+            Self::Ran(concluded) | Self::Panicked { concluded, .. } => concluded,
         }
     }
 
@@ -2486,6 +2518,7 @@ impl Replay {
 }
 
 /// What a row that is still failing is re-parked with.
+#[derive(Clone)]
 struct Settlement {
     error_kind: String,
     error_message: String,
@@ -3208,7 +3241,7 @@ async fn re_park_dead_letter(
 }
 
 /// One page of the reactions a policy has parked, in the order they happened,
-/// starting after `after`.
+/// starting after `after` and stopping at `backlog`.
 ///
 /// Bounded by [`RETRY_PAGE_SIZE`]. An outage parks one reaction per event it
 /// refused, so the set this walks is the size of the outage: reading it whole
@@ -3218,18 +3251,21 @@ async fn load_parked_reactions(
     pool: &Pool<Postgres>,
     policy_name: &str,
     after: ReactionKeyset,
+    backlog: i64,
 ) -> Result<Vec<ParkedReaction>, replay::Error> {
     let rows = sqlx::query(
         "SELECT global_position, event_id \
          FROM policy_dead_letters \
          WHERE policy_name = $1 AND (global_position, event_id) > ($2, $3) \
+           AND global_position <= $4 \
          GROUP BY global_position, event_id \
          ORDER BY global_position ASC, event_id ASC \
-         LIMIT $4",
+         LIMIT $5",
     )
     .bind(policy_name)
     .bind(after.global_position)
     .bind(after.event_id)
+    .bind(backlog)
     .bind(RETRY_PAGE_SIZE)
     .fetch_all(pool)
     .await
@@ -3243,6 +3279,26 @@ async fn load_parked_reactions(
             event_id: row.get("event_id"),
         })
         .collect())
+}
+
+/// The furthest position this policy has parked a reaction at, or `None` when it
+/// has parked none.
+///
+/// What a bulk retry treats as the backlog it was asked to drain. A worker drains
+/// the feed forward, so anything it parks while the retry runs is at a greater
+/// position and is this call's business no more than an event that has not
+/// happened yet.
+async fn last_parked_position(
+    pool: &Pool<Postgres>,
+    policy_name: &str,
+) -> Result<Option<i64>, replay::Error> {
+    sqlx::query_scalar(
+        "SELECT MAX(global_position) FROM policy_dead_letters WHERE policy_name = $1",
+    )
+    .bind(policy_name)
+    .fetch_one(pool)
+    .await
+    .map_err(crate::db_error)
 }
 
 /// The rows one reaction parked, oldest first.

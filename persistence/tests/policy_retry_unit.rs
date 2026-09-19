@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use common::policy_harness::{
     ArchivedDeadLetter, DeadLetter, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
+    OBSERVE_TIMEOUT,
 };
 use replay_persistence::{
     DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Dispatch, PersistedEvent, Policy,
@@ -48,6 +49,13 @@ const PANIC_SAME_TARGET: &str = "panic-same-target";
 /// Tag whose reaction sends two commands to the **same** instance where the
 /// first always succeeds: at park time only the second has a row.
 const SHIFTED: &str = "shifted";
+
+/// The same shift, with the second command panicking instead of refusing.
+const SHIFTED_PANIC: &str = "shifted-panic";
+
+/// Tag whose reaction parks a row *and* appends an event that makes another
+/// reaction of the same kind: a policy that keeps parking while a retry runs.
+const FEEDS: &str = "feeds";
 
 /// Tag whose reaction dispatches one command, for tests that care about how many
 /// reactions there are rather than what each parks.
@@ -149,6 +157,24 @@ impl Policy for TwoCommandPolicy {
                     },
                 ),
                 Self::dispatch(FIRST_SUBJECT, &self.second_recovered, SECOND_FAILURE),
+            ],
+            SHIFTED_PANIC => vec![
+                Dispatch::to::<Probe>(
+                    ProbeUrn::new(FIRST_SUBJECT).unwrap(),
+                    ProbeCommand::Echo {
+                        tag: "always-succeeds".to_string(),
+                    },
+                ),
+                Self::explode(FIRST_SUBJECT),
+            ],
+            FEEDS => vec![
+                Dispatch::to::<Probe>(
+                    ProbeUrn::new(SECOND_SUBJECT).unwrap(),
+                    ProbeCommand::Ping {
+                        tag: FEEDS.to_string(),
+                    },
+                ),
+                first(),
             ],
             ONE_COMMAND => vec![first()],
             _ => return vec![],
@@ -899,4 +925,78 @@ async fn a_failing_command_keeps_a_row_even_when_a_duplicate_aligns_the_counts_p
         }
     );
     assert!(harness.dead_letters().await.is_empty());
+
+    harness.shutdown().await;
+}
+
+/// A row parked for a dispatch that **panicked** is not settled by a sibling
+/// that succeeded before it, even when the two are indistinguishable.
+///
+/// The reaction sends two commands to one instance: the first succeeds, the
+/// second panics, so only the second parks a row. The dispatch a replay unwinds
+/// out of is one of its conclusions — carrying the panic — rather than a
+/// dispatch it never reached, which is what keeps that row from claiming its
+/// sibling's success and leaving the table resolved.
+#[tokio::test]
+async fn a_panicking_dispatch_settles_its_own_row_not_its_siblings_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_shift_panic", reaction.policy()).await;
+
+    harness.ping("subject-1", SHIFTED_PANIC).await;
+    let parked = harness.await_dead_letters(1).await;
+    assert_eq!(parked.len(), 1, "only the panicking command parks a row");
+    assert_eq!(parked[0].error_kind, PANIC_KIND);
+
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        },
+        "a reaction that still panics has not recovered"
+    );
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        after.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![parked[0].id],
+        "the panicking row stays parked, got {after:#?}"
+    );
+    assert_eq!(after[0].error_kind, PANIC_KIND);
+    assert!(after[0].error_message.contains(PANIC_REASON));
+    assert!(
+        harness.archived_dead_letters().await.is_empty(),
+        "and nothing leaves on the strength of the command that did work"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A bulk retry drains the backlog it was asked to drain and returns, even while
+/// the policy keeps parking.
+///
+/// Retries take no advisory lock, so the worker goes on reacting — and a policy
+/// whose reaction appends an event parks a *new* reaction every time one of its
+/// reactions is replayed. Walking to an empty page would chase that forever and
+/// never return to the operator, so the walk stops at the last reaction parked
+/// when the call began.
+#[tokio::test]
+async fn a_bulk_retry_returns_while_the_policy_keeps_parking_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_feeds", reaction.policy()).await;
+
+    // Each reaction pings another stream and then fails: the drain parks a chain
+    // of them, bounded by the causation-depth limit.
+    harness.ping("subject-1", FEEDS).await;
+    let backlog = harness.await_dead_letters(3).await.len();
+
+    let summary = tokio::time::timeout(OBSERVE_TIMEOUT, harness.retry_parked())
+        .await
+        .expect("a bulk retry must return rather than chase a policy that keeps parking");
+    assert_eq!(
+        summary.reactions_resolved + summary.reactions_still_failing,
+        backlog,
+        "it settles the backlog it was asked for, not what arrived while it ran"
+    );
+
+    harness.shutdown().await;
 }
