@@ -1,25 +1,33 @@
-//! When a blocked Policy gets to say so, and how often.
+//! When a Policy that reads nothing gets to say why, and how often.
 //!
-//! A Policy parked in front of a hole in `global_position` and a healthy idle one
-//! both read an empty feed, so both used to emit nothing (funkode-io/replay#164).
-//! What separates them is a hole that outlives the appends that could have filled
-//! it. This module holds the gate that decides when that has happened, and the
-//! probe that describes it.
+//! A Policy that reads nothing is either caught up or waiting: the feed only delivers
+//! events whose writing transaction has ended, so a write that stays open holds back
+//! everything committed after it ([`crate::policy_feed`]). The two look identical from
+//! outside — an empty feed — and in funkode-io/replay#164 a healthy idle Policy and a
+//! stopped one produced byte-identical output: nothing.
+//!
+//! This module holds the probe that tells them apart and the gate that decides when the
+//! difference is worth reporting. The wait itself is not a fault: it ends when the write
+//! ends. What an operator needs is to know it is happening, and for how long.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sqlx::{Pool, Postgres, Row};
 
-/// Built-in default for [`resolve_blocked_warn_after`]. Below it, a missing
-/// position is an append still committing, which the feed is designed to wait for.
+use crate::commit_stamp::{reject_foreign_stamp, CommitStamp, StampSource};
+use crate::policy_feed::FeedPoint;
+
+/// Built-in default for [`resolve_blocked_warn_after`]. Below it, a wait is an ordinary
+/// append taking its time, which the feed is designed to wait for.
 const DEFAULT_BLOCKED_WARN_AFTER: Duration = Duration::from_secs(30);
 
 /// Environment variable overriding the built-in interval, in seconds.
 const BLOCKED_WARN_AFTER_ENV_VAR: &str = "REPLAY_BLOCKED_WARN_AFTER_SECS";
 
-/// How long a hole must persist before it is reported, and the minimum spacing
+/// How long a wait must persist before it is reported, and the minimum spacing
 /// between repeats.
 ///
 /// Precedence: `REPLAY_BLOCKED_WARN_AFTER_SECS` → 30s. `0` and unparseable values
@@ -32,32 +40,46 @@ pub(crate) fn resolve_blocked_warn_after() -> Duration {
         .map_or(DEFAULT_BLOCKED_WARN_AFTER, Duration::from_secs)
 }
 
-/// One Policy's history in front of one hole.
+/// One Policy's current wait.
 struct Sighting {
-    /// The hole. A different one restarts the clock: it is a different wait.
-    missing_position: i64,
-    /// First poll that saw it.
+    /// Where the Policy was waiting. The subject of the wait, and the only thing that
+    /// ends one: a cursor that has moved is a Policy that advanced or was repositioned,
+    /// so the next wait is a new outage and starts a new clock — including across two
+    /// [`crate::PolicyRunner::drain`] calls, which load a fresh cursor each time and so
+    /// never observe the transition between them.
+    ///
+    /// Not the withheld row, which changes *during* one wait: a transaction that
+    /// committed above the watermark sorts ahead of the one reported before it, and
+    /// restarting the clock there would let staggered commits push the warning past its
+    /// threshold indefinitely.
+    cursor: FeedPoint,
+    /// First poll of this wait.
     first_seen: Instant,
     /// Last poll that reported it.
     reported: Option<Instant>,
 }
 
 impl Sighting {
-    fn new(missing_position: i64, first_seen: Instant) -> Self {
+    fn new(cursor: FeedPoint, first_seen: Instant) -> Self {
         Self {
-            missing_position,
+            cursor,
             first_seen,
             reported: None,
         }
     }
 }
 
-/// Decides which polls of a blocked Policy get to write a record.
+/// Decides which polls of a waiting Policy get to write a record.
 ///
-/// Two conditions, both per Policy: the hole must have survived `interval` of
-/// polling, and the last record must be at least `interval` old. The first is why
-/// an append landing in the next millisecond stays silent; the second is why a
-/// Policy blocked for three days does not write three days of log.
+/// Two conditions, both per Policy: the wait must have survived `interval` of polling,
+/// and the last record must be at least `interval` old. The first is why an append
+/// committing in the next millisecond stays silent; the second is why a Policy behind a
+/// write held open for three days does not write three days of log.
+///
+/// The clock belongs to the wait, not to the row being waited on: it starts when the
+/// Policy first reads nothing at a cursor and runs until that cursor moves — either
+/// because the drain called [`cleared`](Self::cleared) when the feed moved, or because a
+/// later poll arrives at a different one.
 ///
 /// One entry per Policy, so memory is bounded by the code that registers them.
 pub(crate) struct BlockedWatch {
@@ -73,21 +95,25 @@ impl BlockedWatch {
         }
     }
 
-    /// Record a poll that found `policy` parked in front of `missing_position`, and
-    /// return whether this poll reports it.
+    /// Record a poll that found `policy` waiting at `cursor`, and return whether this
+    /// poll reports it.
     ///
     /// Decides and claims under one lock, so concurrent drains of the same Policy
     /// cannot both report. `now` is read before the lock, so two of them can arrive
     /// out of order; ages saturate, and the older one then skips a poll.
-    pub(crate) fn poll(&self, policy: &str, missing_position: i64, now: Instant) -> bool {
+    pub(crate) fn poll(&self, policy: &str, cursor: FeedPoint, now: Instant) -> bool {
         let mut seen = self.lock();
-        let is_new_hole = seen
-            .get(policy)
-            .is_none_or(|sighting| sighting.missing_position != missing_position);
-        if is_new_hole {
-            seen.insert(policy.to_owned(), Sighting::new(missing_position, now));
-        }
-        let sighting = seen.get_mut(policy).expect("present or just inserted");
+        let sighting = match seen.entry(policy.to_owned()) {
+            // The wait this process is already timing.
+            Entry::Occupied(waiting) if waiting.get().cursor == cursor => waiting.into_mut(),
+            // A wait somewhere else: the Policy advanced or was repositioned in between,
+            // whether or not this process saw it happen.
+            Entry::Occupied(mut elsewhere) => {
+                elsewhere.insert(Sighting::new(cursor, now));
+                elsewhere.into_mut()
+            }
+            Entry::Vacant(first) => first.insert(Sighting::new(cursor, now)),
+        };
 
         if now.saturating_duration_since(sighting.first_seen) < self.interval {
             return false;
@@ -103,20 +129,8 @@ impl BlockedWatch {
         true
     }
 
-    /// Record that `policy` is looking at `missing_position` without deciding
-    /// anything: the poll that first sees a hole may still have work in front of
-    /// it, and the hole is no younger for that.
-    pub(crate) fn sighted(&self, policy: &str, missing_position: i64, now: Instant) {
-        let mut seen = self.lock();
-        if seen
-            .get(policy)
-            .is_none_or(|sighting| sighting.missing_position != missing_position)
-        {
-            seen.insert(policy.to_owned(), Sighting::new(missing_position, now));
-        }
-    }
-
-    /// Forget `policy`: it has advanced, so its next hole is a new wait.
+    /// Forget `policy`: it has advanced or caught up, so its next wait starts from
+    /// scratch.
     pub(crate) fn cleared(&self, policy: &str) {
         self.lock().remove(policy);
     }
@@ -128,11 +142,22 @@ impl BlockedWatch {
     }
 }
 
-/// What the database says about a Policy that read nothing.
+/// What the database says about a Policy that read nothing while the log has moved on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BlockedFor {
-    /// `MAX(global_position)`: how much of the log is stranded behind the hole.
-    pub(crate) head: i64,
+pub(crate) struct Waiting {
+    /// `MAX(global_position)`: the highest number the log has issued.
+    ///
+    /// Reported as evidence that the log is moving while this Policy is not, and for
+    /// nothing else. It is not the feed's head and not a backlog: the feed advances in
+    /// `(commit_txid, global_position)` order, where a later point can hold a lower
+    /// position, so the arithmetic distance from a cursor to this number means nothing
+    /// (ADR-0022). Logged as `log_max_position` so an incident cannot read it as one.
+    pub(crate) log_max_position: i64,
+    /// The oldest event the watermark holds back, and the transaction that wrote it.
+    pub(crate) withheld: FeedPoint,
+    /// `pg_snapshot_xmin`: the oldest transaction still running. Everything below it
+    /// has ended, and everything the Policy is waiting for was written at or above it.
+    pub(crate) watermark: CommitStamp,
     /// Time since the cursor last advanced (`policy_cursors.updated_at`).
     ///
     /// Persisted rather than in-memory so a restart or a leadership change does not
@@ -140,171 +165,218 @@ pub(crate) struct BlockedFor {
     pub(crate) elapsed: Duration,
 }
 
-/// Read the head and how long `policy`'s cursor has been parked, if it is still
-/// parked where the feed left it.
+/// The oldest event `policy` cannot be given yet, if there is one.
 ///
-/// The row is only returned when the cursor is still at `cursor` and
-/// `missing_position` is still absent, so a hole that filled — or an operator who
-/// moved the cursor — between the read and this query silences the report instead of
-/// dating it from a state that no longer holds.
+/// `None` is the ordinary answer: the Policy has everything that has finished being
+/// written, which is a healthy idle Policy and stays silent. A row comes back only when
+/// the cursor is still where the feed left it *and* an event past it sits at or above
+/// the watermark — written by, or after, a transaction that has not ended.
 ///
-/// One row, three index probes; the event log is never scanned.
-pub(crate) async fn probe_blocked(
+/// Read on an empty poll only, where there is nothing else to pay for: one row, index
+/// probes on `policy_cursors` and `idx_events_commit_txid_position`, no scan of the log.
+pub(crate) async fn probe_waiting(
     pool: &Pool<Postgres>,
     policy: &str,
-    cursor: i64,
-    missing_position: i64,
-) -> Result<Option<BlockedFor>, replay::Error> {
+    cursor: FeedPoint,
+) -> Result<Option<Waiting>, replay::Error> {
     let row = sqlx::query(
-        "SELECT COALESCE((SELECT MAX(global_position) FROM events), 0) AS head, \
+        "SELECT COALESCE((SELECT MAX(global_position) FROM events), 0) AS log_max_position, \
+         pg_snapshot_xmin(pg_current_snapshot())::text AS watermark, \
+         pg_snapshot_xmax(pg_current_snapshot())::text AS next_txid, \
+         w.global_position AS withheld_position, \
+         w.commit_txid::text AS withheld_commit_txid, \
          GREATEST(EXTRACT(EPOCH FROM (now() - pc.updated_at)) * 1000, 0)::bigint AS parked_ms \
          FROM policy_cursors pc \
-         WHERE pc.name = $1 AND pc.position = $2 \
-           AND NOT EXISTS (SELECT 1 FROM events WHERE global_position = $3)",
+         JOIN LATERAL ( \
+             SELECT global_position, commit_txid FROM events \
+             WHERE (commit_txid, global_position) > ($2::xid8, $3) \
+               AND commit_txid >= pg_snapshot_xmin(pg_current_snapshot()) \
+             ORDER BY commit_txid, global_position LIMIT 1 \
+         ) w ON TRUE \
+         WHERE pc.name = $1 AND pc.position = $3 AND pc.commit_txid = $2::xid8",
     )
     .bind(policy)
-    .bind(cursor)
-    .bind(missing_position)
+    .bind(cursor.commit_txid.to_string())
+    .bind(cursor.position)
     .fetch_optional(pool)
     .await
     .map_err(crate::db_error)?;
 
-    Ok(row.map(|row| BlockedFor {
-        head: row.get("head"),
-        elapsed: Duration::from_millis(row.get::<i64, _>("parked_ms") as u64),
-    }))
+    row.map(|row| {
+        // The withheld event is the other place a restored log shows itself, and there it
+        // is loud rather than silent: a stamp from a cluster that no longer exists is
+        // never below this one's watermark, so the feed stalls for good. Without this it
+        // would be reported as an open write somebody is about to commit.
+        let withheld_commit_txid = CommitStamp::from_row(&row, "withheld_commit_txid")?;
+        reject_foreign_stamp(
+            policy,
+            StampSource::WithheldEvent,
+            withheld_commit_txid,
+            CommitStamp::from_row(&row, "next_txid")?,
+        )?;
+        Ok(Waiting {
+            log_max_position: row.get("log_max_position"),
+            withheld: FeedPoint {
+                commit_txid: withheld_commit_txid,
+                position: row.get("withheld_position"),
+            },
+            watermark: CommitStamp::from_row(&row, "watermark")?,
+            elapsed: Duration::from_millis(row.get::<i64, _>("parked_ms") as u64),
+        })
+    })
+    .transpose()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commit_stamp::CommitStamp;
 
     const INTERVAL: Duration = Duration::from_secs(30);
 
-    /// A hole that clears within the interval is an append landing, not an
-    /// incident: the case the whole gate exists for.
+    /// A cursor a Policy is waiting at. Where it is does not matter; that it is the
+    /// same one across polls of one wait does.
+    fn parked_at(position: i64) -> FeedPoint {
+        FeedPoint {
+            commit_txid: CommitStamp::parse("91827").expect("a plain counter parses"),
+            position,
+        }
+    }
+
+    /// A wait that clears within the interval is an append landing, not an incident:
+    /// the case the whole gate exists for.
     #[test]
-    fn a_hole_younger_than_the_interval_is_not_reported() {
+    fn a_wait_younger_than_the_interval_is_not_reported() {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(!watch.poll("import_started", 42, start + Duration::from_secs(29)));
+        assert!(!watch.poll("import_started", parked_at(7), start));
+        assert!(!watch.poll(
+            "import_started",
+            parked_at(7),
+            start + Duration::from_secs(29)
+        ));
     }
 
     #[test]
-    fn a_hole_that_outlives_the_interval_is_reported() {
+    fn a_wait_that_outlives_the_interval_is_reported() {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(watch.poll("import_started", 42, start + INTERVAL));
+        assert!(!watch.poll("import_started", parked_at(7), start));
+        assert!(watch.poll("import_started", parked_at(7), start + INTERVAL));
     }
 
-    /// A blocked Policy polls forever and must not write a record per poll.
+    /// A waiting Policy polls forever and must not write a record per poll.
     #[test]
     fn a_report_silences_the_rest_of_the_interval() {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(watch.poll("import_started", 42, start + INTERVAL));
+        assert!(!watch.poll("import_started", parked_at(7), start));
+        assert!(watch.poll("import_started", parked_at(7), start + INTERVAL));
 
         assert!(!watch.poll(
             "import_started",
-            42,
+            parked_at(7),
             start + INTERVAL + Duration::from_secs(1)
         ));
         assert!(!watch.poll(
             "import_started",
-            42,
+            parked_at(7),
             start + INTERVAL + Duration::from_secs(29)
         ));
-        assert!(watch.poll("import_started", 42, start + INTERVAL + INTERVAL));
+        assert!(watch.poll("import_started", parked_at(7), start + INTERVAL + INTERVAL));
     }
 
-    /// The clock runs from the hole, not from the Policy: a cursor idle for an hour
-    /// that then waits on an in-flight append must stay silent.
+    /// The row reported as earliest changes while the wait goes on — a transaction
+    /// that committed above the watermark sorts ahead of the one reported before it —
+    /// and the clock must not restart with it. Staggered commits behind one long
+    /// transaction would otherwise postpone the warning for as long as they kept
+    /// arriving, which is exactly the outage it exists to name.
+    ///
+    /// Pinned by the signature as much as by the polls: the withheld row is not an
+    /// input here, so no change to it can reach the clock.
     #[test]
-    fn a_different_hole_restarts_the_clock() {
+    fn a_new_earliest_withheld_row_does_not_restart_the_clock() {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(!watch.poll("import_started", 99, start + INTERVAL));
-        assert!(watch.poll("import_started", 99, start + INTERVAL + INTERVAL));
+        assert!(!watch.poll("import_started", parked_at(7), start));
+        assert!(watch.poll("import_started", parked_at(7), start + INTERVAL));
     }
 
-    /// Nineteen policies stopped at the same hole in the incident; each is its own
-    /// signal.
+    /// A wait the process never saw end: two `drain()` calls either side of a cursor
+    /// an external writer moved. Nothing calls `cleared`, so the cursor is the only
+    /// evidence that the second wait is not the first one carrying on — and a fresh
+    /// wait must serve its full interval rather than inherit a warning that is due.
+    #[test]
+    fn a_wait_at_a_different_cursor_starts_a_new_clock() {
+        let watch = BlockedWatch::new(INTERVAL);
+        let start = Instant::now();
+
+        assert!(!watch.poll("import_started", parked_at(7), start));
+        assert!(!watch.poll("import_started", parked_at(9), start + INTERVAL));
+        assert!(watch.poll("import_started", parked_at(9), start + INTERVAL + INTERVAL));
+    }
+
+    /// And the suppression does not travel either: a reported wait must not silence the
+    /// first report of the next one.
+    #[test]
+    fn a_wait_at_a_different_cursor_is_not_suppressed_by_the_last_report() {
+        let watch = BlockedWatch::new(INTERVAL);
+        let start = Instant::now();
+
+        assert!(!watch.poll("import_started", parked_at(7), start));
+        assert!(watch.poll("import_started", parked_at(7), start + INTERVAL));
+
+        let moved_on = start + INTERVAL + Duration::from_secs(1);
+        assert!(!watch.poll("import_started", parked_at(9), moved_on));
+        assert!(watch.poll("import_started", parked_at(9), moved_on + INTERVAL));
+    }
+
+    /// Nineteen policies stopped behind the same write in the incident; each is its
+    /// own signal.
     #[test]
     fn policies_are_gated_independently() {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(watch.poll("import_started", 42, start + INTERVAL));
+        assert!(!watch.poll("import_started", parked_at(7), start));
+        assert!(watch.poll("import_started", parked_at(7), start + INTERVAL));
 
-        assert!(!watch.poll("price_fanout", 42, start + INTERVAL));
+        assert!(!watch.poll("price_fanout", parked_at(7), start + INTERVAL));
     }
 
+    /// The clock runs from the wait, not from the Policy: a cursor idle for an hour
+    /// that then waits on an open write must stay silent until the wait itself is old.
     #[test]
     fn a_policy_that_advanced_starts_its_next_wait_from_scratch() {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start));
+        assert!(!watch.poll("import_started", parked_at(7), start));
         watch.cleared("import_started");
 
-        assert!(!watch.poll("import_started", 42, start + Duration::from_secs(29)));
+        assert!(!watch.poll(
+            "import_started",
+            parked_at(7),
+            start + Duration::from_secs(29)
+        ));
         assert!(watch.poll(
             "import_started",
-            42,
+            parked_at(7),
             start + Duration::from_secs(29) + INTERVAL
         ));
     }
 
-    /// A poll that saw the hole while it still had work starts the clock: the hole
-    /// is no younger for the policy having been busy in front of it.
     #[test]
-    fn a_sighting_starts_the_clock_without_reporting() {
-        let watch = BlockedWatch::new(INTERVAL);
-        let start = Instant::now();
-
-        watch.sighted("import_started", 42, start);
-
-        assert!(watch.poll("import_started", 42, start + INTERVAL));
-    }
-
-    #[test]
-    fn a_sighting_of_the_hole_already_seen_does_not_restart_the_clock() {
-        let watch = BlockedWatch::new(INTERVAL);
-        let start = Instant::now();
-
-        watch.sighted("import_started", 42, start);
-        watch.sighted("import_started", 42, start + INTERVAL);
-
-        assert!(watch.poll("import_started", 42, start + INTERVAL));
-    }
-
-    #[test]
-    fn a_sighting_of_a_different_hole_restarts_the_clock() {
-        let watch = BlockedWatch::new(INTERVAL);
-        let start = Instant::now();
-
-        watch.sighted("import_started", 42, start);
-        watch.sighted("import_started", 99, start + INTERVAL);
-
-        assert!(!watch.poll("import_started", 99, start + INTERVAL));
-    }
-
-    #[test]
-    fn clearing_a_policy_that_was_never_blocked_is_a_no_op() {
+    fn clearing_a_policy_that_was_never_waiting_is_a_no_op() {
         let watch = BlockedWatch::new(INTERVAL);
 
         watch.cleared("never_ran");
 
-        assert!(!watch.poll("never_ran", 42, Instant::now()));
+        assert!(!watch.poll("never_ran", parked_at(7), Instant::now()));
     }
 
     /// Two drains can read the clock in one order and reach the lock in the other.
@@ -314,9 +386,9 @@ mod tests {
         let watch = BlockedWatch::new(INTERVAL);
         let start = Instant::now();
 
-        assert!(!watch.poll("import_started", 42, start + INTERVAL));
-        assert!(!watch.poll("import_started", 42, start));
-        assert!(watch.poll("import_started", 42, start + INTERVAL + INTERVAL));
+        assert!(!watch.poll("import_started", parked_at(7), start + INTERVAL));
+        assert!(!watch.poll("import_started", parked_at(7), start));
+        assert!(watch.poll("import_started", parked_at(7), start + INTERVAL + INTERVAL));
     }
 
     #[test]

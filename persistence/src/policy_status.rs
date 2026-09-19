@@ -14,6 +14,15 @@
 //! no liveness field: no table can see whether a worker task exists, so a
 //! `CaughtUp` Policy whose worker died is indistinguishable here from an idle
 //! one. [`crate::PolicyRunnerDaemon::liveness`] is what tells them apart.
+//!
+//! **Three of its fields outlived their arithmetic.** A Policy advances in
+//! `(commit_txid, global_position)` order since funkode-io/replay#195
+//! (`docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md`), where a later point
+//! can hold a lower position: `lag` subtracts two numbers whose difference counts
+//! nothing, and `missing_position` — with the `Blocked` condition it outranks everything
+//! for — names a stop the feed cannot make. They are still computed and reported;
+//! funkode-io/replay#196 removes them, in its own review, because deleting a public field
+//! and an enum variant is not a rider on a behaviour change.
 
 use std::fmt;
 

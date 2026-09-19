@@ -2122,8 +2122,18 @@ to `start_at()`:
 
 | `StartAt` | Behaviour |
 |-----------|-----------|
-| `StartAt::Now` (default) | Cursor begins at the current global head; only newly appended events are processed. Safe when you don't want to fire commands retroactively across existing history. |
+| `StartAt::Now` (default) | Cursor begins at the head of the feed's order — the greatest `(commit_txid, global_position)` among visible events — so only what sorts after it is processed. Safe when you don't want to fire commands retroactively across existing history. The cut is a point in the log's order, not an instant: a write already in flight is delivered if its transaction is younger than the head's and skipped if it is older. |
 | `StartAt::Beginning` | Cursor begins at position 0; the full event history is drained once, then the policy follows live appends. Use this for backfill or projections derived from audit events. |
+
+`start_at` is consulted **once in a policy's lifetime** — on the first registration that
+finds no `policy_cursors` row. Every later start, replica and rolling deploy reads the
+stored row instead. So `Now` is decided on the deploy that introduces the policy, which
+is usually a live system under load: a write in flight at that instant whose transaction
+is older than the head's is history the policy never sees. Long writes are the exposure
+— a running import or a batch append, not ordinary sub-millisecond commands. If a
+specific policy must not start on a coin toss, pre-seed its cursor row before deploying
+(see [Moving a cursor on a running system](#moving-a-cursor-on-a-running-system)); with
+a row present, `start_at` is never consulted.
 
 The cursor is written to Postgres **at least every `checkpoint_batch_size` events**
 and unconditionally at the end of every drain pass. A crash after a command is
@@ -2138,15 +2148,62 @@ runner state: you can reposition a policy against a live deployment with plain
 SQL, without restarting a process or dropping leadership.
 
 ```sql
--- skip a position that can never be delivered, or rewind to re-deliver events
-UPDATE policy_cursors SET position = 264786, updated_at = now()
+-- reposition a policy: forward to pass events, backward to re-deliver them.
+-- The sentinel is the instruction marker: "a position, not a point".
+UPDATE policy_cursors SET position = 264786, commit_txid = '0'::xid8, updated_at = now()
 WHERE name = 'price_fanout';
 ```
 
-The row also records the transaction that wrote the event at that position
-(`commit_txid`), which is the half the feed will be ordered by. You never write it:
-the runner derives it from the position you set, so the instruction stays the one
-column it has always been.
+(There is no longer a "skip a position that can never be delivered" repair. A burned
+position belongs to no event, so it is not a point the feed can stop at — see the
+runbook below.)
+
+The row also records the transaction that wrote the event the policy stopped at
+(`commit_txid`), which is the half the feed is ordered by. **The position is still the
+whole instruction**; `commit_txid = '0'::xid8` is how you say so. The sentinel orders
+before every real transaction and names no event, so the runner reads the row as an
+instruction and derives the transaction half itself.
+
+Write it even though the position alone usually suffices: a row always carries *some*
+transaction half, and if the old cursor and the event at your new position came from the
+same transaction, the leftover half names a real event — a point, which the runner then
+resumes from verbatim. Nothing is lost when that happens (everything below a cursor the
+runner wrote has already been delivered), but the rewind is in feed order, so an event
+past your position written by an *older* transaction is not replayed. The sentinel makes
+the instruction unambiguous whatever the log looks like.
+
+What it derives is the *conservative* reading of your position, because a position is
+not a cut in `(commit_txid, global_position)` order — an event past it may have been
+written by an older transaction than the event at it. The runner takes `position = P`
+to mean "everything at or before P is processed" and resumes from the greatest point
+that still delivers every event past P: the earliest transaction holding one, or one
+below the commit watermark when none is readable yet. The row keeps the position you
+wrote and shows the derived transaction beside it.
+
+The consequence to expect: **events at or before P are delivered again if a transaction
+younger than the resume point wrote them.** That set is not bounded by a small constant
+— one old transaction holding the first event past P puts every younger transaction's
+work at or before P back on the feed — so size it as "everything written concurrently
+around P", not "a few". That is the direction the ambiguity is resolved in: the same
+idempotency contract that covers crash re-delivery covers this, while the other
+direction would skip an event silently and permanently.
+
+To place a policy at an exact point with no replay, write **both** columns with a pair
+that names a real event:
+
+```sql
+-- the transaction that wrote the event at the position you are aiming at
+SELECT commit_txid FROM events WHERE global_position = 264786;
+
+UPDATE policy_cursors SET position = 264786, commit_txid = '91827'::xid8, updated_at = now()
+WHERE name = 'price_fanout';
+```
+
+The runner honours a pair whose `commit_txid` is the one on the event at `position`,
+because such a row is indistinguishable from one it wrote itself; anything else is read
+as a position and derived from. The same trick pre-seeds a policy before its code ever
+ships — `INSERT` the row and `StartAt` is never consulted
+([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
 
 The leader picks the new position up **the next time its feed comes back empty**
 — within one poll `interval` for an idle or stuck policy, and after it has caught
@@ -2718,7 +2775,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `name` | Stable policy name (the cursor key). |
 | `position` | Last processed `global_position`. |
 | `head` | Current global head (`MAX(global_position)`). |
-| `lag` | Positions still to process (`head - position`). |
+| `lag` | `head - position`. Counts nothing since [#195](https://github.com/funkode-io/replay/issues/195): see below. |
 | `next_position` | Lowest `global_position` past the cursor that exists; `None` when nothing is left. |
 | `missing_position` | `position + 1` when that position is absent but a later one exists; otherwise `None`. |
 | `last_checkpoint_at` | When the cursor last advanced (staleness signal). |
@@ -2728,14 +2785,23 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 
 `head` is the raw `MAX(global_position)`. Because `global_position` is a
 `BIGSERIAL` assigned at INSERT but only made visible at COMMIT, a higher position
-can commit before a lower one, so the head can momentarily contain gaps. A position
-that is present, though, names exactly one event: a unique index enforces it, so a
-cursor stepping position by position cannot step over an event. When you
-need a **stable cut** of the log — the largest position `H` such that every
+can commit before a lower one, so the head can momentarily contain gaps.
+
+**`lag`, `next_position` and `missing_position` read `position` as progress, and it is
+not.** A policy advances in `(commit_txid, global_position)` order
+([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)), where a
+later point can hold a lower position, so `head - position` is the distance between two
+numbers rather than a count of anything, a fully drained policy can report a non-zero
+`lag`, and the "hole" the other two describe is not a state the feed can be in. All three
+are removed in [#196](https://github.com/funkode-io/replay/issues/196). Until then, read
+`last_checkpoint_at` for staleness, `dead_letter_count` for damage, and the daemon's
+liveness for whether a worker is running at all.
+
+When you need a **stable cut** of the log — the largest position `H` such that every
 position in `1..=H` is present, e.g. to freeze a version at publish time — use
 `PostgresEventStore::contiguous_high_water_mark()` instead of `head`; replaying
 events with `global_position <= H` then observes the same set of events on every
-later read.
+later read. It is a cut for *readers*, unrelated to how far any policy has got.
 
 `condition` is derived with a strict precedence — **a hole outranks dead letters,
 dead letters outrank lag**:
@@ -2750,10 +2816,11 @@ dead letters outrank lag**:
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
 `"Degraded"`, `"Blocked"`) for JSON/UI consumers.
 
-An append in flight is indistinguishable from a permanent hole *in a single reading*,
-so a `Blocked` reading may clear on the next poll — either because the append landed,
-or because the runner established that nothing can land there and crossed it (see
-below). Alert on it persisting.
+`missing_position` and `Blocked` describe a position the feed stops at, which the feed
+no longer does: it reads in `(commit_txid, global_position)` order, and a missing
+position is not in that order at all. The fields are still reported and are being removed
+([#196](https://github.com/funkode-io/replay/issues/196)); what does hold a policy back
+is a write that has not committed, and the log below is where it shows.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only
@@ -2765,60 +2832,119 @@ derived from the operational tables, and no table can see whether a worker task
 exists. A `CaughtUp` policy whose worker died looks exactly like one that is idle
 — `daemon.liveness()` is what tells them apart.
 
-### What a blocked policy writes to the log
+### What a waiting policy writes to the log
 
-`PolicyStatusStore` answers "is anything blocked?" only when asked. A policy that
-stops in front of a hole also says so in the log, because in
+`PolicyStatusStore` answers "is anything behind?" only when asked. A policy that cannot
+advance also says so in the log, because in
 [#164](https://github.com/funkode-io/replay/issues/164) a healthy idle policy and a
-permanently blocked one produced byte-identical output: nothing.
+permanently stopped one produced byte-identical output: nothing.
+
+The feed delivers an event only once the transaction that wrote it has ended, so a write
+held open holds back everything committed after it
+([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)). That wait is
+the only thing that stops a policy now, and these are the lines it writes:
 
 | Level | When | Fields |
 |-------|------|--------|
-| `debug` | every poll whose feed stops at a hole | `policy`, `cursor`, `expected`, `found` |
-| `warn` | positions were crossed because no transaction can fill them | `policy`, `cursor`, `skipped_from`, `skipped_to`, `skipped`, `next_position` |
-| `warn` | the hole has persisted longer than the escalation threshold | `policy`, `cursor`, `head`, `missing_position`, `next_position`, `blocked_for_secs` |
+| `debug` | every poll whose feed is waiting on an open write | `policy`, `cursor`, `cursor_commit_txid`, `withheld_position`, `withheld_commit_txid`, `watermark` |
+| `warn` | the wait has outlived the escalation threshold | the above, plus `log_max_position` and `waiting_for_secs` |
 
 ```text
-DEBUG replay_persistence::policy_runner: policy feed stops at a gap in global_position
-      policy=price_fanout cursor=264785 expected=264786 found=264787
-WARN  replay_persistence::policy_runner: policy feed skipped global_position values
-      that can never appear: … policy=price_fanout cursor=264785
-      skipped_from=264786 skipped_to=264786 skipped=1 next_position=264787
-WARN  replay_persistence::policy_runner: policy is blocked: its feed stops at a
-      global_position that does not exist yet. A transaction still holds it …
-      policy=price_fanout cursor=264785 head=264956 missing_position=264786
-      next_position=264787 blocked_for_secs=259200
+DEBUG replay_persistence::policy_runner: policy feed is waiting for an open write to end
+      policy=price_fanout cursor=264785 cursor_commit_txid=91827 withheld_position=264786
+      withheld_commit_txid=91830 watermark=91830
+WARN  replay_persistence::policy_runner: policy is waiting on a write that has not
+      ended: … policy=price_fanout cursor=264785 cursor_commit_txid=91827
+      log_max_position=264956
+      withheld_position=264786 withheld_commit_txid=91830 watermark=91830
+      waiting_for_secs=259200
 ```
 
 | Setting | Env var | Default |
 |---------|---------|---------|
-| How long a hole must persist before the first `warn`, and the minimum spacing between repeats | `REPLAY_BLOCKED_WARN_AFTER_SECS` | `30` |
+| How long a wait must persist before the first `warn`, and the minimum spacing between repeats | `REPLAY_BLOCKED_WARN_AFTER_SECS` | `30` |
 
 Alert on the `warn`. Two clocks meet in it, and they answer different questions:
 
-- **When to warn** is decided by how long *this hole* has been in front of the cursor,
-  measured in the running process. Below the threshold a missing position is an append
-  still committing, which the feed is designed to wait for, so a policy idle for an
-  hour that then waits on a commit stays silent.
-- **`blocked_for_secs`** is measured from `policy_cursors.updated_at` — the last time
-  the cursor advanced — so it survives restarts and leadership changes and reports the
-  age of the outage, not the age of the process.
+- **When to warn** is decided by how long *this wait* has lasted, measured in the running
+  process. Below the threshold it is an ordinary append taking its time, which the feed
+  is designed to wait for, so a policy idle for an hour that then waits on a commit stays
+  silent.
+- **`waiting_for_secs`** is measured from `policy_cursors.updated_at` — the last time the
+  cursor advanced — so it survives restarts and leadership changes and reports the age of
+  the outage, not the age of the process.
+
+`log_max_position` is `MAX(global_position)`, reported as evidence that the log is
+moving while this policy is not. It is **not** a backlog: the feed advances in
+`(commit_txid, global_position)` order, so the arithmetic distance from `cursor` to it
+is not a count of anything, and a cursor an operator moved can sit above it.
 
 A caught-up idle policy logs nothing at all.
 
-### Why a hole no longer stops a policy for good
+### What to do about a policy that is waiting
 
-`nextval` is not transactional: a `global_position` taken by an append that then
-aborts is burned, and no event can ever carry it. The runner tells that apart from an
-append still committing exactly, with no timeout — only a transaction that has
-already taken the position can write it, and such a transaction holds a lock on the
-sequence until it ends. A hole whose holders have all ended, and which is still
-missing when re-read afterwards, is crossed: the runner logs the `warn` above and
-moves the cursor past the whole burned run in one step
-([ADR-0015](docs/adr/0015-policy-crosses-a-position-no-transaction-can-fill.md)).
+Nothing, usually: the wait ends when the write ends, and moving the cursor past it would
+skip the events that write is about to publish. Find the open transaction instead and end
+it. Transaction ids are instance-wide, so the culprit may be in another database and may be
+`idle in transaction` rather than running a statement — what identifies it is holding an
+xid, and the oldest xid is the one holding the watermark:
 
-So the second `warn` — `policy is blocked` — now reports a wait that is still
-legitimate: a long-running append, or a cursor an operator parked in front of a
-position that does not exist yet. Moving a parked cursor by hand remains supported
-and is still the tool for those; it is no longer the only way out of a burned
-position.
+```sql
+-- sessions holding an xid, oldest transaction first
+SELECT 'session' AS kind, pid::text AS id, datname, usename, state,
+       backend_xid AS xid, age(backend_xid) AS xid_age,
+       now() - xact_start AS open_for, query
+FROM pg_stat_activity
+WHERE backend_xid IS NOT NULL
+UNION ALL
+-- prepared transactions: they hold an xid with no session behind them
+SELECT 'prepared', gid, database, owner, '2pc',
+       transaction, age(transaction), now() - prepared, NULL
+FROM pg_prepared_xacts
+ORDER BY xid_age DESC;
+```
+
+The first row — the **greatest `xid_age`** — is the transaction every waiting Policy is
+behind. Both halves are needed: a prepared transaction keeps its xid and pins the
+watermark, but has no row in `pg_stat_activity`, so a `pg_stat_activity`-only query can
+name the wrong session or return nothing at all while every Policy stays blocked. Resolve
+a prepared one with `COMMIT PREPARED`/`ROLLBACK PREPARED` on its `gid`.
+`idle_in_transaction_session_timeout` bounds the accidental version of the session case
+(and does nothing for the prepared case); see
+[#214](https://github.com/funkode-io/replay/issues/214) for the scope of the stall.
+
+Positions the log will never issue need no handling. `nextval` is not transactional, so a
+`global_position` taken by an append that aborts is burned for good; because the feed
+reads in `(commit_txid, global_position)` order, a burned number belongs to no event and
+is not a point the feed can stop at.
+
+### After restoring the database into a different cluster
+
+`commit_txid` is an `xid8`, a counter owned by one PostgreSQL cluster. **Physical**
+restores carry it: PITR, promoting a replica, an in-place `pg_upgrade`. **Logical** ones do
+not — `pg_dump`/`pg_restore` into a fresh cluster, or logical replication, including the
+blue/green upgrades managed services build on it. The restored rows then carry ids the new
+cluster has not issued, and its own counter starts again from the beginning.
+
+The runner refuses to read such a log, naming the policy and logging the repair, because
+the failure it prevents is silent: a **caught-up** cursor stamped `50000` sorts above every
+event the new cluster appends, so the feed comes back empty, the policy reports itself idle,
+and every reaction is dropped until the counter climbs past the restored value.
+
+With the daemon stopped, rebase the stamps:
+
+```sql
+UPDATE events SET commit_txid = '0'::xid8
+WHERE commit_txid >= pg_snapshot_xmax(pg_current_snapshot());
+
+UPDATE policy_cursors SET commit_txid = '0'::xid8
+WHERE commit_txid >= pg_snapshot_xmax(pg_current_snapshot());
+```
+
+Every restored event is committed — there is no open transaction left in a cluster that no
+longer exists — so the sentinel is the honest stamp for all of them: it orders below every
+id the new cluster will issue, and the restored events keep the `global_position` order they
+already have. This is the same state migration 0018 leaves for events older than itself. The
+`events` update rewrites the table; on a large log, run it in batches. Each cursor lands on a
+position-only point and is completed on the next poll, so a policy resumes where it was
+without replaying what it had already done.

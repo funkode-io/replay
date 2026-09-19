@@ -1,237 +1,307 @@
-//! How far a Policy's cursor may advance over the positions read past it, which
-//! of them are delivered, and the hole that stopped it.
+//! The slice of the log a Policy reads on a poll, and the order it reads it in.
 //!
-//! Contiguity is decided on the unfiltered `global_position` stream: a position the
-//! Policy's filter excludes advances the cursor and fires nothing, like a compaction
-//! snapshot (ADR-0004, ADR-0013). Pure, so it needs no database.
+//! The order is the pair `(commit_txid, global_position)`: the transaction that wrote
+//! an event, then the position it took within the log. The feed reads only events
+//! whose writing transaction has certainly ended — `commit_txid` below
+//! `pg_snapshot_xmin(pg_current_snapshot())`, the standard Postgres CDC/outbox
+//! watermark — and that is what makes the order a Policy may walk with a single
+//! cursor (funkode-io/replay#195).
 //!
-//! Advancing one position at a time assumes each one names a single event; a unique
-//! index on `events (global_position)` makes that so (migration 0015).
+//! Why the pair rather than the position alone. A `global_position` is drawn from a
+//! sequence when a write *starts* and becomes visible when it *finishes*, so the
+//! positions appear out of order and a position taken by an aborted write never
+//! appears at all. Reading in position order therefore needs a theory of holes; reading
+//! in transaction order needs none:
+//!
+//! - every row below the watermark is already visible, and no row below it can appear
+//!   later, so nothing ever turns up behind a point the Policy has passed;
+//! - a position burned by an aborted write belongs to no row, so it is not a hole in
+//!   this order — it is simply not in it;
+//! - a write still in flight sits at or above the watermark with everything committed
+//!   after it, so its events are delivered in their place once it ends, never skipped
+//!   and never early.
+//!
+//! The cost is stated rather than hidden: a long-running write holds the watermark
+//! down and delays the events behind it until it ends. That is bounded by the write and
+//! self-healing; [`crate::policy_blocked`] is what says so out loud.
+//!
+//! Delivery is decided per row and never touches the order: an event the Policy's
+//! `stream_filter` excludes, and a compaction snapshot row, advance the cursor and fire
+//! nothing (ADR-0004, ADR-0013).
+
+use serde_json::Value;
+use sqlx::{Pool, Postgres, QueryBuilder, Row};
 
 use crate::commit_stamp::CommitStamp;
+use crate::{PersistedEvent, PostgresEventStore, StreamFilter};
 
-/// One position from the window read past a Policy's cursor. `delivered` is `None`
-/// for a compaction snapshot or an event the Policy's filter excludes.
+/// A point in the Policy feed: a transaction, and a position within the log.
+///
+/// Ordered lexicographically, transaction first — the order the feed reads in, and the
+/// reason a cursor records both halves (funkode-io/replay#194). Two points are
+/// comparable whatever their positions, so a Policy's progress is a single value even
+/// though the log's positions arrive out of order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FeedPoint {
+    pub(crate) commit_txid: CommitStamp,
+    pub(crate) position: i64,
+}
+
+/// Whether a stored cursor row is already a point in the feed's order.
+///
+/// It is one when the event at its position carries its transaction — which is every row
+/// this crate wrote — and when it is the sentinel at position 0, where a Policy that has
+/// processed nothing sits, already behind every transaction.
+///
+/// The check is what keeps a restart free: [`conservative_point`] would derive a point
+/// *behind* a running Policy, because the events past its position include the ones it
+/// walked over to get there.
+///
+/// An operator's position-only instruction carries [`CommitStamp::SENTINEL`], and on a
+/// log with sentinel-stamped events — every event older than migration 0018, and every
+/// event a restore rebased — the two can meet: the instruction names one of those events
+/// and is taken as an exact point. It cannot cost an event. Those stamps are a
+/// *position-prefix* of the log (0018 backfills the constant and switches the default to
+/// `pg_current_xact_id()` in one transaction), so the derivation returns the same point:
+/// the first stamp past that position is the sentinel again. Where the prefix is broken,
+/// the exact point is the lower of the two and the difference is re-delivery.
+pub(crate) fn names_a_feed_point(stored: FeedPoint, at_position: Option<CommitStamp>) -> bool {
+    at_position == Some(stored.commit_txid)
+        || (stored.position == 0 && stored.commit_txid == CommitStamp::SENTINEL)
+}
+
+/// The point a Policy resumes from when its row names no event — a row that predates
+/// migration 0022 and carries the sentinel, or the one-column move ADR-0012 gives an
+/// operator.
+///
+/// A position is not a cut in `(commit_txid, global_position)` order: the events past it
+/// may have been written by transactions older than the one at it. Reading such a row as
+/// "processed everything at or before this position" is the only reading that is true of
+/// both, so the point derived from it is the greatest one that still delivers every event
+/// past that position:
+///
+/// - `first_past_commit_txid`, the earliest transaction holding such an event, when the feed
+///   can already see one;
+/// - otherwise one below `watermark`, because an event that is still to appear was
+///   written by a transaction that is still running, and those sit at or above it.
+///
+/// Both may re-deliver: an event at or before `position` written by a younger transaction
+/// sorts after the derived point. That is the direction the ambiguity is resolved in —
+/// delivery is at-least-once and a rewind is visible, while a skip is silent and
+/// permanent.
+pub(crate) fn conservative_point(
+    stored: FeedPoint,
+    first_past_commit_txid: Option<CommitStamp>,
+    watermark: CommitStamp,
+) -> FeedPoint {
+    FeedPoint {
+        commit_txid: first_past_commit_txid.unwrap_or_else(|| watermark.previous()),
+        position: stored.position,
+    }
+}
+
+/// One row from the window read past a Policy's cursor. `delivered` is `None` for a
+/// compaction snapshot or an event the Policy's filter excludes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowPosition<E> {
-    /// The transaction that wrote the event at this position, carried so a checkpoint
-    /// can record the pair the cursor stopped at (funkode-io/replay#194).
-    pub(crate) commit_txid: CommitStamp,
-    pub(crate) global_position: i64,
+    pub(crate) point: FeedPoint,
     pub(crate) delivered: Option<E>,
 }
 
-impl<E> WindowPosition<E> {
-    #[cfg(test)]
-    pub(crate) fn delivered(global_position: i64, event: E) -> Self {
-        Self {
-            commit_txid: CommitStamp::SENTINEL,
-            global_position,
-            delivered: Some(event),
-        }
-    }
-
-    /// A position that only advances the cursor: filtered out, or synthetic.
-    #[cfg(test)]
-    pub(crate) fn skipped(global_position: i64) -> Self {
-        Self {
-            commit_txid: CommitStamp::SENTINEL,
-            global_position,
-            delivered: None,
-        }
-    }
-}
-
-/// The hole a feed stopped at: the position expected next, and the one found instead.
+/// Read the events past `cursor` the Policy may advance over, in feed order.
 ///
-/// Carried out of the decision rather than dropped inside it, because "the feed stops
-/// here" is the one fact an operator of a blocked Policy never had
-/// (funkode-io/replay#164).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Gap {
-    /// The position the cursor would have advanced to next.
-    pub(crate) expected: i64,
-    /// The lowest position past `expected` that actually exists.
-    pub(crate) found: i64,
-}
-
-/// How far the cursor may advance this poll, and why it stops there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Feed<E> {
-    /// The prefix of the window the cursor may advance over, in position order.
-    pub(crate) positions: Vec<WindowPosition<E>>,
-    /// Set when the window ended at a hole rather than at its own end.
-    pub(crate) gap: Option<Gap>,
-}
-
-/// The prefix of `window` the cursor may advance over, and the hole that ends it.
+/// Unfiltered — every row past the cursor, up to `limit` — because how far the cursor
+/// gets belongs to the log, not to the rows the Policy asked for (ADR-0013). `filter`
+/// is evaluated per row as `matches_filter` and decides delivery only; an excluded row
+/// advances the cursor like a compaction snapshot (`compacted_snapshot = TRUE`,
+/// ADR-0004).
 ///
-/// `window` is every position past `cursor` that was read, ascending, with
-/// filtered-out ones present as `delivered: None`. Truncated at the first hole: a
-/// missing position may be an append still in flight (ADR-0003 skip-safety). The
-/// window is truncated in place, so deciding costs no allocation.
-pub(crate) fn feed_from_window<E>(cursor: i64, mut window: Vec<WindowPosition<E>>) -> Feed<E> {
-    let gap = window
-        .iter()
-        .zip(cursor + 1..)
-        .find(|(position, expected)| position.global_position != *expected)
-        .map(|(position, expected)| Gap {
-            expected,
-            found: position.global_position,
-        });
+/// The `WHERE` clause is the whole decision: the row comparison resumes the pair order,
+/// and the watermark withholds anything an unfinished write could still be overtaken
+/// by. Both are index-ordered columns of `idx_events_commit_txid_position` (migration
+/// 0019), so the plan is a forward index scan the `LIMIT` stops early.
+pub(crate) async fn read_feed(
+    pool: &Pool<Postgres>,
+    filter: StreamFilter,
+    cursor: FeedPoint,
+    limit: u32,
+) -> Result<Vec<WindowPosition<PersistedEvent<Value>>>, replay::Error> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
+         global_position, commit_txid::text AS commit_txid, compacted_snapshot, COALESCE((",
+    );
+    // As a predicate NULL means no match; read as a value it must be collapsed.
+    PostgresEventStore::add_filters(&mut qb, filter);
+    qb.push("), FALSE) AS matches_filter FROM events WHERE (commit_txid, global_position) > (");
+    qb.push_bind(cursor.commit_txid.to_string());
+    qb.push("::xid8, ");
+    qb.push_bind(cursor.position);
+    qb.push(") AND commit_txid < pg_snapshot_xmin(pg_current_snapshot())");
+    qb.push(" ORDER BY commit_txid, global_position LIMIT ");
+    qb.push_bind(limit as i64);
 
-    if let Some(gap) = gap {
-        // Everything from `expected` on is past the hole: unreachable this poll.
-        window.truncate((gap.expected - cursor - 1) as usize);
+    let rows = qb.build().fetch_all(pool).await.map_err(crate::db_error)?;
+
+    let mut window = Vec::with_capacity(rows.len());
+    for row in rows {
+        let point = FeedPoint {
+            commit_txid: CommitStamp::from_row(&row, "commit_txid")?,
+            position: row.get("global_position"),
+        };
+        let is_snapshot: bool = row.get("compacted_snapshot");
+        let matches_filter: bool = row.get("matches_filter");
+
+        // Only delivered rows are parsed; a skipped row's bytes are still fetched.
+        let delivered = if is_snapshot || !matches_filter {
+            None
+        } else {
+            Some(PersistedEvent::<Value>::try_from(row)?)
+        };
+
+        window.push(WindowPosition { point, delivered });
     }
 
-    Feed {
-        positions: window,
-        gap,
-    }
+    Ok(window)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{feed_from_window, Gap, WindowPosition};
-
+    /// A sentinel cursor on a sentinel-stamped log takes the exact-point branch instead
+    /// of the conservative one. On the log migration 0018 leaves — and the one a restore
+    /// is rebased to — the two branches agree, so the branch cannot skip an event.
     #[test]
-    fn an_empty_window_advances_nothing() {
-        let window: Vec<WindowPosition<&str>> = Vec::new();
+    fn on_a_sentinel_stamped_log_both_branches_name_the_same_point() {
+        let instruction = super::FeedPoint {
+            commit_txid: crate::commit_stamp::CommitStamp::SENTINEL,
+            position: 7,
+        };
 
-        let feed = feed_from_window(7, window);
-
-        assert_eq!(feed.positions, Vec::new());
-        assert_eq!(feed.gap, None);
-    }
-
-    #[test]
-    fn a_contiguous_window_is_delivered_whole() {
-        let window = vec![
-            WindowPosition::delivered(8, "a"),
-            WindowPosition::delivered(9, "b"),
-        ];
-
-        let feed = feed_from_window(7, window.clone());
-
-        assert_eq!(feed.positions, window);
-        assert_eq!(feed.gap, None, "a window that simply ran out is not a gap");
-    }
-
-    /// The bug this module exists for: a filter that excludes position 8 must not
-    /// hide position 9.
-    #[test]
-    fn filtered_out_positions_advance_the_cursor_without_being_delivered() {
-        let window = vec![
-            WindowPosition::skipped(8),
-            WindowPosition::delivered(9, "b"),
-            WindowPosition::skipped(10),
-            WindowPosition::delivered(11, "d"),
-        ];
-
-        let feed = feed_from_window(7, window.clone());
-
-        assert_eq!(feed.positions, window);
-        assert_eq!(feed.gap, None);
-        assert_eq!(feed.positions.last().map(|p| p.global_position), Some(11));
+        assert!(super::names_a_feed_point(
+            instruction,
+            Some(crate::commit_stamp::CommitStamp::SENTINEL)
+        ));
         assert_eq!(
-            feed.positions
-                .iter()
-                .filter_map(|p| p.delivered)
-                .collect::<Vec<_>>(),
-            vec!["b", "d"]
+            super::conservative_point(
+                instruction,
+                // The next event in the prefix carries the sentinel too.
+                Some(crate::commit_stamp::CommitStamp::SENTINEL),
+                crate::commit_stamp::CommitStamp::parse("500").unwrap(),
+            ),
+            instruction
         );
     }
 
-    /// ADR-0003 skip-safety: a position that was not read may still be in flight.
+    use super::{conservative_point, names_a_feed_point, FeedPoint};
+    use crate::commit_stamp::CommitStamp;
+
+    fn point(commit_txid: &str, position: i64) -> FeedPoint {
+        FeedPoint {
+            commit_txid: CommitStamp::parse(commit_txid).expect("a plain counter parses"),
+            position,
+        }
+    }
+
+    fn stamp(commit_txid: &str) -> CommitStamp {
+        CommitStamp::parse(commit_txid).expect("a plain counter parses")
+    }
+
+    /// A row this crate wrote names an event, and resuming from it is what makes a
+    /// restart cost nothing: deriving a point for it would rewind the Policy, because
+    /// the events past its position include the ones it walked over to get there.
     #[test]
-    fn a_hole_truncates_the_window() {
-        let window = vec![
-            WindowPosition::delivered(8, "a"),
-            WindowPosition::delivered(10, "c"),
-            WindowPosition::delivered(11, "d"),
-        ];
+    fn a_pair_that_names_an_event_is_resumed_as_written() {
+        assert!(names_a_feed_point(point("12", 2), Some(stamp("12"))));
+    }
 
-        let feed = feed_from_window(7, window);
+    /// The upgrade this rule exists for: a cursor written before the transaction half
+    /// existed sits at a position under the sentinel, and the event there was written by
+    /// a real transaction.
+    #[test]
+    fn a_sentinel_row_over_a_stamped_event_names_nothing() {
+        assert!(!names_a_feed_point(point("0", 2), Some(stamp("12"))));
+    }
 
-        assert_eq!(feed.positions, vec![WindowPosition::delivered(8, "a")]);
+    /// An operator's move: the position is new, the transaction half is whatever the row
+    /// happened to hold.
+    #[test]
+    fn a_stale_transaction_half_names_nothing() {
+        assert!(!names_a_feed_point(point("7", 40), Some(stamp("12"))));
+    }
+
+    /// The #164 recovery moves past a burned position, where there is no event at all.
+    #[test]
+    fn a_position_no_event_carries_names_nothing() {
+        assert!(!names_a_feed_point(point("7", 500), None));
+    }
+
+    /// `StartAt::Beginning` before the first poll: the sentinel at position 0 is where a
+    /// Policy that has processed nothing sits, and it already precedes every transaction.
+    /// Deriving a point for it would move it forward for no reason.
+    #[test]
+    fn a_policy_that_has_processed_nothing_is_already_a_point() {
+        assert!(names_a_feed_point(
+            FeedPoint {
+                commit_txid: CommitStamp::SENTINEL,
+                position: 0,
+            },
+            None
+        ));
+    }
+
+    /// The derivation resumes just inside the earliest transaction holding an event past
+    /// the position: what that transaction wrote past it is delivered, and every
+    /// transaction below it wrote only events the position covers.
+    #[test]
+    fn a_position_resumes_at_the_earliest_transaction_past_it() {
         assert_eq!(
-            feed.gap,
-            Some(Gap {
-                expected: 9,
-                found: 10
-            }),
-            "the hole the feed stopped at is what an operator needs named"
+            conservative_point(point("0", 2), Some(stamp("11")), stamp("100")),
+            point("11", 2)
+        );
+    }
+
+    /// Nothing past the position is readable yet — a caught-up Policy, or the #164
+    /// recovery where the operator moves past a burned position. The events still to come
+    /// were written at or above the watermark, so the point sits one below it and lets
+    /// every one of them through.
+    #[test]
+    fn a_position_with_nothing_readable_past_it_resumes_below_the_watermark() {
+        assert_eq!(
+            conservative_point(point("0", 264_786), None, stamp("100")),
+            point("99", 264_786),
+            "an append in flight holds a transaction at or above 100, so 99 precedes it"
         );
     }
 
     #[test]
-    fn a_hole_at_the_head_of_the_window_advances_nothing() {
-        let window = vec![
-            WindowPosition::delivered(9, "b"),
-            WindowPosition::delivered(10, "c"),
-        ];
-
-        let feed = feed_from_window(7, window);
-
-        assert_eq!(feed.positions, Vec::new());
-        assert_eq!(
-            feed.gap,
-            Some(Gap {
-                expected: 8,
-                found: 9
-            }),
-            "an empty feed with a gap is a blocked Policy; without one it is idle"
-        );
+    fn a_later_position_in_the_same_transaction_comes_later() {
+        assert!(point("100", 8) < point("100", 9));
     }
 
-    /// Filtered-out positions are read, so they are never themselves holes.
+    /// The property the whole read path rests on: what a write commits is delivered
+    /// after everything the writes before it committed, whatever positions the two
+    /// took. A position that arrives out of order is not out of *this* order.
     #[test]
-    fn a_hole_behind_filtered_out_positions_still_truncates() {
-        let window = vec![
-            WindowPosition::skipped(8),
-            WindowPosition::skipped(9),
-            WindowPosition::delivered(11, "d"),
-        ];
-
-        let feed = feed_from_window(7, window);
-
-        assert_eq!(
-            feed.positions,
-            vec![WindowPosition::skipped(8), WindowPosition::skipped(9)]
-        );
-        assert_eq!(
-            feed.gap,
-            Some(Gap {
-                expected: 10,
-                found: 11
-            })
-        );
+    fn a_later_transaction_comes_later_whatever_position_it_took() {
+        assert!(point("100", 900) < point("101", 8));
     }
 
-    /// A multi-position hole reports its first missing position, which is the one
-    /// the cursor is parked in front of.
+    /// Events that predate the stamp (migration 0018) carry the sentinel, and a cursor
+    /// that predates 0022 does too: both sit at the head of the order, where the
+    /// position order they were written in is the order they are read in.
     #[test]
-    fn a_wide_hole_reports_its_first_missing_position() {
-        let window = vec![WindowPosition::delivered(20, "t")];
+    fn the_sentinel_comes_before_every_real_transaction() {
+        let migrated = FeedPoint {
+            commit_txid: CommitStamp::SENTINEL,
+            position: 264_786,
+        };
 
-        let feed = feed_from_window(7, window);
-
-        assert_eq!(
-            feed.gap,
-            Some(Gap {
-                expected: 8,
-                found: 20
-            })
+        assert!(migrated < point("1", 1));
+        assert!(
+            migrated
+                < FeedPoint {
+                    commit_txid: CommitStamp::SENTINEL,
+                    position: 264_787,
+                }
         );
-    }
-
-    /// Whatever the reader hands over is the most the cursor can move in one poll.
-    #[test]
-    fn the_feed_is_never_longer_than_the_window() {
-        let window: Vec<WindowPosition<&str>> =
-            (1..=100).map(WindowPosition::<&str>::skipped).collect();
-
-        assert_eq!(feed_from_window(0, window).positions.len(), 100);
     }
 }

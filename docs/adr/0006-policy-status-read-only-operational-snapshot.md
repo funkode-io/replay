@@ -1,6 +1,12 @@
 # Policy status is a read-only operational snapshot, not a projection
 
-**Status:** accepted
+**Status:** accepted; its arithmetic is outdated by
+[ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md). A Policy no longer
+advances in `global_position` order, so `lag` (`head - position`) counts nothing, and
+`missing_position` / `Blocked` describe a stop the feed cannot make. The fields are still
+reported, and [#196](https://github.com/funkode-io/replay/issues/196) removes them; what
+this ADR decides — that status is a read-only derivation of the operational tables, with
+no second type and no liveness in it — is unchanged.
 
 Policies are checkpointed background subscribers (ADR-0003): they store a
 `global_position` cursor, advance at-least-once, and on permanent failure write a

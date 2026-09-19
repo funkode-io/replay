@@ -21,8 +21,14 @@ use crate::{PersistedEvent, StreamFilter};
 /// Cursor initialization behavior used on first policy registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartAt {
-    /// Start from the current global head, so only newly appended events are
-    /// processed.
+    /// Start from the current head of the feed's order, so only what sorts after it is
+    /// processed. The cut is a point, `(commit_txid, global_position)`, not an instant:
+    /// a write in flight when the Policy is registered falls on whichever side of it
+    /// that write's transaction id puts it — older than the head's transaction, it is
+    /// history and is never delivered; younger, it arrives once it commits. No point in
+    /// this order separates "in flight" from "still to come": the one that catches every
+    /// open write is the watermark, and it replays every event committed while any
+    /// transaction was open.
     #[default]
     Now,
     /// Start from position 0 and process full history once.

@@ -157,9 +157,14 @@ impl PostgresEventStore {
     /// the same set of events on every later read, because no in-flight hole can
     /// later fill in below `H`.
     ///
-    /// This is the scalar counterpart of the contiguous-prefix scan the policy
-    /// runner uses to avoid skipping in-flight events. Returns `0` when the log
-    /// is empty or its very first position has not yet committed.
+    /// Returns `0` when the log is empty or its very first position has not yet
+    /// committed.
+    ///
+    /// It was the scalar counterpart of the policy runner's contiguous-prefix scan; the
+    /// runner stopped reading that way in
+    /// `docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md` and this is now a
+    /// caller-facing stable cut and nothing else. A Policy's progress is not measured
+    /// against it: the two speak different orders.
     pub async fn contiguous_high_water_mark(&self) -> Result<i64, replay::Error> {
         // Number the rows in global order: the first position whose row number
         // diverges from the value marks the first gap, so the contiguous prefix

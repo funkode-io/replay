@@ -21,24 +21,91 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sqlx::{Pool, Postgres, QueryBuilder, Row};
+use sqlx::{Pool, Postgres, Row};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use replay::{Aggregate, Metadata};
 
-use crate::burned_position::{
-    resume_after_burned, sequence_holders, BurnedPositions, Permanence, Resume,
-};
-use crate::commit_stamp::CommitStamp;
+use crate::commit_stamp::{reject_foreign_stamp, CommitStamp, StampSource};
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
-use crate::policy_blocked::{probe_blocked, resolve_blocked_warn_after, BlockedWatch};
-use crate::policy_feed::{feed_from_window, Feed, Gap, WindowPosition};
+use crate::policy_blocked::{probe_waiting, resolve_blocked_warn_after, BlockedWatch};
+use crate::policy_feed::{
+    conservative_point, names_a_feed_point, read_feed, FeedPoint, WindowPosition,
+};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
 };
 use crate::policy_narration::{Narration, Poll, Record, PROGRESS_EVERY};
-use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
+use crate::{Cqrs, PersistedEvent, PostgresEventStore};
+
+/// Where a parked dead letter sits in the order its Policy delivered it: when it was
+/// parked, and which row it was when two land in the same transaction's `now()`.
+type ParkedAt = (chrono::DateTime<chrono::Utc>, i64);
+
+/// How many times [`PolicyCursor::adopt`] re-reads a cursor row that moved under it
+/// before giving up on the poll. Each attempt is a row somebody else wrote in the time
+/// this one took two statements; five of them in a row is not an operator correcting a
+/// Policy, and failing the poll retries in one interval without delivering anything.
+const ADOPT_ATTEMPTS: usize = 5;
+
+/// How many parked dead letters [`PolicyRunner::retry_policy_dead_letters`] enumerates
+/// per round trip. The bound on that call's memory: a backlog of any size is retried a
+/// page at a time.
+const DEAD_LETTER_RETRY_PAGE: i64 = 100;
+
+/// One page of a Policy's parked dead letters in parking order, resuming after `after`.
+///
+/// The row comparison is the resume, in the same shape the Policy feed uses. It reads
+/// `idx_dead_letters_policy (policy_name, created_at DESC)` backwards; `id` orders only
+/// the rows sharing a `created_at`, which is one parking transaction's worth.
+async fn dead_letter_page(
+    pool: &Pool<Postgres>,
+    policy_name: &str,
+    after: Option<ParkedAt>,
+    until: ParkedAt,
+    page: i64,
+) -> Result<Vec<ParkedAt>, replay::Error> {
+    let (after_created_at, after_id) = match after {
+        Some((created_at, id)) => (Some(created_at), Some(id)),
+        None => (None, None),
+    };
+    let (until_created_at, until_id) = until;
+
+    sqlx::query_as::<_, ParkedAt>(
+        "SELECT created_at, id FROM policy_dead_letters \
+         WHERE policy_name = $1 \
+           AND ($2::timestamptz IS NULL OR (created_at, id) > ($2, $3)) \
+           AND (created_at, id) <= ($4, $5) \
+         ORDER BY created_at ASC, id ASC LIMIT $6",
+    )
+    .bind(policy_name)
+    .bind(after_created_at)
+    .bind(after_id)
+    .bind(until_created_at)
+    .bind(until_id)
+    .bind(page)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)
+}
+
+/// The last row parked when a bulk retry starts, which is where it stops.
+///
+/// `None` when the Policy has parked nothing.
+async fn last_parked(
+    pool: &Pool<Postgres>,
+    policy_name: &str,
+) -> Result<Option<ParkedAt>, replay::Error> {
+    sqlx::query_as::<_, ParkedAt>(
+        "SELECT created_at, id FROM policy_dead_letters \
+         WHERE policy_name = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(policy_name)
+    .fetch_optional(pool)
+    .await
+    .map_err(crate::db_error)
+}
 
 /// Erased, services-bound execution path for one aggregate type.
 ///
@@ -356,7 +423,7 @@ impl PolicyRunnerBuilder {
             replica_id: self.replica_id,
             supervision: self.supervision,
             on_escalation: self.on_escalation,
-            stopped: StoppedPolicies::new(),
+            waiting: Arc::new(BlockedWatch::new(resolve_blocked_warn_after())),
         }
     }
 }
@@ -409,48 +476,9 @@ pub struct PolicyRunner {
     supervision: WorkerSupervision,
     /// What the consumer does about a worker this runner has given up on.
     on_escalation: EscalationHook,
-    /// What this process remembers about the Policies that are stopped, shared by
-    /// every drain path so a stop is judged the same way however it is driven.
-    stopped: StoppedPolicies,
-}
-
-/// What a running process remembers about a Policy that is parked in front of a
-/// hole: how long it has been there, and whether any transaction can still fill it.
-///
-/// The two are separate questions with separate answers — one is about elapsed time
-/// and decides when to report, the other is about running transactions and decides
-/// when to move — but they share a subject and a lifetime: the moment a Policy is no
-/// longer parked where it was, both are stale ([`forget`](Self::forget)).
-#[derive(Clone)]
-struct StoppedPolicies {
-    /// Rate gate for the blocked-policy warning.
-    blocked: Arc<BlockedWatch>,
-    /// Candidate transactions for each Policy's hole, as first observed.
-    burned: Arc<BurnedPositions>,
-}
-
-impl StoppedPolicies {
-    fn new() -> Self {
-        Self {
-            blocked: Arc::new(BlockedWatch::new(resolve_blocked_warn_after())),
-            burned: Arc::new(BurnedPositions::new()),
-        }
-    }
-
-    /// Note that `policy` is parked in front of `gap` without judging it: the poll
-    /// that first sees a hole may still have work in front of it, and the hole is no
-    /// younger for that.
-    fn sighted(&self, policy: &str, gap: Gap) {
-        self.blocked
-            .sighted(policy, gap.expected, std::time::Instant::now());
-    }
-
-    /// Forget everything known about where `policy` was stopped: it is no longer
-    /// parked there, so the next hole is a fresh wait and a fresh question.
-    fn forget(&self, policy: &str) {
-        self.blocked.cleared(policy);
-        self.burned.cleared(policy);
-    }
+    /// How long each Policy has been waiting on a write that has not ended, shared by
+    /// every drain path so a wait is reported the same way however it is driven.
+    waiting: Arc<BlockedWatch>,
 }
 
 /// Handle for background policy tasks spawned by [`PolicyRunner::start_polling`].
@@ -823,10 +851,11 @@ impl PolicyRunner {
 
     /// Manually drain every registered policy once.
     ///
-    /// For each policy: read the gap-free prefix of events past its cursor,
-    /// `react`, execute the returned dispatches through [`Cqrs`], and advance the
-    /// cursor — one event at a time, advancing only after that event's commands
-    /// have committed (at-least-once delivery; reactions must be idempotent).
+    /// For each policy: read the events past its cursor whose writing transaction
+    /// has ended, `react`, execute the returned dispatches through [`Cqrs`], and
+    /// advance the cursor — one event at a time, advancing only after that event's
+    /// commands have committed (at-least-once delivery; reactions must be
+    /// idempotent).
     ///
     /// Returns how many dispatches **committed** across all policies — a progress
     /// signal, not an audit. A delivery that fails does not contribute its
@@ -1022,8 +1051,8 @@ impl PolicyRunner {
 
     /// Bulk-retry every parked dead letter for `policy_name`, oldest-first.
     ///
-    /// Enumerates the policy's parked dead letters in ascending
-    /// `global_position` (then `created_at`) order and applies
+    /// Enumerates the policy's parked dead letters in the order they were parked
+    /// (`created_at`, then `id`) and applies
     /// [`retry_dead_letter`](Self::retry_dead_letter) to each — the
     /// bulk-recovery convenience for replaying a backlog that piled up while a
     /// downstream dependency was down. Every row resolves or re-parks exactly
@@ -1032,34 +1061,62 @@ impl PolicyRunner {
     /// concurrency, archive-on-resolve) to the primitive. It takes no advisory
     /// lock and never touches `policy_cursors`.
     ///
+    /// Parking order rather than `global_position`: a row is parked as the Policy
+    /// delivers it, so it *is* the order the Policy saw those events in, and since
+    /// funkode-io/replay#195 that order is `(commit_txid, global_position)` — replaying
+    /// by position would run reactions in an order the live feed never produced. It also
+    /// survives an event the log no longer has, which a join back to `events` would not.
+    ///
     /// Returns a [`DeadLetterRetrySummary`] counting how many rows resolved and
     /// how many failed again; the policy has fully recovered when
     /// `still_failing == 0`. A policy with no parked dead letters is a clean
     /// no-op (a zero summary). Rows removed concurrently (e.g. by
     /// [`discard_dead_letter`](Self::discard_dead_letter)) are skipped.
+    ///
+    /// Read in [`DEAD_LETTER_RETRY_PAGE`]-row keyset pages, so a backlog of any size
+    /// costs the same memory: a Policy that parked a million reactions is exactly the
+    /// caller this exists for, and materialising its ids would put that backlog on the
+    /// heap. The keyset advances past every row it selected, resolved or not — a row that
+    /// fails again keeps its `id` and `created_at`, so paging on "the page after the last
+    /// row seen" terminates where paging on "the first N still parked" would loop.
+    ///
+    /// Bounded in rows as well as in memory: it retries what was parked when it started
+    /// and stops there. Because it deliberately runs without the policy lock, the worker
+    /// goes on parking rows behind it, and each one extends the keyset by another page —
+    /// a Policy failing faster than this retries would never see the call return. Rows
+    /// parked after it started are the next call's work.
     pub async fn retry_policy_dead_letters(
         &self,
         policy_name: &str,
     ) -> Result<DeadLetterRetrySummary, replay::Error> {
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM policy_dead_letters \
-             WHERE policy_name = $1 \
-             ORDER BY global_position ASC, created_at ASC, id ASC",
-        )
-        .bind(policy_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(crate::db_error)?;
-
         let mut summary = DeadLetterRetrySummary::default();
-        for id in ids {
-            match self.retry_dead_letter(id).await? {
-                DeadLetterRetry::Resolved => summary.resolved += 1,
-                DeadLetterRetry::StillFailing => summary.still_failing += 1,
-                DeadLetterRetry::NotFound => {}
+        let mut after: Option<ParkedAt> = None;
+        let Some(until) = last_parked(&self.pool, policy_name).await? else {
+            return Ok(summary);
+        };
+
+        loop {
+            let page = dead_letter_page(
+                &self.pool,
+                policy_name,
+                after,
+                until,
+                DEAD_LETTER_RETRY_PAGE,
+            )
+            .await?;
+            let Some(last) = page.last().copied() else {
+                return Ok(summary);
+            };
+            after = Some(last);
+
+            for (_, id) in page {
+                match self.retry_dead_letter(id).await? {
+                    DeadLetterRetry::Resolved => summary.resolved += 1,
+                    DeadLetterRetry::StillFailing => summary.still_failing += 1,
+                    DeadLetterRetry::NotFound => {}
+                }
             }
         }
-        Ok(summary)
     }
 
     /// Start one long-lived worker task per registered policy, backed by two
@@ -1206,7 +1263,7 @@ impl PolicyRunner {
                 cqrs: self.cqrs.clone(),
                 pool: self.pool.clone(),
                 executors: self.executors.clone(),
-                stopped: self.stopped.clone(),
+                waiting: Arc::clone(&self.waiting),
                 shutdown_rx: shutdown_rx.clone(),
                 leader_rx,
                 wake_tx: wake_tx.clone(),
@@ -1288,7 +1345,7 @@ impl PolicyRunner {
             &mut cursor,
             max_depth,
             &mut Reporting {
-                stopped: &self.stopped,
+                waiting: &self.waiting,
                 narration: None,
             },
         )
@@ -1668,7 +1725,7 @@ struct PolicyWorker {
     cqrs: Cqrs<PostgresEventStore>,
     pool: Pool<Postgres>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
-    stopped: StoppedPolicies,
+    waiting: Arc<BlockedWatch>,
     shutdown_rx: watch::Receiver<bool>,
     leader_rx: watch::Receiver<bool>,
     /// Kept as the sender so each attempt subscribes its own receiver; a
@@ -1694,7 +1751,7 @@ impl PolicyWorker {
             cqrs,
             pool,
             executors,
-            stopped,
+            waiting,
             mut shutdown_rx,
             mut leader_rx,
             wake_tx,
@@ -1755,15 +1812,17 @@ impl PolicyWorker {
                 }
             };
 
-            // Where this worker picks up, once per election. It is the only
-            // line a process killed from outside leaves: the same
-            // `next_position` on every restart names a poison event
-            // (`SELECT * FROM events WHERE global_position = <next_position>`), a
-            // position that advances means the process is leaking instead.
+            // Where this worker picks up, once per election. It is the only line a
+            // process killed from outside leaves: the same pair on every restart names
+            // an event the worker cannot survive, a pair that advances means the process
+            // is leaking instead. The event itself is the first row past the pair —
+            // `SELECT * FROM events WHERE (commit_txid, global_position) > (<txid>, <pos>)
+            // ORDER BY commit_txid, global_position LIMIT 1` — because the successor in
+            // this order is not `position + 1` and may hold a lower position entirely.
             tracing::info!(
                 policy = %name,
                 resuming_after = cursor.position(),
-                next_position = cursor.position() + 1,
+                resuming_after_commit_txid = %cursor.point().commit_txid,
                 "policy worker is leading; resuming after its last checkpoint"
             );
 
@@ -1789,7 +1848,7 @@ impl PolicyWorker {
                     &mut cursor,
                     max_depth,
                     &mut Reporting {
-                        stopped: &stopped,
+                        waiting: &waiting,
                         narration: Some(&mut narration),
                     },
                 )
@@ -2217,7 +2276,7 @@ fn narrate(policy: &str, record: Record) {
 /// [Narration]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#narration
 struct Reporting<'a> {
     /// Where a feed that stops is remembered, and how often it is reported.
-    stopped: &'a StoppedPolicies,
+    waiting: &'a BlockedWatch,
     /// The bracket around a burst of work. `None` for [`PolicyRunner::drain`],
     /// which polls once on the caller's command: a manual drain that opened a
     /// burst would leave a bracket nothing ever closes.
@@ -2257,53 +2316,36 @@ async fn drain_policy_once(
         policy_name: &name,
         dispatch_timeout,
     };
-    let Feed { positions, gap } =
-        read_feed(pool, policy.stream_filter(), cursor.position(), read_batch).await?;
+    let window = read_feed(pool, policy.stream_filter(), cursor.point(), read_batch).await?;
 
-    if positions.is_empty() {
-        // Nothing to process: the policy is idle, or parked in front of a gap
-        // that will never fill. Both are the states an operator corrects by hand
-        // with an UPDATE on `policy_cursors`, and both are the only moments when
-        // a re-read costs nothing, so this is where a *running* leader picks the
-        // correction up — no restart, no leadership change.
+    if window.is_empty() {
+        // Nothing to process: the policy is caught up, or every event past it was
+        // written after a transaction that has not ended. Both are moments when a
+        // re-read costs nothing, so this is where a *running* leader picks up a
+        // cursor an operator moved by hand — no restart, no leadership change.
         if cursor.refresh(pool, &name).await? {
             tracing::info!(
                 policy = %name,
                 position = cursor.position(),
                 "persisted cursor was moved externally; adopting it"
             );
-            // The gap was read from the position the operator has just replaced:
-            // reporting it would name a stop that no longer exists.
-            reporting.stopped.forget(&name);
+            // Whatever this poll was waiting behind was read from a cursor the
+            // operator has just replaced.
+            reporting.waiting.cleared(&name);
             // Not a catch-up: this poll read nothing and proved nothing about
             // the feed, which now starts somewhere else entirely.
             reporting.tell(&name, Poll::Stalled);
             return Ok(0);
         }
 
-        match gap {
-            // Parked in front of a hole, and the cursor is where the read left it.
-            Some(gap) => {
-                trace_gap(&name, gap);
-                // A hole no running transaction can fill is crossed here; anything
-                // else is an append the feed is right to wait for, and waiting is
-                // what gets reported.
-                if !skip_burned_positions(pool, &name, cursor, gap, reporting.stopped).await? {
-                    report_blocked(pool, &name, gap, &reporting.stopped.blocked).await?;
-                }
-                // A Policy stopped in front of a hole has not reached the end of
-                // its feed, whatever this poll read. Reporting it as caught up
-                // would say the opposite of what happened, and the block has a
-                // record of its own.
-                reporting.tell(&name, Poll::Stalled);
-            }
-            // Caught up: a healthy idle policy, and it stays silent unless this
-            // is the poll that closes a burst.
-            None => {
-                reporting.stopped.forget(&name);
-                reporting.tell(&name, Poll::Exhausted);
-            }
-        }
+        // Waiting on an open write is not being caught up: the events past the cursor
+        // exist and are owed to this Policy, which is the difference between the two
+        // records an empty poll can earn.
+        let poll = match report_waiting(pool, &name, cursor.point(), reporting.waiting).await? {
+            true => Poll::Stalled,
+            false => Poll::Exhausted,
+        };
+        reporting.tell(&name, poll);
         return Ok(0);
     }
 
@@ -2311,31 +2353,13 @@ async fn drain_policy_once(
     // minutes must run inside the bracket rather than before it.
     reporting.tell(&name, Poll::Found { at: started });
 
-    match gap {
-        // A truncated window: the policy advances over the prefix now and parks at
-        // the hole. The hole is as old as this poll even though this poll had work,
-        // so the clock starts here rather than on the first empty poll.
-        //
-        // Whether the hole can ever fill is asked on the *next* poll, once the
-        // prefix has been delivered and the feed comes back empty: the answer costs
-        // a query, and a poll with work in front of it has somewhere better to be.
-        // The delay is one poll, and the positions are no less burned for it.
-        Some(gap) => {
-            trace_gap(&name, gap);
-            reporting.stopped.sighted(&name, gap);
-        }
-        // Advancing with nothing in the way.
-        None => reporting.stopped.forget(&name),
-    }
+    // The feed moved, so nothing this process remembers about waiting still holds.
+    reporting.waiting.cleared(&name);
 
     let mut executed = 0;
     let mut events_since_checkpoint = 0u32;
-    for WindowPosition {
-        commit_txid,
-        global_position,
-        delivered,
-    } in positions
-    {
+    for WindowPosition { point, delivered } in window {
+        let global_position = point.position;
         if let Some(raw) = delivered {
             let depth = event_causation_depth(&raw);
             if depth >= max_depth {
@@ -2363,7 +2387,7 @@ async fn drain_policy_once(
             }
         }
         // Always track in-memory position.
-        cursor.advance_to(commit_txid, global_position);
+        cursor.advance_to(point);
         events_since_checkpoint += 1;
         // Told as the cursor moves rather than when the poll returns: one poll's
         // batch is dispatched event by event, each bounded only by the dispatch
@@ -2399,134 +2423,63 @@ async fn drain_policy_once(
     Ok(executed)
 }
 
-/// Trace the stop: the one fact the blocked deployment in funkode-io/replay#164
-/// never had. Cheap enough to emit on every poll, so it needs no rate limit.
+/// Say why a Policy that read nothing read nothing.
 ///
-/// `cursor` is where the *feed* stops: the position before the hole, which is where
-/// the poll leaves the cursor when it gets that far. It is a property of the read,
-/// not of what the reactions then managed to do, so it is the same field whether the
-/// window was empty or was truncated after a prefix.
-fn trace_gap(name: &str, gap: Gap) {
+/// An empty feed is either a caught-up Policy or one waiting on a write that has not
+/// ended: the feed withholds everything committed after a transaction that is still
+/// running, because that transaction may yet publish events which belong in front of
+/// them ([`crate::policy_feed`]). The wait resolves itself when the write ends, so it
+/// is reported rather than acted on.
+///
+/// The probe is what tells the two apart, and it runs only on an empty poll — there is
+/// nothing else to pay for on one. A caught-up Policy has nothing withheld and stays
+/// silent; a waiting one traces every poll, and escalates to `warn` once
+/// [`BlockedWatch`] says the wait has outlived the interval an operator would call
+/// ordinary.
+async fn report_waiting(
+    pool: &Pool<Postgres>,
+    name: &str,
+    cursor: FeedPoint,
+    waiting: &BlockedWatch,
+) -> Result<bool, replay::Error> {
+    let Some(wait) = probe_waiting(pool, name, cursor).await? else {
+        // Caught up: a healthy idle policy, and it stays silent.
+        waiting.cleared(name);
+        return Ok(false);
+    };
+
     tracing::debug!(
         policy = %name,
-        cursor = gap.expected - 1,
-        expected = gap.expected,
-        found = gap.found,
-        "policy feed stops at a gap in global_position"
+        cursor = cursor.position,
+        cursor_commit_txid = %cursor.commit_txid,
+        withheld_position = wait.withheld.position,
+        withheld_commit_txid = %wait.withheld.commit_txid,
+        watermark = %wait.watermark,
+        "policy feed is waiting for an open write to end"
     );
-}
 
-/// Cross a hole no transaction can ever fill, returning whether the Policy moved.
-///
-/// The feed stops at a missing `global_position` because it cannot tell an append
-/// still committing from a position burned by one that aborted — `nextval` is not
-/// transactional, so an aborted append's positions are gone for good
-/// (funkode-io/replay#164). The two are told apart by who holds the sequence:
-/// only a transaction that has already taken the missing position can write it, and
-/// it holds a lock on the sequence until it ends (see [`crate::burned_position`]).
-///
-/// The order of the two queries is the correctness argument and not an accident:
-/// the lock is read first, and only a position still missing *after* that read can
-/// never appear, because Postgres publishes a commit before releasing its locks.
-///
-/// Every burned position in front of the cursor is crossed in one move, so an
-/// aborted batch that burned thousands costs one poll rather than thousands.
-async fn skip_burned_positions(
-    pool: &Pool<Postgres>,
-    name: &str,
-    cursor: &mut PolicyCursor,
-    gap: Gap,
-    stopped: &StoppedPolicies,
-) -> Result<bool, replay::Error> {
-    let Some(holders) = sequence_holders(pool).await? else {
-        // More transactions hold the sequence than this process will track. An
-        // incomplete candidate set can only produce a wrong "permanent", so the
-        // poll declines to judge and looks again next time.
-        return Ok(false);
-    };
-    if stopped.burned.verdict(name, gap.expected, holders) == Permanence::Fillable {
-        return Ok(false);
+    if !waiting.poll(name, cursor, std::time::Instant::now()) {
+        return Ok(true);
     }
-
-    let resume = resume_after_burned(pool, name, cursor.position()).await?;
-    let Resume::Skip { next_position } = resume else {
-        // The cursor moved under us, or the hole is gone: either way this verdict
-        // is about a position the Policy is no longer parked in front of.
-        stopped.forget(name);
-        return Ok(false);
-    };
-
-    // The record is written after the checkpoint, not before: a cursor moved by an
-    // operator between the read above and this write loses the compare-and-set, and
-    // this process then crossed nothing. A `warn` saying otherwise would send
-    // whoever reads it looking for a move that never happened.
-    let parked_at = cursor.position();
-    cursor.park_at(next_position - 1);
-    match cursor.checkpoint(pool, name).await? {
-        Checkpoint::Written => tracing::warn!(
-            policy = %name,
-            cursor = parked_at,
-            skipped_from = gap.expected,
-            skipped_to = next_position - 1,
-            skipped = next_position - gap.expected,
-            next_position,
-            "policy feed skipped global_position values that can never appear: no \
-             transaction still holds them, so they were burned by an append that \
-             aborted. Advancing past them (funkode-io/replay#164)"
-        ),
-        Checkpoint::Superseded => log_superseded(name, cursor),
-    }
-    stopped.forget(name);
-
-    Ok(true)
-}
-
-/// Report a Policy parked in front of a hole long enough for the hole to be
-/// permanent rather than an append still landing.
-///
-/// The wait is by design (ADR-0003 skip-safety): a `global_position` is assigned at
-/// `INSERT` and visible at `COMMIT`, so a missing one is normally about to land.
-/// A hole that outlives the transactions that could fill it is crossed by
-/// [`skip_burned_positions`] instead, so what reaches this warning is a wait that is
-/// still legitimate and has lasted longer than an operator wants to be left guessing
-/// about — a long-running append, or a Policy whose cursor an operator has parked in
-/// front of a position that does not exist yet.
-///
-/// [`BlockedWatch`] decides which poll reports; the probe then runs at most once
-/// per interval, to name the head and how long the cursor has been parked.
-async fn report_blocked(
-    pool: &Pool<Postgres>,
-    name: &str,
-    gap: Gap,
-    blocked: &BlockedWatch,
-) -> Result<(), replay::Error> {
-    if !blocked.poll(name, gap.expected, std::time::Instant::now()) {
-        return Ok(());
-    }
-
-    // Confirms the hole is still there and the cursor still in front of it: the read
-    // that found it is a few statements old by now.
-    let Some(parked) = probe_blocked(pool, name, gap.expected - 1, gap.expected).await? else {
-        return Ok(());
-    };
 
     tracing::warn!(
         policy = %name,
-        // The feed was empty, so the cursor is parked immediately before the hole.
-        cursor = gap.expected - 1,
-        head = parked.head,
-        missing_position = gap.expected,
-        next_position = gap.found,
-        blocked_for_secs = parked.elapsed.as_secs(),
-        "policy is blocked: its feed stops at a global_position that does not exist \
-         yet. A transaction still holds it, so this is an append that has not \
-         committed, or a cursor parked in front of a position that was never \
-         written. A position no transaction holds is crossed automatically \
-         (funkode-io/replay#170), so do not move the cursor past this one until the \
-         append it is waiting for is known to be gone"
+        cursor = cursor.position,
+        cursor_commit_txid = %cursor.commit_txid,
+        log_max_position = wait.log_max_position,
+        withheld_position = wait.withheld.position,
+        withheld_commit_txid = %wait.withheld.commit_txid,
+        watermark = %wait.watermark,
+        cursor_stale_for_secs = wait.elapsed.as_secs(),
+        "policy is waiting on a write that has not ended: every event past its cursor \
+         was written at or after a transaction that is still running, and delivering \
+         one now would put it ahead of events that transaction may still publish. It \
+         clears by itself when that write commits or aborts; an open write is the thing \
+         to look for, and `cursor_stale_for_secs` bounds how long it can have been open \
+         (funkode-io/replay#195)"
     );
 
-    Ok(())
+    Ok(true)
 }
 
 /// Report a checkpoint that lost to a cursor moved outside this process. The
@@ -2968,57 +2921,6 @@ async fn load_event_by_id(
     }
 }
 
-/// Read the window of positions past `cursor` the policy may advance over.
-///
-/// Unfiltered — every `global_position > cursor`, up to `limit` — because contiguity
-/// belongs to the position stream, not to the rows the policy asked for (ADR-0013).
-/// `filter` is evaluated per row as `matches_filter` and decides delivery only; an
-/// excluded row advances the cursor like a compaction snapshot
-/// (`compacted_snapshot = TRUE`, ADR-0004). [`feed_from_window`] then truncates the
-/// window at the first hole, and names the hole it truncated at.
-async fn read_feed(
-    pool: &Pool<Postgres>,
-    filter: StreamFilter,
-    cursor: i64,
-    limit: u32,
-) -> Result<Feed<PersistedEvent<Value>>, replay::Error> {
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-         global_position, commit_txid::text AS commit_txid, compacted_snapshot, COALESCE((",
-    );
-    // As a predicate NULL means no match; read as a value it must be collapsed.
-    PostgresEventStore::add_filters(&mut qb, filter);
-    qb.push("), FALSE) AS matches_filter FROM events WHERE global_position > ");
-    qb.push_bind(cursor);
-    qb.push(" ORDER BY global_position ASC LIMIT ");
-    qb.push_bind(limit as i64);
-
-    let rows = qb.build().fetch_all(pool).await.map_err(crate::db_error)?;
-
-    let mut window = Vec::with_capacity(rows.len());
-    for row in rows {
-        let global_position: i64 = row.get("global_position");
-        let commit_txid = CommitStamp::from_row(&row, "commit_txid")?;
-        let is_snapshot: bool = row.get("compacted_snapshot");
-        let matches_filter: bool = row.get("matches_filter");
-
-        // Only delivered rows are parsed; a skipped row's bytes are still fetched.
-        let delivered = if is_snapshot || !matches_filter {
-            None
-        } else {
-            Some(PersistedEvent::<Value>::try_from(row)?)
-        };
-
-        window.push(WindowPosition {
-            commit_txid,
-            global_position,
-            delivered,
-        });
-    }
-
-    Ok(feed_from_window(cursor, window))
-}
-
 async fn execute_dispatch(
     cqrs: &Cqrs<PostgresEventStore>,
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
@@ -3054,18 +2956,6 @@ async fn execute_dispatch(
         .await
 }
 
-/// A point in the Policy feed: the transaction a Policy stopped in and the position it
-/// stopped at.
-///
-/// The pair is what a cursor records (funkode-io/replay#194). Only the position decides
-/// delivery today; the transaction is recorded so the feed can be ordered by writes that
-/// have finished rather than by the numbers those writes took (funkode-io/replay#171).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CursorPoint {
-    commit_txid: CommitStamp,
-    position: i64,
-}
-
 /// A policy's point in the global feed, paired with the value this process
 /// believes is stored in `policy_cursors`.
 ///
@@ -3082,9 +2972,9 @@ struct CursorPoint {
 ///   fails instead of silently reinstating it.
 struct PolicyCursor {
     /// Last point handed to the policy in this process.
-    point: CursorPoint,
+    point: FeedPoint,
     /// The value this process last observed in `policy_cursors`.
-    persisted: CursorPoint,
+    persisted: FeedPoint,
 }
 
 /// Outcome of a [`PolicyCursor::checkpoint`].
@@ -3098,26 +2988,19 @@ enum Checkpoint {
 }
 
 impl PolicyCursor {
-    /// Where the policy is, for the feed and for the log.
+    /// Where the policy is in the feed's order: what the next read resumes from.
+    fn point(&self) -> FeedPoint {
+        self.point
+    }
+
+    /// Where the policy is in the log, for the operator-facing tables and the log.
     fn position(&self) -> i64 {
         self.point.position
     }
 
-    /// Move onto the position just read, in the transaction that wrote it.
-    fn advance_to(&mut self, commit_txid: CommitStamp, position: i64) {
-        self.point = CursorPoint {
-            commit_txid,
-            position,
-        };
-    }
-
-    /// Move onto a position no event carries, keeping the transaction half.
-    ///
-    /// A burned position was taken by a write that aborted, so there is no event there
-    /// and no transaction to name: the last write the policy passed is still the one it
-    /// stopped in.
-    fn park_at(&mut self, position: i64) {
-        self.point.position = position;
+    /// Move onto the point just read.
+    fn advance_to(&mut self, point: FeedPoint) {
+        self.point = point;
     }
 
     /// Load the stored checkpoint, bootstrapping the row from `start_at` the
@@ -3184,37 +3067,74 @@ impl PolicyCursor {
         Ok(self.point != before)
     }
 
-    /// Take on a stored point this process did not write, completing its transaction
-    /// half from the log.
+    /// Take on a stored point this process did not write, completing it from the log.
     ///
     /// The operator's instruction is a position — that is the control surface ADR-0012
-    /// documents, and it stays one column wide. The transaction that belongs with a
-    /// position is the one that wrote the last event at or before it, which is exactly
-    /// what the runner itself stores, so a pair the runner wrote survives this untouched
-    /// and a position written alone is completed rather than refused.
+    /// documents, and it stays one column wide — and so is the row migration 0022 leaves
+    /// behind. Neither is a point in the feed's order, so [`conservative_point`] derives
+    /// one that delivers every event past that position; a row that already names an
+    /// event ([`names_a_feed_point`]) is left as it is, and costs one indexed lookup.
     ///
     /// The completion is written back, so the row shows the point the Policy resumes
-    /// from rather than the half-instruction it was given — without disturbing
-    /// `updated_at`, since nothing was processed. Losing that compare-and-set means the
-    /// row moved again; the next poll reads it and adopts that instead.
+    /// from rather than the half-instruction it was given — position untouched, and
+    /// without disturbing `updated_at`, since nothing was processed.
+    ///
+    /// Losing that compare-and-set means the row moved again while this derivation ran,
+    /// and the write that won is the instruction now: the loser starts over from it
+    /// rather than keeping a point derived from a row nobody holds. Keeping it would
+    /// read the feed from an instruction that has been replaced — delivering, for one
+    /// batch, the events an operator's forward move meant to skip, with the conflict
+    /// only surfacing at the checkpoint afterwards.
+    ///
+    /// Nothing is assigned until it settles, so the cursor never holds a point derived
+    /// from a row that is gone. Bounded by [`ADOPT_ATTEMPTS`]: a row rewritten faster
+    /// than this can read it fails the poll with the cursor left where this process
+    /// already was — a valid point, re-read on the next poll — rather than moved
+    /// somewhere nobody asked for.
     async fn adopt(
         &mut self,
         pool: &Pool<Postgres>,
         name: &str,
-        stored: CursorPoint,
+        stored: FeedPoint,
     ) -> Result<(), replay::Error> {
-        self.persisted = stored;
-        self.point = CursorPoint {
-            commit_txid: commit_txid_at(pool, stored.position).await?,
-            position: stored.position,
-        };
+        let mut stored = stored;
 
-        if self.point != self.persisted
-            && complete_commit_txid(pool, name, self.persisted, self.point.commit_txid).await?
-        {
-            self.persisted = self.point;
+        for _ in 0..ADOPT_ATTEMPTS {
+            let point = match commit_txid_at(pool, stored.position).await? {
+                // The common path, and the one that must stay cheap: every election and
+                // every manual drain of a Policy this process left where it is pays one
+                // indexed lookup and no scan.
+                at_position if names_a_feed_point(stored, at_position) => stored,
+                _ => {
+                    let (first_past_commit_txid, watermark) =
+                        conservative_inputs(pool, stored.position).await?;
+                    conservative_point(stored, first_past_commit_txid, watermark)
+                }
+            };
+
+            if point == stored {
+                self.persisted = stored;
+                self.point = point;
+                return Ok(());
+            }
+            if complete_commit_txid(pool, name, stored, point.commit_txid).await? {
+                self.persisted = point;
+                self.point = point;
+                return Ok(());
+            }
+
+            stored = read_point(pool, name).await?.ok_or_else(|| {
+                replay::Error::not_found("policy cursor row vanished while it was adopted")
+                    .with_operation("policy_cursor_adopt")
+                    .with_context("policy", name)
+            })?;
         }
-        Ok(())
+
+        Err(
+            replay::Error::conflict("policy cursor row moved faster than it could be adopted")
+                .with_operation("policy_cursor_adopt")
+                .with_context("policy", name),
+        )
     }
 
     /// Persist the in-memory point, but only if the stored one is still the
@@ -3238,13 +3158,19 @@ impl PolicyCursor {
     }
 }
 
-/// Read a policy's stored point, or `None` when it has no row yet.
-async fn read_point(
-    pool: &Pool<Postgres>,
-    name: &str,
-) -> Result<Option<CursorPoint>, replay::Error> {
+/// A policy's stored point, `None` when it has no row yet, refused if this cluster did
+/// not issue its stamp.
+///
+/// The origin check rides along on the read that every election, every refresh and every
+/// manual drain already does, so it costs a column rather than a query — and it sits on
+/// the cursor because that is where a restore is silent: a cursor stamped by another
+/// cluster sorts above everything this one appends, so the feed comes back empty and the
+/// Policy looks idle. See [`reject_foreign_stamp`].
+async fn read_point(pool: &Pool<Postgres>, name: &str) -> Result<Option<FeedPoint>, replay::Error> {
     let row = sqlx::query(
-        "SELECT position, commit_txid::text AS commit_txid FROM policy_cursors WHERE name = $1",
+        "SELECT position, commit_txid::text AS commit_txid, \
+         pg_snapshot_xmax(pg_current_snapshot())::text AS next_txid \
+         FROM policy_cursors WHERE name = $1",
     )
     .bind(name)
     .fetch_optional(pool)
@@ -3252,10 +3178,17 @@ async fn read_point(
     .map_err(crate::db_error)?;
 
     row.map(|row| {
-        Ok(CursorPoint {
+        let point = FeedPoint {
             commit_txid: CommitStamp::from_row(&row, "commit_txid")?,
             position: row.get("position"),
-        })
+        };
+        reject_foreign_stamp(
+            name,
+            StampSource::Cursor,
+            point.commit_txid,
+            CommitStamp::from_row(&row, "next_txid")?,
+        )?;
+        Ok(point)
     })
     .transpose()
 }
@@ -3264,7 +3197,7 @@ async fn read_point(
 async fn insert_point(
     pool: &Pool<Postgres>,
     name: &str,
-    point: CursorPoint,
+    point: FeedPoint,
 ) -> Result<(), replay::Error> {
     sqlx::query(
         "INSERT INTO policy_cursors (name, position, commit_txid, updated_at) \
@@ -3287,8 +3220,8 @@ async fn insert_point(
 async fn write_point(
     pool: &Pool<Postgres>,
     name: &str,
-    from: CursorPoint,
-    to: CursorPoint,
+    from: FeedPoint,
+    to: FeedPoint,
 ) -> Result<bool, replay::Error> {
     let updated = sqlx::query(
         "UPDATE policy_cursors SET position = $2, commit_txid = $3::xid8, updated_at = now() \
@@ -3316,7 +3249,7 @@ async fn write_point(
 async fn complete_commit_txid(
     pool: &Pool<Postgres>,
     name: &str,
-    from: CursorPoint,
+    from: FeedPoint,
     to: CommitStamp,
 ) -> Result<bool, replay::Error> {
     let updated = sqlx::query(
@@ -3334,50 +3267,118 @@ async fn complete_commit_txid(
     Ok(updated.rows_affected() > 0)
 }
 
-/// The transaction that belongs with `position`: the one that wrote the last event at or
-/// before it.
+/// The transaction that wrote the event at `position`, or `None` when no event is there.
 ///
-/// [`CommitStamp::SENTINEL`] when there is no such event — a cursor at 0, or a log with
-/// nothing in it yet — which orders before every real transaction, exactly as a cursor
-/// that has processed nothing should. A position past the head takes the head's
-/// transaction: the events between are the ones the policy is being told it has passed.
+/// One lookup on the unique index over `global_position` (migration 0015), which is what
+/// decides whether a stored row is already a point and the rest of the derivation can be
+/// skipped.
 async fn commit_txid_at(
     pool: &Pool<Postgres>,
     position: i64,
-) -> Result<CommitStamp, replay::Error> {
+) -> Result<Option<CommitStamp>, replay::Error> {
     let stamp = sqlx::query_scalar::<_, String>(
-        "SELECT commit_txid::text FROM events WHERE global_position <= $1 \
-         ORDER BY global_position DESC LIMIT 1",
+        "SELECT commit_txid::text FROM events WHERE global_position = $1",
     )
     .bind(position)
     .fetch_optional(pool)
     .await
     .map_err(crate::db_error)?;
 
-    stamp.map_or(Ok(CommitStamp::SENTINEL), |stamp| {
-        CommitStamp::parse(stamp.as_str())
-    })
+    stamp
+        .map(|stamp| CommitStamp::parse(stamp.as_str()))
+        .transpose()
 }
 
+/// The two facts [`conservative_point`] derives from: the earliest transaction holding a
+/// readable event past `position`, and the watermark — read in one statement, so they
+/// cannot describe different instants.
+///
+/// The scan past the position is over `global_position`, not over the feed's own index:
+/// the rows past a cursor are the ones it has yet to deliver, so a cursor near the head
+/// reads a handful whatever the log's size, while ordering by `commit_txid` would walk
+/// the whole log below the watermark to discover there is nothing past the cursor at all.
+/// It runs only for a row that names no event, which is the upgrade and the operator's
+/// move — never the steady state.
+///
+/// `MIN` over `xid8` goes through `numeric`, which has one: the type has comparison
+/// operators but no aggregates.
+/// Needs no origin check of its own: the `< watermark` filter cannot select a stamp from
+/// another cluster, since a restored one is never below this cluster's oldest running
+/// transaction. [`read_point`] is where that log is caught.
+async fn conservative_inputs(
+    pool: &Pool<Postgres>,
+    position: i64,
+) -> Result<(Option<CommitStamp>, CommitStamp), replay::Error> {
+    let row = sqlx::query(
+        "SELECT (SELECT MIN(commit_txid::text::numeric)::text FROM events \
+           WHERE global_position > $1 AND commit_txid < w.watermark) AS first_past_commit_txid, \
+         w.watermark::text AS watermark \
+         FROM (SELECT pg_snapshot_xmin(pg_current_snapshot()) AS watermark) w",
+    )
+    .bind(position)
+    .fetch_one(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    let first_past_commit_txid = row
+        .get::<Option<String>, _>("first_past_commit_txid")
+        .map(|text| CommitStamp::parse(text.as_str()))
+        .transpose()?;
+
+    Ok((
+        first_past_commit_txid,
+        CommitStamp::from_row(&row, "watermark")?,
+    ))
+}
+
+/// The point a Policy registered for the first time starts from.
+///
+/// [`StartAt::Now`] is the greatest point the feed's own order has reached: the last row
+/// in `(commit_txid, global_position)` among those visible. Not `MAX(global_position)`,
+/// which names a different row — an xid is taken at a transaction's first write to any
+/// table, so a transaction that writes elsewhere first can commit an event with a higher
+/// `commit_txid` at a *lower* position. Starting at the head position would leave that
+/// row sorting after the cursor, and a Policy registered to skip history would replay it.
+///
+/// A write in flight at that moment is not separated from one still to come: it is
+/// delivered if its transaction is younger than the head's and skipped if it is older,
+/// because that is where its events sort. Neither is a gap in the order — the point is
+/// exact — but it is why `Now` is a cut in the log's order rather than a cut in time. The
+/// start point that catches every open write is the watermark, and it costs the opposite
+/// mistake: every event committed while any transaction was open becomes history the
+/// Policy replays, unboundedly far back for a long-running one.
+///
+/// `Beginning` is position 0 under the sentinel stamp, which precedes every event.
 async fn bootstrap_point(
     pool: &Pool<Postgres>,
     start_at: StartAt,
-) -> Result<CursorPoint, replay::Error> {
-    let position = match start_at {
-        StartAt::Beginning => 0,
-        StartAt::Now => {
-            let head =
-                sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(global_position) FROM events")
-                    .fetch_one(pool)
-                    .await
-                    .map_err(crate::db_error)?;
-            head.unwrap_or_default()
-        }
+) -> Result<FeedPoint, replay::Error> {
+    if start_at == StartAt::Beginning {
+        return Ok(FeedPoint {
+            commit_txid: CommitStamp::SENTINEL,
+            position: 0,
+        });
+    }
+
+    let row = sqlx::query(
+        "SELECT commit_txid::text AS commit_txid, global_position FROM events \
+         ORDER BY commit_txid DESC, global_position DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    // An empty log has no point to start from, so `Now` and `Beginning` coincide.
+    let Some(row) = row else {
+        return Ok(FeedPoint {
+            commit_txid: CommitStamp::SENTINEL,
+            position: 0,
+        });
     };
 
-    Ok(CursorPoint {
-        commit_txid: commit_txid_at(pool, position).await?,
-        position,
+    Ok(FeedPoint {
+        commit_txid: CommitStamp::from_row(&row, "commit_txid")?,
+        position: row.get("global_position"),
     })
 }
 
@@ -4444,13 +4445,15 @@ mod pinned_session_tests {
 #[cfg(test)]
 mod cursor_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
+    use sqlx::{PgPool, Postgres, Row};
     use testcontainers_modules::postgres;
     use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 
     use crate::commit_stamp::CommitStamp;
+    use crate::policy_feed::read_feed;
+    use crate::StreamFilter;
 
-    use super::{read_point, Checkpoint, CursorPoint, PolicyCursor, StartAt};
+    use super::{read_point, Checkpoint, FeedPoint, PolicyCursor, StartAt};
 
     const POLICY: &str = "cursor_under_test";
 
@@ -4493,7 +4496,7 @@ mod cursor_tests {
     /// Append `count` events through the store's own insert path, one transaction each,
     /// and report the point each one landed at. No runner is involved: these tests are
     /// about what a cursor makes of the log, not about how it got there.
-    async fn append_events(pool: &PgPool, count: usize) -> Vec<CursorPoint> {
+    async fn append_events(pool: &PgPool, count: usize) -> Vec<FeedPoint> {
         let mut points = Vec::with_capacity(count);
         for index in 0..count {
             sqlx::query(
@@ -4513,7 +4516,7 @@ mod cursor_tests {
             .await
             .expect("reading the appended event must succeed");
 
-            points.push(CursorPoint {
+            points.push(FeedPoint {
                 commit_txid: CommitStamp::from_row(&row, "commit_txid")
                     .expect("an appended event carries a readable stamp"),
                 position: row.get("global_position"),
@@ -4523,11 +4526,42 @@ mod cursor_tests {
     }
 
     /// The row as it stands, which is what a restarted process and an operator both read.
-    async fn stored(pool: &PgPool) -> CursorPoint {
+    async fn stored(pool: &PgPool) -> FeedPoint {
         read_point(pool, POLICY)
             .await
             .expect("reading the cursor must succeed")
             .expect("the cursor row exists")
+    }
+
+    /// Append one event inside a transaction the caller holds open, on a stream of its
+    /// own, and report the position it took. What a Policy would see of it is decided by
+    /// when the caller commits.
+    async fn append_inside(tx: &mut sqlx::Transaction<'static, Postgres>, stream: &str) -> i64 {
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM append_event(gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, \
+             'Appended', $1, 'Probe', NULL)",
+        )
+        .bind(stream)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("appending inside the held transaction must succeed");
+
+        sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("the append's own row is visible to itself")
+    }
+
+    /// The positions the feed delivers from `point`, which is what a cursor is *for*:
+    /// the row it stores only matters through the events it goes on to see.
+    async fn feed_from(pool: &PgPool, point: FeedPoint) -> Vec<i64> {
+        read_feed(pool, StreamFilter::All, point, 100)
+            .await
+            .expect("reading the feed must succeed")
+            .into_iter()
+            .map(|row| row.point.position)
+            .collect()
     }
 
     /// The operator's instruction from ADR-0012, unchanged by this ticket: a position,
@@ -4559,7 +4593,7 @@ mod cursor_tests {
         let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        cursor.advance_to(events[1].commit_txid, events[1].position);
+        cursor.advance_to(events[1]);
 
         assert_eq!(
             cursor.checkpoint(&pool, POLICY).await.unwrap(),
@@ -4585,7 +4619,7 @@ mod cursor_tests {
 
         assert_eq!(
             stored(&pool).await,
-            CursorPoint {
+            FeedPoint {
                 commit_txid: CommitStamp::SENTINEL,
                 position: 0,
             }
@@ -4615,7 +4649,7 @@ mod cursor_tests {
         let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        cursor.advance_to(events[0].commit_txid, events[0].position);
+        cursor.advance_to(events[0]);
         cursor.checkpoint(&pool, POLICY).await.unwrap();
 
         // Someone else moves the row's transaction half only. The position this process
@@ -4628,7 +4662,7 @@ mod cursor_tests {
             .await
             .expect("the outside write must succeed");
 
-        cursor.advance_to(events[1].commit_txid, events[1].position);
+        cursor.advance_to(events[1]);
         assert_eq!(
             cursor.checkpoint(&pool, POLICY).await.unwrap(),
             Checkpoint::Superseded,
@@ -4641,9 +4675,9 @@ mod cursor_tests {
         );
     }
 
-    /// ADR-0012's control surface stays one column wide: the operator writes a position
-    /// and the runner supplies the transaction that belongs with it — the one that wrote
-    /// the event there, which is what the runner would have stored itself.
+    /// ADR-0012's control surface stays one column wide, and the runner reads the
+    /// position it is given as "everything at or before this is processed": the point it
+    /// derives keeps that position and delivers every event past it.
     #[tokio::test]
     async fn an_operator_may_move_the_position_alone_postgres_test() {
         let (pool, _container) = start_postgres().await;
@@ -4652,31 +4686,37 @@ mod cursor_tests {
         let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        cursor.advance_to(events[0].commit_txid, events[0].position);
+        cursor.advance_to(events[2]);
         cursor.checkpoint(&pool, POLICY).await.unwrap();
 
-        move_position(&pool, events[2].position).await;
+        move_position(&pool, events[0].position).await;
 
         assert!(
             cursor.refresh(&pool, POLICY).await.unwrap(),
             "the running leader adopts a cursor moved underneath it"
         );
         assert_eq!(
-            cursor.point, events[2],
-            "the adopted point carries the transaction that wrote the event there"
+            cursor.point.position, events[0].position,
+            "the position is the operator's instruction, kept as written"
+        );
+        assert_eq!(
+            feed_from(&pool, cursor.point).await,
+            vec![events[1].position, events[2].position],
+            "and the rewind re-delivers everything past it"
         );
         assert_eq!(
             stored(&pool).await,
-            events[2],
-            "and the row is completed, so it shows the point the policy resumes from"
+            cursor.point,
+            "the row is completed, so it shows the point the policy resumes from"
         );
     }
 
     /// The same instruction aimed at a position no event carries — the #164 recovery,
     /// where the operator moves past a burned position. There is no transaction to name
-    /// there, so the cursor takes the last one it has passed.
+    /// there and nothing readable past it, so the cursor sits one below the watermark:
+    /// behind every write that could still appear, past everything that already has.
     #[tokio::test]
-    async fn a_position_no_event_carries_takes_the_transaction_before_it_postgres_test() {
+    async fn a_position_no_event_carries_resumes_below_every_write_still_to_come_postgres_test() {
         let (pool, _container) = start_postgres().await;
         let events = append_events(&pool, 2).await;
 
@@ -4686,21 +4726,221 @@ mod cursor_tests {
         move_position(&pool, events[1].position + 10).await;
         cursor.refresh(&pool, POLICY).await.unwrap();
 
+        assert_eq!(cursor.point.position, events[1].position + 10);
+        assert!(
+            feed_from(&pool, cursor.point).await.is_empty(),
+            "the events the operator declared passed are not delivered again"
+        );
+
+        let appended = append_events(&pool, 1).await;
         assert_eq!(
-            cursor.point,
-            CursorPoint {
-                commit_txid: events[1].commit_txid,
-                position: events[1].position + 10,
-            }
+            feed_from(&pool, cursor.point).await,
+            vec![appended[0].position],
+            "and the policy is moved on, not parked past the log"
         );
     }
 
-    /// Completing a transaction half is bookkeeping, not progress: a Policy that has
-    /// been parked for ten minutes still reads as parked for ten minutes afterwards.
+    /// The upgrade a position-only cursor is read conservatively for: under the old
+    /// position order this Policy had processed everything through its position, and one
+    /// of the writes past it was in flight at the time under an *older* transaction than
+    /// the event it stopped at. Completing the row to the transaction at its position
+    /// would sort that write behind the cursor and lose it for good.
+    #[tokio::test]
+    async fn an_append_in_flight_under_a_migrated_cursor_is_still_delivered_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let first = append_events(&pool, 1).await;
+
+        // In flight, and older than what follows: it takes its transaction id before the
+        // next append commits, and its row — at a higher position — after.
+        let mut in_flight = pool.begin().await.expect("beginning must succeed");
+        sqlx::query_scalar::<_, String>("SELECT pg_current_xact_id()::text")
+            .fetch_one(&mut *in_flight)
+            .await
+            .expect("taking a transaction id must succeed");
+
+        let stopped_at = append_events(&pool, 1).await[0];
+        let held = append_inside(&mut in_flight, "urn:probe:in-flight").await;
+        assert!(
+            held > stopped_at.position,
+            "the write in flight must sit past the cursor: {held} <= {}",
+            stopped_at.position
+        );
+
+        // The row migration 0022 leaves for a Policy that was running: a position, and
+        // the sentinel.
+        sqlx::query("INSERT INTO policy_cursors (name, position) VALUES ($1, $2)")
+            .bind(POLICY)
+            .bind(stopped_at.position)
+            .execute(&pool)
+            .await
+            .expect("staging the migrated cursor must succeed");
+
+        let cursor = PolicyCursor::load(&pool, POLICY, StartAt::Now)
+            .await
+            .expect("loading must succeed");
+        in_flight.commit().await.expect("committing must succeed");
+
+        assert!(
+            feed_from(&pool, cursor.point).await.contains(&held),
+            "the write that was in flight when the cursor was migrated is delivered"
+        );
+        assert!(
+            !feed_from(&pool, cursor.point)
+                .await
+                .contains(&first[0].position),
+            "and the log below the cursor's position is not replayed to get there"
+        );
+    }
+
+    /// The instruction and the point are two different writes, and the sentinel is what
+    /// tells them apart.
+    ///
+    /// A position alone is ambiguous by construction: a row carries a transaction half
+    /// whatever the operator does, and if the old cursor and the target event came from
+    /// the same transaction that half still names the event at the new position — a
+    /// genuine point, honoured as written. Honouring it loses nothing (everything below a
+    /// cursor the runner wrote has been delivered) but it rewinds in *feed* order, so an
+    /// event past the position written by an older transaction is not replayed.
+    ///
+    /// Writing the sentinel says "this is an instruction, not a point" in the one column
+    /// the surface has, and gets the conservative reading every time.
+    #[tokio::test]
+    async fn a_position_only_move_says_so_with_the_sentinel_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+
+        // A transaction that takes its id first and appends last: its event sits at the
+        // highest position under the *lowest* transaction, so it is the first thing the
+        // feed delivers and the last thing a position-ordered rewind would reach.
+        let mut older = pool.begin().await.expect("beginning must succeed");
+        sqlx::query_scalar::<_, String>("SELECT pg_current_xact_id()::text")
+            .fetch_one(&mut *older)
+            .await
+            .expect("taking a transaction id must succeed");
+
+        let events = append_events(&pool, 3).await;
+        let older_position = append_inside(&mut older, "urn:probe:older").await;
+        older.commit().await.expect("committing must succeed");
+
+        // The pair an operator's move leaves behind when the target event belongs to the
+        // transaction the cursor already named.
+        sqlx::query(
+            "INSERT INTO policy_cursors (name, position, commit_txid) VALUES ($1, $2, $3::xid8)",
+        )
+        .bind(POLICY)
+        .bind(events[1].position)
+        .bind(events[1].commit_txid.to_string())
+        .execute(&pool)
+        .await
+        .expect("staging the operator's move must succeed");
+
+        let as_a_point = PolicyCursor::load(&pool, POLICY, StartAt::Now)
+            .await
+            .expect("loading must succeed");
+        assert_eq!(
+            as_a_point.point, events[1],
+            "a pair that names an event is resumed from as written"
+        );
+        assert!(
+            !feed_from(&pool, as_a_point.point)
+                .await
+                .contains(&older_position),
+            "which rewinds in feed order: the older transaction's event is behind it"
+        );
+
+        // The same instruction, written as an instruction.
+        sqlx::query(
+            "UPDATE policy_cursors SET position = $2, commit_txid = '0'::xid8 WHERE name = $1",
+        )
+        .bind(POLICY)
+        .bind(events[1].position)
+        .execute(&pool)
+        .await
+        .expect("the operator's move must succeed");
+
+        let as_an_instruction = PolicyCursor::load(&pool, POLICY, StartAt::Now)
+            .await
+            .expect("loading must succeed");
+        assert_eq!(
+            as_an_instruction.point.position, events[1].position,
+            "the position is still the operator's"
+        );
+        assert!(
+            feed_from(&pool, as_an_instruction.point)
+                .await
+                .contains(&older_position),
+            "and every event past it is delivered, whatever transaction wrote it"
+        );
+    }
+
+    /// A completion that loses its compare-and-set has been overtaken: the row holds a
+    /// later instruction than the one this derivation started from, and that instruction
+    /// is the one the Policy must resume from. Keeping the overtaken point would read a
+    /// batch from an operator's *replaced* move — delivering events their forward move
+    /// meant to skip, with the conflict only surfacing at the checkpoint afterwards.
+    ///
+    /// Staged by adopting a stored value the row no longer holds, which is what losing
+    /// that race leaves behind.
+    #[tokio::test]
+    async fn an_adoption_overtaken_by_a_later_move_takes_the_later_one_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let events = append_events(&pool, 3).await;
+
+        let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        // What this process read a moment ago: the operator's first move.
+        let overtaken = FeedPoint {
+            commit_txid: CommitStamp::SENTINEL,
+            position: events[0].position,
+        };
+        sqlx::query(
+            "UPDATE policy_cursors SET position = $2, commit_txid = '0'::xid8 WHERE name = $1",
+        )
+        .bind(POLICY)
+        .bind(overtaken.position)
+        .execute(&pool)
+        .await
+        .expect("the first move must succeed");
+
+        // And what the row holds by the time the completion is written: the second.
+        sqlx::query(
+            "UPDATE policy_cursors SET position = $2, commit_txid = '0'::xid8 WHERE name = $1",
+        )
+        .bind(POLICY)
+        .bind(events[2].position)
+        .execute(&pool)
+        .await
+        .expect("the second move must succeed");
+
+        cursor
+            .adopt(&pool, POLICY, overtaken)
+            .await
+            .expect("adopting must succeed");
+
+        assert_eq!(
+            cursor.point.position, events[2].position,
+            "the cursor resumes from the move that won, not the one it started deriving"
+        );
+        assert_eq!(
+            stored(&pool).await,
+            cursor.point,
+            "and the row is completed for the winner"
+        );
+        assert!(
+            !feed_from(&pool, cursor.point)
+                .await
+                .contains(&events[1].position),
+            "so the batch after it cannot deliver what the winning move passed"
+        );
+    }
+
+    /// Completing a cursor row is bookkeeping, not progress: a Policy that has been
+    /// parked for ten minutes still reads as parked for ten minutes afterwards.
     ///
     /// The case is a database upgraded through 0022 whose cursor sits on an event
     /// appended after 0018: the row takes the sentinel, and the first leader to load it
-    /// derives the real id.
+    /// derives the point it resumes from.
     #[tokio::test]
     async fn completing_the_transaction_half_reports_no_progress_postgres_test() {
         let (pool, _container) = start_postgres().await;
@@ -4721,10 +4961,15 @@ mod cursor_tests {
             .await
             .expect("loading must succeed");
 
+        let completed = stored(&pool).await;
         assert_eq!(
-            stored(&pool).await,
-            events[1],
-            "the load completed the transaction half from the log"
+            completed.position, events[1].position,
+            "the position is untouched: it is the half the row was sure of"
+        );
+        assert_ne!(
+            completed.commit_txid,
+            CommitStamp::SENTINEL,
+            "and the transaction half is no longer the sentinel, which would replay the log"
         );
         assert_eq!(
             last_advanced(&pool).await,
@@ -4733,7 +4978,10 @@ mod cursor_tests {
         );
 
         // A checkpoint that does move the policy is progress, and says so.
-        cursor.advance_to(events[1].commit_txid, events[1].position + 1);
+        cursor.advance_to(FeedPoint {
+            commit_txid: events[1].commit_txid,
+            position: events[1].position + 1,
+        });
         cursor.checkpoint(&pool, POLICY).await.unwrap();
         assert!(
             last_advanced(&pool).await > parked_since,
@@ -4765,7 +5013,7 @@ mod cursor_tests {
             .await
             .expect("staging the migrated cursor must succeed");
 
-        let expected = CursorPoint {
+        let expected = FeedPoint {
             commit_txid: CommitStamp::SENTINEL,
             position: events[1].position,
         };
@@ -4781,6 +5029,193 @@ mod cursor_tests {
             stored(&pool).await,
             expected,
             "and the row is left alone: there is nothing to complete"
+        );
+    }
+}
+
+/// The keyset [`PolicyRunner::retry_policy_dead_letters`] walks a backlog with.
+///
+/// Driven against the rows rather than through a retry, because what has to hold is a
+/// property of the enumeration alone: every parked row is handed back exactly once, in
+/// the order its Policy parked them, however many pages that takes.
+#[cfg(test)]
+mod dead_letter_page_tests {
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::PgPool;
+    use testcontainers_modules::postgres;
+    use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
+
+    use super::{dead_letter_page, last_parked, ParkedAt};
+
+    const POLICY: &str = "paged_policy";
+
+    /// As `cursor_tests` pins it: `xid8` needs PostgreSQL 13, and this module cannot
+    /// reach the suite's shared image file.
+    const POSTGRES_TAG: &str = "13-alpine";
+
+    async fn start_postgres() -> (PgPool, ContainerAsync<postgres::Postgres>) {
+        let container = postgres::Postgres::default()
+            .with_tag(POSTGRES_TAG)
+            .start()
+            .await
+            .expect("failed to start the postgres container");
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to read the container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to read the container port");
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&format!(
+                "postgres://postgres:postgres@{host}:{port}/postgres"
+            ))
+            .await
+            .expect("failed to create the postgres pool");
+
+        sqlx::migrate!("./tests/migrations")
+            .run(&pool)
+            .await
+            .expect("migrations must succeed");
+
+        (pool, container)
+    }
+
+    /// Park `count` rows for `POLICY`, the first `tied` of them sharing one `created_at`
+    /// — what a page boundary landing inside one parking transaction looks like.
+    async fn park(pool: &PgPool, count: usize, tied: usize) {
+        for nth in 0..count {
+            let age = if nth < tied { 0 } else { nth as i32 };
+            sqlx::query(
+                "INSERT INTO policy_dead_letters \
+                 (policy_name, global_position, event_id, error_kind, error_message, created_at) \
+                 VALUES ($1, $2, gen_random_uuid(), 'Permanent', 'parked', \
+                         now() + make_interval(secs => $3))",
+            )
+            .bind(POLICY)
+            .bind(nth as i64)
+            .bind(f64::from(age))
+            .execute(pool)
+            .await
+            .expect("parking a dead letter must succeed");
+        }
+    }
+
+    /// Walk every page the way the retry does, and report the ids in the order it would
+    /// have retried them.
+    async fn walk(pool: &PgPool, page: i64) -> Vec<i64> {
+        let mut walked = Vec::new();
+        let mut after: Option<ParkedAt> = None;
+        let Some(until) = last_parked(pool, POLICY)
+            .await
+            .expect("reading the boundary must succeed")
+        else {
+            return walked;
+        };
+        loop {
+            let rows = dead_letter_page(pool, POLICY, after, until, page)
+                .await
+                .expect("reading a page must succeed");
+            let Some(last) = rows.last().copied() else {
+                return walked;
+            };
+            after = Some(last);
+            walked.extend(rows.into_iter().map(|(_, id)| id));
+        }
+    }
+
+    /// The property the bound rests on: pages that tile the backlog exactly, including
+    /// across a boundary that falls inside one `created_at`, where `id` is the only thing
+    /// separating the rows.
+    #[tokio::test]
+    async fn pages_hand_back_every_parked_row_once_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        park(&pool, 7, 3).await;
+
+        let whole = walk(&pool, 100).await;
+        assert_eq!(whole.len(), 7, "one page covers the backlog: {whole:?}");
+
+        for page in [1, 2, 3, 7] {
+            assert_eq!(
+                walk(&pool, page).await,
+                whole,
+                "a backlog walked {page} rows at a time is the same walk"
+            );
+        }
+    }
+
+    /// The scan stops at the backlog it started with. Bulk retry runs without the policy
+    /// lock, so the worker keeps parking rows behind it; without a boundary each new row
+    /// extends the walk and a Policy failing faster than it retries never returns.
+    #[tokio::test]
+    async fn a_walk_ignores_rows_parked_after_it_started_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        park(&pool, 3, 0).await;
+
+        let until = last_parked(&pool, POLICY)
+            .await
+            .expect("reading the boundary must succeed")
+            .expect("three rows are parked");
+        // Parked later in the same order the worker would: after the boundary row.
+        for nth in 0..5 {
+            sqlx::query(
+                "INSERT INTO policy_dead_letters \
+                 (policy_name, global_position, event_id, error_kind, error_message, created_at) \
+                 VALUES ($1, $2, gen_random_uuid(), 'Permanent', 'parked later', \
+                         now() + make_interval(hours => 1, secs => $3))",
+            )
+            .bind(POLICY)
+            .bind(100 + nth)
+            .bind(nth as f64)
+            .execute(&pool)
+            .await
+            .expect("parking a later dead letter must succeed");
+        }
+
+        let mut walked = Vec::new();
+        let mut after: Option<ParkedAt> = None;
+        loop {
+            let rows = dead_letter_page(&pool, POLICY, after, until, 2)
+                .await
+                .expect("reading a page must succeed");
+            let Some(last) = rows.last().copied() else {
+                break;
+            };
+            after = Some(last);
+            walked.extend(rows.into_iter().map(|(_, id)| id));
+        }
+
+        assert_eq!(
+            walked.len(),
+            3,
+            "the walk covers what was parked when it started, and stops: {walked:?}"
+        );
+    }
+
+    /// A row that fails again keeps its `id` and `created_at`, so the keyset must move
+    /// past it: a page asked for "the first N still parked" would hand back the same
+    /// failing row forever.
+    #[tokio::test]
+    async fn a_page_resumes_past_a_row_that_is_still_parked_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        park(&pool, 3, 0).await;
+
+        let until = last_parked(&pool, POLICY)
+            .await
+            .expect("reading the boundary must succeed")
+            .expect("three rows are parked");
+        let first = dead_letter_page(&pool, POLICY, None, until, 1)
+            .await
+            .expect("reading a page must succeed");
+        let again = dead_letter_page(&pool, POLICY, first.last().copied(), until, 1)
+            .await
+            .expect("reading a page must succeed");
+
+        assert_ne!(
+            first[0].1, again[0].1,
+            "nothing was retried, and the next page is still the next row"
         );
     }
 }

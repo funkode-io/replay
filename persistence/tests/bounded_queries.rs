@@ -32,19 +32,21 @@ struct Reviewed {
 /// Every `fetch_all` in `persistence/src`, with the bound that makes it safe.
 const REVIEWED: &[Reviewed] = &[
     Reviewed {
-        file: "src/policy_runner.rs",
+        file: "src/policy_feed.rs",
         function: "read_feed",
         justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
                         (default 100). Bounded by the tunable, not by the feed — nor by \
-                        the policy's stream filter, which now selects what is delivered \
-                        from the window rather than what is read (ADR-0013).",
+                        the policy's stream filter, which selects what is delivered from \
+                        the window rather than what is read (ADR-0013).",
     },
     Reviewed {
         file: "src/policy_runner.rs",
-        function: "retry_policy_dead_letters",
-        justification: "Reads i64 ids only, for one policy's dead letters. Grows with a \
-                        policy's recorded failures — 8 bytes each, and an operator \
-                        retrying them is an explicit act on a set they can see.",
+        function: "dead_letter_page",
+        justification: "SQL carries LIMIT $page, bound by DEAD_LETTER_RETRY_PAGE (100). \
+                        retry_policy_dead_letters walks a backlog of any size through \
+                        this one page at a time, resuming on (created_at, id); the \
+                        previous version materialised every id first, which grew with \
+                        the failures a policy had recorded.",
     },
     Reviewed {
         file: "src/policy_status.rs",

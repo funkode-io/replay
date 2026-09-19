@@ -3188,15 +3188,18 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
     daemon.shutdown().await;
 }
 
-/// Issue #168: an operator must be able to move a stuck cursor on a *running*
-/// leader. Recreates the #164 incident — a hole in `global_position` that the feed
-/// parks in front of — and then applies the recovery that needed every replica
-/// scaled to zero: a plain `UPDATE policy_cursors`. The daemon keeps running and
-/// leading throughout.
+/// Issue #168: an operator must be able to reposition a Policy on a *running* leader —
+/// a plain `UPDATE policy_cursors`, the recovery that used to need every replica scaled
+/// to zero (ADR-0012). The daemon keeps running and leading throughout.
 ///
-/// The hole is held open by a transaction that never commits, because that is the
-/// kind the runner is right to wait at: a position no transaction holds is crossed
-/// on its own since #170, and would never reach the operator.
+/// The move under test is a rewind, because its effect is a fact rather than an absence:
+/// the events past the new position are delivered again and the fee is charged again,
+/// where a forward move would be observed by waiting for a reaction that never comes.
+///
+/// It is also the move that outlived the incident this test was written from. A hole in
+/// `global_position` is no longer a point the feed stops at (funkode-io/replay#195), and
+/// what does hold a Policy back now — a write that has not committed — is not something
+/// a cursor move should release: the events it is waiting for are still coming.
 #[tokio::test]
 async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_test() {
     let container = postgres_container().start().await.unwrap();
@@ -3255,80 +3258,45 @@ async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_tes
                 .balance
         }
     };
+    let settles_at = |want: f64| async move {
+        for _ in 0..100 {
+            if (balance().await - want).abs() < f64::EPSILON {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    };
 
-    // Wait until the daemon has charged the fee for the first deposit: 100 - 5.
+    // Two deposits, each charged a fee by the daemon: 100 - 5 + 100 - 5.
     deposit(1).await;
-    let mut settled = false;
-    for _ in 0..100 {
-        if (balance().await - 95.0).abs() < f64::EPSILON {
-            settled = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(settled, "expected the daemon to charge the first fee");
-
-    // Take a global position and keep it: to every other session this is an append
-    // in flight, so the feed must wait at the hole it leaves.
-    let mut holder = pg_pool.begin().await.unwrap();
-    let burned: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
-        .fetch_one(&mut *holder)
-        .await
-        .unwrap();
-
-    // The next deposit lands behind the hole, so the policy is now wedged: the
-    // fee for it never fires, however long we wait.
     deposit(2).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(
-        (balance().await - 195.0).abs() < f64::EPSILON,
-        "expected the policy to be wedged in front of the gap"
+        settles_at(190.0).await,
+        "expected the daemon to charge a fee for both deposits"
     );
 
-    // The operator's recovery, against the live deployment.
-    let moved = sqlx::query(
-        "UPDATE policy_cursors SET position = $1, updated_at = now() \
-         WHERE name = $2 AND position < $1",
-    )
-    .bind(burned)
-    .bind("withdraw_fee_policy_start_at_beginning")
-    .execute(&pg_pool)
-    .await
-    .unwrap();
-    assert_eq!(moved.rows_affected(), 1, "operator update must hit one row");
-
-    // Honoured by the running leader: the stranded deposit is charged.
-    let mut recovered = false;
-    for _ in 0..100 {
-        if (balance().await - 190.0).abs() < f64::EPSILON {
-            recovered = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(
-        recovered,
-        "expected the running daemon to honour the corrected cursor without a restart"
-    );
-
-    // And the correction is never rolled back by the stale in-memory value, which
-    // is `burned - 1`: the property is that the stored position never falls behind
-    // the operator's write, not that the drain has already checkpointed past it
-    // (that is a race with the poll, and the balance above already proves it drains).
-    for _ in 0..10 {
-        let stored: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
+    // The operator's instruction is a position, and nothing else: the runner completes
+    // the transaction half from the log.
+    let moved =
+        sqlx::query("UPDATE policy_cursors SET position = 0, updated_at = now() WHERE name = $1")
             .bind("withdraw_fee_policy_start_at_beginning")
-            .fetch_one(&pg_pool)
+            .execute(&pg_pool)
             .await
             .unwrap();
-        assert!(
-            stored >= burned,
-            "stored cursor {stored} fell back behind the operator's correction {burned}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    assert_eq!(moved.rows_affected(), 1, "operator update must hit one row");
 
-    holder.rollback().await.unwrap();
+    // Honoured by the running leader, with no restart and no leadership change: both
+    // deposits are delivered again, and charged again.
+    assert!(
+        settles_at(180.0).await,
+        "expected the running daemon to honour the rewound cursor without a restart"
+    );
+
+    // That the fee was charged again is also what rules out the stale in-memory value
+    // being written back over the operator's: a cursor that jumped to where this process
+    // was would have delivered nothing.
+
     daemon.shutdown().await;
 }
 
@@ -3759,7 +3727,7 @@ async fn policy_lagging_behind_compaction_skips_synthetic_snapshot_postgres_test
 
     // Two dispatches: gp=1 (Deposited pre-compaction) + gp=4 (Deposited post-compaction).
     // If dispatches == 3 the synthetic was mis-delivered.
-    // If dispatches < 2 the cursor stalled before gp=4 (gap-detection broken).
+    // If dispatches < 2 the cursor stalled before gp=4.
     assert_eq!(
         dispatches, 2,
         "policy must react to both real Deposited events and skip the synthetic snapshot"
@@ -5340,6 +5308,71 @@ async fn retry_policy_dead_letters_resolves_all_oldest_first_postgres_test() {
     assert_eq!(
         advisory_locks, 0,
         "bulk retry must not acquire an advisory lock"
+    );
+}
+
+/// Replay follows the order the Policy parked the rows in, not their numeric positions.
+///
+/// Since funkode-io/replay#195 the feed delivers in `(commit_txid, global_position)`
+/// order, so an event at a lower position can be parked *after* one at a higher position
+/// — a transaction that takes its id early and appends late puts its events at the head
+/// of the feed and the tail of the log. Retrying by position would then run reactions in
+/// an order the Policy never saw; the serial fixture above cannot tell the two apart,
+/// because there the two orders agree.
+///
+/// Staged on the parked rows themselves rather than by manufacturing the transaction-id
+/// inversion: what the retry must honour is the record of what this Policy did, and that
+/// record is `created_at`.
+#[tokio::test]
+async fn retry_policy_dead_letters_replays_in_parking_order_postgres_test() {
+    let target = OrderedPickyAccountUrn::new("bulk-parking-order").unwrap();
+    let (_container, pg_pool, cqrs) = manufacture_dead_letters(
+        OrderedPickyPolicy {
+            target: target.clone(),
+        },
+        &[10.0, 20.0], // both even → both resolve
+    )
+    .await;
+
+    // Invert parking order against position order: the row at the higher position was
+    // parked first, which is what feed-order delivery of an inverted log produces.
+    sqlx::query(
+        "UPDATE policy_dead_letters SET created_at = now() - interval '1 minute' \
+         WHERE policy_name = 'ordered_picky_policy' \
+           AND global_position = (SELECT MAX(global_position) FROM policy_dead_letters \
+                                  WHERE policy_name = 'ordered_picky_policy')",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("staging the parking order must succeed");
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<OrderedPickyAccount>(())
+        .register_policy(OrderedPickyPolicy {
+            target: target.clone(),
+        })
+        .build();
+
+    let summary = runner
+        .retry_policy_dead_letters("ordered_picky_policy")
+        .await
+        .expect("bulk retry must not error");
+    assert_eq!(
+        summary,
+        replay_persistence::DeadLetterRetrySummary {
+            resolved: 2,
+            still_failing: 0,
+        }
+    );
+
+    let account = cqrs
+        .fetch_aggregate::<OrderedPickyAccount>(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        account.applied,
+        vec![20, 10],
+        "the row parked first is replayed first, though its position is the higher one"
     );
 }
 

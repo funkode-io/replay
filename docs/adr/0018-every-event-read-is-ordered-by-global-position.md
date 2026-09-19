@@ -1,6 +1,10 @@
 # Every event read is ordered by `global_position`
 
-**Status:** accepted
+**Status:** accepted, narrowed by
+[ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md): the [Policy feed] is no
+longer one of the reads this rule covers. It orders by `(commit_txid, global_position)`,
+which is the "order by commit visibility" option rejected below — rejected for *this*
+question, and taken up for the feed's own. Everything else here stands.
 
 **Amends** [ADR-0011](0011-inline-projections-flushed-in-bounded-chunks.md)'s keyset
 decision: the rebuild cursor's `(created, version, id)` key, and the index behind it.
@@ -27,9 +31,13 @@ security bug — a revoked ACL member kept read/write access
 ## Decision
 
 `global_position` is the sort key of every event read: `stream_events`, the
-inline-projection rebuild's keyset pages, compaction's fold over the live stream, and the
-[Policy feed], which already used it. There is one ordering rule, so it cannot drift
-between read paths.
+inline-projection rebuild's keyset pages, and compaction's fold over the live stream.
+There is one ordering rule, so it cannot drift between read paths.
+
+The [Policy feed] used it too when this was written, and no longer does: it asks "has
+every earlier writer finished?", which a position cannot answer, so ADR-0022 moved it to
+`(commit_txid, global_position)`. The reads above ask a different question — relative
+order within a committed log — and keep this key.
 
 It is a valid key where `created` is not. The `BIGSERIAL` is drawn by `nextval()` at
 INSERT, inside the same `FOR UPDATE` critical section that assigns `version`: a second
@@ -57,17 +65,17 @@ the rule that change established and finishes applying it.
   strict `created` difference, not a tie, so `id` never gets a vote.
 - **Order by commit visibility (`xid8`).** The right key for the feed's "has every earlier
   writer finished?" question, and it is being pursued there — `events.commit_txid` landed
-  with [#193](https://github.com/funkode-io/replay/issues/193), unread until
-  [#171](https://github.com/funkode-io/replay/issues/171) moves the feed onto it. It
-  answers a different question from this one: a point-in-time read of a committed stream
-  needs relative order, not a visibility watermark — and it costs a backfill and a cursor
-  format change, which this rule does not.
+  with [#193](https://github.com/funkode-io/replay/issues/193), and
+  [#195](https://github.com/funkode-io/replay/issues/195) moved the feed onto it
+  (ADR-0022). It answers a different question from this one: a point-in-time read of a
+  committed stream needs relative order, not a visibility watermark — and it costs a
+  backfill and a cursor format change, which this rule does not.
 
 ## Consequences
 
 - **Gaps do not matter.** A burned position leaves a hole; relative order is unaffected,
-  which is all a full stream read depends on. Contiguity is the feed's problem
-  (ADR-0015), not a read's.
+  which is all a full stream read depends on. Contiguity was the feed's problem
+  (ADR-0015) until ADR-0022 left it with no holes to have.
 - **Uniqueness is load-bearing.** A `>` cursor with no tiebreaker steps over the second
   row of a duplicated position. `BIGSERIAL` implies no constraint; the unique index
   [#200](https://github.com/funkode-io/replay/issues/200) added (migration 0015) is what

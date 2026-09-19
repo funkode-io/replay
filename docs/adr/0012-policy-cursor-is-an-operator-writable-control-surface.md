@@ -1,6 +1,9 @@
 # The persisted policy cursor is an operator-writable control surface
 
-**Status:** accepted
+**Status:** accepted; the derivation of the transaction half is amended by
+[ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md), which changed what a
+position can mean. The control surface itself is unchanged: an operator writes a
+position.
 
 The leader loaded a Policy's cursor once per leadership term and kept it in
 memory for the whole term. `policy_cursors` was therefore a crash-recovery
@@ -35,12 +38,24 @@ the daemon runs, and the in-memory position is a lease on it.
 - **The instruction is a position; the transaction half is derived from it.** The
   cursor became a pair — `(commit_txid, position)` — when events started carrying
   the transaction that wrote them (funkode-io/replay#194). An operator still writes
-  the position alone, and the runner completes the pair from the log: the
-  transaction that belongs with a position is the one that wrote the last event at
-  or before it, which is exactly what the runner would have stored itself. It
-  writes the completed pair back, so the row shows the point the Policy resumes
-  from rather than the half-instruction it was given. The compare-and-set covers
-  both halves.
+  the position alone, and the runner completes the pair from the log. It writes the
+  completed pair back, so the row shows the point the Policy resumes from rather than
+  the half-instruction it was given. The compare-and-set covers both halves.
+
+  **Amended by ADR-0022.** The completion was "the transaction that wrote the last event
+  at or before the position". Once the feed reads in `(commit_txid, global_position)`
+  order that is unsafe: an event past the position can belong to an *older* transaction,
+  and completing this way sorts it behind the cursor and loses it. The position is now
+  read as "everything at or before P is processed" and completed to the greatest point
+  that still delivers every event past P — the earliest transaction holding one, or one
+  below the commit watermark when none is readable. It re-delivers rather than skips,
+  which is the side at-least-once delivery already covers.
+
+  **The sentinel is the instruction marker.** A row always carries a transaction half, so
+  "position only" needs a way to say itself: `commit_txid = '0'::xid8` names no event and
+  orders before every transaction, so the runner reads it as an instruction. Without it,
+  a leftover half that happens to name the event at the new position is a point, and is
+  honoured — the same rewind, but in feed order rather than position order.
 
 - **The cursor may move in either direction.** Nothing clamps the adopted value
   to be greater than the in-memory one. Moving forward skips events (the #164
@@ -68,10 +83,16 @@ the daemon runs, and the in-memory position is a lease on it.
   against the database, not a handle on the running process. SQL is the surface
   that already exists; this ADR makes it honest rather than replacing it.
 
-- **Honouring a transaction half an operator writes by hand.** It cannot be told
-  apart from the stale one left in the row by a position-only move, and the move is
-  the documented instruction. A pair the runner wrote survives derivation unchanged,
-  so nothing is lost by treating the position as the whole instruction.
+- **Honouring a transaction half an operator writes by hand.** Rejected here on the
+  grounds that it could not be told apart from the stale one a position-only move leaves
+  in the row. **ADR-0022 supplies the test that was missing**: a pair is honoured exactly
+  when the event at `position` carries that `commit_txid`, which a stale half does not,
+  and which a row the runner wrote always does. The runner must honour such a pair — its
+  own rows are indistinguishable from an operator's, and re-deriving them would rewind a
+  Policy on every election — so an operator who wants a point rather than an instruction
+  writes the pair, and one who wants the documented one-column instruction writes the
+  position. This also makes pre-seeding a cursor before a Policy first runs a supported
+  operation: with a row present, `StartAt` is never consulted.
 
 ## Consequences
 
