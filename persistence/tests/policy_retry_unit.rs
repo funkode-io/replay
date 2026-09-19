@@ -57,11 +57,17 @@ const SHIFTED_PANIC: &str = "shifted-panic";
 /// reaction of the same kind: a policy that keeps parking while a retry runs.
 const FEEDS: &str = "feeds";
 
+/// Tag whose reaction dispatches one always-failing command, at the instance the
+/// policy's *current* code names: the switch stands for a deploy that changed the
+/// reaction between the park and the retry.
+const RETARGETED: &str = "retargeted";
+
 /// Tag whose reaction dispatches one command, for tests that care about how many
 /// reactions there are rather than what each parks.
 const ONE_COMMAND: &str = "one-command";
 
-/// Reactions a bulk retry parks in [`a_bulk_retry_pages_a_backlog_no_page_holds`]:
+/// Reactions parked by
+/// [`a_bulk_retry_pages_a_backlog_settling_each_reaction_once_postgres_test`]:
 /// one more than the page the runner reads, so the walk must fetch a second one
 /// and must not re-read the first.
 const MORE_THAN_A_PAGE: usize = 101;
@@ -95,6 +101,7 @@ struct TwoCommandPolicy {
     reactions: Arc<AtomicUsize>,
     first_recovered: Arc<AtomicBool>,
     second_recovered: Arc<AtomicBool>,
+    retargeted: Arc<AtomicBool>,
 }
 
 impl TwoCommandPolicy {
@@ -109,6 +116,16 @@ impl TwoCommandPolicy {
             }
         };
         Dispatch::to::<Probe>(ProbeUrn::new(stream).unwrap(), command)
+    }
+
+    /// A dispatch the aggregate always refuses.
+    fn refuse(stream: &str, reason: &str) -> Dispatch {
+        Dispatch::to::<Probe>(
+            ProbeUrn::new(stream).unwrap(),
+            ProbeCommand::Refuse {
+                reason: reason.to_string(),
+            },
+        )
     }
 
     /// A dispatch that panics inside the command handler.
@@ -176,6 +193,11 @@ impl Policy for TwoCommandPolicy {
                 ),
                 first(),
             ],
+            RETARGETED => vec![if self.retargeted.load(Ordering::SeqCst) {
+                Self::refuse(SECOND_SUBJECT, SECOND_FAILURE)
+            } else {
+                Self::refuse(FIRST_SUBJECT, FIRST_FAILURE)
+            }],
             ONE_COMMAND => vec![first()],
             _ => return vec![],
         };
@@ -189,6 +211,7 @@ struct Reaction {
     calls: Arc<AtomicUsize>,
     first_recovered: Arc<AtomicBool>,
     second_recovered: Arc<AtomicBool>,
+    retargeted: Arc<AtomicBool>,
 }
 
 impl Reaction {
@@ -197,6 +220,7 @@ impl Reaction {
             calls: Arc::new(AtomicUsize::new(0)),
             first_recovered: Arc::new(AtomicBool::new(false)),
             second_recovered: Arc::new(AtomicBool::new(false)),
+            retargeted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -206,12 +230,14 @@ impl Reaction {
         let reactions = Arc::clone(&self.calls);
         let first_recovered = Arc::clone(&self.first_recovered);
         let second_recovered = Arc::clone(&self.second_recovered);
+        let retargeted = Arc::clone(&self.retargeted);
         move |builder, policy| {
             builder.register_policy(TwoCommandPolicy {
                 name: policy.to_string(),
                 reactions: Arc::clone(&reactions),
                 first_recovered: Arc::clone(&first_recovered),
                 second_recovered: Arc::clone(&second_recovered),
+                retargeted: Arc::clone(&retargeted),
             })
         }
     }
@@ -1001,6 +1027,51 @@ async fn a_bulk_retry_returns_while_the_policy_keeps_parking_postgres_test() {
         summary.reactions_resolved + summary.reactions_still_failing >= seen,
         "it drains at least what was parked when it was called, got {summary:?} for \
          {seen} reaction(s) already parked"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A retry that fails on a command the reaction had *not* parked leaves a dead
+/// letter for it, and says the reaction is still failing.
+///
+/// A replay runs the policy as its code defines it **now** (ADR-0007), so a
+/// deploy between the park and the retry can make the reaction emit a different
+/// command — one that fails permanently and has no row of its own. The row it
+/// used to park resolves, because the reaction no longer emits what that row
+/// named; parking the new failure is what keeps the retry the drain's equal
+/// rather than a path that executes a failing command and leaves nothing behind.
+#[tokio::test]
+async fn a_retry_parks_a_failure_the_reaction_had_not_parked_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_retarget", reaction.policy()).await;
+
+    harness.ping("subject-1", RETARGETED).await;
+    let parked = harness.await_dead_letters(1).await;
+    assert_eq!(parked[0].target_stream_id, Some(urn_of(FIRST_SUBJECT)));
+
+    // The deploy: the reaction now sends its command somewhere else, where it
+    // also fails.
+    reaction.retargeted.store(true, Ordering::SeqCst);
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        },
+        "a reaction that still fails permanently is not resolved, whichever \
+         command it now fails on"
+    );
+
+    let after = harness.dead_letters().await;
+    assert_eq!(after.len(), 1, "the new failure has a row, got {after:#?}");
+    assert_ne!(after[0].id, parked[0].id);
+    assert_eq!(after[0].target_stream_id, Some(urn_of(SECOND_SUBJECT)));
+    assert!(after[0].error_message.contains(SECOND_FAILURE));
+    assert_eq!(
+        archived_ids(&harness.archived_dead_letters().await),
+        vec![(parked[0].id, "retried")],
+        "and the row for the command the reaction no longer emits leaves"
     );
 
     harness.shutdown().await;

@@ -74,6 +74,14 @@ What changes is what a retry is *for* — one reaction, not one row.
   replay, carrying the panic, which is what stops the row it parked from being
   settled by an indistinguishable sibling that succeeded first.
 
+- **A failure no row speaks for is parked, as the drain would park it.** The
+  mirror of the rule above: a reaction re-evaluated as the policy defines it now
+  can fail on a command it never parked — a deploy changed it — and that failure
+  gets its own row, naming its own dispatch, with the reaction reported still
+  failing. Without it a retry could execute a command, watch it fail permanently,
+  clear the table and report the reaction resolved. It is the only row a retry
+  inserts: a command already parked is updated in place.
+
 - **The summary counts reactions, and says so.**
   `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing }` — a
   deliberate breaking change to a public type. The old names were silent about
