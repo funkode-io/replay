@@ -66,7 +66,11 @@ goes back to the pool while the blocker is still holding the row.
 - **It bounds the transaction, not one statement.** Everything the append
   transaction does — including writes by registered inline projections — is
   bounded by the same value. That is the intent: the bound is on this library's
-  waiting, not on one row.
+  waiting, not on one row. Which is why `55P03` is classified in `db_error`, the
+  function a projection handler maps its own failures with, and not only where
+  this crate takes the stream row: a contended projection write would otherwise
+  reach the runner as `Internal` and be parked without a retry. A handler that
+  maps sqlx errors its own way owns that classification, as it owns every other.
 
 - **`statement_timeout` stays out.** A consumer can already set it, and any other
   pool-level option, through `PgConnectOptions`, and neither of them bounds a lock

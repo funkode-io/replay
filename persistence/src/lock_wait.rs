@@ -69,6 +69,53 @@ pub(crate) fn has_code(error: &sqlx::Error, code: &str) -> bool {
     }
 }
 
+/// Fakes for the failures this module recognises.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A database error carrying `code`, since sqlx exposes no constructor for
+    /// one: the SQLSTATE is the only part of its shape this crate reads.
+    pub(crate) fn refused(code: &'static str, message: &'static str) -> sqlx::Error {
+        // sqlx has no public constructor for a DatabaseError, so the check is
+        // exercised through the one shape that matters to it: the SQLSTATE.
+        struct Refused {
+            code: &'static str,
+            message: &'static str,
+        }
+        impl std::fmt::Debug for Refused {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.message)
+            }
+        }
+        impl std::fmt::Display for Refused {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.message)
+            }
+        }
+        impl std::error::Error for Refused {}
+        impl sqlx::error::DatabaseError for Refused {
+            fn message(&self) -> &str {
+                self.message
+            }
+            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+                Some(std::borrow::Cow::Borrowed(self.code))
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+        sqlx::Error::Database(Box::new(Refused { code, message }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

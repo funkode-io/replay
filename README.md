@@ -2280,6 +2280,11 @@ failure and parks a dead letter once the retries are spent. It is set with
 `SET LOCAL`, so a connection carries no `lock_timeout` back to the pool
 ([ADR-0022](docs/adr/0022-a-stream-lock-wait-is-bounded-on-the-server.md)).
 
+It bounds the whole append transaction, inline projections included. A projection
+handler that maps its errors with `db_error` reports a contended write as the same
+retryable `Unavailable`; one that maps sqlx errors its own way decides that for
+itself.
+
 **`Duration::ZERO` — or `REPLAY_STREAM_LOCK_WAIT_MS=0` — disables the bound** and
 waits forever, which is the behaviour before this existed. It is written out as
 `lock_timeout = '0'` rather than left unset, so it overrides a `lock_timeout` your

@@ -333,6 +333,76 @@ async fn a_bounded_append_leaves_no_lock_timeout_behind_postgres_test() {
     );
 }
 
+/// The bound covers the whole append transaction, inline projections included —
+/// and a projection's own write that runs into it is as retryable as the stream
+/// row's: `db_error`, which is what a handler maps its failures with, classifies
+/// `55P03` rather than sweeping it into `Internal`, where the runner would park it
+/// without a retry.
+#[tokio::test]
+async fn a_contended_projection_write_is_retryable_postgres_test() {
+    let (pool, url, _container) = start_postgres().await;
+    sqlx::query("CREATE TABLE balances (stream_id TEXT PRIMARY KEY, amount DOUBLE PRECISION)")
+        .execute(&pool)
+        .await
+        .expect("the projection's table is the consumer's to create");
+    sqlx::query("INSERT INTO balances VALUES ('held', 0)")
+        .execute(&pool)
+        .await
+        .expect("seeds the row the blocker holds");
+
+    let store = PostgresEventStore::builder(pool.clone())
+        .stream_lock_wait(LOCK_WAIT)
+        .register_postgres_event_handler::<LedgerEvent, _>("balances", 1, move |conn, events| {
+            Box::pin(async move {
+                for _ in events {
+                    sqlx::query("UPDATE balances SET amount = amount + 1 WHERE stream_id = 'held'")
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(replay_persistence::db_error)?;
+                }
+                Ok(())
+            })
+        })
+        .build()
+        .await
+        .expect("the store builds");
+
+    // Held by a session of its own: a row in the projection's table this time, not
+    // the stream's.
+    let mut blocker = PgConnection::connect(&url).await.expect("blocker connects");
+    sqlx::query("BEGIN")
+        .execute(&mut blocker)
+        .await
+        .expect("begins");
+    sqlx::query("SELECT amount FROM balances WHERE stream_id = 'held' FOR UPDATE")
+        .execute(&mut blocker)
+        .await
+        .expect("blocker takes the projection's row");
+
+    let cqrs = Cqrs::new(store);
+    let urn = LedgerUrn::new("projection-contended").expect("a valid urn");
+    let failure = tokio::time::timeout(WAITED_ENOUGH, append(&cqrs, &urn, 4.0))
+        .await
+        .expect("the server abandoned the projection's wait too")
+        .expect_err("the append cannot commit a projection write it never made");
+
+    assert_eq!(
+        failure.kind(),
+        ErrorKind::Unavailable,
+        "a contended projection write is the same contention the stream row reports: {failure}"
+    );
+    assert!(failure.is_temporary(), "{failure}");
+    assert!(
+        pool_still_serves(&pool).await,
+        "the failed append's connection is back in the pool"
+    );
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut blocker)
+        .await
+        .expect("releases");
+}
+
 /// `lock_timeout` is an integer of milliseconds, so a wait past `i32::MAX` is a
 /// value the server refuses outright — which would fail every append rather than
 /// bound one. It is clamped to the ceiling instead.
