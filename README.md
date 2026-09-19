@@ -2281,7 +2281,9 @@ failure and parks a dead letter once the retries are spent. It is set with
 ([ADR-0022](docs/adr/0022-a-stream-lock-wait-is-bounded-on-the-server.md)).
 
 **`Duration::ZERO` — or `REPLAY_STREAM_LOCK_WAIT_MS=0` — disables the bound** and
-waits forever, which is the behaviour before this existed. That is the opposite
+waits forever, which is the behaviour before this existed. It is written out as
+`lock_timeout = '0'` rather than left unset, so it overrides a `lock_timeout` your
+own pool or role may carry: asking for no limit gets no limit. That is the opposite
 of `REPLAY_DISPATCH_TIMEOUT_MS=0`, which reads as *unset*: this value is passed to
 Postgres, where zero already means "no limit". Negative and unparseable values
 fall back to the default rather than silently removing the bound.

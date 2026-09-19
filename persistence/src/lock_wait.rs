@@ -19,14 +19,23 @@ pub(crate) const LOCK_NOT_AVAILABLE: &str = "55P03";
 ///
 /// `SET LOCAL`, so the bound dies with the transaction and a connection carries
 /// nothing back to the pool; `set_config(…, true)` rather than `SET` because only
-/// the former takes a bind parameter. A wait of zero is Postgres's own "no limit",
-/// so nothing is sent at all.
+/// the former takes a bind parameter.
+///
+/// A wait of zero is written out as `0ms` rather than skipped: zero is Postgres's
+/// own "no limit", and a consumer who asked for no limit must get it even on a
+/// connection whose session carries a `lock_timeout` of its own. Skipping the
+/// statement would inherit that setting and report the resulting failure as a wait
+/// this library never made.
 pub(crate) async fn bound(conn: &mut PgConnection, wait: Duration) -> Result<(), sqlx::Error> {
-    if wait.is_zero() {
-        return Ok(());
-    }
+    // Sub-millisecond is floored rather than rounded to zero, which would read as
+    // "no limit" — the opposite of what a caller asking for 100µs wants.
+    let limit = if wait.is_zero() {
+        0
+    } else {
+        wait.as_millis().max(1)
+    };
     sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-        .bind(format!("{}ms", wait.as_millis().max(1)))
+        .bind(format!("{limit}ms"))
         .execute(conn)
         .await?;
     Ok(())

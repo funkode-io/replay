@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 use replay::ErrorKind;
 use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PostgresEventStore};
-use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, PgPool};
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Connection, PgConnection, PgPool};
 use testcontainers_modules::postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ContainerAsync;
@@ -98,7 +98,13 @@ impl replay::Compactable for Ledger {
 
 /// A migrated database, and a pool of exactly one connection for the store under
 /// test: the whole point is that a stranded connection is a starved pool.
-async fn start_postgres() -> (PgPool, String, ContainerAsync<postgres::Postgres>) {
+///
+/// `session_lock_timeout` is what the consumer's own pool carries — the setting a
+/// deployment may already have on its connections, and which this library's bound
+/// has to override in both directions.
+async fn start_postgres_with(
+    session_lock_timeout: Option<&'static str>,
+) -> (PgPool, String, ContainerAsync<postgres::Postgres>) {
     let container = postgres_container()
         .start()
         .await
@@ -115,12 +121,29 @@ async fn start_postgres() -> (PgPool, String, ContainerAsync<postgres::Postgres>
         // Without this, a starved pool reports "pool timed out" only after 30s, so a
         // regression would look like a hang rather than a failure.
         .acquire_timeout(Duration::from_secs(5))
+        .after_connect(move |conn, _| {
+            Box::pin(async move {
+                if let Some(limit) = session_lock_timeout {
+                    // `SET` takes no bind parameter, and the value is a constant of
+                    // this test rather than anything a caller supplies.
+                    sqlx::query(AssertSqlSafe(format!("SET lock_timeout = '{limit}'")))
+                        .execute(conn)
+                        .await?;
+                }
+                Ok(())
+            })
+        })
         .connect(&url)
         .await
         .expect("connects");
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     (pool, url, container)
+}
+
+/// The common case: a pool carrying no `lock_timeout` of its own.
+async fn start_postgres() -> (PgPool, String, ContainerAsync<postgres::Postgres>) {
+    start_postgres_with(None).await
 }
 
 /// A session of its own holding `stream`'s row exactly as a stalled append, an
@@ -261,10 +284,12 @@ async fn a_compaction_blocked_on_the_stream_row_fails_and_frees_its_connection_p
     let blocker = Blocker::holding(&url, &stream_id).await;
 
     let cqrs = Cqrs::new(store(&pool, LOCK_WAIT).await);
+    // A read is not blocked by a row lock, so the aggregate loads while the blocker
+    // holds it; what the compaction then blocks on is its own `FOR UPDATE`.
     let aggregate = cqrs
         .fetch_aggregate::<Ledger>(&urn)
         .await
-        .expect("the aggregate loads before the row is held");
+        .expect("a plain read is not blocked by a held row");
 
     let failure = tokio::time::timeout(
         WAITED_ENOUGH,
@@ -311,9 +336,14 @@ async fn a_bounded_append_leaves_no_lock_timeout_behind_postgres_test() {
 /// The documented opt-out: zero is passed to `lock_timeout`, where it already
 /// means "wait forever", and the append waits for the blocker exactly as it did
 /// before this bound existed.
+///
+/// On a pool whose sessions carry a `lock_timeout` of their own, because that is
+/// the case where "disabled" has to mean disabled rather than "inherit whatever is
+/// there": a bound that only skipped its own statement would report that session's
+/// limit as a wait this library never made.
 #[tokio::test]
 async fn a_zero_wait_restores_the_unbounded_behaviour_postgres_test() {
-    let (pool, url, _container) = start_postgres().await;
+    let (pool, url, _container) = start_postgres_with(Some("500ms")).await;
     let (urn, stream_id) = seeded_stream(&pool, "opted-out").await;
     let blocker = Blocker::holding(&url, &stream_id).await;
 

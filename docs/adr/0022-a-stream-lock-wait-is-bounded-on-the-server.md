@@ -35,7 +35,10 @@ goes back to the pool while the blocker is still holding the row.
 
 - **Zero means disabled, not unset.** The value goes verbatim to `lock_timeout`,
   where zero already means "wait forever", so zero is the documented opt-out and
-  restores the behaviour this replaced. It deliberately diverges from
+  restores the behaviour this replaced. It is written out as `'0'` rather than
+  left unset, so it also overrides a `lock_timeout` the consumer's pool or role
+  carries — a bound that merely skipped its own statement would inherit that one
+  and report it as a wait this library never made. It deliberately diverges from
   `REPLAY_DISPATCH_TIMEOUT_MS`, whose zero reads as *unset* because that value
   goes to a tokio timer rather than to Postgres. Unset, negative and unparseable
   values fall back to the default: a typo must not silently remove a bound.
@@ -49,9 +52,12 @@ goes back to the pool while the blocker is still holding the row.
 
 - **`SET LOCAL`, via `set_config(…, true)`.** The bound dies with its transaction,
   so a pooled connection carries nothing into its next use — and `set_config`
-  takes a bind parameter, which `SET` does not. The same pattern the liveness beat
-  already uses on the cursor row
-  ([ADR-0020](0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)).
+  takes a bind parameter, which `SET` does not. It is written on every
+  transaction, including a disabled one, so the setting the transaction runs under
+  is always this library's and never the session's leftovers. The same pattern the
+  liveness beat already uses on the cursor row
+  ([ADR-0020](0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)),
+  shared with it in `lock_wait.rs`.
 
 - **It bounds the transaction, not one statement.** Everything the append
   transaction does — including writes by registered inline projections — is
