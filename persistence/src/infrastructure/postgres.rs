@@ -106,13 +106,16 @@ fn stream_lock_error(
     if !crate::lock_wait::is_lock_not_available(&error) {
         return crate::db_error(error);
     }
+    // The limit as the server received it, not as the caller wrote it: a wait of
+    // 100µs is sent as 1ms, and reporting the caller's `0ms` would name the one
+    // value this setting reads as "no limit".
+    let limit = crate::lock_wait::limit_ms(wait);
     replay::Error::unavailable(format!(
-        "waited {}ms for the stream row lock without getting it",
-        wait.as_millis()
+        "waited {limit}ms for the stream row lock without getting it"
     ))
     .with_operation(operation)
     .with_context("stream_id", stream_id)
-    .with_context("stream_lock_wait_ms", wait.as_millis())
+    .with_context("stream_lock_wait_ms", limit)
 }
 
 type BoxedPostgresEventHandler<E> = Box<
@@ -362,9 +365,11 @@ impl PostgresEventStoreBuilder {
     ///
     /// Overrides `REPLAY_STREAM_LOCK_WAIT_MS` and the built-in default of 30s.
     /// [`Duration::ZERO`] disables the bound and waits forever, which is the behaviour
-    /// this replaced. The lower bound on a useful value is the longest *honest* hold,
-    /// and in this library that is `compact`: it holds the row for a fold over the whole
-    /// stream, so a value below that parks work that was only slow.
+    /// this replaced, and a wait beyond what PostgreSQL's `lock_timeout` can express
+    /// (about 24.8 days) is clamped to that ceiling. The lower bound on a useful value
+    /// is the longest *honest* hold, and in this library that is `compact`: it holds the
+    /// row for a fold over the whole stream, so a value below that parks work that was
+    /// only slow.
     pub fn stream_lock_wait(mut self, wait: Duration) -> Self {
         self.stream_lock_wait = Some(wait);
         self

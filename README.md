@@ -2286,7 +2286,9 @@ waits forever, which is the behaviour before this existed. It is written out as
 own pool or role may carry: asking for no limit gets no limit. That is the opposite
 of `REPLAY_DISPATCH_TIMEOUT_MS=0`, which reads as *unset*: this value is passed to
 Postgres, where zero already means "no limit". Negative and unparseable values
-fall back to the default rather than silently removing the bound.
+fall back to the default rather than silently removing the bound, and a wait
+longer than `lock_timeout` can express (about 24.8 days) is clamped to that
+ceiling rather than failing every append.
 
 Diagnosis: **a spike of these means a long holder, not a broken append.** Look for
 what is holding the stream the error names — `pg_locks` joined to

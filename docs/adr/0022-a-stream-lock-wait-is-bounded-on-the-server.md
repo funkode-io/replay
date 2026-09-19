@@ -41,7 +41,11 @@ goes back to the pool while the blocker is still holding the row.
   and report it as a wait this library never made. It deliberately diverges from
   `REPLAY_DISPATCH_TIMEOUT_MS`, whose zero reads as *unset* because that value
   goes to a tokio timer rather than to Postgres. Unset, negative and unparseable
-  values fall back to the default: a typo must not silently remove a bound.
+  values fall back to the default: a typo must not silently remove a bound. A
+  value past what `lock_timeout` can express — an integer of milliseconds, so
+  about 24.8 days — is clamped to that ceiling rather than sent: an unclamped one
+  makes the `set_config` itself fail, turning a bound on one statement into a
+  failure of every append and compaction.
 
 - **`55P03` is `Unavailable`, not `Conflict`.** `Error::conflict` is this
   codebase's optimistic-concurrency failure and arrives carrying an expected and

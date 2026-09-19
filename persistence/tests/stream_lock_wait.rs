@@ -333,6 +333,21 @@ async fn a_bounded_append_leaves_no_lock_timeout_behind_postgres_test() {
     );
 }
 
+/// `lock_timeout` is an integer of milliseconds, so a wait past `i32::MAX` is a
+/// value the server refuses outright — which would fail every append rather than
+/// bound one. It is clamped to the ceiling instead.
+#[tokio::test]
+async fn a_wait_longer_than_postgres_accepts_still_appends_postgres_test() {
+    let (pool, _url, _container) = start_postgres().await;
+    let (urn, _stream_id) = seeded_stream(&pool, "absurd-wait").await;
+
+    let cqrs = Cqrs::new(store(&pool, Duration::from_secs(60 * 60 * 24 * 365)).await);
+
+    append(&cqrs, &urn, 3.0)
+        .await
+        .expect("a wait nobody could ever reach must not fail the append");
+}
+
 /// The documented opt-out: zero is passed to `lock_timeout`, where it already
 /// means "wait forever", and the append waits for the blocker exactly as it did
 /// before this bound existed.
