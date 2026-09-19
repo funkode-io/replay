@@ -74,8 +74,12 @@ they may no longer hold.
   delete optimistically before executing. Because every row op is a single
   primary-key-scoped `DELETE`/`UPDATE`, concurrent retries of the same row are
   idempotent and commutative.
-  *(ADR-0021: the row op is unchanged, but one replay now performs it for every row
-  of the reaction, each with that row's own outcome.)*
+  *(ADR-0021: one replay now performs the row op for every row of the reaction,
+  each with that row's own outcome, and every settlement stamps `retry_count` and
+  `last_retried_at`. The op is still one primary-key-scoped statement, so
+  concurrent retries of a row cannot corrupt or duplicate it — but they are no
+  longer idempotent: each leaves a count, which is what makes "has anyone tried
+  this since the outage?" answerable from the table.)*
 
 - **Discard ships paired with retry.** An operator who judges a reaction permanently
   unrecoverable can **discard** the dead letter — drop the row without re-executing.

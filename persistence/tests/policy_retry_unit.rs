@@ -971,14 +971,19 @@ async fn a_panicking_dispatch_settles_its_own_row_not_its_siblings_postgres_test
     harness.shutdown().await;
 }
 
-/// A bulk retry drains the backlog it was asked to drain and returns, even while
-/// the policy keeps parking.
+/// A bulk retry returns against a policy that is still parking.
 ///
 /// Retries take no advisory lock, so the worker goes on reacting — and a policy
 /// whose reaction appends an event parks a *new* reaction every time one of its
 /// reactions is replayed. Walking to an empty page would chase that forever and
 /// never return to the operator, so the walk stops at the last reaction parked
 /// when the call began.
+///
+/// How many that is, this test cannot say: the daemon parks more between the
+/// observation below and the retry's own high-water read, and more again while
+/// it runs. What is not timing-dependent is that the call **returns** and that it
+/// settled at least the backlog that was already there — the high-water mark
+/// cannot be behind rows this test has seen.
 #[tokio::test]
 async fn a_bulk_retry_returns_while_the_policy_keeps_parking_postgres_test() {
     let reaction = Reaction::new();
@@ -987,15 +992,15 @@ async fn a_bulk_retry_returns_while_the_policy_keeps_parking_postgres_test() {
     // Each reaction pings another stream and then fails: the drain parks a chain
     // of them, bounded by the causation-depth limit.
     harness.ping("subject-1", FEEDS).await;
-    let backlog = harness.await_dead_letters(3).await.len();
+    let seen = harness.await_dead_letters(3).await.len();
 
     let summary = tokio::time::timeout(OBSERVE_TIMEOUT, harness.retry_parked())
         .await
         .expect("a bulk retry must return rather than chase a policy that keeps parking");
-    assert_eq!(
-        summary.reactions_resolved + summary.reactions_still_failing,
-        backlog,
-        "it settles the backlog it was asked for, not what arrived while it ran"
+    assert!(
+        summary.reactions_resolved + summary.reactions_still_failing >= seen,
+        "it drains at least what was parked when it was called, got {summary:?} for \
+         {seen} reaction(s) already parked"
     );
 
     harness.shutdown().await;
