@@ -43,6 +43,12 @@ use crate::{Cqrs, PersistedEvent, PostgresEventStore};
 /// parked, and which row it was when two land in the same transaction's `now()`.
 type ParkedAt = (chrono::DateTime<chrono::Utc>, i64);
 
+/// How many times [`PolicyCursor::adopt`] re-reads a cursor row that moved under it
+/// before giving up on the poll. Each attempt is a row somebody else wrote in the time
+/// this one took two statements; five of them in a row is not an operator correcting a
+/// Policy, and failing the poll retries in one interval without delivering anything.
+const ADOPT_ATTEMPTS: usize = 5;
+
 /// How many parked dead letters [`PolicyRunner::retry_policy_dead_letters`] enumerates
 /// per round trip. The bound on that call's memory: a backlog of any size is retried a
 /// page at a time.
@@ -2415,7 +2421,7 @@ async fn report_waiting(
         "policy feed is waiting for an open write to end"
     );
 
-    if !waiting.poll(name, std::time::Instant::now()) {
+    if !waiting.poll(name, cursor, std::time::Instant::now()) {
         return Ok(true);
     }
 
@@ -3033,34 +3039,64 @@ impl PolicyCursor {
     ///
     /// The completion is written back, so the row shows the point the Policy resumes
     /// from rather than the half-instruction it was given — position untouched, and
-    /// without disturbing `updated_at`, since nothing was processed. Losing that
-    /// compare-and-set means the row moved again; the next poll reads it and adopts that
-    /// instead.
+    /// without disturbing `updated_at`, since nothing was processed.
+    ///
+    /// Losing that compare-and-set means the row moved again while this derivation ran,
+    /// and the write that won is the instruction now: the loser starts over from it
+    /// rather than keeping a point derived from a row nobody holds. Keeping it would
+    /// read the feed from an instruction that has been replaced — delivering, for one
+    /// batch, the events an operator's forward move meant to skip, with the conflict
+    /// only surfacing at the checkpoint afterwards.
+    ///
+    /// Nothing is assigned until it settles, so the cursor never holds a point derived
+    /// from a row that is gone. Bounded by [`ADOPT_ATTEMPTS`]: a row rewritten faster
+    /// than this can read it fails the poll with the cursor left where this process
+    /// already was — a valid point, re-read on the next poll — rather than moved
+    /// somewhere nobody asked for.
     async fn adopt(
         &mut self,
         pool: &Pool<Postgres>,
         name: &str,
         stored: FeedPoint,
     ) -> Result<(), replay::Error> {
-        self.persisted = stored;
-        self.point = match commit_txid_at(pool, stored.position).await? {
-            // The common path, and the one that must stay cheap: every election and
-            // every manual drain of a Policy this process left where it is pays one
-            // indexed lookup and no scan.
-            at_position if names_a_feed_point(stored, at_position) => stored,
-            _ => {
-                let (first_past_commit_txid, watermark) =
-                    conservative_inputs(pool, stored.position).await?;
-                conservative_point(stored, first_past_commit_txid, watermark)
-            }
-        };
+        let mut stored = stored;
 
-        if self.point != self.persisted
-            && complete_commit_txid(pool, name, self.persisted, self.point.commit_txid).await?
-        {
-            self.persisted = self.point;
+        for _ in 0..ADOPT_ATTEMPTS {
+            let point = match commit_txid_at(pool, stored.position).await? {
+                // The common path, and the one that must stay cheap: every election and
+                // every manual drain of a Policy this process left where it is pays one
+                // indexed lookup and no scan.
+                at_position if names_a_feed_point(stored, at_position) => stored,
+                _ => {
+                    let (first_past_commit_txid, watermark) =
+                        conservative_inputs(pool, stored.position).await?;
+                    conservative_point(stored, first_past_commit_txid, watermark)
+                }
+            };
+
+            if point == stored {
+                self.persisted = stored;
+                self.point = point;
+                return Ok(());
+            }
+            if complete_commit_txid(pool, name, stored, point.commit_txid).await? {
+                self.persisted = point;
+                self.point = point;
+                return Ok(());
+            }
+
+            stored = read_point(pool, name).await?.ok_or_else(|| {
+                replay::Error::not_found("policy cursor row vanished while it was adopted")
+                    .with_operation("policy_cursor_adopt")
+                    .with_context("policy", name)
+            })?;
         }
-        Ok(())
+
+        Err(
+            replay::Error::conflict("policy cursor row moved faster than it could be adopted")
+                .with_operation("policy_cursor_adopt")
+                .with_context("policy", name),
+        )
     }
 
     /// Persist the in-memory point, but only if the stored one is still the
@@ -4776,6 +4812,69 @@ mod cursor_tests {
                 .await
                 .contains(&older_position),
             "and every event past it is delivered, whatever transaction wrote it"
+        );
+    }
+
+    /// A completion that loses its compare-and-set has been overtaken: the row holds a
+    /// later instruction than the one this derivation started from, and that instruction
+    /// is the one the Policy must resume from. Keeping the overtaken point would read a
+    /// batch from an operator's *replaced* move — delivering events their forward move
+    /// meant to skip, with the conflict only surfacing at the checkpoint afterwards.
+    ///
+    /// Staged by adopting a stored value the row no longer holds, which is what losing
+    /// that race leaves behind.
+    #[tokio::test]
+    async fn an_adoption_overtaken_by_a_later_move_takes_the_later_one_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let events = append_events(&pool, 3).await;
+
+        let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        // What this process read a moment ago: the operator's first move.
+        let overtaken = FeedPoint {
+            commit_txid: CommitStamp::SENTINEL,
+            position: events[0].position,
+        };
+        sqlx::query(
+            "UPDATE policy_cursors SET position = $2, commit_txid = '0'::xid8 WHERE name = $1",
+        )
+        .bind(POLICY)
+        .bind(overtaken.position)
+        .execute(&pool)
+        .await
+        .expect("the first move must succeed");
+
+        // And what the row holds by the time the completion is written: the second.
+        sqlx::query(
+            "UPDATE policy_cursors SET position = $2, commit_txid = '0'::xid8 WHERE name = $1",
+        )
+        .bind(POLICY)
+        .bind(events[2].position)
+        .execute(&pool)
+        .await
+        .expect("the second move must succeed");
+
+        cursor
+            .adopt(&pool, POLICY, overtaken)
+            .await
+            .expect("adopting must succeed");
+
+        assert_eq!(
+            cursor.point.position, events[2].position,
+            "the cursor resumes from the move that won, not the one it started deriving"
+        );
+        assert_eq!(
+            stored(&pool).await,
+            cursor.point,
+            "and the row is completed for the winner"
+        );
+        assert!(
+            !feed_from(&pool, cursor.point)
+                .await
+                .contains(&events[1].position),
+            "so the batch after it cannot deliver what the winning move passed"
         );
     }
 

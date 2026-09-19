@@ -2775,7 +2775,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `name` | Stable policy name (the cursor key). |
 | `position` | Last processed `global_position`. |
 | `head` | Current global head (`MAX(global_position)`). |
-| `lag` | Positions still to process (`head - position`). |
+| `lag` | `head - position`. Counts nothing since [#195](https://github.com/funkode-io/replay/issues/195): see below. |
 | `next_position` | Lowest `global_position` past the cursor that exists; `None` when nothing is left. |
 | `missing_position` | `position + 1` when that position is absent but a later one exists; otherwise `None`. |
 | `last_checkpoint_at` | When the cursor last advanced (staleness signal). |
@@ -2785,14 +2785,23 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 
 `head` is the raw `MAX(global_position)`. Because `global_position` is a
 `BIGSERIAL` assigned at INSERT but only made visible at COMMIT, a higher position
-can commit before a lower one, so the head can momentarily contain gaps. A position
-that is present, though, names exactly one event: a unique index enforces it, so a
-cursor stepping position by position cannot step over an event. When you
-need a **stable cut** of the log — the largest position `H` such that every
+can commit before a lower one, so the head can momentarily contain gaps.
+
+**`lag`, `next_position` and `missing_position` read `position` as progress, and it is
+not.** A policy advances in `(commit_txid, global_position)` order
+([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)), where a
+later point can hold a lower position, so `head - position` is the distance between two
+numbers rather than a count of anything, a fully drained policy can report a non-zero
+`lag`, and the "hole" the other two describe is not a state the feed can be in. All three
+are removed in [#196](https://github.com/funkode-io/replay/issues/196). Until then, read
+`last_checkpoint_at` for staleness, `dead_letter_count` for damage, and the daemon's
+liveness for whether a worker is running at all.
+
+When you need a **stable cut** of the log — the largest position `H` such that every
 position in `1..=H` is present, e.g. to freeze a version at publish time — use
 `PostgresEventStore::contiguous_high_water_mark()` instead of `head`; replaying
 events with `global_position <= H` then observes the same set of events on every
-later read.
+later read. It is a cut for *readers*, unrelated to how far any policy has got.
 
 `condition` is derived with a strict precedence — **a hole outranks dead letters,
 dead letters outrank lag**:

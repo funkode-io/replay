@@ -49,7 +49,10 @@ The sequencing key of the event log: a `BIGSERIAL` on `events`, drawn inside the
 same `streams … FOR UPDATE` section that hands out a stream `version`, so within a
 stream it rises with `version` and across streams it is a total order. Every event
 read sorts on it and nothing else
-([ADR-0018](docs/adr/0018-every-event-read-is-ordered-by-global-position.md)).
+([ADR-0018](docs/adr/0018-every-event-read-is-ordered-by-global-position.md)) — with one
+exception, the [Policy feed], which sorts on `([Commit stamp], Global position)` because
+it alone needs to know whether every earlier writer has *finished*
+([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)).
 `created` is a wall-clock audit stamp a time-travel read may *filter* on; it orders
 nothing. A position may be missing (a [Burned position]) but never repeated — a
 unique index enforces that (migration 0015).

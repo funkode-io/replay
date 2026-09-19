@@ -33,7 +33,12 @@ effects**. Therefore a **projection version bump ⇒ reset + replay**, but a
   skew and concurrency). *Amended by
   [ADR-0015](0015-policy-crosses-a-position-no-transaction-can-fill.md): this
   assumed every hole eventually fills, and a position burned by an aborted append
-  never does.*
+  never does. **Superseded** by
+  [ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md): the feed reads in
+  `(commit_txid, global_position)` order below the commit watermark, where a hole is not
+  a thing the reader can stop at, so there is no prefix to keep gap-free and no grace to
+  wait out. `global_position` remains the log's total order and the cursor's second half;
+  what is gone is reading *by* it.*
 - **Delivery is at-least-once.** We do not chase exactly-once delivery (high cost,
   illusory across crash boundaries). Correctness comes from **idempotent aggregate
   commands** (at-least-once + idempotent consumer = effectively-once). The dedup key
