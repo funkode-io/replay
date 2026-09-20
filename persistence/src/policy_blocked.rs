@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use sqlx::{Pool, Postgres, Row};
 
-use crate::commit_stamp::{reject_foreign_stamp, CommitStamp, StampSource};
+use crate::commit_stamp::CommitStamp;
 use crate::policy_feed::FeedPoint;
 
 /// Built-in default for [`resolve_blocked_warn_after`]. Below it, a wait is an ordinary
@@ -182,7 +182,6 @@ pub(crate) async fn probe_waiting(
     let row = sqlx::query(
         "SELECT COALESCE((SELECT MAX(global_position) FROM events), 0) AS log_max_position, \
          pg_snapshot_xmin(pg_current_snapshot())::text AS watermark, \
-         pg_snapshot_xmax(pg_current_snapshot())::text AS next_txid, \
          w.global_position AS withheld_position, \
          w.commit_txid::text AS withheld_commit_txid, \
          GREATEST(EXTRACT(EPOCH FROM (now() - pc.updated_at)) * 1000, 0)::bigint AS parked_ms \
@@ -203,21 +202,10 @@ pub(crate) async fn probe_waiting(
     .map_err(crate::db_error)?;
 
     row.map(|row| {
-        // The withheld event is the other place a restored log shows itself, and there it
-        // is loud rather than silent: a stamp from a cluster that no longer exists is
-        // never below this one's watermark, so the feed stalls for good. Without this it
-        // would be reported as an open write somebody is about to commit.
-        let withheld_commit_txid = CommitStamp::from_row(&row, "withheld_commit_txid")?;
-        reject_foreign_stamp(
-            policy,
-            StampSource::WithheldEvent,
-            withheld_commit_txid,
-            CommitStamp::from_row(&row, "next_txid")?,
-        )?;
         Ok(Waiting {
             log_max_position: row.get("log_max_position"),
             withheld: FeedPoint {
-                commit_txid: withheld_commit_txid,
+                commit_txid: CommitStamp::from_row(&row, "withheld_commit_txid")?,
                 position: row.get("withheld_position"),
             },
             watermark: CommitStamp::from_row(&row, "watermark")?,

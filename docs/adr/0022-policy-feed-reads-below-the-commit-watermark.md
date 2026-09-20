@@ -68,17 +68,19 @@ ADR-0015 rejects it with a test that makes it be wrong on demand.
   operator's position-only instruction carries the same sentinel, so on such a log the
   two meet and the instruction is taken as an exact point. It cannot skip an event: those
   stamps are a position-prefix, so the conservative derivation returns the same point.
-- **`xid8` belongs to one cluster, and a logical restore carries it into another.** After a
-  `pg_dump`/`pg_restore` or logical replication into a fresh cluster, restored stamps sit
-  above every id that cluster will issue: restored events never fall below its watermark,
-  and — the silent half — a caught-up cursor sorts above everything appended next, so the
-  Policy reads an empty feed and looks idle while every reaction is lost. Physical restores
-  (PITR, replica promotion, in-place `pg_upgrade`) carry the counter and are unaffected. The
-  runner refuses to read a stamp at or above `pg_snapshot_xmax(pg_current_snapshot())`, which
-  no transaction of this cluster can hold, and logs the repair: rebase the restored stamps
-  to the sentinel, which is the state migration 0018 already leaves for events older than
-  itself. We rejected an application-owned ordering stamp, which reintroduces the gap
-  between assignment and commit that this decision exists to close.
+- **`xid8` belongs to one cluster, and a logical copy carries the stamps without it.** After a
+  `pg_dump`/`pg_restore`, logical replication or a `pg_upgrade`, the stamps in the log were
+  issued by a counter this cluster does not own. The silent half is a caught-up cursor: it
+  sorts above every event the new cluster appends, so the feed reads empty and the Policy
+  reports itself idle while its reactions are dropped. Migration 0025 records the cluster's
+  `system_identifier` with the log and the runner refuses to read one written elsewhere.
+  Identity, not arithmetic: comparing stamps against the local counter catches the move only
+  while that counter is behind them, and a backfill between the restore and the first poll is
+  enough to hide it for good. The two repairs differ because `pg_upgrade` carries the counter
+  and not the identifier — adopt the cluster — while a logical copy carries neither — rebase
+  the stamps to the sentinel first, which is the state 0018 already leaves. We rejected an
+  application-owned ordering stamp, which reintroduces the gap between assignment and commit
+  that this decision exists to close.
 - A cursor row that names no event — one that predates 0022 and carries the sentinel, or
   the one-column move ADR-0012 gives an operator — is read as "everything at or before
   this position is processed" and completed to the greatest point that still delivers

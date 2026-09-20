@@ -27,7 +27,8 @@ use tokio::task::JoinHandle;
 
 use replay::{Aggregate, Metadata};
 
-use crate::commit_stamp::{reject_foreign_stamp, CommitStamp, StampSource};
+use crate::commit_stamp::CommitStamp;
+use crate::log_origin::reject_foreign_log;
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
 use crate::policy_blocked::{probe_waiting, resolve_blocked_warn_after, BlockedWatch};
 use crate::policy_feed::{
@@ -3159,38 +3160,42 @@ impl PolicyCursor {
 }
 
 /// A policy's stored point, `None` when it has no row yet, refused if this cluster did
-/// not issue its stamp.
+/// not write the log.
 ///
-/// The origin check rides along on the read that every election, every refresh and every
-/// manual drain already does, so it costs a column rather than a query — and it sits on
-/// the cursor because that is where a restore is silent: a cursor stamped by another
-/// cluster sorts above everything this one appends, so the feed comes back empty and the
-/// Policy looks idle. See [`reject_foreign_stamp`].
+/// The origin check rides on the read that every election, every refresh and every manual
+/// drain already does, so it costs three columns rather than a query. It sits here because
+/// this is the read no path into the feed can avoid — the `LEFT JOIN` is what makes that
+/// true of a Policy with no cursor row yet, which would otherwise bootstrap from stamps
+/// another cluster issued. See [`reject_foreign_log`].
 async fn read_point(pool: &Pool<Postgres>, name: &str) -> Result<Option<FeedPoint>, replay::Error> {
     let row = sqlx::query(
-        "SELECT position, commit_txid::text AS commit_txid, \
-         pg_snapshot_xmax(pg_current_snapshot())::text AS next_txid \
-         FROM policy_cursors WHERE name = $1",
+        "SELECT pc.position, pc.commit_txid::text AS commit_txid, \
+         (SELECT system_identifier FROM event_log_origin) AS wrote_the_log, \
+         (SELECT system_identifier FROM pg_control_system()) AS cluster_now, \
+         current_database() AS database \
+         FROM (SELECT 1) AS always \
+         LEFT JOIN policy_cursors pc ON pc.name = $1",
     )
     .bind(name)
-    .fetch_optional(pool)
+    .fetch_one(pool)
     .await
     .map_err(crate::db_error)?;
 
-    row.map(|row| {
-        let point = FeedPoint {
-            commit_txid: CommitStamp::from_row(&row, "commit_txid")?,
-            position: row.get("position"),
-        };
-        reject_foreign_stamp(
-            name,
-            StampSource::Cursor,
-            point.commit_txid,
-            CommitStamp::from_row(&row, "next_txid")?,
-        )?;
-        Ok(point)
-    })
-    .transpose()
+    reject_foreign_log(
+        row.get("database"),
+        name,
+        row.get::<Option<i64>, _>("wrote_the_log"),
+        row.get("cluster_now"),
+    )?;
+
+    let Some(position) = row.get::<Option<i64>, _>("position") else {
+        return Ok(None);
+    };
+
+    Ok(Some(FeedPoint {
+        commit_txid: CommitStamp::from_row(&row, "commit_txid")?,
+        position,
+    }))
 }
 
 /// Create a policy's cursor row, leaving an existing one untouched.

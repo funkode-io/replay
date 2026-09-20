@@ -2918,33 +2918,56 @@ Positions the log will never issue need no handling. `nextval` is not transactio
 reads in `(commit_txid, global_position)` order, a burned number belongs to no event and
 is not a point the feed can stop at.
 
-### After restoring the database into a different cluster
+### After moving the database to another cluster
 
-`commit_txid` is an `xid8`, a counter owned by one PostgreSQL cluster. **Physical**
-restores carry it: PITR, promoting a replica, an in-place `pg_upgrade`. **Logical** ones do
-not — `pg_dump`/`pg_restore` into a fresh cluster, or logical replication, including the
-blue/green upgrades managed services build on it. The restored rows then carry ids the new
-cluster has not issued, and its own counter starts again from the beginning.
+`commit_txid` is an `xid8`, a counter owned by the PostgreSQL cluster that issued it, and
+the feed orders by it. A copy that carries the cluster's `system_identifier` carries the
+counter too — PITR, promoting a replica — and needs nothing. A copy that does not was made
+logically (`pg_dump`/`pg_restore`, logical replication, including the blue/green upgrades
+managed services build on it) or by `pg_upgrade`, and the stamps arrive without the counter
+that gives them meaning.
 
-The runner refuses to read such a log, naming the policy and logging the repair, because
-the failure it prevents is silent: a **caught-up** cursor stamped `50000` sorts above every
-event the new cluster appends, so the feed comes back empty, the policy reports itself idle,
-and every reaction is dropped until the counter climbs past the restored value.
+Migration 0025 records the identifier in `event_log_origin`, and a policy refuses to read a
+log whose recorded cluster is not the one it is connected to, naming itself and logging both
+repairs. Identity rather than arithmetic, because comparing the stamps against the new
+cluster's own counter only works while that counter is behind them: let a backfill run
+between the restore and the first poll and the two overlap, at which point local events sort
+*below* a restored cursor and are skipped with no signal at all — the feed is empty, the
+policy reports itself idle, and the reactions are simply gone.
 
-With the daemon stopped, rebase the stamps:
+**After `pg_upgrade`.** The transaction counter is carried, the identifier is not. The
+stamps are sound; adopt the cluster:
 
 ```sql
-UPDATE events SET commit_txid = '0'::xid8
-WHERE commit_txid >= pg_snapshot_xmax(pg_current_snapshot());
-
-UPDATE policy_cursors SET commit_txid = '0'::xid8
-WHERE commit_txid >= pg_snapshot_xmax(pg_current_snapshot());
+UPDATE event_log_origin
+SET system_identifier = (SELECT system_identifier FROM pg_control_system());
 ```
 
-Every restored event is committed — there is no open transaction left in a cluster that no
-longer exists — so the sentinel is the honest stamp for all of them: it orders below every
-id the new cluster will issue, and the restored events keep the `global_position` order they
-already have. This is the same state migration 0018 leaves for events older than itself. The
-`events` update rewrites the table; on a large log, run it in batches. Each cursor lands on a
-position-only point and is completed on the next poll, so a policy resumes where it was
-without replaying what it had already done.
+**After a logical restore.** The stamps came from the old cluster and mean nothing here.
+With the daemon stopped, rebase them to the sentinel, which is the state migration 0018
+already leaves for events older than itself: it orders below every id this cluster will
+issue, so the restored events keep the `global_position` order they have, ahead of
+everything appended next. Every restored event is committed — there is no open transaction
+left in a cluster that no longer exists — so the sentinel is honest for all of them.
+
+`events` can be large, and one unrestricted `UPDATE` rewrites and locks the whole table, so
+run it in batches until it reports zero rows:
+
+```sql
+-- repeat until 0 rows
+UPDATE events SET commit_txid = '0'::xid8
+WHERE global_position IN (
+    SELECT global_position FROM events
+    WHERE commit_txid <> '0'::xid8
+    ORDER BY global_position
+    LIMIT 50000
+);
+
+-- then, in one statement: cursors are one row per policy
+UPDATE policy_cursors SET commit_txid = '0'::xid8;
+```
+
+Each batch is its own transaction, and the cutoff needs no recomputation: the predicate is
+"not yet rebased", so a batch never revisits a row it has already written. Then adopt the
+cluster with the statement above. Each cursor lands on a position-only point and is completed
+on the next poll, so a policy resumes where it was without replaying what it had already done.
