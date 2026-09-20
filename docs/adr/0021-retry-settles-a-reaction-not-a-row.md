@@ -67,8 +67,11 @@ What changes is what a retry is *for* — one reaction, not one row.
   resolution a declined command is. A row naming **nothing** — parked before the
   identity migration, or parked for a panic in `react` itself — is settled by the
   replay as a whole: archived when nothing failed, re-parked with the replay's
-  first failure otherwise, which is exactly the all-or-nothing semantics it was
-  parked under. A replay that **panicked** concluded nothing about the commands
+  **first** failure otherwise, which is exactly the all-or-nothing semantics it
+  was parked under. Such rows are settled *after* the rows that name a command,
+  whatever the ids say — an upgrade's row is the older one — because a row
+  standing for the whole reaction speaks for every dispatch of it, and reading it
+  first would leave its neighbours nothing of their own to take. A replay that **panicked** concluded nothing about the commands
   it never reached, so every row naming one of those stays parked with the panic.
   The dispatch it unwound out of is not one of them: it is a conclusion of the
   replay, carrying the panic, which is what stops the row it parked from being

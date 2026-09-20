@@ -797,6 +797,25 @@ impl PolicyDaemonHarness {
         .expect("a pre-migration row must still be insertable")
     }
 
+    /// The same, but numbered **below** every row already parked — the real
+    /// shape of an upgrade, where the identity-less row was parked first and the
+    /// rows a later delivery parked come after it.
+    pub async fn park_without_identity_first(&self, event: &AppendedEvent, message: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO policy_dead_letters \
+                 (id, policy_name, global_position, event_id, error_kind, error_message) \
+             VALUES ((SELECT COALESCE(MIN(id), 1) - 1 FROM policy_dead_letters), \
+                     $1, $2, $3, 'Invalid Input', $4) RETURNING id",
+        )
+        .bind(&self.policy_name)
+        .bind(event.global_position)
+        .bind(event.event_id)
+        .bind(message)
+        .fetch_one(&self.pool)
+        .await
+        .expect("a pre-migration row must still be insertable")
+    }
+
     /// Park a second copy of `id`, the way a redelivery of its event does.
     ///
     /// A dead letter is written before the batched cursor checkpoint, so a crash

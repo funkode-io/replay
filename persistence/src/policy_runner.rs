@@ -1082,7 +1082,15 @@ impl PolicyRunner {
             })
             .collect();
 
-        for (row, rows_naming_it) in rows.into_iter().zip(naming) {
+        // Rows that name a command are settled first, whatever their ids. A row
+        // that names none is judged by the replay *as a whole* and speaks for
+        // every dispatch of it, so letting one go first — an upgrade's row is
+        // older than the rows a later delivery parked, hence lower-numbered —
+        // would leave its neighbours nothing of their own to take.
+        let mut ordered: Vec<(ParkedRow, usize)> = rows.into_iter().zip(naming).collect();
+        ordered.sort_by_key(|(row, _)| row.identity.is_none());
+
+        for (row, rows_naming_it) in ordered {
             let outcome = match row.identity.as_ref() {
                 // The command this row was parked for ran again: its own
                 // outcome settles it.
@@ -1149,6 +1157,10 @@ impl PolicyRunner {
             );
             settled.push((id, DeadLetterRetry::StillFailing));
         }
+
+        // Back into the order the rows were parked in, which settling the
+        // identity-less ones last has just disturbed.
+        settled.sort_by_key(|(id, _)| *id);
 
         Ok(settled)
     }
@@ -2543,8 +2555,11 @@ impl Replay {
     /// What settles a row that names no command at all: the replay as a whole,
     /// which is the only thing such a row can be judged by.
     ///
-    /// Such a row stands for the entire reaction, so every dispatch is marked
-    /// claimed — it has already spoken for all of them.
+    /// The **first** failure the replay concluded, as the all-or-nothing retry
+    /// this row was parked under would have stopped at; the panic only when the
+    /// replay concluded nothing at all, which is a panic in `react` itself.
+    /// Every dispatch is marked claimed: the row stands for the whole reaction,
+    /// so it has already spoken for all of them.
     fn verdict(&mut self) -> Option<Settlement> {
         let panicked = match self {
             Self::Panicked { message, .. } => Some(Settlement::panicked(message)),
@@ -2555,7 +2570,7 @@ impl Replay {
             dispatch.claimed = true;
             verdict = verdict.or_else(|| dispatch.outcome.clone());
         }
-        panicked.or(verdict)
+        verdict.or(panicked)
     }
 
     /// The failures no row spoke for: commands this reaction did not park

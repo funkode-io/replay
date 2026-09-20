@@ -37,6 +37,10 @@ const TWO_COMMANDS: &str = "two-commands";
 /// type whatever variant it carries.
 const SAME_TARGET: &str = "same-target";
 
+/// Tag whose reaction fails permanently and *then* panics: which of the two a
+/// row with no identity carries is the order the replay concluded them in.
+const FAILS_THEN_PANICS: &str = "fails-then-panics";
+
 /// Tag whose reaction dispatches a command that concludes and then one that
 /// panics inside its handler.
 const PANIC_AFTER: &str = "panic-after";
@@ -165,6 +169,10 @@ impl Policy for TwoCommandPolicy {
                 Self::dispatch(FIRST_SUBJECT, &self.second_recovered, SECOND_FAILURE),
             ],
             PANIC_AFTER => vec![first(), Self::explode(SECOND_SUBJECT)],
+            FAILS_THEN_PANICS => vec![
+                Self::refuse(FIRST_SUBJECT, FIRST_FAILURE),
+                Self::explode(SECOND_SUBJECT),
+            ],
             PANIC_SAME_TARGET => vec![first(), Self::explode(FIRST_SUBJECT)],
             SHIFTED => vec![
                 Dispatch::to::<Probe>(
@@ -1073,6 +1081,90 @@ async fn a_retry_parks_a_failure_the_reaction_had_not_parked_postgres_test() {
         vec![(parked[0].id, "retried")],
         "and the row for the command the reaction no longer emits leaves"
     );
+
+    harness.shutdown().await;
+}
+
+/// A row that names no command is settled **after** the rows that do, whatever
+/// the ids say.
+///
+/// The real upgrade shape: the identity-less row is the *older* one — parked
+/// before the migration — and the rows a later delivery parked come after it.
+/// Reading it first would let it speak for every dispatch of the reaction and
+/// leave its neighbours nothing of their own to take, archiving rows whose
+/// commands had just failed.
+#[tokio::test]
+async fn an_older_row_with_no_identity_does_not_speak_for_its_neighbours_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_legacy_first", reaction.policy()).await;
+
+    let event = harness.ping("subject-1", TWO_COMMANDS).await;
+    let parked = harness.await_dead_letters(2).await;
+    let first = row_for(&parked, FIRST_SUBJECT);
+    let second = row_for(&parked, SECOND_SUBJECT);
+    let legacy = harness
+        .park_without_identity_first(&event, "parked by an older release")
+        .await;
+    assert!(legacy < first.id, "the upgrade's row is the older one");
+
+    assert_eq!(
+        harness.retry_parked().await,
+        DeadLetterRetrySummary {
+            reactions_resolved: 0,
+            reactions_still_failing: 1,
+        }
+    );
+
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        after.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![legacy, first.id, second.id],
+        "every row stays parked: both commands failed again, got {after:#?}"
+    );
+    assert!(
+        harness.archived_dead_letters().await.is_empty(),
+        "and nothing is archived on the strength of a row that names no command"
+    );
+    let first_after = row_for(&after, FIRST_SUBJECT);
+    let second_after = row_for(&after, SECOND_SUBJECT);
+    assert!(
+        first_after.error_message.contains(FIRST_FAILURE)
+            && second_after.error_message.contains(SECOND_FAILURE),
+        "each identified row still takes its own command's error, got {after:#?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A row that names no command carries the **first** failure of the replay, not
+/// a panic that came after it.
+///
+/// Such a row is settled all-or-nothing, as the retry it was parked under did —
+/// and that retry stopped at the first failure. A panic later in the reaction
+/// says nothing about the command that had already failed.
+#[tokio::test]
+async fn a_row_with_no_identity_carries_the_first_failure_not_a_later_panic_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_first_failure", reaction.policy()).await;
+
+    let event = harness.ping("subject-1", FAILS_THEN_PANICS).await;
+    harness.await_dead_letters(2).await;
+    let legacy = harness
+        .park_without_identity(&event, "parked by an older release")
+        .await;
+
+    harness.retry_parked().await;
+
+    let after = harness.dead_letters().await;
+    let legacy_row = after
+        .iter()
+        .find(|row| row.id == legacy)
+        .expect("the identity-less row is still parked");
+    assert!(
+        legacy_row.error_message.contains(FIRST_FAILURE),
+        "it carries what the replay failed on first, got {legacy_row:#?}"
+    );
+    assert_eq!(legacy_row.error_kind, PERMANENT_KIND);
 
     harness.shutdown().await;
 }
