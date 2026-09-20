@@ -34,7 +34,7 @@ effects**. Therefore a **projection version bump ⇒ reset + replay**, but a
   [ADR-0015](0015-policy-crosses-a-position-no-transaction-can-fill.md): this
   assumed every hole eventually fills, and a position burned by an aborted append
   never does. **Superseded** by
-  [ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md): the feed reads in
+  [ADR-0023](0023-policy-feed-reads-below-the-commit-watermark.md): the feed reads in
   `(commit_txid, global_position)` order below the commit watermark, where a hole is not
   a thing the reader can stop at, so there is no prefix to keep gap-free and no grace to
   wait out. `global_position` remains the log's total order and the cursor's second half;

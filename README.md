@@ -2847,7 +2847,7 @@ can commit before a lower one, so the head can momentarily contain gaps.
 
 **`lag`, `next_position` and `missing_position` read `position` as progress, and it is
 not.** A policy advances in `(commit_txid, global_position)` order
-([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)), where a
+([ADR-0023](docs/adr/0023-policy-feed-reads-below-the-commit-watermark.md)), where a
 later point can hold a lower position, so `head - position` is the distance between two
 numbers rather than a count of anything, a fully drained policy can report a non-zero
 `lag`, and the "hole" the other two describe is not a state the feed can be in. All three
@@ -2899,13 +2899,13 @@ permanently stopped one produced byte-identical output: nothing.
 
 The feed delivers an event only once the transaction that wrote it has ended, so a write
 held open holds back everything committed after it
-([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)). That wait is
+([ADR-0023](docs/adr/0023-policy-feed-reads-below-the-commit-watermark.md)). That wait is
 the only thing that stops a policy now, and these are the lines it writes:
 
 | Level | When | Fields |
 |-------|------|--------|
 | `debug` | every poll whose feed is waiting on an open write | `policy`, `cursor`, `cursor_commit_txid`, `withheld_position`, `withheld_commit_txid`, `watermark` |
-| `warn` | the wait has outlived the escalation threshold | the above, plus `log_max_position` and `waiting_for_secs` |
+| `warn` | the wait has outlived the escalation threshold | the above, plus `log_max_position` and `cursor_stale_for_secs` |
 
 ```text
 DEBUG replay_persistence::policy_runner: policy feed is waiting for an open write to end
@@ -2915,7 +2915,7 @@ WARN  replay_persistence::policy_runner: policy is waiting on a write that has n
       ended: … policy=price_fanout cursor=264785 cursor_commit_txid=91827
       log_max_position=264956
       withheld_position=264786 withheld_commit_txid=91830 watermark=91830
-      waiting_for_secs=259200
+      cursor_stale_for_secs=259200
 ```
 
 | Setting | Env var | Default |
@@ -2928,9 +2928,10 @@ Alert on the `warn`. Two clocks meet in it, and they answer different questions:
   process. Below the threshold it is an ordinary append taking its time, which the feed
   is designed to wait for, so a policy idle for an hour that then waits on a commit stays
   silent.
-- **`waiting_for_secs`** is measured from `policy_cursors.updated_at` — the last time the
-  cursor advanced — so it survives restarts and leadership changes and reports the age of
-  the outage, not the age of the process.
+- **`cursor_stale_for_secs`** is the age of the cursor, measured from
+  `policy_cursors.updated_at` — the last time the cursor advanced — so it survives
+  restarts and leadership changes and reports the age of the outage, not the age of the
+  process or of this wait.
 
 `log_max_position` is `MAX(global_position)`, reported as evidence that the log is
 moving while this policy is not. It is **not** a backlog: the feed advances in
@@ -2980,10 +2981,11 @@ is not a point the feed can stop at.
 
 `commit_txid` is an `xid8`, a counter owned by the PostgreSQL cluster that issued it, and
 the feed orders by it. A copy that carries the cluster's `system_identifier` carries the
-counter too — PITR, promoting a replica — and needs nothing. A copy that does not was made
-logically (`pg_dump`/`pg_restore`, logical replication, including the blue/green upgrades
-managed services build on it) or by `pg_upgrade`, and the stamps arrive without the counter
-that gives them meaning.
+counter too — PITR, promoting a replica — and needs nothing. Two moves break the pairing,
+and they break it differently: a **logical** copy (`pg_dump`/`pg_restore`, logical
+replication, including the blue/green upgrades managed services build on it) carries the
+stamps into a cluster whose own counter starts again, while `pg_upgrade` carries the
+counter and changes the identifier.
 
 Migration 0025 records the identifier in `event_log_origin`, and a policy refuses to read a
 log whose recorded cluster is not the one it is connected to, naming itself and logging both

@@ -52,7 +52,7 @@ read sorts on it and nothing else
 ([ADR-0018](docs/adr/0018-every-event-read-is-ordered-by-global-position.md)) — with one
 exception, the [Policy feed], which sorts on `([Commit stamp], Global position)` because
 it alone needs to know whether every earlier writer has *finished*
-([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)).
+([ADR-0023](docs/adr/0023-policy-feed-reads-below-the-commit-watermark.md)).
 `created` is a wall-clock audit stamp a time-travel read may *filter* on; it orders
 nothing. A position may be missing (a [Burned position]) but never repeated — a
 unique index enforces that (migration 0015).
@@ -63,7 +63,7 @@ _Avoid_: offset, sequence number, event time.
 The slice of the event log one [Policy] reads on a poll: every event past its cursor
 written below the **commit watermark**, in `([Commit stamp], [Global position])` order, up
 to its read batch size and **before** its `stream_filter` is applied
-([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)). The watermark
+([ADR-0023](docs/adr/0023-policy-feed-reads-below-the-commit-watermark.md)). The watermark
 is `pg_snapshot_xmin`, the oldest transaction still running **anywhere in the instance** —
 so an event whose own transaction has committed stays withheld while any older
 xid-bearing write is open, including one in another database
@@ -206,7 +206,7 @@ A `global_position` taken from the sequence by a transaction that then aborted.
 `nextval` is not transactional, so the value is never returned to the sequence and
 no event can ever carry it. Since the [Policy feed] reads in [Commit stamp] order it
 is not a hole in what a Policy reads — it belongs to no event, so it is simply not in
-that order ([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)).
+that order ([ADR-0023](docs/adr/0023-policy-feed-reads-below-the-commit-watermark.md)).
 It is still visible in the log's numbering, where positions are not dense.
 _Avoid_: gap, hole (as a name for the permanent kind), lost position, skipped
 position.
@@ -223,7 +223,7 @@ sentinel `0`, which orders before every real id. A [Policy]'s cursor records the
 it stopped in alongside the position
 ([0022](persistence/tests/migrations/0022_policy_cursor_commit_txid.sql)), and the feed
 reads by the pair, below the watermark of transactions that have all ended
-([ADR-0022](docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)).
+([ADR-0023](docs/adr/0023-policy-feed-reads-below-the-commit-watermark.md)).
 _Avoid_: commit id, transaction number, xmin, sequence.
 
 ### Policy runner

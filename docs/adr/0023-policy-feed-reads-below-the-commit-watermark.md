@@ -69,11 +69,12 @@ ADR-0015 rejects it with a test that makes it be wrong on demand.
   two meet and the instruction is taken as an exact point. It cannot skip an event: those
   stamps are a position-prefix, so the conservative derivation returns the same point.
 - **`xid8` belongs to one cluster, and a logical copy carries the stamps without it.** After a
-  `pg_dump`/`pg_restore`, logical replication or a `pg_upgrade`, the stamps in the log were
-  issued by a counter this cluster does not own. The silent half is a caught-up cursor: it
-  sorts above every event the new cluster appends, so the feed reads empty and the Policy
-  reports itself idle while its reactions are dropped. Migration 0025 records the cluster's
-  `system_identifier` with the log and the runner refuses to read one written elsewhere.
+  `pg_dump`/`pg_restore` or logical replication, the stamps in the log were issued by a counter
+  this cluster does not own; after a `pg_upgrade` the counter comes along and only the identifier
+  changes. The silent half of the logical case is a caught-up cursor: it sorts above every event
+  the new cluster appends, so the feed reads empty and the Policy reports itself idle while its
+  reactions are dropped. Migration 0025 records the cluster's `system_identifier` with the log
+  and the runner refuses to read one written elsewhere.
   Identity, not arithmetic: comparing stamps against the local counter catches the move only
   while that counter is behind them, and a backfill between the restore and the first poll is
   enough to hide it for good. The two repairs differ because `pg_upgrade` carries the counter

@@ -231,7 +231,7 @@ impl PostgresEventStore {
     ///
     /// It was the scalar counterpart of the policy runner's contiguous-prefix scan; the
     /// runner stopped reading that way in
-    /// `docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md` and this is now a
+    /// `docs/adr/0023-policy-feed-reads-below-the-commit-watermark.md` and this is now a
     /// caller-facing stable cut and nothing else. A Policy's progress is not measured
     /// against it: the two speak different orders.
     pub async fn contiguous_high_water_mark(&self) -> Result<i64, replay::Error> {

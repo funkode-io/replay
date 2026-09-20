@@ -1,7 +1,7 @@
 # Every event read is ordered by `global_position`
 
 **Status:** accepted, narrowed by
-[ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md): the [Policy feed] is no
+[ADR-0023](0023-policy-feed-reads-below-the-commit-watermark.md): the [Policy feed] is no
 longer one of the reads this rule covers. It orders by `(commit_txid, global_position)`,
 which is the "order by commit visibility" option rejected below — rejected for *this*
 question, and taken up for the feed's own. Everything else here stands.
@@ -35,7 +35,7 @@ inline-projection rebuild's keyset pages, and compaction's fold over the live st
 There is one ordering rule, so it cannot drift between read paths.
 
 The [Policy feed] used it too when this was written, and no longer does: it asks "has
-every earlier writer finished?", which a position cannot answer, so ADR-0022 moved it to
+every earlier writer finished?", which a position cannot answer, so ADR-0023 moved it to
 `(commit_txid, global_position)`. The reads above ask a different question — relative
 order within a committed log — and keep this key.
 
@@ -67,7 +67,7 @@ the rule that change established and finishes applying it.
   writer finished?" question, and it is being pursued there — `events.commit_txid` landed
   with [#193](https://github.com/funkode-io/replay/issues/193), and
   [#195](https://github.com/funkode-io/replay/issues/195) moved the feed onto it
-  (ADR-0022). It answers a different question from this one: a point-in-time read of a
+  (ADR-0023). It answers a different question from this one: a point-in-time read of a
   committed stream needs relative order, not a visibility watermark — and it costs a
   backfill and a cursor format change, which this rule does not.
 
@@ -75,7 +75,7 @@ the rule that change established and finishes applying it.
 
 - **Gaps do not matter.** A burned position leaves a hole; relative order is unaffected,
   which is all a full stream read depends on. Contiguity was the feed's problem
-  (ADR-0015) until ADR-0022 left it with no holes to have.
+  (ADR-0015) until ADR-0023 left it with no holes to have.
 - **Uniqueness is load-bearing.** A `>` cursor with no tiebreaker steps over the second
   row of a duplicated position. `BIGSERIAL` implies no constraint; the unique index
   [#200](https://github.com/funkode-io/replay/issues/200) added (migration 0015) is what

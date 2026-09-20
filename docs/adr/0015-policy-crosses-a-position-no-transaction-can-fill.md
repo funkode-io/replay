@@ -1,7 +1,7 @@
 # A Policy crosses a `global_position` no transaction can fill
 
 **Status:** superseded by
-[ADR-0022](0022-policy-feed-reads-below-the-commit-watermark.md), which stopped reading
+[ADR-0023](0023-policy-feed-reads-below-the-commit-watermark.md), which stopped reading
 the feed in position order: a hole is no longer something a Policy can stop at, so there
 is nothing to prove permanent and nothing to skip. The machinery this ADR decided on was
 removed with it (#197). What stays true, and is worth reading it for, is why the proof

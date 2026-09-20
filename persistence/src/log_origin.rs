@@ -1,7 +1,7 @@
 //! Which PostgreSQL cluster issued this log's transaction stamps.
 //!
 //! The Policy feed orders by `events.commit_txid`, an `xid8` drawn from a counter one
-//! cluster owns ([ADR-0022](../../docs/adr/0022-policy-feed-reads-below-the-commit-watermark.md)).
+//! cluster owns ([ADR-0023](../../docs/adr/0023-policy-feed-reads-below-the-commit-watermark.md)).
 //! Move the log to another cluster and that order is not wrong in a visible way — it is
 //! silent: a cursor carrying a restored stamp sorts above every event the new cluster
 //! appends, so the feed reads empty, the Policy reports itself idle, and every reaction
@@ -22,15 +22,20 @@ use std::sync::Mutex;
 /// `global_position` order they already have. It is the state migration 0018 leaves for
 /// events older than itself.
 const REBASE_RESTORED_STAMPS: &str = "\
-    UPDATE events SET commit_txid = '0'::xid8 WHERE global_position IN \
-    (SELECT global_position FROM events WHERE commit_txid <> '0'::xid8 \
-     ORDER BY global_position LIMIT 50000); -- repeat until it reports 0 rows, then: \
+    -- repeat until it reports 0 rows:\n\
+    UPDATE events SET commit_txid = '0'::xid8 WHERE global_position IN\n\
+    (SELECT global_position FROM events WHERE commit_txid <> '0'::xid8\n\
+     ORDER BY global_position LIMIT 50000);\n\
+    -- then, once:\n\
     UPDATE policy_cursors SET commit_txid = '0'::xid8;";
 
 /// What tells the log it is where it is now, once the stamps are sound.
 const ADOPT_THIS_CLUSTER: &str = "\
     UPDATE event_log_origin SET system_identifier = \
     (SELECT system_identifier FROM pg_control_system());";
+
+/// How a log with no origin row names its writer.
+const NO_RECORDED_ORIGIN: &str = "unrecorded";
 
 /// Policy feeds whose foreign log has been diagnosed in this process.
 ///
@@ -71,7 +76,9 @@ fn first_diagnosis(cluster_now: i64, database: &str, policy: &str) -> bool {
 /// rebased first.
 /// `wrote_the_log` is `None` when the origin row is missing, which migration 0025 creates
 /// and nothing in the library deletes: a log that cannot say where it was written is
-/// refused on the same grounds as one that says elsewhere.
+/// refused on the same grounds as one that says elsewhere. It reads as
+/// [`NO_RECORDED_ORIGIN`] rather than as an identifier, because every integer is one some
+/// cluster could have — `0` is the xid sentinel, not a system identifier.
 pub(crate) fn reject_foreign_log(
     database: &str,
     policy: &str,
@@ -81,7 +88,10 @@ pub(crate) fn reject_foreign_log(
     if wrote_the_log == Some(cluster_now) {
         return Ok(());
     }
-    let wrote_the_log = wrote_the_log.unwrap_or_default();
+    let wrote_the_log = wrote_the_log.map_or_else(
+        || NO_RECORDED_ORIGIN.to_owned(),
+        |identifier| identifier.to_string(),
+    );
 
     if first_diagnosis(cluster_now, database, policy) {
         tracing::error!(
@@ -91,8 +101,8 @@ pub(crate) fn reject_foreign_log(
             cluster_now,
             rebase = REBASE_RESTORED_STAMPS,
             adopt = ADOPT_THIS_CLUSTER,
-            "policy {policy} cannot continue: this log was written by PostgreSQL cluster \
-             {wrote_the_log} and is being read in cluster {cluster_now}. Events are \
+            "policy {policy} cannot continue: this log's writing PostgreSQL cluster is \
+             {wrote_the_log} and it is being read in cluster {cluster_now}. Events are \
              ordered by the transaction that wrote them, and transaction ids belong to \
              the cluster that issued them, so reading the feed here would skip events \
              rather than deliver them late. With the daemon stopped: after an in-place \
@@ -104,19 +114,21 @@ pub(crate) fn reject_foreign_log(
     }
 
     Err(replay::Error::internal(format!(
-        "policy {policy} reads a log written by cluster {wrote_the_log} in cluster \
+        "policy {policy} reads a log whose writing cluster is {wrote_the_log} in cluster \
          {cluster_now}; see the logged remedy"
     ))
     .with_operation("policy_feed_log_origin")
     .with_context("policy", policy)
     .with_context("database", database)
-    .with_context("wrote_the_log", wrote_the_log.to_string())
+    .with_context("wrote_the_log", wrote_the_log)
     .with_context("cluster_now", cluster_now.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reject_foreign_log, ADOPT_THIS_CLUSTER, REBASE_RESTORED_STAMPS};
+    use super::{
+        reject_foreign_log, ADOPT_THIS_CLUSTER, NO_RECORDED_ORIGIN, REBASE_RESTORED_STAMPS,
+    };
 
     #[test]
     fn a_log_this_cluster_wrote_is_read() {
@@ -126,10 +138,18 @@ mod tests {
     }
 
     /// A log with no recorded origin vouches for nothing, and is refused like one that
-    /// names another cluster.
+    /// names another cluster. It is not reported as cluster `0`: that is the xid
+    /// sentinel, and an operator told a number goes looking for the cluster that has it.
     #[test]
     fn a_log_that_does_not_say_where_it_was_written_is_refused() {
-        assert!(reject_foreign_log("app", "orders", None, 42).is_err());
+        let refused = reject_foreign_log("app", "orders", None, 42)
+            .expect_err("a log with no recorded origin cannot be read");
+
+        let reported = format!("{refused:?}");
+        assert!(
+            reported.contains(NO_RECORDED_ORIGIN),
+            "a missing origin row names itself as such: {reported}"
+        );
     }
 
     /// The case arithmetic on stamps cannot see: the log is foreign whatever the
@@ -155,5 +175,14 @@ mod tests {
             REBASE_RESTORED_STAMPS.contains("LIMIT 50000"),
             "the rebase is batched: it rewrites every row of a table that can be huge"
         );
+        let (batch, cursors) = REBASE_RESTORED_STAMPS
+            .split_once("UPDATE policy_cursors")
+            .expect("the rebase moves the cursors too, or the feed stays refused");
+        assert!(
+            batch.ends_with("-- then, once:\n"),
+            "a `--` comment runs to the end of its line: anything after it on one line is \
+             not SQL an operator can paste. {REBASE_RESTORED_STAMPS}"
+        );
+        assert!(!cursors.contains('\n'), "{REBASE_RESTORED_STAMPS}");
     }
 }
