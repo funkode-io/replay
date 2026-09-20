@@ -8,7 +8,8 @@
 -- funkode-io/replay#171 carries the read-path change, and nothing reads the column yet.
 --
 -- `xid8` rather than `xid`: 64 bits wide and never wrapping, available since
--- PostgreSQL 13, which is the crate's documented floor (README "Requirements").
+-- PostgreSQL 13, which was the crate's documented floor when this landed (README
+-- "Requirements"; the floor is now 15).
 --
 -- The stamp is a column DEFAULT rather than an argument to `append_event`, so every
 -- insert path carries it: normal appends, compaction's synthetic snapshot rows (step 6
