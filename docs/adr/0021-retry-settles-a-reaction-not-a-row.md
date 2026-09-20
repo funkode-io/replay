@@ -83,7 +83,10 @@ What changes is what a retry is *for* — one reaction, not one row.
   gets its own row, naming its own dispatch, with the reaction reported still
   failing. Without it a retry could execute a command, watch it fail permanently,
   clear the table and report the reaction resolved. It is the only row a retry
-  inserts: a command already parked is updated in place.
+  inserts: a command already parked is updated in place. It is therefore also the
+  only settlement two concurrent retries of one reaction can duplicate — every
+  other one is primary-key-scoped — which is funkode-io/replay#220's key to
+  enforce, not a lock to take here.
 
 - **The summary counts reactions, and says so.**
   `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing }` — a
