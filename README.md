@@ -2417,8 +2417,10 @@ or `Serialize` bound.
 
 `retry_count` and `last_retried_at`
 ([0025](persistence/tests/migrations/0025_dead_letter_retry_bookkeeping.sql)) are
-written by every settlement a retry makes — archiving a row that resolved as
-much as re-parking one that did not — and never by a discard.
+written by every settlement a retry makes on a row that already existed —
+archiving a row that resolved as much as re-parking one that did not — and never
+by a discard. A row parked for the first time is untried whichever path parked
+it: the columns count retries made on a row, not executions of a command.
 
 `idx_dead_letters_policy_reaction`
 ([0026](persistence/tests/migrations/0026_dead_letter_reaction_index.sql)) is the

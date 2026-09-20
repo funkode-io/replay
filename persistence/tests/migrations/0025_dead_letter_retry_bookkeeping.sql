@@ -3,8 +3,10 @@
 -- A retry used to leave no trace but the error it overwrote, so "has anyone
 -- tried this since the outage?" was unanswerable from the table
 -- (funkode-io/replay#211). Both columns are stamped on every settlement a retry
--- makes — archiving a row that resolved as much as re-parking one that did not —
--- and never by `discard_dead_letter`, which re-runs nothing.
+-- makes on a row that already existed — archiving a row that resolved as much as
+-- re-parking one that did not — and never by `discard_dead_letter`, which re-runs
+-- nothing. A row a retry parks for the first time is untried, as a row the drain
+-- parks is: the columns count retries made on a row, not executions of a command.
 --
 -- Columns (both tables):
 --   retry_count     — settlements a retry has made on this row. 0 means untried.

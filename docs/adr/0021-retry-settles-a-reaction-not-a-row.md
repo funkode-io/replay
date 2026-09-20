@@ -96,10 +96,13 @@ What changes is what a retry is *for* — one reaction, not one row.
   commands): it feeds `Degraded`, which is `> 0` either way, and a gauge silently
   changing units is worse than two numbers with stated units.
 
-- **Every settlement is recorded on the row**: `retry_count` and
+- **Every settlement of an existing row is recorded on it**: `retry_count` and
   `last_retried_at`, stamped by the archive move as much as by the re-park, so
   "has anyone tried this since the outage?" survives the error message being
-  overwritten. `discard_dead_letter` re-runs nothing and stamps nothing.
+  overwritten. `discard_dead_letter` re-runs nothing and stamps nothing. A row a
+  retry *parks* is untried, as a row the drain parks is: both are a command's
+  first appearance in the table, and the column counts retries made on a row
+  rather than executions of a command.
 
 - **A failed retry leaves the row retryable.** What makes another retry worth
   making is a change outside the library — a dependency that came back — which

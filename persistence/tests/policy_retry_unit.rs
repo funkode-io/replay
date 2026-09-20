@@ -1082,6 +1082,24 @@ async fn a_retry_parks_a_failure_the_reaction_had_not_parked_postgres_test() {
         "and the row for the command the reaction no longer emits leaves"
     );
 
+    // The new row is a first parking, so it is untried — as a row the drain
+    // parks is, having also just executed its command. The columns count
+    // retries made on a row, not executions of a command.
+    assert!(
+        after[0].retry_count == 0 && after[0].last_retried_at.is_none(),
+        "a row a retry parks has no retry history of its own, got {after:#?}"
+    );
+    let retried = harness.dead_letters().await;
+    assert_eq!(
+        harness.retry_parked_row(retried[0].id).await,
+        DeadLetterRetry::StillFailing
+    );
+    let twice = harness.dead_letters().await;
+    assert!(
+        twice[0].retry_count == 1 && twice[0].last_retried_at.is_some(),
+        "and counts from the first retry that settles it, got {twice:#?}"
+    );
+
     harness.shutdown().await;
 }
 

@@ -368,9 +368,10 @@ pub enum DeadLetterRetry {
     /// `BusinessRuleViolation`, or the reaction no longer emits it: the row was
     /// archived into `discarded_dead_letters` (reason `retried`).
     Resolved,
-    /// The row's command failed permanently again: the existing row was updated
-    /// in place with **its own** fresh error, its retry count incremented. No
-    /// second row was inserted for it, and the row stays retryable.
+    /// The row's command failed permanently again: an existing row was updated
+    /// in place with **its own** fresh error and its retry count incremented; a
+    /// command the reaction had not parked before got a row of its own, untried.
+    /// Either way no row was duplicated, and the row stays retryable.
     StillFailing,
     /// No dead-letter row matched the supplied id: nothing to do.
     NotFound,
@@ -893,9 +894,12 @@ impl PolicyRunner {
     /// two concurrent retries of the same reaction can duplicate, since it is not
     /// primary-key-scoped like the rest (funkode-io/replay#220).
     ///
-    /// Every settlement stamps the row's `retry_count` and `last_retried_at`,
-    /// the archived copy included, so what has already been tried survives the
-    /// error message being overwritten.
+    /// Settling a row that already existed stamps its `retry_count` and
+    /// `last_retried_at`, the archived copy included, so what has already been
+    /// tried survives the error message being overwritten. A row this retry
+    /// *parks* carries neither: it is a first parking, born untried exactly as
+    /// the drain's rows are, and the column counts retries made on a row, not
+    /// executions of a command.
     ///
     /// Re-execution safety comes from the causation guard (the command carries
     /// the triggering event's id) plus the optimistic-concurrency check in
