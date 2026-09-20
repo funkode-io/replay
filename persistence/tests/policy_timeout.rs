@@ -248,9 +248,12 @@ async fn retrying_a_parked_timeout_re_parks_it_rather_than_hanging_the_retry_pos
                  it is replaying a reaction that hangs without a dispatch timeout"
             )
         });
-    assert_eq!(summary.resolved, 0, "a command that hangs cannot resolve");
     assert_eq!(
-        summary.still_failing, 1,
+        summary.reactions_resolved, 0,
+        "a command that hangs cannot resolve"
+    );
+    assert_eq!(
+        summary.reactions_still_failing, 1,
         "the row that timed out again must be reported as still failing"
     );
 

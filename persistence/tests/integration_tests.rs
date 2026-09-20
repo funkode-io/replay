@@ -5279,8 +5279,9 @@ where
     (container, pg_pool, cqrs)
 }
 
-/// Bulk retry with several resolvable rows: every row resolves oldest-first,
-/// the active set empties, and the policy leaves `Degraded`.
+/// Bulk retry with several resolvable reactions, one row each: every reaction
+/// resolves oldest-first, the active set empties, and the policy leaves
+/// `Degraded`.
 #[tokio::test]
 async fn retry_policy_dead_letters_resolves_all_oldest_first_postgres_test() {
     let target = OrderedPickyAccountUrn::new("bulk-all").unwrap();
@@ -5312,8 +5313,8 @@ async fn retry_policy_dead_letters_resolves_all_oldest_first_postgres_test() {
     assert_eq!(
         summary,
         replay_persistence::DeadLetterRetrySummary {
-            resolved: 3,
-            still_failing: 0,
+            reactions_resolved: 3,
+            reactions_still_failing: 0,
         }
     );
 
@@ -5379,8 +5380,8 @@ async fn retry_policy_dead_letters_mixed_leaves_unresolved_postgres_test() {
     assert_eq!(
         summary,
         replay_persistence::DeadLetterRetrySummary {
-            resolved: 2,
-            still_failing: 1,
+            reactions_resolved: 2,
+            reactions_still_failing: 1,
         }
     );
 
