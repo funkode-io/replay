@@ -106,9 +106,15 @@ pub struct PolicyStatus {
     pub missing_position: Option<i64>,
     /// When the cursor was last advanced (staleness signal).
     pub last_checkpoint_at: DateTime<Utc>,
-    /// Number of dead-letter rows recorded for this policy.
+    /// Number of parked commands recorded for this policy: one row per command
+    /// per reaction, not per delivery of the triggering event.
     pub dead_letter_count: i64,
-    /// Timestamp of the most recent dead-letter row, if any.
+    /// When this policy last parked a command, if it ever has.
+    ///
+    /// The last *parking*, not the oldest row's creation: a redelivery that
+    /// re-parks a command already parked refreshes its row rather than adding
+    /// one (funkode-io/replay#220), and a reaction failing on every delivery
+    /// must not read like one that failed once and stopped.
     pub last_dead_letter_at: Option<DateTime<Utc>>,
     /// Derived condition: [`PolicyCondition::Blocked`] when
     /// `missing_position` is set, otherwise [`PolicyCondition::Degraded`] when
@@ -177,8 +183,8 @@ impl PolicyStatusStore {
             ) nx ON TRUE
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*)        AS dead_letter_count,
-                    MAX(created_at) AS last_dead_letter_at
+                    COUNT(*)             AS dead_letter_count,
+                    MAX(last_parked_at)  AS last_dead_letter_at
                 FROM policy_dead_letters
                 WHERE policy_name = pc.name
             ) dl ON TRUE

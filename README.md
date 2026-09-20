@@ -22,14 +22,15 @@ claim. The features that hold it up:
 - **13** — every event is stamped with the transaction that wrote it, in the `xid8` type
   PostgreSQL 13 added
   ([0018](persistence/tests/migrations/0018_event_commit_txid.sql));
-- **15** — `NULLS NOT DISTINCT`, which the next schema change needs: a parked dead letter
-  must be unique per command per reaction, over an identity that is nullable for a
-  reaction with no dispatch to name, and before 15 a unique index treats those rows as
-  all different (funkode-io/replay#220).
+- **15** — `NULLS NOT DISTINCT`, which keeps a parked dead letter unique per command
+  per reaction over an identity that is nullable for a reaction with no dispatch to
+  name ([0029](persistence/tests/migrations/0029_dead_letter_unique_command.sql));
+  before 15 a unique index treats those rows as all different
+  (funkode-io/replay#220).
 
-The promise moves ahead of that change rather than with it, so a deployment learns which
-server it needs before the migration that needs it. 13 and 14 are both out of upstream
-support either way.
+The promise moved ahead of that change rather than with it, so a deployment learned
+which server it needed before the migration that needs it. 13 and 14 are both out of
+upstream support either way.
 
 The integration suite runs against 15 itself — the floor is what is promised, so the
 floor is what is verified — and the pinned image tag lives in
@@ -2454,6 +2455,9 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
     aggregate_name   TEXT,                   -- Rust type name of the target aggregate
     target_stream_id TEXT,                   -- URN of the instance the command was sent to
     command_name     TEXT,                   -- Rust type name of the command
+    dispatch_ordinal INTEGER,                -- the dispatch's place in the reaction
+    deliveries       INTEGER     NOT NULL DEFAULT 1,  -- deliveries that parked this command
+    last_parked_at   TIMESTAMPTZ NOT NULL DEFAULT now(), -- when the last of them did
     retry_count      INTEGER     NOT NULL DEFAULT 0,  -- settlements a retry has made on this row
     last_retried_at  TIMESTAMPTZ             -- when the last of them was made
 );
@@ -2463,6 +2467,11 @@ CREATE INDEX IF NOT EXISTS idx_dead_letters_policy
 
 CREATE INDEX CONCURRENTLY idx_dead_letters_policy_reaction
     ON policy_dead_letters (policy_name, global_position, event_id, id);
+
+CREATE UNIQUE INDEX CONCURRENTLY idx_dead_letters_parked_command
+    ON policy_dead_letters (policy_name, event_id, aggregate_name, target_stream_id,
+                            command_name, dispatch_ordinal)
+    NULLS NOT DISTINCT;
 ```
 
 The three identity columns are captured on the `Dispatch` itself, so a policy
@@ -2486,6 +2495,25 @@ access path a retry uses: `(policy_name, created_at DESC)` answers "what failed
 recently", not "which rows belong to this reaction". Built `CONCURRENTLY`, like
 every index this schema adds to a populated table, so parking keeps working while
 it builds.
+
+`idx_dead_letters_parked_command`
+([0029](persistence/tests/migrations/0029_dead_letter_unique_command.sql)) is what
+makes a parked command **one row**. The park is written before the batched cursor
+checkpoint, so a crash in between — or an operator rewinding the cursor — delivers
+the event again; the park is an `ON CONFLICT DO UPDATE` against this key, which
+refreshes the error, counts the delivery in `deliveries` and stamps
+`last_parked_at`, leaving `created_at` and the retry bookkeeping alone. A
+redelivery is not a retry. `dispatch_ordinal` is in the key because a reaction may
+emit the same command type to the same instance twice: those are two parked
+commands and keep two rows. `NULLS NOT DISTINCT` (the reason the floor is
+PostgreSQL 15) extends the key to rows with no dispatch to name, which collapse
+per `(policy_name, event_id)`. Duplicates parked before it existed are collapsed
+by [0028](persistence/tests/migrations/0028_dead_letter_dedupe.sql), which keeps
+the newest generation and archives the rest with reason `superseded`.
+
+`PolicyStatus::last_dead_letter_at` reads `MAX(last_parked_at)`, not
+`MAX(created_at)`: a reaction failing on every delivery must not read like one
+that failed once and stopped.
 
 **Triage queries:**
 
@@ -2513,6 +2541,12 @@ SELECT * FROM policy_dead_letters WHERE error_kind = 'Timeout';
 SELECT policy_name, target_stream_id, retry_count, last_retried_at, error_message
 FROM   policy_dead_letters
 ORDER  BY retry_count DESC;
+
+-- Commands failing on every delivery: parked once, but parked again and again
+SELECT policy_name, target_stream_id, command_name, deliveries, last_parked_at
+FROM   policy_dead_letters
+WHERE  deliveries > 1
+ORDER  BY deliveries DESC;
 ```
 
 #### Retrying and discarding dead letters
@@ -2579,11 +2613,14 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
     error_kind       TEXT        NOT NULL,
     error_message    TEXT        NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL,   -- when the dead letter was written
-    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded'
+    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded' | 'superseded'
     discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     aggregate_name   TEXT,                   -- identity the row carried, kept as-is
     target_stream_id TEXT,
     command_name     TEXT,
+    dispatch_ordinal INTEGER,
+    deliveries       INTEGER     NOT NULL DEFAULT 1,  -- deliveries that parked it
+    last_parked_at   TIMESTAMPTZ NOT NULL DEFAULT now(), -- when the last of them did
     retry_count      INTEGER     NOT NULL DEFAULT 0,  -- retries made, the settling one included
     last_retried_at  TIMESTAMPTZ
 );
@@ -2591,6 +2628,10 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
 CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy
     ON discarded_dead_letters (policy_name, discarded_at DESC);
 ```
+
+`superseded` is the third way out, and the only one no operator asked for: the
+duplicate generations the dedupe migration retired when a parked command became
+unique.
 
 #### `A::Error: Into<replay::Error>` migration note
 

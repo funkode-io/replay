@@ -1103,6 +1103,46 @@ async fn a_retry_parks_a_failure_the_reaction_had_not_parked_postgres_test() {
     harness.shutdown().await;
 }
 
+/// Two retries of one reaction that both fail on a command it had not parked
+/// leave **one** row for it.
+///
+/// Parking a command the reaction had not parked is the one settlement a retry
+/// makes that is not scoped to a row it read, so it was the one two concurrent
+/// operators could duplicate (funkode-io/replay#220). The key over a parked
+/// command is what rules it out: whichever retry gets there second refreshes the
+/// row the first inserted. The assertion holds under either interleaving — a
+/// second retry that runs after the first sees the row in the group and re-parks
+/// it in place — which is the point: there is no interleaving that ends in two
+/// rows.
+#[tokio::test]
+async fn two_retries_that_park_the_same_new_failure_leave_one_row_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("retry_concurrent", reaction.policy()).await;
+
+    harness.ping("subject-1", RETARGETED).await;
+    let parked = harness.await_dead_letters(1).await;
+
+    // The deploy, as in the test above: the reaction now fails on a command with
+    // no row of its own.
+    reaction.retargeted.store(true, Ordering::SeqCst);
+    let (first, second) = tokio::join!(harness.retry_parked(), harness.retry_parked());
+
+    assert!(
+        (first.reactions_still_failing + second.reactions_still_failing) > 0,
+        "the reaction still fails, so at least the retry that replayed it says so"
+    );
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        after.len(),
+        1,
+        "one parked command, whichever retry got there first: {after:#?}"
+    );
+    assert_eq!(after[0].target_stream_id, Some(urn_of(SECOND_SUBJECT)));
+    assert_ne!(after[0].id, parked[0].id);
+
+    harness.shutdown().await;
+}
+
 /// A row that names no command is settled **after** the rows that do, whatever
 /// the ids say.
 ///

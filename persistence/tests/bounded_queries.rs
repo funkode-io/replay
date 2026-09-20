@@ -42,14 +42,14 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "load_parked_reaction",
-        justification: "One reaction's rows: the commands it dispatches (the vector \
-                        `react_erased` already materialises) times the number of times \
-                        that event was delivered \u{2014} a dead letter is written before the \
-                        batched cursor checkpoint, so a crash in between re-parks the \
-                        reaction. A delivery is a crash or an operator's rewind, not a \
-                        row of data: bounded by the Policy's code and the process's \
-                        restarts, not by the table. The duplicate rows are their own \
-                        defect, funkode-io/replay#220.",
+        justification: "One reaction's rows: the commands it dispatches, the vector \
+                        `react_erased` already materialises. A parked command is one \
+                        row \u{2014} unique over the reaction and the dispatch within it, \
+                        enforced by `idx_dead_letters_parked_command` \
+                        (funkode-io/replay#220) \u{2014} so a redelivery of the event \
+                        refreshes rows rather than adding a generation of them. Bounded \
+                        by the Policy's code, not by the table or by the process's \
+                        restarts.",
     },
     Reviewed {
         file: "src/policy_runner.rs",

@@ -1011,7 +1011,7 @@ impl PolicyRunner {
                 policy_name,
                 dispatch_timeout: resolve_dispatch_timeout(policy.as_ref()),
             };
-            for dispatch in policy.react_erased(&raw) {
+            for (ordinal, dispatch) in policy.react_erased(&raw).into_iter().enumerate() {
                 if !self.executors.contains_key(&dispatch.target()) {
                     return Err(replay::Error::invalid_input(
                         "no services registered for the aggregate targeted by a policy dispatch",
@@ -1021,7 +1021,7 @@ impl PolicyRunner {
                     .with_context("aggregate", dispatch.aggregate_name()));
                 }
 
-                let identity = DispatchIdentity::of(&dispatch);
+                let identity = DispatchIdentity::of(ordinal, &dispatch);
                 concluded.dispatching(identity.clone());
                 let outcome = match delivery
                     .execute_dispatch_within(global_position, &raw, dispatch)
@@ -2318,14 +2318,27 @@ struct DispatchIdentity {
     aggregate_name: &'static str,
     target_stream_id: String,
     command_name: &'static str,
+    /// The dispatch's index in the vector the reaction returned.
+    ///
+    /// What keeps a reaction's own repeats apart in the table: two commands of
+    /// one type to one instance are two parked commands, and the key that makes
+    /// a redelivery refresh a row rather than insert one must not merge them
+    /// (funkode-io/replay#220). It is not what matches a row to a replayed
+    /// dispatch — [`ParkedIdentity::names`] is, and it stays blind to the
+    /// ordinal so a row parked before this column existed is matched the same
+    /// way as one parked after.
+    ordinal: i32,
 }
 
 impl DispatchIdentity {
-    fn of(dispatch: &Dispatch) -> Self {
+    fn of(ordinal: usize, dispatch: &Dispatch) -> Self {
         Self {
             aggregate_name: dispatch.aggregate_name(),
             target_stream_id: dispatch.target_stream_id().to_string(),
             command_name: dispatch.command_name(),
+            // A reaction returning more than 2^31 dispatches has exhausted
+            // memory long before it reaches the ordinal's range.
+            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
         }
     }
 }
@@ -3221,8 +3234,8 @@ impl Delivery<'_> {
             let mut executed = 0usize;
             let mut need_retry = false;
 
-            for dispatch in dispatches {
-                let identity = DispatchIdentity::of(&dispatch);
+            for (ordinal, dispatch) in dispatches.into_iter().enumerate() {
+                let identity = DispatchIdentity::of(ordinal, &dispatch);
                 pending.dispatching(identity.clone());
                 let outcome = self
                     .execute_dispatch_within(global_position, raw, dispatch)
@@ -3406,6 +3419,21 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// `identity` names the dispatch that failed. `None` only where there is no
 /// dispatch to name — a panic in `react` itself, which fails before it has built
 /// one — and the row's identity columns stay null.
+///
+/// **One row per parked command per reaction.** The park is written before the
+/// batched cursor checkpoint, so a crash in between — or an operator rewinding
+/// the cursor — delivers the event again and parks the same command again. The
+/// `ON CONFLICT` refreshes the row that command already has with the error this
+/// delivery produced and counts the delivery, rather than leaving a second
+/// generation of rows behind (funkode-io/replay#220). Two concurrent retries
+/// that both park a command the reaction had not parked settle the same way: one
+/// inserts, the other refreshes.
+///
+/// It does **not** touch `created_at` (when the command first failed) or the
+/// retry bookkeeping: a redelivery is not a [`retry_dead_letter`] — nobody
+/// invoked the control surface.
+///
+/// [`retry_dead_letter`]: PolicyRunner::retry_dead_letter
 async fn write_dead_letter(
     executor: impl sqlx::PgExecutor<'_>,
     policy_name: &str,
@@ -3418,8 +3446,15 @@ async fn write_dead_letter(
     sqlx::query_scalar(
         "INSERT INTO policy_dead_letters \
          (policy_name, global_position, event_id, error_kind, error_message, \
-          aggregate_name, target_stream_id, command_name) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+          aggregate_name, target_stream_id, command_name, dispatch_ordinal) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (policy_name, event_id, aggregate_name, target_stream_id, \
+                      command_name, dispatch_ordinal) \
+         DO UPDATE SET error_kind = EXCLUDED.error_kind, \
+                       error_message = EXCLUDED.error_message, \
+                       deliveries = policy_dead_letters.deliveries + 1, \
+                       last_parked_at = now() \
+         RETURNING id",
     )
     .bind(policy_name)
     .bind(global_position)
@@ -3429,6 +3464,7 @@ async fn write_dead_letter(
     .bind(identity.map(|i| i.aggregate_name))
     .bind(identity.map(|i| i.target_stream_id.as_str()))
     .bind(identity.map(|i| i.command_name))
+    .bind(identity.map(|i| i.ordinal))
     .fetch_one(executor)
     .await
     .map_err(crate::db_error)
@@ -3529,11 +3565,8 @@ async fn last_parked_position(
 /// The rows one reaction parked, oldest first.
 ///
 /// Bounded by the commands one reaction dispatches — the vector `react_erased`
-/// already materialises — times the number of times that event was delivered:
-/// the dead letter is written before the batched cursor checkpoint, so a crash
-/// in between (or an operator rewinding the cursor) parks the reaction's rows
-/// again. A delivery is a crash or a rewind, not a row of data, so this cannot
-/// grow with the table; the duplicate rows are their own defect
+/// already materialises. No longer multiplied by the number of times the event
+/// was delivered: a parked command is one row, and a redelivery refreshes it
 /// (funkode-io/replay#220).
 ///
 /// `global_position` is redundant with `event_id` — one event has one position —
@@ -3601,17 +3634,20 @@ async fn move_dead_letter_to_archive(
              WHERE id = $1 \
              RETURNING id, policy_name, global_position, event_id, error_kind, \
                        error_message, created_at, aggregate_name, target_stream_id, \
-                       command_name, retry_count, last_retried_at \
+                       command_name, retry_count, last_retried_at, dispatch_ordinal, \
+                       deliveries, last_parked_at \
          ) \
          INSERT INTO discarded_dead_letters \
              (dead_letter_id, policy_name, global_position, event_id, error_kind, \
               error_message, created_at, reason, aggregate_name, target_stream_id, \
-              command_name, retry_count, last_retried_at) \
+              command_name, retry_count, last_retried_at, dispatch_ordinal, \
+              deliveries, last_parked_at) \
          SELECT id, policy_name, global_position, event_id, error_kind, \
                 error_message, created_at, $2, aggregate_name, target_stream_id, \
                 command_name, \
                 retry_count + (CASE WHEN $2 = 'retried' THEN 1 ELSE 0 END), \
-                CASE WHEN $2 = 'retried' THEN now() ELSE last_retried_at END \
+                CASE WHEN $2 = 'retried' THEN now() ELSE last_retried_at END, \
+                dispatch_ordinal, deliveries, last_parked_at \
          FROM moved",
     )
     .bind(id)
@@ -5139,9 +5175,10 @@ mod cursor_tests {
 
     /// The server the suite is verified against, pinned as
     /// `tests/common/postgres_image.rs` pins it — this module cannot reach that file,
-    /// and `xid8` does not exist before PostgreSQL 13, so an unpinned default would
-    /// fail here rather than run somewhere else.
-    const POSTGRES_TAG: &str = "13-alpine";
+    /// and the migration set needs `NULLS NOT DISTINCT`, which does not exist before
+    /// PostgreSQL 15, so an unpinned default would fail here rather than run somewhere
+    /// else. The two pins move together with the crate's floor (README "Requirements").
+    const POSTGRES_TAG: &str = "15-alpine";
 
     async fn start_postgres() -> (PgPool, ContainerAsync<postgres::Postgres>) {
         let container = postgres::Postgres::default()
