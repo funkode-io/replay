@@ -62,10 +62,12 @@ timeout is how a hang becomes one.
   the positions its append consumed are burned (ADR-0015). The rollback is not
   immediate. Cancelling the future stops this process waiting; it sends Postgres
   nothing, so a dispatch abandoned inside `append_event`'s
-  `SELECT ... FOR UPDATE` holds its pool connection until the lock it was waiting
-  for clears — and each retry takes another. A reaction that hangs in its own code
-  (the common case) holds no connection at all: the command handler runs before
-  the append opens a transaction. See funkode-io/replay#205.
+  `SELECT ... FOR UPDATE` holds its pool connection until that statement finishes
+  — bounded by the stream-lock wait, 30s by default
+  ([ADR-0022](0022-a-stream-lock-wait-is-bounded-on-the-server.md)), or by the
+  blocker itself for a consumer who has opted out of it. A reaction that hangs in
+  its own code (the common case) holds no connection at all: the command handler
+  runs before the append opens a transaction.
 - **A dispatch abandoned while committing may still have committed**, so a retry
   can re-execute work that landed. Unchanged at-least-once behaviour (ADR-0003),
   made safe by the causation guard.

@@ -30,10 +30,6 @@ use sqlx::{Pool, Postgres};
 /// Postgres `undefined_column`: the consumer's schema has no `last_polled_at`.
 const UNDEFINED_COLUMN: &str = "42703";
 
-/// Postgres `lock_not_available`: the beat's `lock_timeout` expired on a row
-/// somebody else holds.
-const LOCK_NOT_AVAILABLE: &str = "55P03";
-
 // ── Liveness ─────────────────────────────────────────────────────────────────
 
 /// What one Policy's worker is doing in this process.
@@ -334,12 +330,8 @@ impl HeartbeatWriter {
         let mut tx = pool.begin().await?;
         // Derived from the cadence, not a constant: a wait longer than the gap
         // between beats would delay the next one, which is the coupling to
-        // workload the fixed cadence exists to remove. `set_config(..., true)`
-        // is `SET LOCAL` with a bind parameter, which `SET` itself does not take.
-        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-            .bind(format!("{}ms", self.lock_wait.as_millis().max(1)))
-            .execute(&mut *tx)
-            .await?;
+        // workload the fixed cadence exists to remove.
+        crate::lock_wait::bound(&mut tx, self.lock_wait).await?;
         sqlx::query(BEAT_SQL)
             .bind(policies)
             .bind(states)
@@ -369,7 +361,7 @@ impl HeartbeatWriter {
             self.columns.absent.store(true, Ordering::Relaxed);
             true
         } else {
-            is_lock_not_available(error)
+            crate::lock_wait::is_lock_not_available(error)
         };
 
         let reported = if expected {
@@ -410,20 +402,7 @@ impl HeartbeatWriter {
 /// Whether Postgres refused the write because a column is not there, as opposed
 /// to any other reason a write can fail.
 fn is_undefined_column(error: &sqlx::Error) -> bool {
-    has_code(error, UNDEFINED_COLUMN)
-}
-
-/// Whether the beat gave up waiting for a row somebody else holds — the tick it
-/// is designed to skip, not a fault.
-fn is_lock_not_available(error: &sqlx::Error) -> bool {
-    has_code(error, LOCK_NOT_AVAILABLE)
-}
-
-fn has_code(error: &sqlx::Error, code: &str) -> bool {
-    match error {
-        sqlx::Error::Database(db) => db.code().as_deref() == Some(code),
-        _ => false,
-    }
+    crate::lock_wait::has_code(error, UNDEFINED_COLUMN)
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -433,6 +412,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::lock_wait::test_support::refused;
 
     /// A registered worker is reported before it has run, and every state it
     /// publishes replaces the previous one.
@@ -593,49 +573,8 @@ mod tests {
     /// The `55P03` a row somebody else holds raises when `lock_timeout` expires.
     fn lock_not_available() -> sqlx::Error {
         refused(
-            LOCK_NOT_AVAILABLE,
+            crate::lock_wait::LOCK_NOT_AVAILABLE,
             "canceling statement due to lock timeout",
         )
-    }
-
-    fn refused(code: &'static str, message: &'static str) -> sqlx::Error {
-        // sqlx has no public constructor for a DatabaseError, so the check is
-        // exercised through the one shape that matters to it: the SQLSTATE.
-        struct Refused {
-            code: &'static str,
-            message: &'static str,
-        }
-        impl std::fmt::Debug for Refused {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.message)
-            }
-        }
-        impl std::fmt::Display for Refused {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.message)
-            }
-        }
-        impl std::error::Error for Refused {}
-        impl sqlx::error::DatabaseError for Refused {
-            fn message(&self) -> &str {
-                self.message
-            }
-            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-                Some(std::borrow::Cow::Borrowed(self.code))
-            }
-            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-                self
-            }
-            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-                self
-            }
-            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-                self
-            }
-            fn kind(&self) -> sqlx::error::ErrorKind {
-                sqlx::error::ErrorKind::Other
-            }
-        }
-        sqlx::Error::Database(Box::new(Refused { code, message }))
     }
 }

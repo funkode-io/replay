@@ -2249,12 +2249,58 @@ bounds the future the runner awaits, and cannot interrupt work the reaction move
 onto another task or a command that never yields — see `CONTEXT.md`'s
 non-guarantees.
 
-It also does not cancel a statement already running in Postgres. A dispatch
-abandoned inside an append that is blocked on another transaction's stream lock
-holds its pool connection until that lock clears, and each retry takes another;
-set `lock_timeout` on the pool if your deployment expects that contention. A
-reaction that hangs in its own code holds no connection — the command handler runs
-before the append opens a transaction.
+It also does not cancel work already running in Postgres. A dispatch abandoned
+inside an append that is blocked on another transaction's stream lock holds its
+pool connection until the server ends that statement — which is what the
+[stream-lock wait](#stream-lock-wait) below is for. A reaction that hangs in its
+own code holds no connection: the command handler runs before the append opens a
+transaction.
+
+### Stream lock wait
+
+An append takes the stream's row with `SELECT ... FOR UPDATE` and holds it for the
+rest of its transaction; `compact` takes the same row and holds it across the
+whole fold. Whoever is waiting is bounded on the server, so an append nobody is
+still waiting for ends and hands its connection back:
+
+| Setting | Store override | Env var | Default |
+|---------|----------------|---------|---------|
+| Time a transaction waits for a stream row | `builder(pool).stream_lock_wait(d)` | `REPLAY_STREAM_LOCK_WAIT_MS` | `30s` |
+
+```rust,ignore
+let store = PostgresEventStore::builder(pool)
+    .stream_lock_wait(Duration::from_secs(30))  // Duration::ZERO waits forever
+    .build()
+    .await?;
+```
+
+Exceeding it is a **retryable** `Unavailable` error naming the stream and the
+limit, so the policy runner retries it under the same back-off as any transient
+failure and parks a dead letter once the retries are spent. It is set with
+`SET LOCAL`, so a connection carries no `lock_timeout` back to the pool
+([ADR-0022](docs/adr/0022-a-stream-lock-wait-is-bounded-on-the-server.md)).
+
+It bounds the whole append transaction, inline projections included. A projection
+handler that maps its errors with `db_error` reports a contended write as the same
+retryable `Unavailable`; one that maps sqlx errors its own way decides that for
+itself.
+
+**`Duration::ZERO` — or `REPLAY_STREAM_LOCK_WAIT_MS=0` — disables the bound** and
+waits forever, which is the behaviour before this existed. It is written out as
+`lock_timeout = '0'` rather than left unset, so it overrides a `lock_timeout` your
+own pool or role may carry: asking for no limit gets no limit. That is the opposite
+of `REPLAY_DISPATCH_TIMEOUT_MS=0`, which reads as *unset*: this value is passed to
+Postgres, where zero already means "no limit". Negative and unparseable values
+fall back to the default rather than silently removing the bound, and a wait
+longer than `lock_timeout` can express (about 24.8 days) is clamped to that
+ceiling rather than failing every append.
+
+Diagnosis: **a spike of these means a long holder, not a broken append.** Look for
+what is holding the stream the error names — `pg_locks` joined to
+`pg_stat_activity` — before looking at the service that failed. The floor on any
+value you choose is the longest honest hold, and in this library that is `compact`:
+it is O(stream length), so a stream long enough to take more than the wait will
+fail the appends queued behind it.
 
 ### Failure handling
 
