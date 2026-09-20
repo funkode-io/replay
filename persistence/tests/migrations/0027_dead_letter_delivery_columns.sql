@@ -26,6 +26,12 @@
 --
 -- Existing rows are one delivery each and were parked when they were created,
 -- which is what the backfill says.
+--
+-- The backfill and the `SET NOT NULL` it feeds scan both tables under ACCESS
+-- EXCLUSIVE, unlike the concurrent index builds around them (0026, 0029): the
+-- scan is over the parked backlog an outage leaves, not over `events`, and the
+-- alternative — a nullable column — would put "parked, time unknown" in the
+-- column a Policy's status reads its recency from.
 ALTER TABLE policy_dead_letters
     ADD COLUMN IF NOT EXISTS dispatch_ordinal INTEGER,
     ADD COLUMN IF NOT EXISTS deliveries       INTEGER NOT NULL DEFAULT 1,

@@ -891,9 +891,10 @@ impl PolicyRunner {
     /// retry can make the reaction fail on a command it never parked; the retry
     /// parks it exactly as the drain would, and reports the reaction still
     /// failing. This is the only insert a retry makes: a row for a command
-    /// already parked is updated, never duplicated — and it is the one settlement
-    /// two concurrent retries of the same reaction can duplicate, since it is not
-    /// primary-key-scoped like the rest (funkode-io/replay#220).
+    /// already parked is updated, never duplicated — and two concurrent retries
+    /// of the same reaction settle it the same way, since the table now keys a
+    /// parked command and the second insert refreshes the first
+    /// (ADR-0023).
     ///
     /// Settling a row that already existed stamps its `retry_count` and
     /// `last_retried_at`, the archived copy included, so what has already been

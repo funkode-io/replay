@@ -2498,7 +2498,8 @@ it builds.
 
 `idx_dead_letters_parked_command`
 ([0029](persistence/tests/migrations/0029_dead_letter_unique_command.sql)) is what
-makes a parked command **one row**. The park is written before the batched cursor
+makes a parked command **one row**
+([ADR-0023](docs/adr/0023-a-parked-command-is-one-row.md)). The park is written before the batched cursor
 checkpoint, so a crash in between — or an operator rewinding the cursor — delivers
 the event again; the park is an `ON CONFLICT DO UPDATE` against this key, which
 refreshes the error, counts the delivery in `deliveries` and stamps
