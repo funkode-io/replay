@@ -14,14 +14,26 @@ You can chose you implement just `Stream` (state will be built from events) or `
 
 ## Requirements
 
-`es-replay-persistence` requires **PostgreSQL 13 or later**.
+`es-replay-persistence` requires **PostgreSQL 15 or later**.
 
 That floor is a feature floor, not just the oldest release the suite is willing to
-claim: every event is stamped with the transaction that wrote it, in the `xid8` type
-PostgreSQL 13 added
-([0018](persistence/tests/migrations/0018_event_commit_txid.sql)). The integration suite
-runs against 13 itself — the floor is what is promised, so the floor is what is verified
-— and the pinned image tag lives in `persistence/tests/common/postgres_image.rs`.
+claim. The features that hold it up:
+
+- **13** — every event is stamped with the transaction that wrote it, in the `xid8` type
+  PostgreSQL 13 added
+  ([0018](persistence/tests/migrations/0018_event_commit_txid.sql));
+- **15** — `NULLS NOT DISTINCT`, which the next schema change needs: a parked dead letter
+  must be unique per command per reaction, over an identity that is nullable for a
+  reaction with no dispatch to name, and before 15 a unique index treats those rows as
+  all different (funkode-io/replay#220).
+
+The promise moves ahead of that change rather than with it, so a deployment learns which
+server it needs before the migration that needs it. 13 and 14 are both out of upstream
+support either way.
+
+The integration suite runs against 15 itself — the floor is what is promised, so the
+floor is what is verified — and the pinned image tag lives in
+`persistence/tests/common/postgres_image.rs`.
 
 The core `es-replay` crate has no database requirement at all, and is the half that runs
 on WASM.
