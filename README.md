@@ -1972,6 +1972,29 @@ let archived = cqrs
     .await?;
 ```
 
+### What compaction does to an event's numbers
+
+Compaction restarts a stream's `version` at 1, so hydrating a compacted aggregate always
+replays `1..N`. That makes `version` a *replay* number: after a compaction it names a
+place in the current live stream, not a place in the stream's history, and the same
+`(stream_id, version)` pair recurs over a long-lived stream.
+
+Each event therefore also carries `stream_seq`, its place in its own stream, which
+compaction continues rather than restarts — the snapshot rows take the numbers after the
+ones they archived. It is assigned by the database on every insert path, it is unique per
+stream, and a stream's numbers have no holes. Nothing reads it yet
+([ADR-0023](docs/adr/0023-a-stream-is-numbered-twice.md),
+[funkode-io/replay#195](https://github.com/funkode-io/replay/issues/195)).
+
+Migration [0027](persistence/tests/migrations/0027_event_stream_seq.sql) backfills the
+column, and it is not an online migration. It runs as one transaction whose first
+statement takes ACCESS EXCLUSIVE on `events` and holds it until the last one commits, so
+for its whole duration — the row-by-row backfill, the `NOT NULL` scan and the unique
+index build — every reader and every writer of `events` waits, not just appends. Budget
+WAL and dead-tuple space of about one table copy, and run it in a maintenance window: on
+a large log a Policy poll blocks along with everything else, so a fleet will look stalled
+rather than slow.
+
 ### Skipping unchanged streams (`needs_compaction`)
 
 A maintenance job that compacts many streams on a schedule should not re-archive a

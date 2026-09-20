@@ -45,3 +45,8 @@ never freeze write-model maintenance or grow the live stream unbounded.
 - The lagging-policy-across-compaction scenarios (walk pre-compaction originals once,
   never double-fire synthetics, continue past the checkpoint) are covered by
   Docker-gated Postgres integration tests that document the intent.
+- The marker is also where a stream's `version` axis restarts and its `stream_seq` axis
+  does not
+  ([ADR-0023](0023-a-stream-is-numbered-twice.md)): the synthetic rows continue the
+  sequence they were archived out of, so a reader counting a stream's events sees no jump
+  across a compaction.

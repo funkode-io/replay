@@ -55,6 +55,20 @@ nothing. A position may be missing (a [Burned position]) but never repeated — 
 unique index enforces that (migration 0015).
 _Avoid_: offset, sequence number, event time.
 
+### Stream place
+
+The place an event holds in its own stream: `stream_seq`, assigned by a trigger from a
+counter on the `streams` row and never reset
+([0027](persistence/tests/migrations/0027_event_stream_seq.sql)). A stream's places are
+contiguous — the trigger increments that counter and reads back what it wrote in one
+statement, so racing inserts serialise on it — and a unique index holds each place to one
+event for the life of the stream. That is what a stream `version` cannot promise:
+compaction restarts it at 1 so hydration reads `1..N`, which makes `(stream_id, version)`
+name two different events over time
+([ADR-0023](docs/adr/0023-a-stream-is-numbered-twice.md)). Nothing reads it yet
+(funkode-io/replay#195).
+_Avoid_: stream sequence, stream version, offset, per-stream position.
+
 ### Policy feed
 
 The slice of the event log one [Policy] reads on a poll: every [Global position]
