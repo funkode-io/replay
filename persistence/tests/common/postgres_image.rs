@@ -9,9 +9,9 @@
 //! exactly how five tests came to run on `postgres:11-alpine` unnoticed until
 //! funkode-io/replay#193 needed a type it does not have.
 //!
-//! PostgreSQL 13 is out of upstream support since November 2025. Pinning it states what
-//! the crate still runs on, not what a deployment should be running; raising the pin is
-//! raising the floor, and belongs in the README in the same change.
+//! PostgreSQL 13 and 14 are both out of upstream support. The pin states what the crate
+//! promises, not what a deployment should be running; raising the pin is raising the
+//! floor, and belongs in the README in the same change.
 //!
 //! `allow(dead_code)` module-wide: every test binary that says `mod common;` compiles
 //! this module, including the ones that never start a container.
@@ -21,7 +21,7 @@ use testcontainers_modules::postgres;
 use testcontainers_modules::testcontainers::{ContainerRequest, ImageExt};
 
 /// Image tag pinning the PostgreSQL release the suite runs against.
-pub const POSTGRES_TAG: &str = "13-alpine";
+pub const POSTGRES_TAG: &str = "15-alpine";
 
 /// The port the server listens on inside the container.
 pub const POSTGRES_PORT: u16 = 5432;

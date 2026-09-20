@@ -15,7 +15,7 @@
 -- carry it (PITR, promoting a replica); `pg_dump`/`pg_restore` and logical replication do
 -- not. Neither does `pg_upgrade`, which *does* carry the transaction counter, so the two
 -- cases have different repairs and the runner names both. It is readable by any role
--- (verified on PostgreSQL 13, this crate's floor).
+-- (verified on PostgreSQL 13, below this crate's floor of 15).
 --
 -- One row: the primary key is a constant.
 CREATE TABLE IF NOT EXISTS event_log_origin (

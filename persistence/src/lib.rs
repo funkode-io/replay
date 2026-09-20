@@ -5,6 +5,7 @@ mod error;
 mod filters;
 mod infrastructure;
 mod inline_projection;
+mod lock_wait;
 mod log_origin;
 mod persisted_event;
 mod policy;

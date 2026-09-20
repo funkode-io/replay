@@ -188,8 +188,20 @@ directions: a Policy held inside one reaction has a healthy feed in front of it,
 and a blocked one is not running a reaction at all.
 _Avoid_: deadline, SLA, watchdog, timeout (unqualified).
 
-### Burned position
+### Stream lock wait
 
+How long a transaction of this library waits for a stream's row before the server
+abandons it — one value for both transactions that take that row, the append and
+`compact`, defaulting to 30s and disabled by zero
+([ADR-0022](docs/adr/0022-a-stream-lock-wait-is-bounded-on-the-server.md)). It
+bounds *this* library's waiting, not the holder: a wait that runs out is
+`Unavailable` and retryable, and a spike of them names a long holder rather than a
+broken append. Distinct from the [Dispatch timeout], which is a client-side bound
+that Postgres never hears about; this one is the server's, which is what lets an
+abandoned append hand its connection back.
+_Avoid_: lock timeout (unqualified), statement timeout, deadlock detection.
+
+### Burned position
 A `global_position` taken from the sequence by a transaction that then aborted.
 `nextval` is not transactional, so the value is never returned to the sequence and
 no event can ever carry it. Since the [Policy feed] reads in [Commit stamp] order it
@@ -395,9 +407,11 @@ it:
   ends this process's wait and sends the server nothing, so a dispatch abandoned
   inside a statement holds its pool connection until that statement finishes. The
   case that reaches this is an append blocked on another transaction's stream
-  lock; a reaction hanging in its own code holds no connection, because the
-  command handler runs before the append opens its transaction. Deployments that
-  expect lock contention should set `lock_timeout` on the pool.
+  lock, and the server — not the timeout — is what ends it, after the
+  [Stream lock wait] ([ADR-0022](docs/adr/0022-a-stream-lock-wait-is-bounded-on-the-server.md)).
+  A consumer who sets that wait to zero is back to holding the connection until
+  the blocker clears. A reaction hanging in its own code holds no connection,
+  because the command handler runs before the append opens its transaction.
 - **An OOM kill is not containable in-process.** The kernel ends the process; no
   supervision layer can catch it. The only defences are bounding what a reaction
   loads and bounding how long it may run.
@@ -407,6 +421,7 @@ it:
 [Policy feed]: #policy-feed
 [Dead letter]: #dead-letter
 [Dispatch timeout]: #dispatch-timeout
+[Stream lock wait]: #stream-lock-wait
 [Retry]: #retry
 [Discard]: #discard
 [Cursor move]: #cursor-move
