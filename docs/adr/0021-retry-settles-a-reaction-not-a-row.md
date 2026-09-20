@@ -176,5 +176,12 @@ What changes is what a retry is *for* — one reaction, not one row.
   `(policy_name, global_position, event_id, id)`, serves both the page's keyset
   and the group's lookup.
 
+- **Settling a reaction is one transaction.** Archiving what resolved, re-parking
+  what failed and parking what had no row happen together or not at all: a
+  database error part-way through would otherwise leave a resolved row archived
+  and a still-failing command with nothing in the table, and the drain is long
+  past the event that would park it again. The replay itself is outside that
+  transaction — it executes commands, which is not something to hold open.
+
 [Dead letter]: ../../CONTEXT.md#dead-letter
 [Retry]: ../../CONTEXT.md#retry

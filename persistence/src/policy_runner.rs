@@ -1062,6 +1062,12 @@ impl PolicyRunner {
 
     /// Settle each row of a reaction's group with what the replay concluded for
     /// **its** command, and park what failed with no row to settle.
+    ///
+    /// One transaction, so a database error part-way through leaves the group as
+    /// the replay found it. Without that, a row archived early and an insert that
+    /// then failed would take a still-failing command out of the table with
+    /// nothing put back: the drain is long past the event and would never park it
+    /// again.
     async fn settle(
         &self,
         reaction: &ParkedReaction,
@@ -1070,6 +1076,7 @@ impl PolicyRunner {
     ) -> Result<Vec<(i64, DeadLetterRetry)>, replay::Error> {
         let mut replay = replay;
         let mut settled = Vec::with_capacity(rows.len());
+        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
         // How many rows name each row's identity, read before any of them is
         // settled: what tells a group of indistinguishable dispatches from a
         // dispatch that parked no row at all.
@@ -1104,7 +1111,7 @@ impl PolicyRunner {
 
             let settlement = match outcome {
                 None => {
-                    if move_dead_letter_to_archive(&self.pool, row.id, "retried").await? {
+                    if move_dead_letter_to_archive(&mut *tx, row.id, "retried").await? {
                         DeadLetterRetry::Resolved
                     } else {
                         // A concurrent discard removed the row between the group
@@ -1117,7 +1124,7 @@ impl PolicyRunner {
                     error_kind,
                     error_message,
                 }) => {
-                    if re_park_dead_letter(&self.pool, row.id, &error_kind, &error_message).await? {
+                    if re_park_dead_letter(&mut *tx, row.id, &error_kind, &error_message).await? {
                         DeadLetterRetry::StillFailing
                     } else {
                         // Same concurrent discard as the archive branch, from
@@ -1138,7 +1145,7 @@ impl PolicyRunner {
         // nothing behind while the retry reported the reaction resolved.
         for unclaimed in replay.unclaimed_failures() {
             let id = write_dead_letter(
-                &self.pool,
+                &mut *tx,
                 &reaction.policy_name,
                 reaction.global_position,
                 reaction.event_id,
@@ -1159,6 +1166,8 @@ impl PolicyRunner {
             );
             settled.push((id, DeadLetterRetry::StillFailing));
         }
+
+        tx.commit().await.map_err(crate::db_error)?;
 
         // Back into the order the rows were parked in, which settling the
         // identity-less ones last has just disturbed.
@@ -3276,7 +3285,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// dispatch to name — a panic in `react` itself, which fails before it has built
 /// one — and the row's identity columns stay null.
 async fn write_dead_letter(
-    pool: &Pool<Postgres>,
+    executor: impl sqlx::PgExecutor<'_>,
     policy_name: &str,
     global_position: i64,
     event_id: uuid::Uuid,
@@ -3298,7 +3307,7 @@ async fn write_dead_letter(
     .bind(identity.map(|i| i.aggregate_name))
     .bind(identity.map(|i| i.target_stream_id.as_str()))
     .bind(identity.map(|i| i.command_name))
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .map_err(crate::db_error)
 }
@@ -3314,7 +3323,7 @@ async fn write_dead_letter(
 /// Returns whether a row was still there to re-park: a concurrent discard
 /// leaves nothing to update, which is not a reaction still failing.
 async fn re_park_dead_letter(
-    pool: &Pool<Postgres>,
+    executor: impl sqlx::PgExecutor<'_>,
     id: i64,
     error_kind: &str,
     error_message: &str,
@@ -3328,7 +3337,7 @@ async fn re_park_dead_letter(
     .bind(id)
     .bind(error_kind)
     .bind(error_message)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(crate::db_error)?;
     Ok(result.rows_affected() > 0)
@@ -3460,7 +3469,7 @@ async fn load_parked_reaction(
 /// retry bookkeeping the same way [`re_park_dead_letter`] does; a discard
 /// re-runs nothing and stamps nothing.
 async fn move_dead_letter_to_archive(
-    pool: &Pool<Postgres>,
+    executor: impl sqlx::PgExecutor<'_>,
     id: i64,
     reason: &str,
 ) -> Result<bool, replay::Error> {
@@ -3485,7 +3494,7 @@ async fn move_dead_letter_to_archive(
     )
     .bind(id)
     .bind(reason)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(crate::db_error)?;
 
