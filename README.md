@@ -1995,10 +1995,13 @@ waits, not just appends. Budget WAL and dead-tuple space of about one table copy
 it in a maintenance window: on a large log a Policy poll blocks along with everything
 else, so a fleet will look stalled rather than slow.
 
-A place, once given, is permanent: the migration also installs triggers that reject an
-`UPDATE` moving an event to another place or another stream, and one rewinding a stream's
-counter by hand. Either would strand the counter and stop that stream accepting events on
-its next append.
+A place, once given, is permanent. Nothing in the database enforces that: the event log
+is written by this library and by nothing else — `append_event`, compaction, the
+migrations — and its invariants are maintained by that one writer, as
+`global_position`'s uniqueness and a stream's `version` contiguity always have been.
+Editing `events` with hand-written SQL breaks them. The row that *is* meant to be edited
+by hand is `policy_cursors`
+([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
 
 ### Skipping unchanged streams (`needs_compaction`)
 

@@ -39,12 +39,13 @@ not the caller took its lock first — an insert that bypasses `append_event` en
 numbered as correctly as one that does not. Holes *between* streams are not this axis's
 problem: there is no order between streams to break.
 
-A place is also permanent, which takes a second pair of triggers. An `UPDATE` that moved
-an event to a free place, or to another stream, would leave a hole behind it and strand
-the counter, so the next append would collide on the unique index and that stream would
-stop accepting events — a corruption that looks like a successful statement. Both are
-rejected, as is a write to `streams.stream_seq` from anywhere but the assigning trigger
-itself.
+A place is also permanent, and nothing enforces that beyond the code that writes it. The
+log is written by this library — `append_event`, compaction, the migrations — and by
+nothing else, so the numbering is maintained the way `global_position`'s uniqueness and a
+stream's `version` contiguity are maintained: by the one writer there is.
+[ADR-0012](0012-policy-cursor-is-an-operator-writable-control-surface.md) makes
+`policy_cursors` an operator-writable control surface precisely because the log is not
+one.
 
 Rejected alternatives:
 
@@ -56,6 +57,11 @@ Rejected alternatives:
   lock, and [#195](https://github.com/funkode-io/replay/issues/195)'s "which streams are
   behind this Policy" query would have to aggregate over `events` rather than read one
   row per stream.
+- **Defend the numbering with triggers that reject an `UPDATE` or a `DELETE`.** They
+  would have to let the assigning trigger's own write through, they cannot tell dropping
+  a stream from dropping one event out of the middle, and they would make every future
+  migration that renumbers disable them first. The log has never been defended this way,
+  and one column is not the place to start.
 - **Assign it in `append_event`.** That covers the appends and misses the other insert
   paths — compaction's synthetic rows, and anything a deployment writes itself.
 
@@ -71,17 +77,12 @@ Rejected alternatives:
   enough to migrate in a window is worth an axis a Policy can trust, and that an online
   variant — batched backfill, `CONCURRENTLY` index, `NOT VALID` constraint — can be built
   later without changing what the column means.
-- Deleting events by hand now breaks a guarantee rather than just losing data: a stream's
-  places would no longer be contiguous, and a Policy reading them would wait for one that
-  is never coming. `DELETE` is deliberately **not** rejected the way an `UPDATE` is —
-  dropping a stream entirely is legitimate, and a row trigger cannot tell that from
-  dropping one event out of the middle. [#195](https://github.com/funkode-io/replay/issues/195)
-  therefore cannot treat a missing place as "not written yet" indefinitely; it needs a way
-  to tell a gap that will fill from one that never will. ADR-0004 already rules out
-  pruning archived events for a different reason; this is a second.
-- A migration that needs to renumber has to disable the triggers to do it
-  (`ALTER TABLE events DISABLE TRIGGER events_place_is_permanent`), which is the intended
-  friction: nothing renumbers a stream by accident.
+- Editing `events` by hand now breaks one more invariant than it used to: a stream's
+  places would stop being contiguous, and a Policy reading them would wait for one that is
+  never coming, or collide on a place the counter has already passed. This is the same
+  contract the log has always had — ADR-0004 already rules out pruning archived events for
+  a different reason — stated once more because
+  [#195](https://github.com/funkode-io/replay/issues/195) will depend on it.
 - Nothing reads the column yet. It is the expand half of
   [#171](https://github.com/funkode-io/replay/issues/171); the read is #195.
 

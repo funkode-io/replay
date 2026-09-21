@@ -302,9 +302,10 @@ async fn events_written_before_the_migration_are_numbered_in_order_postgres_test
     );
 }
 
-/// The sequence is a place in a stream, and a place holds one event. Nothing may put a
-/// second event in it — the guarantee funkode-io/replay#195's completeness check rests
-/// on, and the reason it is an index rather than a convention.
+/// A place holds one event. The unique index is what makes that true of the stored data
+/// rather than only of the code that writes it — funkode-io/replay#195's completeness
+/// check reads it as a fact, and a write path that ever got it wrong would fail loudly
+/// here instead of silently renumbering a stream.
 #[tokio::test]
 async fn two_events_of_a_stream_cannot_share_a_place_postgres_test() {
     let (pool, _container) = start_postgres().await;
@@ -327,56 +328,6 @@ async fn two_events_of_a_stream_cannot_share_a_place_postgres_test() {
         sequences.values().cloned().collect::<Vec<_>>(),
         vec![vec![1, 2]],
         "and the stream still counts its events once each: {sequences:?}"
-    );
-}
-
-/// A place is permanent. Moving an event to a *free* place would be accepted by the
-/// unique index and would strand the counter behind it, so the stream's next append
-/// collides and that stream stops accepting events for good — a corruption that looks
-/// like a successful statement.
-#[tokio::test]
-async fn an_event_keeps_the_place_it_was_given_postgres_test() {
-    let (pool, _container) = start_postgres().await;
-    MIGRATOR.run(&pool).await.expect("migrations must succeed");
-
-    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
-    let ledger = LedgerUrn::new("settled").unwrap();
-    let elsewhere = LedgerUrn::new("elsewhere").unwrap();
-    append(&cqrs, &ledger, LedgerCommand::AddTwice { amount: 10.0 }).await;
-    append(&cqrs, &elsewhere, LedgerCommand::Add { amount: 1.0 }).await;
-
-    let vacated = sqlx::query("UPDATE events SET stream_seq = 3 WHERE stream_seq = 2")
-        .execute(&pool)
-        .await;
-    assert!(
-        vacated.is_err(),
-        "moving an event to a free place is rejected: {vacated:?}"
-    );
-
-    let rehomed = sqlx::query("UPDATE events SET stream_id = $1 WHERE stream_seq = 2")
-        .bind(elsewhere.to_string())
-        .execute(&pool)
-        .await;
-    assert!(
-        rehomed.is_err(),
-        "moving an event to another stream is rejected: {rehomed:?}"
-    );
-
-    let rewound = sqlx::query("UPDATE streams SET stream_seq = 0 WHERE id = $1")
-        .bind(ledger.to_string())
-        .execute(&pool)
-        .await;
-    assert!(
-        rewound.is_err(),
-        "rewinding the counter by hand is rejected: {rewound:?}"
-    );
-
-    append(&cqrs, &ledger, LedgerCommand::Add { amount: 5.0 }).await;
-    let sequences = sequences(&pool).await;
-    assert_eq!(
-        sequences.values().cloned().collect::<Vec<_>>(),
-        vec![vec![1], vec![1, 2, 3]],
-        "so the stream still takes appends, at the place after its last: {sequences:?}"
     );
 }
 
