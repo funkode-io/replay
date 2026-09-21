@@ -2509,12 +2509,13 @@ emit the same command type to the same instance twice: those are two parked
 commands and keep two rows. `NULLS NOT DISTINCT` (the reason the floor is
 PostgreSQL 15) extends the key to rows with no dispatch to name, which collapse
 per `(policy_name, event_id)`. A row parked before the ordinal existed names its
-command but not its place, so the migration cannot tell a redelivery's duplicate
-from a reaction that emitted that command twice: those rows are numbered apart
-with a **negative** ordinal rather than collapsed, and only rows naming no
-dispatch are collapsed by
-[0028](persistence/tests/migrations/0028_dead_letter_dedupe.sql) — the newest
-generation kept, the rest archived with reason `superseded`.
+command but not its place — and one parked before the identity columns existed
+names nothing at all — so the migration cannot tell a redelivery's duplicate from
+two different commands: those rows are numbered apart with a **negative** ordinal
+rather than collapsed. Only a panicking reaction's row is collapsed by
+[0028](persistence/tests/migrations/0028_dead_letter_dedupe.sql), because a panic
+settles the delivery by unwinding and so parks exactly one row per delivery: the
+newest parking is kept and the rest archived with reason `superseded`.
 
 Apply these migrations with the release that parks through `ON CONFLICT`, before
 it runs: a replica still on the previous version parks with a plain INSERT and

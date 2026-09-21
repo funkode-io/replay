@@ -2,37 +2,43 @@
 -- prove is a duplicate.
 --
 -- Before the next migration can forbid a second row for one parked command
--- (funkode-io/replay#220), no two rows may share the key it builds. Two shapes
--- get there, and they are not the same problem:
+-- (funkode-io/replay#220), no two rows may share the key it builds. Which of
+-- them are duplicates is a question the table can only answer for one shape:
 --
---   1. A row that names a dispatch but not its place in the reaction — parked
---      after 0024 and before 0027. Two such siblings may be a redelivery's
---      duplicate *or* a reaction that legitimately emitted the same command type
---      to the same instance twice, both failing. Nothing recorded tells them
---      apart. So they are made unique, not collapsed: a synthetic ordinal keeps
---      both rows, and the worst case is the triage noise the table already has.
---      Retiring one would take an active failure out of the table on a guess,
---      which is the one thing a dead letter must never do (0014 refuses to clean
---      `events` positions for the same reason).
+--   * A row parked after 0024 and before 0027 names its command but not its
+--     place in the reaction. Two of them are *either* a redelivery's duplicate
+--     or a reaction that legitimately emitted that command twice.
+--   * A row parked before 0024 names nothing at all, and n commands failing on
+--     one event parked n such rows, differing only in free text (0024's own
+--     header). Two of them are *either* a redelivery's duplicate or two
+--     different commands.
+--   * A row parked for a **panic** — `error_kind = 'Panic'` (`PANIC_ERROR_KIND`)
+--     with no dispatch named — is the exception: the unwind settles the
+--     delivery, so that shape parks exactly one row per delivery in every
+--     release that has contained a panic at all (ADR-0016). Siblings of it are
+--     therefore duplicates, and nothing else is.
 --
---   2. A row that names no dispatch at all — parked before 0024, or parked for a
---      panic in `react`, which fails before any dispatch exists. That case parks
---      exactly one row per delivery *by construction*, so siblings are
---      duplicates, and the second phase collapses them.
+-- So the ambiguous rows are made unique rather than collapsed (phase 1), and
+-- only the provable duplicates are collapsed (phase 2). The cost of keeping an
+-- ambiguous pair is the triage noise the table already has; the cost of
+-- collapsing one is an active failure retired on a guess, which is the one thing
+-- a dead letter must never do — 0014 refuses to clean `events` positions for the
+-- same reason.
 --
 -- Its own file, ahead of the index, because the index cannot run in a
 -- transaction and this must (0014/0015 split for the same reason): a dedupe that
 -- half-ran would leave the table in a state neither the old code nor the new one
 -- describes.
 
--- Phase 1. A legacy row's place in its reaction was never recorded, so it takes
--- a negative one: unique within its group, ordered by the order the rows were
--- parked in, and never equal to a dispatch's index, which counts from 0. That
+-- Phase 1. A row whose place in its reaction was never recorded takes a negative
+-- one: unique within its group, ordered by the order the rows were parked in,
+-- and outside the range a dispatch's index can take, which counts from 0. That
 -- is also what a negative ordinal means when an operator reads one — "parked
 -- before the column existed", not "the -2nd command".
 --
--- Every such row is numbered, not only the ones with siblings, so a null ordinal
--- goes back to meaning exactly one thing: no dispatch to name.
+-- A panic's row is left alone, null ordinal and all: it is what phase 2
+-- collapses, and it is how the running code parks the same panic again, so the
+-- key must go on matching it.
 UPDATE policy_dead_letters dl
 SET dispatch_ordinal = legacy.ordinal
 FROM (
@@ -45,38 +51,43 @@ FROM (
         )::int AS ordinal
     FROM policy_dead_letters
     WHERE dispatch_ordinal IS NULL
-      AND aggregate_name IS NOT NULL
+      AND NOT (aggregate_name IS NULL
+               AND target_stream_id IS NULL
+               AND command_name IS NULL
+               AND error_kind = 'Panic')
 ) legacy
 WHERE dl.id = legacy.id;
 
--- Phase 2. What is left duplicating the key is a reaction parked once per
--- delivery with nothing to name. The newest generation survives, carrying what
--- the group knew between them: the earliest `created_at` (when the reaction
--- first failed), its own newest error, the summed `deliveries`, the greatest
+-- Phase 2. The generations a redelivery left of a panicking reaction. The newest
+-- *parking* survives — by `last_parked_at`, not by `id`: a row's id is taken when
+-- it is inserted and its timestamps when its transaction began, so the two can
+-- disagree — carrying what the group knew between them: the earliest `created_at`
+-- (when the reaction first failed), its own newest error, the latest
+-- `last_parked_at` (so the recency signal `PolicyStatus` reads cannot move
+-- backwards over the collapse), the summed `deliveries`, the greatest
 -- `retry_count` and the latest `last_retried_at` (a retry settles every
 -- generation, but an older generation may have been settled by a retry the
--- newest one missed). The losers are archived `superseded`, not deleted: a
--- parked failure has never left this schema without a record of it.
+-- newest one missed).
 --
--- Grouped on the whole key rather than on the null-identity rows alone, so a
--- duplicate written by hand is collapsed here too rather than failing the index
--- build with nothing but a constraint name to go on.
+-- The losers are archived `superseded`, not deleted: a parked failure has never
+-- left this schema without a record of it.
 WITH grouped AS (
     SELECT
         policy_name,
         event_id,
-        aggregate_name,
-        target_stream_id,
-        command_name,
-        dispatch_ordinal,
-        max(id)                AS keep_id,
-        min(created_at)        AS first_parked_at,
-        sum(deliveries)::int   AS deliveries,
-        max(retry_count)       AS retry_count,
-        max(last_retried_at)   AS last_retried_at
+        (array_agg(id ORDER BY last_parked_at DESC, id DESC))[1] AS keep_id,
+        min(created_at)      AS first_parked_at,
+        max(last_parked_at)  AS last_parked_at,
+        sum(deliveries)::int AS deliveries,
+        max(retry_count)     AS retry_count,
+        max(last_retried_at) AS last_retried_at
     FROM policy_dead_letters
-    GROUP BY policy_name, event_id, aggregate_name, target_stream_id,
-             command_name, dispatch_ordinal
+    WHERE aggregate_name IS NULL
+      AND target_stream_id IS NULL
+      AND command_name IS NULL
+      AND dispatch_ordinal IS NULL
+      AND error_kind = 'Panic'
+    GROUP BY policy_name, event_id
     HAVING count(*) > 1
 ),
 superseded AS (
@@ -84,10 +95,11 @@ superseded AS (
     USING grouped g
     WHERE dl.policy_name = g.policy_name
       AND dl.event_id = g.event_id
-      AND dl.aggregate_name IS NOT DISTINCT FROM g.aggregate_name
-      AND dl.target_stream_id IS NOT DISTINCT FROM g.target_stream_id
-      AND dl.command_name IS NOT DISTINCT FROM g.command_name
-      AND dl.dispatch_ordinal IS NOT DISTINCT FROM g.dispatch_ordinal
+      AND dl.aggregate_name IS NULL
+      AND dl.target_stream_id IS NULL
+      AND dl.command_name IS NULL
+      AND dl.dispatch_ordinal IS NULL
+      AND dl.error_kind = 'Panic'
       AND dl.id <> g.keep_id
     RETURNING dl.id, dl.policy_name, dl.global_position, dl.event_id, dl.error_kind,
               dl.error_message, dl.created_at, dl.aggregate_name, dl.target_stream_id,
@@ -107,6 +119,7 @@ archived AS (
 )
 UPDATE policy_dead_letters dl
 SET created_at      = g.first_parked_at,
+    last_parked_at  = g.last_parked_at,
     deliveries      = g.deliveries,
     retry_count     = g.retry_count,
     last_retried_at = g.last_retried_at

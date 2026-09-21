@@ -48,11 +48,21 @@ async fn start_postgres() -> (ContainerAsync<postgres::Postgres>, PgPool) {
     (container, pool)
 }
 
+/// The `error_kind` a refused command is parked under: what a row that names no
+/// dispatch carried before 0024 gave it identity columns.
+const REFUSED_KIND: &str = "Invalid Input";
+
+/// The `error_kind` a panicking reaction is parked under — `PANIC_ERROR_KIND`.
+/// The one shape that parks exactly one row per delivery, and therefore the one
+/// the dedupe may collapse.
+const PANIC_KIND: &str = "Panic";
+
 /// One parked command, as the park path writes it.
 struct Parked {
     event_id: uuid::Uuid,
     command_name: Option<&'static str>,
     dispatch_ordinal: Option<i32>,
+    error_kind: &'static str,
     error_message: &'static str,
     created_at: DateTime<Utc>,
     deliveries: i32,
@@ -74,6 +84,7 @@ impl Parked {
             event_id,
             command_name,
             dispatch_ordinal,
+            error_kind: REFUSED_KIND,
             error_message,
             // Truncated to what `timestamptz` stores: a staged time that cannot
             // survive the round trip makes an assertion about which timestamp
@@ -84,6 +95,13 @@ impl Parked {
             retry_count: 0,
             last_retried_at: None,
         }
+    }
+
+    /// The same row, as a panicking reaction parks it: no dispatch to name, and
+    /// the kind that says the unwind settled the delivery.
+    fn panicked(mut self) -> Self {
+        self.error_kind = PANIC_KIND;
+        self
     }
 
     fn retried(mut self, retry_count: i32, last_retried_at: DateTime<Utc>) -> Self {
@@ -101,7 +119,7 @@ async fn park(pool: &PgPool, policy: &str, row: &Parked) -> Result<i64, sqlx::Er
              (policy_name, global_position, event_id, error_kind, error_message, \
               aggregate_name, target_stream_id, command_name, dispatch_ordinal, \
               created_at, last_parked_at, deliveries, retry_count, last_retried_at) \
-         VALUES ($1, 1, $2, 'Invalid Input', $3, \
+         VALUES ($1, 1, $2, $10, $3, \
                  CASE WHEN $4::text IS NULL THEN NULL ELSE 'app::Account' END, \
                  CASE WHEN $4::text IS NULL THEN NULL ELSE 'urn:account:1' END, \
                  $4, $5, $6, $6, $7, $8, $9) \
@@ -116,6 +134,7 @@ async fn park(pool: &PgPool, policy: &str, row: &Parked) -> Result<i64, sqlx::Er
     .bind(row.deliveries)
     .bind(row.retry_count)
     .bind(row.last_retried_at)
+    .bind(row.error_kind)
     .fetch_one(pool)
     .await
 }
@@ -123,7 +142,8 @@ async fn park(pool: &PgPool, policy: &str, row: &Parked) -> Result<i64, sqlx::Er
 /// Every active row of `policy`, oldest id first.
 async fn active(pool: &PgPool, policy: &str) -> Vec<sqlx::postgres::PgRow> {
     sqlx::query(
-        "SELECT id, event_id, command_name, dispatch_ordinal, error_message, created_at, \
+        "SELECT id, event_id, command_name, dispatch_ordinal, error_kind, error_message, \
+                created_at, \
                 last_parked_at, deliveries, retry_count, last_retried_at \
          FROM policy_dead_letters WHERE policy_name = $1 ORDER BY id ASC",
     )
@@ -250,13 +270,14 @@ async fn two_rows_with_a_null_identity_collapse_onto_one_reaction_postgres_test(
     );
 }
 
-/// The generations a redelivery left for a reaction with nothing to name are
-/// collapsed by the migration, and every row it retires is archived.
+/// The generations a redelivery left of a **panicking** reaction are collapsed
+/// by the migration, and every row it retires is archived.
 ///
-/// A reaction that names no dispatch parks exactly one row per delivery, so its
-/// siblings *are* duplicates — the one shape the migration can collapse without
-/// guessing. What survives is the newest generation, carrying what the group
-/// knew between them.
+/// A panic settles the delivery by unwinding, so that shape parks exactly one
+/// row per delivery — the one thing in this table that makes siblings provably
+/// duplicates. What survives is the newest *parking*, which is not always the
+/// greatest id: a row takes its id when it is inserted and its timestamps when
+/// its transaction began.
 #[tokio::test]
 async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     let (_container, pool) = start_postgres().await;
@@ -268,33 +289,30 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     let event = uuid::Uuid::new_v4();
     let other_event = uuid::Uuid::new_v4();
     let first_failed = (Utc::now() - Duration::hours(3)).trunc_subsecs(6);
+    let last_parked = first_failed + Duration::minutes(20);
     let retried_at = (Utc::now() - Duration::hours(2)).trunc_subsecs(6);
 
-    // Three deliveries of one panicking reaction, the middle one settled by a
-    // retry that left it still failing — the row an operator has already worked
-    // on is not the newest generation.
+    // Three deliveries of one panicking reaction. The second is the last one
+    // parked and the one a retry has already settled; the third was inserted
+    // afterwards by a transaction that began before it, so the greatest id and
+    // the newest parking are different rows.
     let oldest = park(
         &pool,
         "dedupe",
-        &Parked::of(event, None, None, "delivery 1", first_failed),
+        &Parked::of(event, None, None, "delivery 1", first_failed).panicked(),
     )
     .await
     .expect("staging the first generation");
-    let middle = park(
+    let newest_parking = park(
         &pool,
         "dedupe",
-        &Parked::of(
-            event,
-            None,
-            None,
-            "delivery 2",
-            first_failed + Duration::minutes(10),
-        )
-        .retried(2, retried_at),
+        &Parked::of(event, None, None, "delivery 2", last_parked)
+            .panicked()
+            .retried(2, retried_at),
     )
     .await
     .expect("staging the second generation");
-    let newest = park(
+    let greatest_id = park(
         &pool,
         "dedupe",
         &Parked::of(
@@ -302,8 +320,9 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
             None,
             None,
             "delivery 3",
-            first_failed + Duration::minutes(20),
-        ),
+            first_failed + Duration::minutes(10),
+        )
+        .panicked(),
     )
     .await
     .expect("staging the third generation");
@@ -313,7 +332,7 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     let untouched = park(
         &pool,
         "dedupe",
-        &Parked::of(other_event, None, None, "only once", first_failed),
+        &Parked::of(other_event, None, None, "only once", first_failed).panicked(),
     )
     .await
     .expect("staging the reaction parked once");
@@ -328,23 +347,29 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
         rows.iter()
             .map(|r| r.get::<i64, _>("id"))
             .collect::<Vec<_>>(),
-        vec![newest, untouched],
-        "one row per parked reaction, the newest generation of each: {rows:#?}"
+        vec![newest_parking, untouched],
+        "one row per parked reaction, the last one parked of each: {rows:#?}"
     );
 
     let survivor = rows
         .iter()
-        .find(|r| r.get::<i64, _>("id") == newest)
-        .expect("the newest generation survives");
+        .find(|r| r.get::<i64, _>("id") == newest_parking)
+        .expect("the newest parking survives");
     assert_eq!(
         survivor.get::<String, _>("error_message"),
-        "delivery 3",
+        "delivery 2",
         "the survivor keeps its own error: the last thing the reaction did"
     );
     assert_eq!(
         survivor.get::<DateTime<Utc>, _>("created_at"),
         first_failed,
         "and the earliest created_at of the group: when it first failed"
+    );
+    assert_eq!(
+        survivor.get::<DateTime<Utc>, _>("last_parked_at"),
+        last_parked,
+        "and the latest parking, so the recency signal cannot move backwards \
+         over the collapse"
     );
     assert_eq!(
         survivor.get::<i32, _>("deliveries"),
@@ -371,7 +396,7 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
             .collect::<Vec<_>>(),
         vec![
             (oldest, "superseded".to_string()),
-            (middle, "superseded".to_string())
+            (greatest_id, "superseded".to_string())
         ],
         "the losers leave the active set with a reason of their own — neither \
          retried nor discarded, since nobody invoked either: {retired:#?}"
@@ -379,9 +404,9 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     assert_eq!(
         retired
             .iter()
-            .find(|r| r.get::<i64, _>("dead_letter_id") == middle)
+            .find(|r| r.get::<i64, _>("dead_letter_id") == greatest_id)
             .map(|r| r.get::<String, _>("error_message")),
-        Some("delivery 2".to_string()),
+        Some("delivery 3".to_string()),
         "each archived generation keeps what it recorded"
     );
     assert_eq!(
@@ -394,7 +419,7 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     let refusal = park(
         &pool,
         "dedupe",
-        &Parked::of(event, None, None, "delivery 4", Utc::now()),
+        &Parked::of(event, None, None, "delivery 4", Utc::now()).panicked(),
     )
     .await
     .expect_err("a fourth generation must be refused once the key exists");
@@ -404,6 +429,82 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
             .and_then(|e| e.code())
             .as_deref(),
         Some("23505")
+    );
+}
+
+/// Rows parked before the identity columns existed are kept apart, not
+/// collapsed — however little they say about themselves.
+///
+/// Before 0024, n commands failing on one event parked n rows that differed only
+/// in free text (0024's own header). Such a group is *either* one command parked
+/// by n deliveries or n commands parked by one, and the table cannot tell; only
+/// a panic's row, which settles the delivery by unwinding, is provably one per
+/// delivery. So these are numbered apart like any other ambiguous sibling, and
+/// the panic row parked for the same event keeps the null ordinal the running
+/// code still writes.
+#[tokio::test]
+async fn pre_identity_siblings_are_kept_apart_not_collapsed_postgres_test() {
+    let (_container, pool) = start_postgres().await;
+    migrations_through(BEFORE_DEDUPE)
+        .run(&pool)
+        .await
+        .expect("migrations up to the dedupe must succeed");
+
+    let event = uuid::Uuid::new_v4();
+    let parked_at = (Utc::now() - Duration::hours(1)).trunc_subsecs(6);
+    let first_command = park(
+        &pool,
+        "pre-identity",
+        &Parked::of(event, None, None, "the fee command failed", parked_at),
+    )
+    .await
+    .expect("staging the first pre-identity row");
+    let second_command = park(
+        &pool,
+        "pre-identity",
+        &Parked::of(
+            event,
+            None,
+            None,
+            "the ledger command failed",
+            parked_at + Duration::seconds(1),
+        ),
+    )
+    .await
+    .expect("staging the second pre-identity row");
+    let panicked = park(
+        &pool,
+        "pre-identity",
+        &Parked::of(event, None, None, "reaction exploded", parked_at).panicked(),
+    )
+    .await
+    .expect("staging the panic row");
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("the migration must run against a pre-identity backlog");
+
+    let rows = active(&pool, "pre-identity").await;
+    assert_eq!(
+        rows.iter()
+            .map(|r| (
+                r.get::<i64, _>("id"),
+                r.get::<Option<i32>, _>("dispatch_ordinal")
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (first_command, Some(-1)),
+            (second_command, Some(-2)),
+            (panicked, None)
+        ],
+        "every ambiguous row survives, numbered apart; the panic keeps the null \
+         ordinal the running code parks it with: {rows:#?}"
+    );
+    assert!(
+        archived(&pool, "pre-identity").await.is_empty(),
+        "nothing was retired: nothing in this backlog could be shown to be a \
+         duplicate"
     );
 }
 

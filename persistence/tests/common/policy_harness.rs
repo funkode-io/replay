@@ -48,8 +48,10 @@
 //! - [`PolicyDaemonHarness::retry_parked_row`] /
 //!   [`PolicyDaemonHarness::discard_parked_row`] — the same controls on one row,
 //!   by the id an operator reads off the table.
-//! - [`PolicyDaemonHarness::park_without_identity`] — a row as a release before
-//!   the identity migration parked it, which running code can no longer write.
+//! - [`PolicyDaemonHarness::park_without_identity`] /
+//!   [`PolicyDaemonHarness::park_panic_without_identity`] — a row as a release
+//!   before the identity migration parked it, which running code can no longer
+//!   write.
 //! - [`PolicyDaemonHarness::redeliver`] — the event delivered to the policy
 //!   again, by the cursor rewind that causes it in production.
 //! - [`PolicyDaemonHarness::park_again`] — a second row for one parked command,
@@ -837,6 +839,30 @@ impl PolicyDaemonHarness {
             "INSERT INTO policy_dead_letters \
                  (policy_name, global_position, event_id, error_kind, error_message) \
              VALUES ($1, $2, $3, 'Invalid Input', $4) RETURNING id",
+        )
+        .bind(&self.policy_name)
+        .bind(event.global_position)
+        .bind(event.event_id)
+        .bind(message)
+        .fetch_one(&self.pool)
+        .await
+        .expect("a pre-migration row must still be insertable")
+    }
+
+    /// A row as an older release parked it for a reaction that **panicked**:
+    /// no dispatch to name, and the kind that says the unwind settled the
+    /// delivery.
+    ///
+    /// The shape an upgrade really inherits with a null ordinal. The dedupe
+    /// migration numbers every other identity-less row apart, because only a
+    /// panic parks exactly one row per delivery; a panic's row keeps the null
+    /// ordinal the running code still writes, so it is the one an old release's
+    /// row and a new delivery can share (funkode-io/replay#220).
+    pub async fn park_panic_without_identity(&self, event: &AppendedEvent, message: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO policy_dead_letters \
+                 (policy_name, global_position, event_id, error_kind, error_message) \
+             VALUES ($1, $2, $3, 'Panic', $4) RETURNING id",
         )
         .bind(&self.policy_name)
         .bind(event.global_position)

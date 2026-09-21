@@ -42,14 +42,16 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "load_parked_reaction",
-        justification: "One reaction's rows: the commands it dispatches, the vector \
-                        `react_erased` already materialises. A parked command is one \
-                        row \u{2014} unique over the reaction and the dispatch within it, \
-                        enforced by `idx_dead_letters_parked_command` \
-                        (funkode-io/replay#220) \u{2014} so a redelivery of the event \
-                        refreshes rows rather than adding a generation of them. Bounded \
-                        by the Policy's code, not by the table or by the process's \
-                        restarts.",
+        justification: "One reaction's rows: one per command it dispatches (the vector \
+                        `react_erased` already materialises), plus the rows parked for \
+                        that event before `idx_dead_letters_parked_command` keyed the \
+                        table (funkode-io/replay#220). That legacy tail is the old \
+                        code's commands times its deliveries, it is fixed at the moment \
+                        the migration runs \u{2014} every later park refreshes a row rather \
+                        than adding one \u{2014} and it is not a number in the code, which is \
+                        why bounding the read over it is tracked by \
+                        funkode-io/replay#228. Not bounded by the table: the rows of one \
+                        reaction, never of a policy's backlog.",
     },
     Reviewed {
         file: "src/policy_runner.rs",

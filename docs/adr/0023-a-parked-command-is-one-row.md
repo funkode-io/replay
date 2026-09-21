@@ -43,17 +43,24 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   vector `react_erased` returned tells them apart. Its stability across a replay
   is exactly that of the production-order matching ADR-0021 already relies on.
 
-- **A legacy sibling is made unique, not retired.** A row parked after 0024 and
-  before 0027 names its command but not its place, so two of them are *either* a
-  redelivery's duplicate or a reaction that legitimately emitted that command
-  twice — and nothing recorded says which. The migration numbers them instead of
-  collapsing them: a negative ordinal, unique within the group and outside the
-  range a dispatch's index can take. The cost is the triage noise the table
-  already has; the alternative retires an active failure on a guess, which is the
-  one thing a dead letter must never do (0014 refuses to clean `events`
-  positions for the same reason). Only the rows that name *no* dispatch are
-  collapsed, because that case parks exactly one row per delivery by
-  construction.
+- **Only a provable duplicate is retired.** A row parked after 0024 and before
+  0027 names its command but not its place; a row parked before 0024 names
+  nothing at all, and n commands failing on one event parked n such rows (0024's
+  own header). Either group is *either* a redelivery's duplicate or several
+  distinct commands, and nothing recorded says which. The exception is a panic:
+  the unwind settles the delivery, so `error_kind = 'Panic'` with no dispatch
+  named is one row per delivery in every release that contained a panic at all
+  (ADR-0016). So the migration collapses that shape and **numbers the rest
+  apart** — a negative ordinal, unique within the group and outside the range a
+  dispatch's index can take. The cost of keeping an ambiguous pair is the triage
+  noise the table already has; the cost of collapsing one is an active failure
+  retired on a guess, which is the one thing a dead letter must never do (0014
+  refuses to clean `events` positions for the same reason).
+
+- **The survivor is the newest *parking*, not the greatest id.** An id is taken
+  when a row is inserted and its timestamps when its transaction began, so the
+  two can disagree; and the survivor carries the group's latest `last_parked_at`,
+  so the recency signal cannot move backwards over the collapse.
 
 - **`NULLS NOT DISTINCT`**, which is why the crate's floor is PostgreSQL 15
   (funkode-io/replay#222). A panic in `react` fails before any dispatch exists, so
@@ -118,6 +125,13 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   settlement for rows a replay cannot tell apart is still load-bearing, and its
   fabricated-duplicate tests still describe a table an upgrade can hold.
 
+- **One reaction's group is not yet bounded by a number in the code.** Keeping the
+  ambiguous rows keeps their count, which is the old code's commands times the
+  deliveries it saw. The tail is frozen at the migration — every later park
+  refreshes a row — but `load_parked_reaction` reads the group whole, and
+  `AGENTS.md` asks for a number. Tracked by funkode-io/replay#228; a `LIMIT` is
+  not the fix, because a retry settles every row of a reaction from one replay.
+
 - **`deliveries` is a new triage signal**: a command that keeps being re-parked is
   one whose Policy keeps crashing or being rewound, which the error message alone
   never said.
@@ -144,10 +158,16 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   the schema; a read that collapses rows leaves every writer free to make more,
   and every reader free to disagree about how.
 
-- **Collapsing legacy siblings that name a command** — what the issue asked for,
+- **Collapsing every duplicate-looking sibling** — what the issue asked for,
   before the ambiguity above was noticed. It retires a row that may be the only
   record of a second failing command, and the noise it saves is finite and
   clearable by hand.
+
+- **Dating rows against the migration history** to tell a row an old binary parked
+  from one the new binary parked. `_sqlx_migrations.installed_on` is sqlx's
+  bookkeeping, not this schema's, and a rolling deploy parks through the old code
+  after the migration lands anyway — so it would answer the question wrongly in
+  exactly the window it was added for.
 
 [Retry]: ../../CONTEXT.md#retry
 [Discard]: ../../CONTEXT.md#discard

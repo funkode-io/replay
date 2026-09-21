@@ -322,9 +322,11 @@ async fn a_panicking_reaction_parks_one_row_however_often_the_event_arrives_post
 /// A row parked before the identity migration is refreshed by a redelivery of
 /// its event, not duplicated by it.
 ///
-/// The upgrade's backlog is rows with every identity column null. A panic in
-/// `react` parks exactly such a row, so a redelivery of that event has one to
-/// land on — and lands on it.
+/// The row an upgrade leaves with a null ordinal is a panicking reaction's: the
+/// dedupe numbers every other identity-less row apart, because only a panic
+/// parks exactly one row per delivery. A panic in `react` parks exactly that
+/// shape again, so a redelivery has the inherited row to land on — and lands on
+/// it.
 #[tokio::test]
 async fn a_pre_migration_row_is_refreshed_by_a_redelivery_not_duplicated_postgres_test() {
     let deliveries = Arc::new(AtomicUsize::new(0));
@@ -342,7 +344,7 @@ async fn a_pre_migration_row_is_refreshed_by_a_redelivery_not_duplicated_postgre
         .await_dispatch_caused_by(event.global_position)
         .await;
     let inherited = harness
-        .park_without_identity(&event, "parked by an older release")
+        .park_panic_without_identity(&event, "parked by an older release")
         .await;
 
     // The reaction now panics before it builds a dispatch, so the redelivery
