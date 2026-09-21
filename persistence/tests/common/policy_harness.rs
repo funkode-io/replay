@@ -637,7 +637,14 @@ impl PolicyDaemonHarness {
     /// redelivers every event since the last checkpoint; an operator rewinding
     /// the cursor (ADR-0012) does the same deliberately, and is the half of it a
     /// test can perform.
+    ///
+    /// Waits for the cursor to reach `event` before moving it, because that same
+    /// window is what a test races otherwise: a rewind written while the worker
+    /// still has the event in flight is erased by the checkpoint that follows
+    /// it — the compare-and-set sees the position it expects and advances — and
+    /// the event is never delivered again.
     pub async fn redeliver(&self, event: &AppendedEvent) {
+        self.await_cursor_at_least(event.global_position).await;
         self.move_cursor_to(event.global_position - 1).await;
     }
 
