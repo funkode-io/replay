@@ -436,11 +436,15 @@ async fn an_insert_that_names_no_place_is_rejected_postgres_test() {
     );
 }
 
-/// The migration takes `events` for its whole duration, so an append that starts while it
-/// runs waits rather than failing — and is numbered after the rows the backfill numbered,
-/// not alongside them.
+/// A command issued while the migration is open waits for it and is then numbered by the
+/// new function: `Cqrs::execute` hydrates the aggregate first, so it blocks on `events`
+/// before it ever reaches `append_event` and resolves that function only once the
+/// migration has committed.
+///
+/// A caller already *inside* the old function when the migration commits is the other
+/// case, and it is the test below.
 #[tokio::test]
-async fn an_append_blocked_by_the_migration_is_given_the_next_place_postgres_test() {
+async fn a_command_issued_during_the_migration_waits_and_is_numbered_postgres_test() {
     let (pool, _container) = start_postgres().await;
     migrations_through(BEFORE_SEQUENCE)
         .run(&pool)
@@ -464,7 +468,7 @@ async fn an_append_blocked_by_the_migration_is_given_the_next_place_postgres_tes
         let ledger = ledger.clone();
         async move { append(&cqrs, &ledger, LedgerCommand::Add { amount: 5.0 }).await }
     });
-    await_blocked_on_events(&pool).await;
+    await_blocked_on(&pool, "events").await;
 
     migration.commit().await.expect("committing the migration");
     appending.await.expect("the blocked append must finish");
@@ -478,15 +482,73 @@ async fn an_append_blocked_by_the_migration_is_given_the_next_place_postgres_tes
     );
 }
 
-/// Wait until something is queued behind a lock on `events`.
-async fn await_blocked_on_events(pool: &PgPool) {
+/// An append that is already inside `append_event` when the migration commits keeps the
+/// function body it entered with — the one that writes no place — and is refused by the
+/// new constraint rather than leaving a row without one.
+///
+/// This is why the migration needs writers quiesced and not merely blocked: the failure
+/// is loud and costs that one command, and the log is left as it was.
+#[tokio::test]
+async fn an_append_already_inside_the_old_function_is_refused_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+    migrations_through(BEFORE_SEQUENCE)
+        .run(&pool)
+        .await
+        .expect("migrations up to the sequence must succeed");
+
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let ledger = LedgerUrn::new("mid-flight").unwrap();
+    append(&cqrs, &ledger, LedgerCommand::Add { amount: 10.0 }).await;
+
+    let mut migration = pool.begin().await.expect("beginning the migration");
+    migration
+        .execute(sqlx::raw_sql(AssertSqlSafe(migrations::sql(SEQUENCE))))
+        .await
+        .unwrap_or_else(|e| panic!("migration {SEQUENCE} must apply: {e}"));
+
+    // Straight to the function, as a caller that has already hydrated would be: it enters
+    // the old body and blocks inside it, on `streams`, rather than on the read `execute`
+    // would do first.
+    let appending = tokio::spawn({
+        let pool = pool.clone();
+        let stream_id = ledger.to_string();
+        async move {
+            sqlx::query(
+                "SELECT id FROM append_event(gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, \
+                 'Added', $1, 'Ledger', NULL)",
+            )
+            .bind(stream_id)
+            .execute(&pool)
+            .await
+        }
+    });
+    await_blocked_on(&pool, "streams").await;
+
+    migration.commit().await.expect("committing the migration");
+    let outcome = appending.await.expect("the blocked append must finish");
+
+    assert!(
+        outcome.is_err(),
+        "the old function body cannot name a place, so its insert is refused: {outcome:?}"
+    );
+    let sequences = sequences(&pool).await;
+    assert_eq!(
+        sequences.values().cloned().collect::<Vec<_>>(),
+        vec![vec![1]],
+        "and the log is left with what it had: {sequences:?}"
+    );
+}
+
+/// Wait until something is queued behind a lock on `relation`.
+async fn await_blocked_on(pool: &PgPool, relation: &str) {
     let deadline = Instant::now() + BLOCKED_TIMEOUT;
     loop {
         let blocked: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_locks l \
                JOIN pg_class c ON c.oid = l.relation \
-              WHERE c.relname = 'events' AND NOT l.granted",
+              WHERE c.relname = $1 AND NOT l.granted",
         )
+        .bind(relation)
         .fetch_one(pool)
         .await
         .expect("reading pg_locks must succeed");
@@ -496,7 +558,7 @@ async fn await_blocked_on_events(pool: &PgPool) {
         }
         assert!(
             Instant::now() < deadline,
-            "the append never blocked on the migration's lock"
+            "nothing ever blocked on the migration's lock on {relation}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

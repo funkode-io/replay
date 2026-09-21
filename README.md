@@ -1995,14 +1995,21 @@ waits, not just appends. Budget WAL and dead-tuple space of about one table copy
 it in a maintenance window: on a large log a Policy poll blocks along with everything
 else, so a fleet will look stalled rather than slow.
 
-**Order the rollout: quiesce compaction, migrate, then deploy.** Appends survive a
-mixed-version fleet in both directions — `append_event` keeps its old signature and an
-old process's appends are numbered correctly by the new function underneath it.
-Compaction does not: an old process writes its snapshot rows with an `INSERT` that names
-no place, which this migration makes impossible, and a new process calls a function an
-un-migrated database does not have. Either way the failure is loud and nothing is
-corrupted — compaction is best-effort maintenance and the next run succeeds — but a
-scheduled compaction job should be paused across the window rather than left to error.
+**Order the rollout: quiesce writers, migrate, then deploy.** Two things fail if they
+overlap the migration, both loudly and neither corrupting anything:
+
+- **An append already inside `append_event` when the migration commits.** It keeps the
+  function body it entered with, which writes no place, and its insert is refused. A
+  command *issued* during the migration is fine — it waits and then calls the new
+  function — so this is specifically the write that was already in flight.
+- **Compaction, from either side of a mixed-version fleet.** An old process writes its
+  snapshot rows with an `INSERT` naming no place, which this migration makes impossible;
+  a new process calls a function an un-migrated database does not have. It is best-effort
+  maintenance, so the next run after the rollout succeeds.
+
+Appends from an old process are otherwise safe once the migration has landed:
+`append_event` keeps its signature and is numbered by the new function underneath it, so
+the fleet can be rolled at leisure.
 
 A place, once given, is permanent. Nothing in the database enforces that: the event log
 is written by this library and by nothing else — `write_event` and the migrations — and

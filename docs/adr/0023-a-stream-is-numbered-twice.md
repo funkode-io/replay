@@ -94,13 +94,13 @@ Rejected alternatives:
   those fixtures also call `common::places::settle`: a hand-written insert owes the
   counter the same update the store performs, or the next append through the store asks
   for a place the fixture has taken.
-- **Compaction is not compatible across a mixed-version fleet, and appends are.** An old
-  process appends through `append_event`, whose signature is unchanged, and is numbered
-  correctly by the new function underneath. Its `compact`, though, writes snapshot rows
-  with an `INSERT` naming no place, which this migration makes impossible; and a new
-  process's `compact` calls a function an un-migrated database lacks. Both fail loudly
-  rather than corrupting anything, and compaction is best-effort maintenance, but the
-  rollout has to quiesce it across the window (README).
+- **The migration needs writers quiesced, not merely blocked.** An append already inside
+  the old `append_event` when it commits keeps that body, which writes no place, and is
+  refused; compaction fails from either side of a mixed-version fleet, since an old
+  process's snapshot `INSERT` names no place and a new one calls a function an un-migrated
+  database lacks. All of it fails loudly and none of it corrupts anything — an append from
+  an old process is safe once the migration has landed, because `append_event` keeps its
+  signature — but the window is a quiet one. The README carries the rollout order.
 - Migration 0027 takes `events` offline for its duration. The README ("What compaction
   does to an event's numbers") states the cost; the decision here is that a log small
   enough to migrate in a window is worth an axis a Policy can trust, and that an online
