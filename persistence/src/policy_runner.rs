@@ -1152,12 +1152,15 @@ impl PolicyRunner {
         for unclaimed in replay.unclaimed_failures() {
             let id = write_dead_letter(
                 &mut *tx,
-                &reaction.policy_name,
-                reaction.global_position,
-                reaction.event_id,
-                Some(&unclaimed.identity),
-                &unclaimed.settlement.error_kind,
-                &unclaimed.settlement.error_message,
+                DeadLetterWrite {
+                    policy_name: &reaction.policy_name,
+                    global_position: reaction.global_position,
+                    event_id: reaction.event_id,
+                    identity: Some(&unclaimed.identity),
+                    error_kind: &unclaimed.settlement.error_kind,
+                    error_message: &unclaimed.settlement.error_message,
+                    parking: Parking::Retry,
+                },
             )
             .await?;
             tracing::warn!(
@@ -3178,12 +3181,15 @@ impl Delivery<'_> {
                 self.park(global_position, raw, attempt).await?;
                 write_dead_letter(
                     self.pool,
-                    policy_name,
-                    global_position,
-                    raw.id,
-                    in_flight.as_ref(),
-                    PANIC_ERROR_KIND,
-                    &message,
+                    DeadLetterWrite {
+                        policy_name,
+                        global_position,
+                        event_id: raw.id,
+                        identity: in_flight.as_ref(),
+                        error_kind: PANIC_ERROR_KIND,
+                        error_message: &message,
+                        parking: Parking::Delivery,
+                    },
                 )
                 .await?;
                 Ok(0)
@@ -3318,12 +3324,15 @@ impl Delivery<'_> {
             );
             write_dead_letter(
                 self.pool,
-                self.policy_name,
-                global_position,
-                raw.id,
-                Some(&identity),
-                &failure.error_kind(),
-                &failure.to_string(),
+                DeadLetterWrite {
+                    policy_name: self.policy_name,
+                    global_position,
+                    event_id: raw.id,
+                    identity: Some(&identity),
+                    error_kind: &failure.error_kind(),
+                    error_message: &failure.to_string(),
+                    parking: Parking::Delivery,
+                },
             )
             .await?;
         }
@@ -3412,6 +3421,35 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+/// One parked command, as [`write_dead_letter`] writes it: which reaction, which
+/// dispatch of it, and what that dispatch failed with.
+struct DeadLetterWrite<'a> {
+    policy_name: &'a str,
+    global_position: i64,
+    event_id: uuid::Uuid,
+    /// The dispatch the row names. `None` only where there is none to name: a
+    /// panic in `react` itself, which fails before it has built one.
+    identity: Option<&'a DispatchIdentity>,
+    error_kind: &'a str,
+    error_message: &'a str,
+    parking: Parking,
+}
+
+/// Why a row is being parked: which of the two writers is at the keyboard.
+///
+/// Both go through [`write_dead_letter`], and both may find the row already
+/// there — but only one of them is a delivery of the event. A retry that parks a
+/// command the reaction had not parked is racing another retry of the same
+/// reaction, not watching the event arrive again, and must not say it was
+/// delivered again (funkode-io/replay#227).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Parking {
+    /// The drain parked it, for the delivery it is settling.
+    Delivery,
+    /// A retry parked it, for a command the reaction had not parked before.
+    Retry,
+}
+
 /// Write a dead-letter record for a reaction that could not be completed.
 ///
 /// `error_kind` is the [`replay::ErrorKind`] of a returned error, or
@@ -3425,36 +3463,51 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// batched cursor checkpoint, so a crash in between — or an operator rewinding
 /// the cursor — delivers the event again and parks the same command again. The
 /// `ON CONFLICT` refreshes the row that command already has with the error this
-/// delivery produced and counts the delivery, rather than leaving a second
-/// generation of rows behind (funkode-io/replay#220). Two concurrent retries
-/// that both park a command the reaction had not parked settle the same way: one
-/// inserts, the other refreshes.
+/// delivery produced rather than leaving a second generation of rows behind
+/// (ADR-0023). It does **not** touch `created_at` (when the command first
+/// failed) or the retry bookkeeping: a redelivery is not a [`retry_dead_letter`]
+/// — nobody invoked the control surface.
 ///
-/// It does **not** touch `created_at` (when the command first failed) or the
-/// retry bookkeeping: a redelivery is not a [`retry_dead_letter`] — nobody
-/// invoked the control surface.
+/// Only a [`Parking::Delivery`] counts a delivery and moves `last_parked_at`. A
+/// [`Parking::Retry`] that conflicts has lost a race with another retry of the
+/// same reaction (ADR-0021), which is not the event arriving again; it refreshes
+/// the error and nothing else.
+///
+/// `clock_timestamp()`, not `now()`, and never backwards: `now()` is fixed at
+/// transaction start, and a retry parks inside one, so a settlement that began
+/// earlier can commit later and would otherwise stamp the recency signal a live
+/// delivery has already moved.
 ///
 /// [`retry_dead_letter`]: PolicyRunner::retry_dead_letter
 async fn write_dead_letter(
     executor: impl sqlx::PgExecutor<'_>,
-    policy_name: &str,
-    global_position: i64,
-    event_id: uuid::Uuid,
-    identity: Option<&DispatchIdentity>,
-    error_kind: &str,
-    error_message: &str,
+    park: DeadLetterWrite<'_>,
 ) -> Result<i64, replay::Error> {
+    let DeadLetterWrite {
+        policy_name,
+        global_position,
+        event_id,
+        identity,
+        error_kind,
+        error_message,
+        parking,
+    } = park;
     sqlx::query_scalar(
         "INSERT INTO policy_dead_letters \
          (policy_name, global_position, event_id, error_kind, error_message, \
-          aggregate_name, target_stream_id, command_name, dispatch_ordinal) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+          aggregate_name, target_stream_id, command_name, dispatch_ordinal, \
+          last_parked_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp()) \
          ON CONFLICT (policy_name, event_id, aggregate_name, target_stream_id, \
                       command_name, dispatch_ordinal) \
          DO UPDATE SET error_kind = EXCLUDED.error_kind, \
                        error_message = EXCLUDED.error_message, \
-                       deliveries = policy_dead_letters.deliveries + 1, \
-                       last_parked_at = now() \
+                       deliveries = policy_dead_letters.deliveries \
+                           + CASE WHEN $10 THEN 1 ELSE 0 END, \
+                       last_parked_at = CASE WHEN $10 \
+                           THEN GREATEST(policy_dead_letters.last_parked_at, \
+                                         clock_timestamp()) \
+                           ELSE policy_dead_letters.last_parked_at END \
          RETURNING id",
     )
     .bind(policy_name)
@@ -3466,6 +3519,7 @@ async fn write_dead_letter(
     .bind(identity.map(|i| i.target_stream_id.as_str()))
     .bind(identity.map(|i| i.command_name))
     .bind(identity.map(|i| i.ordinal))
+    .bind(parking == Parking::Delivery)
     .fetch_one(executor)
     .await
     .map_err(crate::db_error)

@@ -43,6 +43,18 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   vector `react_erased` returned tells them apart. Its stability across a replay
   is exactly that of the production-order matching ADR-0021 already relies on.
 
+- **A legacy sibling is made unique, not retired.** A row parked after 0024 and
+  before 0027 names its command but not its place, so two of them are *either* a
+  redelivery's duplicate or a reaction that legitimately emitted that command
+  twice — and nothing recorded says which. The migration numbers them instead of
+  collapsing them: a negative ordinal, unique within the group and outside the
+  range a dispatch's index can take. The cost is the triage noise the table
+  already has; the alternative retires an active failure on a guess, which is the
+  one thing a dead letter must never do (0014 refuses to clean `events`
+  positions for the same reason). Only the rows that name *no* dispatch are
+  collapsed, because that case parks exactly one row per delivery by
+  construction.
+
 - **`NULLS NOT DISTINCT`**, which is why the crate's floor is PostgreSQL 15
   (funkode-io/replay#222). A panic in `react` fails before any dispatch exists, so
   its row names none; before 15 every such row is distinct from every other and
@@ -55,11 +67,26 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   `retry_count` / `last_retried_at` are untouched: nobody invoked the control
   surface.
 
+- **Only a delivery counts as one.** The same `ON CONFLICT` catches a retry that
+  parks a command the reaction had not parked and loses the race to another retry
+  of the same reaction (ADR-0021). That is not the event arriving again, so it
+  refreshes the error and leaves `deliveries` and `last_parked_at` alone —
+  otherwise two operators clicking retry would fabricate a redelivery that never
+  happened.
+
+- **The stamp is `clock_timestamp()`, and never moves backwards.** `now()` is
+  fixed at transaction start and a retry parks inside a transaction, so a
+  settlement that began earlier can commit later; `GREATEST` over the stored
+  value keeps the recency signal monotonic.
+
 - **The recency signal moves with it.** `PolicyStatus::last_dead_letter_at` reads
   `MAX(last_parked_at)`, not `MAX(created_at)`, which an in-place refresh never
   moves. A command failing on fifty deliveries must not read like one that failed
   once and stopped. `dead_letter_count` keeps counting parked commands and does
-  not change units.
+  not change units. The index the status read scans carries `last_parked_at` as a
+  payload column
+  ([0030](../../persistence/tests/migrations/0030_dead_letter_status_index.sql)),
+  so the poll a consumer's health endpoint makes on a timer stays index-only.
 
 - **The rows already duplicated are collapsed by the migration**
   ([0028](../../persistence/tests/migrations/0028_dead_letter_dedupe.sql)), not by
@@ -71,16 +98,25 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
 
 ## Consequences
 
+- **The migrations belong with the release, before it runs.** The park needs the
+  key to conflict on, and a binary that predates it parks with an unconditional
+  INSERT. A replica still running the old code while 0029 exists takes a `23505`
+  on the one thing the key forbids — re-parking a command it has already parked —
+  which fails that poll rather than that row: the failure it could not write is
+  the one already in the table. The same window can make the concurrent build fail
+  on a duplicate the old writer created, which is why the build must not be
+  stepped over by `IF NOT EXISTS`.
+
 - **A crash inside the checkpoint window costs nothing in the table.** The window
   itself is untouched: the park still does not participate in the checkpoint's
   transaction, and re-running a reaction whose commands partially succeeded is
   defined behaviour (ADR-0003). What the key removes is the row, not the work.
 
 - **A row parked before 0027 and a later delivery's row for the same command can
-  still coexist**: the older row carries a null ordinal, the newer one an ordinal,
-  and the key cannot merge them. So ADR-0021's shared-verdict settlement for rows
-  a replay cannot tell apart is still load-bearing, and its fabricated-duplicate
-  tests still describe a table an upgrade can hold.
+  still coexist**: the older row carries a synthetic negative ordinal, the newer
+  one a dispatch's index, and nothing can merge them. So ADR-0021's shared-verdict
+  settlement for rows a replay cannot tell apart is still load-bearing, and its
+  fabricated-duplicate tests still describe a table an upgrade can hold.
 
 - **`deliveries` is a new triage signal**: a command that keeps being re-parked is
   one whose Policy keeps crashing or being rewound, which the error message alone
@@ -107,6 +143,11 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
 - **De-duplicating on read.** The question "what is a parked command" belongs in
   the schema; a read that collapses rows leaves every writer free to make more,
   and every reader free to disagree about how.
+
+- **Collapsing legacy siblings that name a command** — what the issue asked for,
+  before the ambiguity above was noticed. It retires a row that may be the only
+  record of a second failing command, and the noise it saves is finite and
+  clearable by hand.
 
 [Retry]: ../../CONTEXT.md#retry
 [Discard]: ../../CONTEXT.md#discard

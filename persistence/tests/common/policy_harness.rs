@@ -270,8 +270,9 @@ pub struct DeadLetter {
     /// Rust type name of the failing command.
     pub command_name: Option<String>,
     /// The failing dispatch's index in the vector the reaction returned. `None`
-    /// on the same rows the other identity columns are null on, and on a row
-    /// parked before the ordinal existed.
+    /// on the same rows the other identity columns are null on; **negative** on
+    /// a row parked before the column existed, which names a command but not its
+    /// place, and was numbered apart by the dedupe migration.
     pub dispatch_ordinal: Option<i32>,
     /// Deliveries of the triggering event that parked this command. 1 until the
     /// event is delivered again.

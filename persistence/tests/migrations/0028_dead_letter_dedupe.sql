@@ -1,23 +1,66 @@
--- Collapse the duplicate generations a redelivery left behind.
+-- Make every parked command unique, without retiring one the library cannot
+-- prove is a duplicate.
 --
 -- Before the next migration can forbid a second row for one parked command
--- (funkode-io/replay#220), the rows that already exist must become one per
--- command. These duplicates are the library's own — an unconditional INSERT on
--- a table with no key — unlike the hand-written `events` positions 0014 refuses
--- to clean, so this cleans them.
+-- (funkode-io/replay#220), no two rows may share the key it builds. Two shapes
+-- get there, and they are not the same problem:
+--
+--   1. A row that names a dispatch but not its place in the reaction — parked
+--      after 0024 and before 0027. Two such siblings may be a redelivery's
+--      duplicate *or* a reaction that legitimately emitted the same command type
+--      to the same instance twice, both failing. Nothing recorded tells them
+--      apart. So they are made unique, not collapsed: a synthetic ordinal keeps
+--      both rows, and the worst case is the triage noise the table already has.
+--      Retiring one would take an active failure out of the table on a guess,
+--      which is the one thing a dead letter must never do (0014 refuses to clean
+--      `events` positions for the same reason).
+--
+--   2. A row that names no dispatch at all — parked before 0024, or parked for a
+--      panic in `react`, which fails before any dispatch exists. That case parks
+--      exactly one row per delivery *by construction*, so siblings are
+--      duplicates, and the second phase collapses them.
 --
 -- Its own file, ahead of the index, because the index cannot run in a
 -- transaction and this must (0014/0015 split for the same reason): a dedupe that
 -- half-ran would leave the table in a state neither the old code nor the new one
 -- describes.
+
+-- Phase 1. A legacy row's place in its reaction was never recorded, so it takes
+-- a negative one: unique within its group, ordered by the order the rows were
+-- parked in, and never equal to a dispatch's index, which counts from 0. That
+-- is also what a negative ordinal means when an operator reads one — "parked
+-- before the column existed", not "the -2nd command".
 --
--- What survives is the newest generation, carrying what the group knew between
--- them: the earliest `created_at` (when the command first failed), its own
--- newest error, the summed `deliveries`, the greatest `retry_count` and the
--- latest `last_retried_at` (a retry settles every generation, but an older
--- generation may have been settled by a retry the newest one missed). The losers
--- are archived `superseded`, not deleted: a parked failure has never left this
--- schema without a record of it.
+-- Every such row is numbered, not only the ones with siblings, so a null ordinal
+-- goes back to meaning exactly one thing: no dispatch to name.
+UPDATE policy_dead_letters dl
+SET dispatch_ordinal = legacy.ordinal
+FROM (
+    SELECT
+        id,
+        -row_number() OVER (
+            PARTITION BY policy_name, event_id, aggregate_name, target_stream_id,
+                         command_name
+            ORDER BY id
+        )::int AS ordinal
+    FROM policy_dead_letters
+    WHERE dispatch_ordinal IS NULL
+      AND aggregate_name IS NOT NULL
+) legacy
+WHERE dl.id = legacy.id;
+
+-- Phase 2. What is left duplicating the key is a reaction parked once per
+-- delivery with nothing to name. The newest generation survives, carrying what
+-- the group knew between them: the earliest `created_at` (when the reaction
+-- first failed), its own newest error, the summed `deliveries`, the greatest
+-- `retry_count` and the latest `last_retried_at` (a retry settles every
+-- generation, but an older generation may have been settled by a retry the
+-- newest one missed). The losers are archived `superseded`, not deleted: a
+-- parked failure has never left this schema without a record of it.
+--
+-- Grouped on the whole key rather than on the null-identity rows alone, so a
+-- duplicate written by hand is collapsed here too rather than failing the index
+-- build with nothing but a constraint name to go on.
 WITH grouped AS (
     SELECT
         policy_name,

@@ -2462,8 +2462,8 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
     last_retried_at  TIMESTAMPTZ             -- when the last of them was made
 );
 
-CREATE INDEX IF NOT EXISTS idx_dead_letters_policy
-    ON policy_dead_letters (policy_name, created_at DESC);
+CREATE INDEX CONCURRENTLY idx_dead_letters_policy_created_parked
+    ON policy_dead_letters (policy_name, created_at DESC) INCLUDE (last_parked_at);
 
 CREATE INDEX CONCURRENTLY idx_dead_letters_policy_reaction
     ON policy_dead_letters (policy_name, global_position, event_id, id);
@@ -2508,13 +2508,25 @@ redelivery is not a retry. `dispatch_ordinal` is in the key because a reaction m
 emit the same command type to the same instance twice: those are two parked
 commands and keep two rows. `NULLS NOT DISTINCT` (the reason the floor is
 PostgreSQL 15) extends the key to rows with no dispatch to name, which collapse
-per `(policy_name, event_id)`. Duplicates parked before it existed are collapsed
-by [0028](persistence/tests/migrations/0028_dead_letter_dedupe.sql), which keeps
-the newest generation and archives the rest with reason `superseded`.
+per `(policy_name, event_id)`. A row parked before the ordinal existed names its
+command but not its place, so the migration cannot tell a redelivery's duplicate
+from a reaction that emitted that command twice: those rows are numbered apart
+with a **negative** ordinal rather than collapsed, and only rows naming no
+dispatch are collapsed by
+[0028](persistence/tests/migrations/0028_dead_letter_dedupe.sql) — the newest
+generation kept, the rest archived with reason `superseded`.
+
+Apply these migrations with the release that parks through `ON CONFLICT`, before
+it runs: a replica still on the previous version parks with a plain INSERT and
+takes a `23505` if it re-parks a command it has already parked. That fails the
+poll, not the record — the row it could not write is the one already there.
 
 `PolicyStatus::last_dead_letter_at` reads `MAX(last_parked_at)`, not
 `MAX(created_at)`: a reaction failing on every delivery must not read like one
-that failed once and stopped.
+that failed once and stopped. `idx_dead_letters_policy_created_parked`
+([0030](persistence/tests/migrations/0030_dead_letter_status_index.sql), which
+replaces `idx_dead_letters_policy`) carries that column as an index payload, so
+the status poll stays index-only.
 
 **Triage queries:**
 

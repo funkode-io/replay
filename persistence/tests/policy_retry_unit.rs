@@ -1104,16 +1104,17 @@ async fn a_retry_parks_a_failure_the_reaction_had_not_parked_postgres_test() {
 }
 
 /// Two retries of one reaction that both fail on a command it had not parked
-/// leave **one** row for it.
+/// leave **one** row for it, and one that says it was delivered once.
 ///
 /// Parking a command the reaction had not parked is the one settlement a retry
 /// makes that is not scoped to a row it read, so it was the one two concurrent
 /// operators could duplicate (funkode-io/replay#220). The key over a parked
 /// command is what rules it out: whichever retry gets there second refreshes the
-/// row the first inserted. The assertion holds under either interleaving — a
-/// second retry that runs after the first sees the row in the group and re-parks
-/// it in place — which is the point: there is no interleaving that ends in two
-/// rows.
+/// row the first inserted — without counting a delivery, because a retry losing
+/// a race is not the event arriving again. The assertion holds under either
+/// interleaving — a second retry that runs after the first sees the row in the
+/// group and re-parks it in place — which is the point: there is no interleaving
+/// that ends in two rows.
 #[tokio::test]
 async fn two_retries_that_park_the_same_new_failure_leave_one_row_postgres_test() {
     let reaction = Reaction::new();
@@ -1139,6 +1140,11 @@ async fn two_retries_that_park_the_same_new_failure_leave_one_row_postgres_test(
     );
     assert_eq!(after[0].target_stream_id, Some(urn_of(SECOND_SUBJECT)));
     assert_ne!(after[0].id, parked[0].id);
+    assert_eq!(
+        after[0].deliveries, 1,
+        "the event was delivered once; a retry that lost the race must not say \
+         otherwise, got {after:#?}"
+    );
 
     harness.shutdown().await;
 }

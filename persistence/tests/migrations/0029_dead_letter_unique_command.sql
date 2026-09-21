@@ -27,7 +27,17 @@
 -- inside a transaction, hence `-- no-transaction` and one statement in this
 -- file. No IF NOT EXISTS: a concurrent build that fails leaves an *invalid*
 -- index behind, and IF NOT EXISTS would step over it and report success with no
--- key enforced (0019, 0020, 0026).
+-- key enforced (0019, 0020, 0026). 0015 records how to tell an invalid leftover
+-- from a live index and how to clear one.
+--
+-- Rollout: apply this with the release that parks through `ON CONFLICT`, before
+-- that release runs. A binary that predates it cannot use the key — its park is
+-- an unconditional INSERT — so a replica still running the old code while this
+-- index exists takes a 23505 on the one thing the key forbids: re-parking a
+-- command it has already parked. That fails the poll rather than the row, and
+-- the parked failure it could not write is the one already in the table. The
+-- same window can make the build itself fail on a duplicate that old writer
+-- created; the build is then re-run, which is why it must not be stepped over.
 CREATE UNIQUE INDEX CONCURRENTLY idx_dead_letters_parked_command
     ON policy_dead_letters (policy_name, event_id, aggregate_name, target_stream_id,
                             command_name, dispatch_ordinal)

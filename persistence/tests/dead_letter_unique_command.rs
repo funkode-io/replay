@@ -129,11 +129,15 @@ async fn active(pool: &PgPool, policy: &str) -> Vec<sqlx::postgres::PgRow> {
     .expect("reading the active table must succeed")
 }
 
-/// Every archived row of `policy`, oldest id first.
+/// Every archived row of `policy`, by the id the row had while it was active.
+///
+/// Not by the archive's own id: the migration archives through
+/// `DELETE ... RETURNING`, whose order is the planner's business, so the row
+/// numbers it hands out say nothing about which generation was which.
 async fn archived(pool: &PgPool, policy: &str) -> Vec<sqlx::postgres::PgRow> {
     sqlx::query(
         "SELECT dead_letter_id, reason, error_message, deliveries, retry_count \
-         FROM discarded_dead_letters WHERE policy_name = $1 ORDER BY id ASC",
+         FROM discarded_dead_letters WHERE policy_name = $1 ORDER BY dead_letter_id ASC",
     )
     .bind(policy)
     .fetch_all(pool)
@@ -242,13 +246,13 @@ async fn two_rows_with_a_null_identity_collapse_onto_one_reaction_postgres_test(
     );
 }
 
-/// A table that already holds duplicate generations is collapsed by the
-/// migration, and every row it retires is archived rather than deleted.
+/// The generations a redelivery left for a reaction with nothing to name are
+/// collapsed by the migration, and every row it retires is archived.
 ///
-/// These duplicates are the library's own — an unconditional INSERT with no key
-/// over it — so cleaning them is the library's job, unlike the hand-written
-/// `events` positions 0014 refuses to clean. What survives is the newest
-/// generation, carrying what the group knew between them.
+/// A reaction that names no dispatch parks exactly one row per delivery, so its
+/// siblings *are* duplicates — the one shape the migration can collapse without
+/// guessing. What survives is the newest generation, carrying what the group
+/// knew between them.
 #[tokio::test]
 async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     let (_container, pool) = start_postgres().await;
@@ -258,22 +262,17 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
         .expect("migrations up to the dedupe must succeed");
 
     let event = uuid::Uuid::new_v4();
+    let other_event = uuid::Uuid::new_v4();
     let first_failed = Utc::now() - Duration::hours(3);
     let retried_at = Utc::now() - Duration::hours(2);
 
-    // Three deliveries of one command, the middle one settled by a retry that
-    // left it still failing — the row an operator has already worked on is not
-    // the newest generation.
+    // Three deliveries of one panicking reaction, the middle one settled by a
+    // retry that left it still failing — the row an operator has already worked
+    // on is not the newest generation.
     let oldest = park(
         &pool,
         "dedupe",
-        &Parked::of(
-            event,
-            Some("app::Withdraw"),
-            Some(0),
-            "delivery 1",
-            first_failed,
-        ),
+        &Parked::of(event, None, None, "delivery 1", first_failed),
     )
     .await
     .expect("staging the first generation");
@@ -282,8 +281,8 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
         "dedupe",
         &Parked::of(
             event,
-            Some("app::Withdraw"),
-            Some(0),
+            None,
+            None,
             "delivery 2",
             first_failed + Duration::minutes(10),
         )
@@ -296,8 +295,8 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
         "dedupe",
         &Parked::of(
             event,
-            Some("app::Withdraw"),
-            Some(0),
+            None,
+            None,
             "delivery 3",
             first_failed + Duration::minutes(20),
         ),
@@ -305,21 +304,15 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     .await
     .expect("staging the third generation");
 
-    // A command of the same reaction that was parked once: nothing to collapse,
-    // and the dedupe must leave it exactly as it is.
+    // A reaction to another event, parked once: nothing to collapse, and the
+    // dedupe must leave it exactly as it is.
     let untouched = park(
         &pool,
         "dedupe",
-        &Parked::of(
-            event,
-            Some("app::Freeze"),
-            Some(1),
-            "only once",
-            first_failed,
-        ),
+        &Parked::of(other_event, None, None, "only once", first_failed),
     )
     .await
-    .expect("staging the command parked once");
+    .expect("staging the reaction parked once");
 
     MIGRATOR
         .run(&pool)
@@ -332,7 +325,7 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
             .map(|r| r.get::<i64, _>("id"))
             .collect::<Vec<_>>(),
         vec![newest, untouched],
-        "one row per parked command, the newest generation of each: {rows:#?}"
+        "one row per parked reaction, the newest generation of each: {rows:#?}"
     );
 
     let survivor = rows
@@ -342,12 +335,12 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     assert_eq!(
         survivor.get::<String, _>("error_message"),
         "delivery 3",
-        "the survivor keeps its own error: the last thing the command did"
+        "the survivor keeps its own error: the last thing the reaction did"
     );
     assert_eq!(
         survivor.get::<DateTime<Utc>, _>("created_at"),
         first_failed,
-        "and the earliest created_at of the group: when the command first failed"
+        "and the earliest created_at of the group: when it first failed"
     );
     assert_eq!(
         survivor.get::<i32, _>("deliveries"),
@@ -380,8 +373,11 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
          retried nor discarded, since nobody invoked either: {retired:#?}"
     );
     assert_eq!(
-        retired[1].get::<String, _>("error_message"),
-        "delivery 2",
+        retired
+            .iter()
+            .find(|r| r.get::<i64, _>("dead_letter_id") == middle)
+            .map(|r| r.get::<String, _>("error_message")),
+        Some("delivery 2".to_string()),
         "each archived generation keeps what it recorded"
     );
     assert_eq!(
@@ -394,13 +390,7 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
     let refusal = park(
         &pool,
         "dedupe",
-        &Parked::of(
-            event,
-            Some("app::Withdraw"),
-            Some(0),
-            "delivery 4",
-            Utc::now(),
-        ),
+        &Parked::of(event, None, None, "delivery 4", Utc::now()),
     )
     .await
     .expect_err("a fourth generation must be refused once the key exists");
@@ -410,5 +400,187 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
             .and_then(|e| e.code())
             .as_deref(),
         Some("23505")
+    );
+}
+
+/// Two legacy rows that name the same command are kept apart, not collapsed.
+///
+/// A row parked before the ordinal existed records which command failed but not
+/// its place in the reaction, so two of them are *either* a redelivery's
+/// duplicate or a reaction that legitimately emitted that command twice — and
+/// nothing recorded says which. Collapsing them would take an active failure out
+/// of the table on a guess. They are made unique instead, by a synthetic
+/// negative ordinal no dispatch can have.
+#[tokio::test]
+async fn legacy_siblings_naming_one_command_are_kept_not_collapsed_postgres_test() {
+    let (_container, pool) = start_postgres().await;
+    migrations_through(BEFORE_DEDUPE)
+        .run(&pool)
+        .await
+        .expect("migrations up to the dedupe must succeed");
+
+    let event = uuid::Uuid::new_v4();
+    let parked_at = Utc::now() - Duration::hours(1);
+    let first = park(
+        &pool,
+        "legacy",
+        &Parked::of(
+            event,
+            Some("app::Withdraw"),
+            None,
+            "first sibling",
+            parked_at,
+        ),
+    )
+    .await
+    .expect("staging the first legacy row");
+    let second = park(
+        &pool,
+        "legacy",
+        &Parked::of(
+            event,
+            Some("app::Withdraw"),
+            None,
+            "second sibling",
+            parked_at + Duration::seconds(1),
+        ),
+    )
+    .await
+    .expect("staging the second legacy row");
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("the migration must run against a table of legacy siblings");
+
+    let rows = active(&pool, "legacy").await;
+    assert_eq!(
+        rows.iter()
+            .map(|r| (
+                r.get::<i64, _>("id"),
+                r.get::<Option<i32>, _>("dispatch_ordinal")
+            ))
+            .collect::<Vec<_>>(),
+        vec![(first, Some(-1)), (second, Some(-2))],
+        "both rows survive, numbered in the order they were parked and outside \
+         the range a dispatch's index can take: {rows:#?}"
+    );
+    assert!(
+        archived(&pool, "legacy").await.is_empty(),
+        "nothing was retired, because nothing could be shown to be a duplicate"
+    );
+
+    // And the key is live over them: the command this release parks for the same
+    // reaction takes its own ordinal, and a second copy of a legacy row is
+    // refused.
+    park(
+        &pool,
+        "legacy",
+        &Parked::of(
+            event,
+            Some("app::Withdraw"),
+            Some(0),
+            "parked by this release",
+            Utc::now(),
+        ),
+    )
+    .await
+    .expect("a dispatch's own ordinal cannot collide with a synthetic one");
+    let refusal = park(
+        &pool,
+        "legacy",
+        &Parked::of(
+            event,
+            Some("app::Withdraw"),
+            Some(-1),
+            "a copy of the first sibling",
+            Utc::now(),
+        ),
+    )
+    .await
+    .expect_err("a row duplicating a numbered legacy row must be refused");
+    assert_eq!(
+        refusal
+            .as_database_error()
+            .and_then(|e| e.code())
+            .as_deref(),
+        Some("23505")
+    );
+}
+
+/// The status read model's aggregate over the parked rows stays off the heap.
+///
+/// `PolicyStatus` counts a policy's parked commands and reads when it last
+/// parked one, on every poll of a consumer's health endpoint. Reading
+/// `last_parked_at` instead of `created_at` would have made that a heap fetch
+/// per parked row; the payload column on `idx_dead_letters_policy_created_parked`
+/// is what keeps it index-only.
+#[tokio::test]
+async fn the_status_aggregate_reads_only_the_index_postgres_test() {
+    let (_container, pool) = start_postgres().await;
+    MIGRATOR.run(&pool).await.expect("migrations must succeed");
+
+    let event = uuid::Uuid::new_v4();
+    for ordinal in 0..50 {
+        park(
+            &pool,
+            "covered",
+            &Parked::of(
+                event,
+                Some("app::Withdraw"),
+                Some(ordinal),
+                "failed",
+                Utc::now(),
+            ),
+        )
+        .await
+        .expect("seeding parked rows must succeed");
+    }
+    sqlx::query("ANALYZE policy_dead_letters")
+        .execute(&pool)
+        .await
+        .expect("ANALYZE must succeed");
+
+    // Fifty rows fit in a page or two, so the planner would read them
+    // sequentially whatever indexes exist, and a bitmap scan is never index-only
+    // however well the index covers the query. Taking both choices away asks the
+    // question this test is about: can the aggregate be answered from an index
+    // alone?
+    let mut conn = pool.acquire().await.expect("acquiring a connection");
+    for off in ["SET enable_seqscan = off", "SET enable_bitmapscan = off"] {
+        sqlx::query(off)
+            .execute(&mut *conn)
+            .await
+            .expect("narrowing the planner's choices must succeed");
+    }
+
+    let plan: Vec<String> = sqlx::query(
+        "EXPLAIN SELECT COUNT(*), MAX(last_parked_at) FROM policy_dead_letters \
+         WHERE policy_name = $1",
+    )
+    .bind("covered")
+    .fetch_all(&mut *conn)
+    .await
+    .expect("EXPLAIN must succeed")
+    .iter()
+    .map(|row| row.get::<String, _>(0))
+    .collect();
+
+    assert!(
+        plan.iter().any(|line| line.contains("Index Only Scan")
+            && line.contains("idx_dead_letters_policy_created_parked")),
+        "the status aggregate must be answered from the index alone: {plan:?}"
+    );
+
+    let indexes: Vec<String> =
+        sqlx::query_scalar("SELECT indexname::text FROM pg_indexes WHERE tablename = $1")
+            .bind("policy_dead_letters")
+            .fetch_all(&pool)
+            .await
+            .expect("reading pg_indexes must succeed");
+    assert!(
+        !indexes.contains(&"idx_dead_letters_policy".to_string()),
+        "and the index it supersedes must be dropped, not left to cost the park \
+         path a second write: {indexes:?}"
     );
 }
