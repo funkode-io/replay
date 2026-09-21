@@ -57,14 +57,14 @@ _Avoid_: offset, sequence number, event time.
 
 ### Stream place
 
-The place an event holds in its own stream: `stream_seq`, assigned by a trigger from a
-counter on the `streams` row and never reset
+The place an event holds in its own stream: `stream_seq`, assigned by `write_event` from
+a counter on the `streams` row and never reset
 ([0027](persistence/tests/migrations/0027_event_stream_seq.sql)). A stream's places are
-contiguous — the trigger increments that counter and reads back what it wrote in one
-statement, so racing inserts serialise on it — and a unique index holds each place to one
-event for the life of the stream. Permanence is the library's to keep: the log is written
-by `append_event`, by compaction and by the migrations, and by nothing else, which is the
-same contract [Global position] has always had and the opposite of the [Cursor move] one
+contiguous — one function numbers every event, under the streams-row lock it already
+takes — and a unique index holds each place to one event for the life of the stream.
+Permanence is the library's to keep: the log is written by `write_event` and by nothing
+else, which is the same contract [Global position] has always had and the opposite of the
+[Cursor move] one
 ([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
 That is what a stream `version` cannot promise: compaction restarts it at 1 so hydration
 reads `1..N`, which makes `(stream_id, version)` name two different events over time

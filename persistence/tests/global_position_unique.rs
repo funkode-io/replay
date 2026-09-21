@@ -56,23 +56,42 @@ async fn seed_stream(pool: &PgPool, stream_id: &str) {
 
 /// Inserts one event, writing `global_position` explicitly — the only way to produce a
 /// duplicate, and what any "claim the position" writer would do.
+///
+/// `stream_seq` (migration 0027) is named only on a database that has it: one of these
+/// tests stages the schema as it stood before 0015, where the column does not exist yet.
 async fn insert_event_at(
     pool: &PgPool,
     stream_id: &str,
     version: i64,
     global_position: i64,
+    schema: Schema,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO events (id, data, metadata, stream_id, type, version, global_position) \
-         VALUES ($1, '{}', '{}', $2, 'Granted', $3, $4)",
-    )
-    .bind(uuid::Uuid::new_v4())
-    .bind(stream_id)
-    .bind(version)
-    .bind(global_position)
-    .execute(pool)
-    .await
-    .map(|_| ())
+    let statement = match schema {
+        Schema::Current => {
+            "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq, global_position) \
+             VALUES ($1, '{}', '{}', $2, 'Granted', $3, $3, $4)"
+        }
+        Schema::BeforeTheUniqueIndex => {
+            "INSERT INTO events (id, data, metadata, stream_id, type, version, global_position) \
+             VALUES ($1, '{}', '{}', $2, 'Granted', $3, $4)"
+        }
+    };
+
+    sqlx::query(statement)
+        .bind(uuid::Uuid::new_v4())
+        .bind(stream_id)
+        .bind(version)
+        .bind(global_position)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Which schema a seeding statement is written against.
+#[derive(Clone, Copy)]
+enum Schema {
+    Current,
+    BeforeTheUniqueIndex,
 }
 
 /// Indexes on `events` that Postgres will not use: the debris a failed concurrent build
@@ -102,11 +121,11 @@ async fn a_duplicate_global_position_is_refused_postgres_test() {
 
     let stream_id = "urn:acl:unique-1";
     seed_stream(&pool, stream_id).await;
-    insert_event_at(&pool, stream_id, 1, 1)
+    insert_event_at(&pool, stream_id, 1, 1, Schema::Current)
         .await
         .expect("the first event takes position 1");
 
-    let refusal = insert_event_at(&pool, stream_id, 2, 1)
+    let refusal = insert_event_at(&pool, stream_id, 2, 1, Schema::Current)
         .await
         .expect_err("a second event must not take position 1");
 
@@ -142,9 +161,15 @@ async fn duplicate_positions_stop_the_migration_and_name_themselves_postgres_tes
     let stream_id = "urn:acl:unique-2";
     seed_stream(&pool, stream_id).await;
     for (version, position) in [(1, 41), (2, 41), (3, 42), (4, 42)] {
-        insert_event_at(&pool, stream_id, version, position)
-            .await
-            .expect("the pre-migration schema allows the duplicate");
+        insert_event_at(
+            &pool,
+            stream_id,
+            version,
+            position,
+            Schema::BeforeTheUniqueIndex,
+        )
+        .await
+        .expect("the pre-migration schema allows the duplicate");
     }
 
     let failure = MIGRATOR
@@ -185,7 +210,7 @@ async fn the_feed_read_still_scans_an_index_postgres_test() {
     let stream_id = "urn:acl:unique-3";
     seed_stream(&pool, stream_id).await;
     for version in 1..=50 {
-        insert_event_at(&pool, stream_id, version, version)
+        insert_event_at(&pool, stream_id, version, version, Schema::Current)
             .await
             .expect("seeding events must succeed");
     }

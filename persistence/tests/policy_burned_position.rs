@@ -131,8 +131,9 @@ async fn stored_cursor(pool: &PgPool, policy: &str) -> i64 {
 /// does with it is the Policy's real behaviour and not an artefact of the fixture.
 async fn clone_event_into(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, source: i64) -> i64 {
     sqlx::query_scalar(
-        "INSERT INTO events (id, data, metadata, stream_id, type, version, created) \
-         SELECT gen_random_uuid(), data, metadata, stream_id, type, version + 1, now() \
+        "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq, created) \
+         SELECT gen_random_uuid(), data, metadata, stream_id, type, version + 1, \
+                stream_seq + 1, now() \
          FROM events WHERE global_position = $1 RETURNING global_position",
     )
     .bind(source)

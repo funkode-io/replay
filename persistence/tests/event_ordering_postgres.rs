@@ -105,8 +105,8 @@ async fn insert_event(
     created: chrono::DateTime<chrono::Utc>,
 ) {
     sqlx::query(
-        "INSERT INTO events (id, data, metadata, stream_id, type, version, created)
-         VALUES ($1, $2, '{}', $3, $4, $5, $6)",
+        "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq, created)
+         VALUES ($1, $2, '{}', $3, $4, $5, $5, $6)",
     )
     .bind(uuid::Uuid::new_v4())
     .bind(data)

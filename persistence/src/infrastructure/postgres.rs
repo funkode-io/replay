@@ -1017,29 +1017,28 @@ impl EventStore for PostgresEventStore {
             .await
             .map_err(crate::db_error)?;
 
-        // 6. Insert compacted events as the new current stream (aggregate_version = NULL).
-        //    These synthetic rows are marked compacted_snapshot = TRUE so the Policy feed
-        //    can skip them; the archived originals (above) carry the true history.
+        // 6. Write the compacted events as the new current stream, through the same
+        //    function a normal append goes through: one place decides a stream's version
+        //    and its place, so the two cannot drift apart (ADR-0023). Step 5 reset the
+        //    version, so these come back out as 1..N; their place continues the stream's.
+        //    `compacted_snapshot = TRUE` is what keeps the Policy feed from delivering
+        //    them, since the archived originals carry the true history.
         let stream_type = A::stream_type();
         let meta_json = metadata.to_json();
-        for (seq, event) in compacted.iter().enumerate() {
+        for event in compacted.iter() {
             let event_type = event.event_type();
             let data = serde_json::to_value(event).map_err(crate::ser_error)?;
-            let version = (seq as i64) + 1;
 
-            sqlx::query(
-                "INSERT INTO events (id, data, metadata, stream_id, type, version, aggregate_version, compacted_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(&data)
-            .bind(&meta_json)
-            .bind(&stream_id_str)
-            .bind(&event_type)
-            .bind(version)
-            .execute(&mut *tx)
-            .await
-            .map_err(crate::db_error)?;
+            sqlx::query("SELECT id FROM write_event($1, $2, $3, $4, $5, $6, NULL, TRUE)")
+                .bind(Uuid::new_v4())
+                .bind(&data)
+                .bind(&meta_json)
+                .bind(&event_type)
+                .bind(&stream_id_str)
+                .bind(&stream_type)
+                .execute(&mut *tx)
+                .await
+                .map_err(crate::db_error)?;
         }
 
         // 7. Update the stream version to the count of compacted events, and advance the

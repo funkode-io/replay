@@ -181,6 +181,40 @@ async fn sequences(pool: &PgPool) -> BTreeMap<String, Vec<i64>> {
         })
 }
 
+/// Compact `ledger` the way `compact` did before the sequence existed: archive the live
+/// events in place and write one snapshot row whose `version` restarts at 1. The store's
+/// own `compact` cannot be used to stage this — it writes through `write_event`, which
+/// this database is too old to have.
+async fn compact_as_the_old_schema_did(pool: &PgPool, ledger: &LedgerUrn) {
+    sqlx::query(
+        "UPDATE events SET aggregate_version = 1 \
+          WHERE stream_id = $1 AND aggregate_version IS NULL",
+    )
+    .bind(ledger.to_string())
+    .execute(pool)
+    .await
+    .expect("archiving the originals must succeed");
+
+    let snapshot = serde_json::to_value(LedgerEvent::Added { amount: 20.0 })
+        .expect("the snapshot event serialises");
+    sqlx::query(
+        "INSERT INTO events \
+           (id, data, metadata, stream_id, type, version, aggregate_version, compacted_snapshot) \
+         VALUES (gen_random_uuid(), $2, '{}'::jsonb, $1, 'Added', 1, NULL, TRUE)",
+    )
+    .bind(ledger.to_string())
+    .bind(&snapshot)
+    .execute(pool)
+    .await
+    .expect("writing the snapshot row must succeed");
+
+    sqlx::query("UPDATE streams SET version = 1, last_compacted_version = 1 WHERE id = $1")
+        .bind(ledger.to_string())
+        .execute(pool)
+        .await
+        .expect("settling the stream must succeed");
+}
+
 /// Append `command` to `ledger`, through the store.
 async fn append(cqrs: &Cqrs<PostgresEventStore>, ledger: &LedgerUrn, command: LedgerCommand) {
     cqrs.execute::<Ledger>(ledger, replay::Metadata::default(), command, &(), None)
@@ -272,10 +306,7 @@ async fn events_written_before_the_migration_are_numbered_in_order_postgres_test
 
     append(&cqrs, &compacted, LedgerCommand::AddTwice { amount: 10.0 }).await;
     append(&cqrs, &plain, LedgerCommand::Add { amount: 1.0 }).await;
-    let aggregate = cqrs.fetch_aggregate::<Ledger>(&compacted).await.unwrap();
-    cqrs.compact(&aggregate, replay::Metadata::default())
-        .await
-        .expect("compaction must succeed");
+    compact_as_the_old_schema_did(&pool, &compacted).await;
 
     MIGRATOR
         .run(&pool)
@@ -374,12 +405,12 @@ async fn concurrent_appends_to_one_stream_leave_no_hole_postgres_test() {
     );
 }
 
-/// The number is assigned by the database, not by the caller: a write path that bypasses
-/// `append_event` gets the next place whatever it asks for. Choosing a place wrongly is a
-/// hole or a duplicate that no later write can repair, so nothing outside the trigger
-/// gets to choose one.
+/// There is one way into the log, and a write path that forgets it fails loudly. The
+/// column has no default, so an insert that names no place is rejected outright rather
+/// than taking one that is held or leaving a hole behind it — which is what lets
+/// `append_event` be the only writer without a trigger standing over the table.
 #[tokio::test]
-async fn an_insert_that_bypasses_append_event_is_still_given_its_place_postgres_test() {
+async fn an_insert_that_names_no_place_is_rejected_postgres_test() {
     let (pool, _container) = start_postgres().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
@@ -387,20 +418,23 @@ async fn an_insert_that_bypasses_append_event_is_still_given_its_place_postgres_
     let ledger = LedgerUrn::new("hand-written").unwrap();
     append(&cqrs, &ledger, LedgerCommand::AddTwice { amount: 10.0 }).await;
 
-    sqlx::query(
-        "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq) \
-         VALUES (gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, $1, 'Added', 99, 99)",
+    let placeless = sqlx::query(
+        "INSERT INTO events (id, data, metadata, stream_id, type, version) \
+         VALUES (gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, $1, 'Added', 99)",
     )
     .bind(ledger.to_string())
     .execute(&pool)
-    .await
-    .expect("a hand-written insert must succeed");
+    .await;
 
+    assert!(
+        placeless.is_err(),
+        "an event written without a place is rejected: {placeless:?}"
+    );
     let sequences = sequences(&pool).await;
     assert_eq!(
         sequences.values().cloned().collect::<Vec<_>>(),
-        vec![vec![1, 2, 3]],
-        "the place it asked for was ignored and the next one assigned: {sequences:?}"
+        vec![vec![1, 2]],
+        "and the stream is left as it was: {sequences:?}"
     );
 }
 

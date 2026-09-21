@@ -1981,8 +1981,10 @@ place in the current live stream, not a place in the stream's history, and the s
 
 Each event therefore also carries `stream_seq`, its place in its own stream, which
 compaction continues rather than restarts — the snapshot rows take the numbers after the
-ones they archived. It is assigned by the database on every insert path, it is unique per
-stream, and a stream's numbers have no holes. Nothing reads it yet
+ones they archived. Both writers go through one function (`write_event`, which
+`append_event` delegates to), so the two numbers are decided together, and the column has
+no default, so a write that does not name a place is rejected rather than guessed at.
+Nothing reads it yet
 ([ADR-0023](docs/adr/0023-a-stream-is-numbered-twice.md),
 [funkode-io/replay#195](https://github.com/funkode-io/replay/issues/195)).
 
@@ -1996,11 +1998,10 @@ it in a maintenance window: on a large log a Policy poll blocks along with every
 else, so a fleet will look stalled rather than slow.
 
 A place, once given, is permanent. Nothing in the database enforces that: the event log
-is written by this library and by nothing else — `append_event`, compaction, the
-migrations — and its invariants are maintained by that one writer, as
-`global_position`'s uniqueness and a stream's `version` contiguity always have been.
-Editing `events` with hand-written SQL breaks them. The row that *is* meant to be edited
-by hand is `policy_cursors`
+is written by this library and by nothing else — `write_event` and the migrations — and
+its invariants are maintained by that one writer, as `global_position`'s uniqueness and a
+stream's `version` contiguity always have been. Editing `events` with hand-written SQL
+breaks them. The row that *is* meant to be edited by hand is `policy_cursors`
 ([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
 
 ### Skipping unchanged streams (`needs_compaction`)

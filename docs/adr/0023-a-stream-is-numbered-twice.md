@@ -26,26 +26,30 @@ Number every event twice, on two axes that answer different questions:
 | `version` | replay | yes | where in the current live stream, for hydration and optimistic concurrency |
 | `stream_seq` | delivery | never | which place in this stream, for good |
 
-`stream_seq` is assigned by a `BEFORE INSERT` trigger from a counter on the `streams` row
-(migration [0027](../../persistence/tests/migrations/0027_event_stream_seq.sql)), and a
-unique index on `(stream_id, stream_seq)` holds a place to one event. A supplied value is
-overwritten rather than trusted: a wrongly chosen place is a hole or a duplicate that no
-later write can repair, so nothing outside the trigger chooses one.
+`stream_seq` is assigned by `write_event`, the one function that writes an event
+(migration [0027](../../persistence/tests/migrations/0027_event_stream_seq.sql)), from a
+counter on the `streams` row it already holds `FOR UPDATE`. Both callers go through it:
+`append_event` is now a thin delegation, and `compact` stopped writing its snapshot rows
+with an `INSERT` of its own — the numbering rules exist once, so a stream's version and
+its place cannot drift apart. A unique index on `(stream_id, stream_seq)` holds a place to
+one event.
 
-A stream's places are contiguous by construction, not by convention. The trigger numbers
-a row by incrementing the counter on the `streams` row and reading back what it wrote, in
-one statement, so two inserts racing for one stream are serialised on that row whether or
-not the caller took its lock first — an insert that bypasses `append_event` entirely is
-numbered as correctly as one that does not. Holes *between* streams are not this axis's
-problem: there is no order between streams to break.
+A stream's places are contiguous by construction, not by convention. The function reads
+the counter from the locked row and writes it back in the `UPDATE` it already performed
+for `version`, so two appends racing for one stream are serialised as they always were,
+and an append costs exactly what it cost before: one row version of the `streams` row.
+Holes *between* streams are not this axis's problem: there is no order between streams to
+break.
 
 A place is also permanent, and nothing enforces that beyond the code that writes it. The
-log is written by this library — `append_event`, compaction, the migrations — and by
-nothing else, so the numbering is maintained the way `global_position`'s uniqueness and a
-stream's `version` contiguity are maintained: by the one writer there is.
+log is written by this library — `write_event` and the migrations — and by nothing else,
+so the numbering is maintained the way `global_position`'s uniqueness and a stream's
+`version` contiguity are maintained: by the one writer there is.
 [ADR-0012](0012-policy-cursor-is-an-operator-writable-control-surface.md) makes
 `policy_cursors` an operator-writable control surface precisely because the log is not
-one.
+one. The column has **no default**, so a write path that forgets it fails on the spot
+instead of taking a place that is held or leaving a hole — the check a trigger would have
+made unnecessary, at the cost of standing over every insert forever.
 
 Rejected alternatives:
 
@@ -57,24 +61,34 @@ Rejected alternatives:
   lock, and [#195](https://github.com/funkode-io/replay/issues/195)'s "which streams are
   behind this Policy" query would have to aggregate over `events` rather than read one
   row per stream.
+- **Assign it in a `BEFORE INSERT` trigger.** It covers every insert path without anyone
+  having to remember, including ones that do not exist yet — and it costs a second
+  `UPDATE` of the `streams` row per event, since the trigger cannot reach the one
+  `append_event` already performs. With two write paths in one file and a `NOT NULL`
+  column with no default, a forgotten path fails loudly anyway, which is the same
+  guarantee without a trigger on the hot path.
+- **Add an eighth argument to `append_event` instead of a new function.** A defaulted
+  argument makes every existing seven-argument call ambiguous between the two candidates,
+  and dropping the seven-argument form fails every append from a process that has not
+  rolled yet. Delegation keeps the migration applicable before or after a deployment, as
+  0018 was.
 - **Defend the numbering with triggers that reject an `UPDATE` or a `DELETE`.** They
-  would have to let the assigning trigger's own write through, they cannot tell dropping
-  a stream from dropping one event out of the middle, and they would make every future
-  migration that renumbers disable them first. The log has never been defended this way,
-  and one column is not the place to start.
-- **Assign it in `append_event`.** That covers the appends and misses the other insert
-  paths — compaction's synthetic rows, and anything a deployment writes itself.
+  cannot tell dropping a stream from dropping one event out of the middle, and they would
+  make every future migration that renumbers disable them first. The log has never been
+  defended this way, and one column is not the place to start.
 
 ## Consequences
 
 - One `BIGINT` per event and one unique index: an index write per append, and a place
   that is never reused even when an event is archived.
 - Every insert now updates the `streams` row. An append already holds that row's lock and
-  already updates it — `append_event` writes `version` at the end — so there is no new
-  contention, but there is a second row version per event, with the WAL and the autovacuum
-  work that follows it. Folding the increment into that existing `UPDATE` would avoid the
-  second write and is the alternative rejected above: it covers appends and misses every
-  other insert path. A bulk insert of many rows into one stream pays one row update each.
+  already updates it, and `write_event` folds the counter into that same `UPDATE`, so an
+  append pays no extra write. Compaction pays one row update per snapshot row where it
+  previously paid one for the whole run — it holds the lock throughout, and a snapshot is
+  a handful of rows.
+- A test fixture that writes to `events` directly now has to name a place, and six of them
+  did. That is the guarantee working: without the trigger, a path that forgets fails at
+  the first insert rather than corrupting a stream quietly.
 - Migration 0027 takes `events` offline for its duration. The README ("What compaction
   does to an event's numbers") states the cost; the decision here is that a log small
   enough to migrate in a window is worth an axis a Policy can trust, and that an online

@@ -8,8 +8,9 @@
 -- (docs/adr/0023-a-stream-is-numbered-twice.md).
 --
 -- This is not an online migration: it rewrites every event row, and the `ADD COLUMN`
--- below holds ACCESS EXCLUSIVE on `events` until the whole file commits. The README
--- ("What compaction does to an event's numbers") states what that costs an operator.
+-- statements below hold ACCESS EXCLUSIVE on `streams` and `events` until the whole file
+-- commits. The README ("What compaction does to an event's numbers") states what that
+-- costs an operator.
 --
 -- The counter lives on `streams` rather than being derived from `MAX(events.stream_seq)`
 -- so that funkode-io/replay#195's "which streams are behind" query reads one row per
@@ -18,6 +19,9 @@
 ALTER TABLE streams
     ADD COLUMN IF NOT EXISTS stream_seq BIGINT NOT NULL DEFAULT 0;
 
+-- No default, and `NOT NULL` once the backfill has run: an insert that does not name a
+-- place fails, rather than taking one that is already held or leaving a hole. That is
+-- what makes `append_event` the only way in without a trigger standing guard.
 ALTER TABLE events
     ADD COLUMN IF NOT EXISTS stream_seq BIGINT;
 
@@ -51,44 +55,93 @@ ALTER TABLE events
 -- without a sort.
 --
 -- Built in the transaction rather than CONCURRENTLY as migrations 0015 and 0019 build
--- theirs: `CREATE INDEX CONCURRENTLY` cannot run inside one, and the numbers, the trigger
--- that keeps assigning them and the index that keeps them unique have to arrive together
--- or not at all. A failed build here rolls back with the rest of the file instead of
--- leaving an invalid index to drop by hand.
+-- theirs: `CREATE INDEX CONCURRENTLY` cannot run inside one, and the numbers and the index
+-- that keeps them unique have to arrive together or not at all.
 CREATE UNIQUE INDEX IF NOT EXISTS uidx_events_stream_seq
     ON events (stream_id, stream_seq);
 
--- A trigger rather than an argument to `append_event`, so every insert path carries the
--- number: appends, compaction's synthetic snapshot rows (step 6 of `compact` inserts into
--- `events` directly), and any row a deployment writes itself. A supplied value is
--- overwritten rather than trusted — a wrongly chosen place is a hole or a duplicate that
--- no later write can repair, so nothing outside this function chooses one.
+-- One implementation writes an event, so that a stream's version and its place are
+-- decided together and cannot drift apart (ADR-0023). Compaction's synthetic snapshot
+-- rows come through it too — before this they were a second `INSERT INTO events` in
+-- `compact`, and a second copy of the numbering rules.
 --
--- The `UPDATE … RETURNING` is what makes a stream's places contiguous: it takes the
--- streams row's lock itself, so two inserts racing for one stream are serialised here
--- whether or not the caller took that lock first, and each reads the counter its
--- predecessor left.
-CREATE OR REPLACE FUNCTION assign_stream_seq() RETURNS trigger
+-- `write_event` rather than an eighth argument on `append_event`: a default argument
+-- would make every existing seven-argument call ambiguous between the two candidates, and
+-- dropping the seven-argument form would fail every append from a process that has not
+-- been rolled yet. `append_event` stays exactly as it was and delegates, so the migration
+-- can be applied before or after a deployment, as 0018 was.
+--
+-- The counter is read from the row the function already holds `FOR UPDATE` and written by
+-- the `UPDATE` it already performs, so an append costs what it cost before: one row
+-- version of the streams row, not two.
+CREATE OR REPLACE FUNCTION write_event(
+    p_id uuid,
+    p_data jsonb,
+    p_metadata jsonb,
+    p_type text,
+    p_stream_id text,
+    p_stream_type text,
+    p_expected_stream_version bigint,
+    p_compacted_snapshot boolean
+) RETURNS TABLE(id uuid, version bigint, created timestamp with time zone)
   LANGUAGE plpgsql
   AS $$
+  DECLARE
+    stream_version bigint;
+    next_stream_seq bigint;
+    persisted_created timestamp with time zone;
   BEGIN
-    UPDATE streams
-       SET stream_seq = stream_seq + 1
-     WHERE id = NEW.stream_id
-    RETURNING stream_seq INTO NEW.stream_seq;
+    SELECT s.version, s.stream_seq INTO stream_version, next_stream_seq
+    FROM streams as s
+    WHERE s.id = p_stream_id FOR UPDATE;
 
-    RETURN NEW;
+    -- if stream doesn't exist - create new one with version 0
+    IF stream_version IS NULL THEN
+      stream_version := 0;
+      next_stream_seq := 0;
+
+      INSERT INTO streams
+      (id, type, version, stream_seq)
+      VALUES
+      (p_stream_id, p_stream_type, stream_version, next_stream_seq);
+    END IF;
+
+    -- check optimistic concurrency
+    IF p_expected_stream_version IS NOT NULL AND stream_version != p_expected_stream_version THEN
+        RETURN;
+    END IF;
+
+    stream_version := stream_version + 1;
+    next_stream_seq := next_stream_seq + 1;
+
+    INSERT INTO events
+        (id, data, metadata, stream_id, type, version, stream_seq, compacted_snapshot)
+    VALUES
+        (p_id, p_data, p_metadata, p_stream_id, p_type, stream_version, next_stream_seq,
+         p_compacted_snapshot)
+    RETURNING events.created INTO persisted_created;
+
+    UPDATE streams as s
+        SET version = stream_version,
+            stream_seq = next_stream_seq
+    WHERE
+        s.id = p_stream_id;
+
+    RETURN QUERY SELECT p_id, stream_version, persisted_created;
   END;
 $$;
 
-DROP TRIGGER IF EXISTS events_assign_stream_seq ON events;
-
-CREATE TRIGGER events_assign_stream_seq
-    BEFORE INSERT ON events
-    FOR EACH ROW EXECUTE FUNCTION assign_stream_seq();
-
--- The log is written by this library and by nothing else: `append_event`, compaction, and
--- the migrations. Nothing here defends the numbering against hand-written SQL, any more
--- than `global_position`'s uniqueness or a stream's `version` contiguity defend
--- themselves; an operator who edits `events` directly breaks those too. The one durable
--- control surface is `policy_cursors` (ADR-0012), and this is not it.
+CREATE OR REPLACE FUNCTION append_event(
+    p_id uuid,
+    p_data jsonb,
+    p_metadata jsonb,
+    p_type text,
+    p_stream_id text,
+    p_stream_type text,
+    p_expected_stream_version bigint default null
+) RETURNS TABLE(id uuid, version bigint, created timestamp with time zone)
+  LANGUAGE sql
+  AS $$
+    SELECT * FROM write_event(p_id, p_data, p_metadata, p_type, p_stream_id, p_stream_type,
+                              p_expected_stream_version, FALSE);
+$$;

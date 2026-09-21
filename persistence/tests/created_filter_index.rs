@@ -91,8 +91,8 @@ async fn time_travel_read_scans_the_created_index_postgres_test() {
         .await
         .expect("seeding the stream row must succeed");
     sqlx::query(
-        "INSERT INTO events (id, data, metadata, stream_id, type, version, created)
-         SELECT gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, 'urn:acl:seed', 'Granted', v,
+        "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq, created)
+         SELECT gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, 'urn:acl:seed', 'Granted', v, v,
                 now() - (v * interval '1 second')
            FROM generate_series(1, 2000) v",
     )
