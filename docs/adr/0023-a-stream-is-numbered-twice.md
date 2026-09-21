@@ -69,9 +69,12 @@ Rejected alternatives:
 
 - One `BIGINT` per event and one unique index: an index write per append, and a place
   that is never reused even when an event is archived.
-- The trigger updates the `streams` row for every inserted event. Appends already hold
-  that row's lock, so they pay nothing new; a bulk insert of many rows into one stream now
-  performs one row update each.
+- Every insert now updates the `streams` row. An append already holds that row's lock and
+  already updates it — `append_event` writes `version` at the end — so there is no new
+  contention, but there is a second row version per event, with the WAL and the autovacuum
+  work that follows it. Folding the increment into that existing `UPDATE` would avoid the
+  second write and is the alternative rejected above: it covers appends and misses every
+  other insert path. A bulk insert of many rows into one stream pays one row update each.
 - Migration 0027 takes `events` offline for its duration. The README ("What compaction
   does to an event's numbers") states the cost; the decision here is that a log small
   enough to migrate in a window is worth an axis a Policy can trust, and that an online
