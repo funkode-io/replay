@@ -18,6 +18,7 @@ mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use common::policy_harness::{
     ArchivedDeadLetter, DeadLetter, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
@@ -106,6 +107,64 @@ struct TwoCommandPolicy {
     first_recovered: Arc<AtomicBool>,
     second_recovered: Arc<AtomicBool>,
     retargeted: Arc<AtomicBool>,
+    gate: Arc<ReplayGate>,
+}
+
+/// A one-shot pause at the end of `react`, so a test can act inside the window
+/// a retry leaves between reading a reaction's rows and settling them.
+///
+/// The dispatches are built before the hold, so a switch the test flips while a
+/// reaction waits here changes what the *next* reaction dispatches, not what
+/// this one is about to execute — which is the deploy-shaped divergence the
+/// window is interesting for.
+#[derive(Default)]
+struct ReplayGate {
+    armed: AtomicBool,
+    entered: AtomicBool,
+    proceed: AtomicBool,
+}
+
+impl ReplayGate {
+    /// Hold the **next** reaction, and only that one: the deliveries the test
+    /// makes while it waits must run straight through.
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Called from `react`. Blocks under [`tokio::task::block_in_place`], which
+    /// hands the worker thread back to the runtime — the daemon has to keep
+    /// polling while the reaction waits.
+    fn hold(&self) {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.entered.store(true, Ordering::SeqCst);
+        tokio::task::block_in_place(|| {
+            let deadline = Instant::now() + OBSERVE_TIMEOUT;
+            while !self.proceed.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the test never released the reaction it held in `react`"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+    }
+
+    async fn await_entered(&self) {
+        let deadline = Instant::now() + OBSERVE_TIMEOUT;
+        while !self.entered.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "no reaction reached the gate the test armed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn release(&self) {
+        self.proceed.store(true, Ordering::SeqCst);
+    }
 }
 
 impl TwoCommandPolicy {
@@ -210,6 +269,7 @@ impl Policy for TwoCommandPolicy {
             _ => return vec![],
         };
         self.reactions.fetch_add(1, Ordering::SeqCst);
+        self.gate.hold();
         dispatches
     }
 }
@@ -220,6 +280,7 @@ struct Reaction {
     first_recovered: Arc<AtomicBool>,
     second_recovered: Arc<AtomicBool>,
     retargeted: Arc<AtomicBool>,
+    gate: Arc<ReplayGate>,
 }
 
 impl Reaction {
@@ -229,6 +290,7 @@ impl Reaction {
             first_recovered: Arc::new(AtomicBool::new(false)),
             second_recovered: Arc::new(AtomicBool::new(false)),
             retargeted: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(ReplayGate::default()),
         }
     }
 
@@ -239,6 +301,7 @@ impl Reaction {
         let first_recovered = Arc::clone(&self.first_recovered);
         let second_recovered = Arc::clone(&self.second_recovered);
         let retargeted = Arc::clone(&self.retargeted);
+        let gate = Arc::clone(&self.gate);
         move |builder, policy| {
             builder.register_policy(TwoCommandPolicy {
                 name: policy.to_string(),
@@ -246,6 +309,7 @@ impl Reaction {
                 first_recovered: Arc::clone(&first_recovered),
                 second_recovered: Arc::clone(&second_recovered),
                 retargeted: Arc::clone(&retargeted),
+                gate: Arc::clone(&gate),
             })
         }
     }
@@ -1146,6 +1210,138 @@ async fn two_retries_that_park_the_same_new_failure_leave_one_row_postgres_test(
          otherwise, got {after:#?}"
     );
 
+    harness.shutdown().await;
+}
+
+/// A row that a delivery re-parks while a retry is replaying it stays parked,
+/// and the retry says so.
+///
+/// The retry reads a reaction's group, replays it, and settles each row
+/// afterwards — seconds during which a redelivery of the same event (a crash
+/// inside the checkpoint window, or a [Cursor move]) can refresh a row in place
+/// now that a parked command is one row (funkode-io/replay#220). Settling by
+/// `id` alone would archive that fresh failure `retried`: the operator's replay
+/// resolved the failure it *read*, nobody retried the one the delivery just
+/// wrote, and the drain is long past the event, so nothing would park it again.
+/// The settlement carries the `deliveries`/`last_parked_at` it read, so the row
+/// a delivery moved is left alone and the caller hears
+/// [`DeadLetterRetry::Superseded`] (funkode-io/replay#227).
+///
+/// [Cursor move]: ../../CONTEXT.md#cursor-move
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_that_reparks_a_row_mid_replay_is_not_settled_by_it_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = Arc::new(PolicyDaemonHarness::start("retry_superseded", reaction.policy()).await);
+
+    let event = harness.ping("subject-1", ONE_COMMAND).await;
+    let parked = harness.await_dead_letters(1).await;
+    let id = parked[0].id;
+    assert_eq!(parked[0].deliveries, 1);
+
+    // The dependency is back, so the replay this retry makes resolves the
+    // command and would archive its row. The gate holds that replay between
+    // reading the row and settling it.
+    reaction.first_recovered.store(true, Ordering::SeqCst);
+    reaction.gate.arm();
+    let retry = {
+        let harness = Arc::clone(&harness);
+        tokio::spawn(async move { harness.retry_parked_row(id).await })
+    };
+
+    // Down again, and the event delivered again: the daemon parks the new
+    // failure in the very row the held replay is about to settle.
+    reaction.gate.await_entered().await;
+    reaction.first_recovered.store(false, Ordering::SeqCst);
+    harness.redeliver(&event).await;
+    harness
+        .observe("the redelivery refreshed the parked row", || async {
+            let rows = harness.dead_letters().await;
+            rows.iter()
+                .any(|row| row.id == id && row.deliveries == 2)
+                .then_some(())
+        })
+        .await;
+    reaction.gate.release();
+
+    assert_eq!(
+        retry.await.expect("the retry task must not panic"),
+        DeadLetterRetry::Superseded,
+        "the row the replay read is not the row it would have settled"
+    );
+
+    let after = harness.dead_letters().await;
+    assert_eq!(after.len(), 1, "got {after:#?}");
+    assert_eq!(after[0].id, id);
+    assert!(
+        after[0].error_message.contains(FIRST_FAILURE) && after[0].deliveries == 2,
+        "the row still carries what the delivery parked, got {after:#?}"
+    );
+    assert!(
+        after[0].retry_count == 0 && after[0].last_retried_at.is_none(),
+        "and a settlement that did not land stamps nothing, got {after:#?}"
+    );
+    assert!(
+        harness.archived_dead_letters().await.is_empty(),
+        "nothing left the active set: no failure was retired on a stale replay"
+    );
+
+    let Ok(harness) = Arc::try_unwrap(harness) else {
+        panic!("the retry task must have released the harness")
+    };
+    harness.shutdown().await;
+}
+
+/// The same window, with a replay that fails: the retry must not overwrite the
+/// delivery's error with its own, nor count a settlement it did not make.
+///
+/// The other half of the guard. Where the archive branch would retire a failure
+/// nobody retried, the re-park branch would replace it with the staler error the
+/// held replay produced and stamp `retry_count` on a row that had moved
+/// underneath it (funkode-io/replay#227).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replay_that_fails_does_not_overwrite_what_a_delivery_reparked_postgres_test() {
+    let reaction = Reaction::new();
+    let harness =
+        Arc::new(PolicyDaemonHarness::start("retry_superseded_failing", reaction.policy()).await);
+
+    let event = harness.ping("subject-1", ONE_COMMAND).await;
+    let parked = harness.await_dead_letters(1).await;
+    let id = parked[0].id;
+
+    reaction.gate.arm();
+    let retry = {
+        let harness = Arc::clone(&harness);
+        tokio::spawn(async move { harness.retry_parked_row(id).await })
+    };
+
+    reaction.gate.await_entered().await;
+    harness.redeliver(&event).await;
+    harness
+        .observe("the redelivery refreshed the parked row", || async {
+            let rows = harness.dead_letters().await;
+            rows.iter()
+                .any(|row| row.id == id && row.deliveries == 2)
+                .then_some(())
+        })
+        .await;
+    reaction.gate.release();
+
+    assert_eq!(
+        retry.await.expect("the retry task must not panic"),
+        DeadLetterRetry::Superseded,
+        "a reaction that still fails, on a row this retry may no longer speak for"
+    );
+
+    let after = harness.dead_letters().await;
+    assert_eq!(after.len(), 1, "got {after:#?}");
+    assert!(
+        after[0].deliveries == 2 && after[0].retry_count == 0,
+        "the row is as the delivery left it, untried, got {after:#?}"
+    );
+
+    let Ok(harness) = Arc::try_unwrap(harness) else {
+        panic!("the retry task must have released the harness")
+    };
     harness.shutdown().await;
 }
 

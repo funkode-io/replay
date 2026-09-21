@@ -95,6 +95,17 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   ([0030](../../persistence/tests/migrations/0030_dead_letter_status_index.sql)),
   so the poll a consumer's health endpoint makes on a timer stays index-only.
 
+- **A settlement settles the row it read.** A retry reads a reaction's group,
+  replays it, and writes the settlements after — and a parked command being one
+  row means a delivery arriving in that window refreshes a row the replay is
+  about to settle, where it used to insert a generation of its own and leave the
+  read row untouched. So the retry carries the row's `deliveries` and
+  `last_parked_at` into its `WHERE`: a row that moved is neither archived
+  `retried` (retiring a failure nobody retried) nor overwritten with the staler
+  error the replay produced, and the caller hears `DeadLetterRetry::Superseded`.
+  A [Discard] carries no version — it re-runs nothing, so what the row says now
+  does not change what the operator asked to retire.
+
 - **The rows already duplicated are collapsed by the migration**
   ([0028](../../persistence/tests/migrations/0028_dead_letter_dedupe.sql)), not by
   the operator: these duplicates are the library's own, unlike the hand-written
@@ -108,10 +119,13 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
 - **The migrations belong with the release, before it runs.** The park needs the
   key to conflict on, and a binary that predates it parks with an unconditional
   INSERT. A replica still running the old code while 0029 exists takes a `23505`
-  on the one thing the key forbids — re-parking a command it has already parked —
-  which fails that poll rather than that row: the failure it could not write is
-  the one already in the table. The same window can make the concurrent build fail
-  on a duplicate the old writer created, which is why the build must not be
+  on the one thing the key forbids for *it* — re-parking a command it has already
+  parked itself — which fails that poll rather than that row: the failure it
+  could not write is the one already in the table. Against a row the *new* code
+  parked it takes no error at all and leaves a sibling: it writes no ordinal, and
+  a null one is distinct from a dispatch's index, which is the same residue an
+  upgrade's backlog holds below. The same window can make the concurrent build
+  fail on a duplicate the old writer created, which is why the build must not be
   stepped over by `IF NOT EXISTS`.
 
 - **A crash inside the checkpoint window costs nothing in the table.** The window
@@ -131,6 +145,17 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   refreshes a row — but `load_parked_reaction` reads the group whole, and
   `AGENTS.md` asks for a number. Tracked by funkode-io/replay#228; a `LIMIT` is
   not the fix, because a retry settles every row of a reaction from one replay.
+
+- **A reaction that changes shape between two deliveries of one event can park
+  the same command twice.** The ordinal is the dispatch's index, so inserting or
+  reordering a dispatch in a deploy gives the same failing command a different
+  one, and a redelivery after that deploy parks beside the row rather than
+  refreshing it. What it leaves is a stale duplicate, not a lost or wrongly
+  retired failure: the rows are settled by `ParkedIdentity::names`, which is
+  blind to the ordinal, so the next replay settles both. The narrower key that
+  would avoid it is the one that merges a reaction's legitimate repeats, and the
+  window is a redelivery — a crash inside the checkpoint window, or a [Cursor
+  move] — spanning a deploy that changed the reaction.
 
 - **`deliveries` is a new triage signal**: a command that keeps being re-parked is
   one whose Policy keeps crashing or being rewound, which the error message alone
@@ -154,6 +179,12 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   concurrent-retry half (ADR-0021) and not the redelivery half, and would be
   removed again when the key landed.
 
+- **Reporting a row a delivery re-parked mid-replay as `StillFailing`.** True of
+  the row and false of the call: the operator would read an error their retry
+  never produced, on a row whose `retry_count` did not move, with no way to tell
+  it from a replay that failed the same way twice. `Superseded` says which, and
+  says to retry again.
+
 - **De-duplicating on read.** The question "what is a parked command" belongs in
   the schema; a read that collapses rows leaves every writer free to make more,
   and every reader free to disagree about how.
@@ -171,3 +202,4 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
 
 [Retry]: ../../CONTEXT.md#retry
 [Discard]: ../../CONTEXT.md#discard
+[Cursor move]: ../../CONTEXT.md#cursor-move

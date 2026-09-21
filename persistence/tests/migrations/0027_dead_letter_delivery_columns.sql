@@ -32,17 +32,15 @@
 -- scan is over the parked backlog an outage leaves, not over `events`, and the
 -- alternative — a nullable column — would put "parked, time unknown" in the
 -- column a Policy's status reads its recency from.
-ALTER TABLE policy_dead_letters
-    ADD COLUMN IF NOT EXISTS dispatch_ordinal INTEGER,
-    ADD COLUMN IF NOT EXISTS deliveries       INTEGER NOT NULL DEFAULT 1,
-    ADD COLUMN IF NOT EXISTS last_parked_at   TIMESTAMPTZ;
-
-UPDATE policy_dead_letters SET last_parked_at = created_at WHERE last_parked_at IS NULL;
-
-ALTER TABLE policy_dead_letters
-    ALTER COLUMN last_parked_at SET DEFAULT now(),
-    ALTER COLUMN last_parked_at SET NOT NULL;
-
+--
+-- The archive goes first, and the active table last, because this migration is
+-- one transaction and every lock it takes is held to the end of it.
+-- `discarded_dead_letters` retains history and can be far larger than the active
+-- backlog, so scanning it after locking `policy_dead_letters` would hold the
+-- daemon's parking path shut for the size of the audit trail. Reversed, the
+-- parking table's ACCESS EXCLUSIVE spans the backlog-sized backfill only; what
+-- the archive's own lock blocks meanwhile is [Retry] and [Discard], which an
+-- operator invokes and a migration window may refuse.
 ALTER TABLE discarded_dead_letters
     ADD COLUMN IF NOT EXISTS dispatch_ordinal INTEGER,
     ADD COLUMN IF NOT EXISTS deliveries       INTEGER NOT NULL DEFAULT 1,
@@ -63,3 +61,14 @@ ALTER TABLE discarded_dead_letters
 ALTER TABLE discarded_dead_letters
     ADD CONSTRAINT discarded_dead_letters_reason_check
     CHECK (reason IN ('retried', 'discarded', 'superseded'));
+
+ALTER TABLE policy_dead_letters
+    ADD COLUMN IF NOT EXISTS dispatch_ordinal INTEGER,
+    ADD COLUMN IF NOT EXISTS deliveries       INTEGER NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS last_parked_at   TIMESTAMPTZ;
+
+UPDATE policy_dead_letters SET last_parked_at = created_at WHERE last_parked_at IS NULL;
+
+ALTER TABLE policy_dead_letters
+    ALTER COLUMN last_parked_at SET DEFAULT now(),
+    ALTER COLUMN last_parked_at SET NOT NULL;

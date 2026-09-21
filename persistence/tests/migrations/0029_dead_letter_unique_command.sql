@@ -33,11 +33,24 @@
 -- Rollout: apply this with the release that parks through `ON CONFLICT`, before
 -- that release runs. A binary that predates it cannot use the key — its park is
 -- an unconditional INSERT — so a replica still running the old code while this
--- index exists takes a 23505 on the one thing the key forbids: re-parking a
--- command it has already parked. That fails the poll rather than the row, and
--- the parked failure it could not write is the one already in the table. The
--- same window can make the build itself fail on a duplicate that old writer
--- created; the build is then re-run, which is why it must not be stepped over.
+-- index exists takes a 23505 on the one thing the key forbids for *it*:
+-- re-parking a command it has already parked itself. That fails the poll rather
+-- than the row, and the parked failure it could not write is the one already in
+-- the table. The same window can make the build itself fail on a duplicate that
+-- old writer created; the build is then re-run, which is why it must not be
+-- stepped over.
+--
+-- What a rolling deploy does leave is a sibling, not a conflict: the old binary
+-- writes no `dispatch_ordinal`, and a null ordinal is distinct from the 0 the
+-- new binary writes for the same command, so the two rows coexist. That is the
+-- residue 0028's header describes from the other end — the dedupe collapses what
+-- existed when it ran, not what a pre-ordinal writer and a later delivery make
+-- afterwards — and a retry settles both, because `ParkedIdentity::names` matches
+-- a row to a replayed dispatch without the ordinal. An old binary retrying or
+-- discarding a *new* row also archives it without the 0027 columns, which loses
+-- `dispatch_ordinal`, `deliveries` and `last_parked_at` from the audit copy only:
+-- nothing reads them back. Quiescing the old replicas avoids both; neither is
+-- worth an outage.
 CREATE UNIQUE INDEX CONCURRENTLY idx_dead_letters_parked_command
     ON policy_dead_letters (policy_name, event_id, aggregate_name, target_stream_id,
                             command_name, dispatch_ordinal)

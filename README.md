@@ -2570,7 +2570,7 @@ band. None take an advisory lock or move the policy cursor:
 
 | Method | Reaction | Outcome |
 |--------|----------|---------|
-| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), or `NotFound`. |
+| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), `Superseded` (a delivery re-parked the row while the replay ran, so it was left as that delivery wrote it), or `NotFound`. |
 | `discard_dead_letter(id)` | None — pure bookkeeping: no `react`, no command, no new event. | `Discarded` or `NotFound`. |
 | `retry_policy_dead_letters(name)` | Bulk: groups the policy's parked rows by the reaction they came from and replays each **once**, oldest-first. | `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing }`. |
 
@@ -2583,6 +2583,15 @@ ones that still fail keep their own error and stay retryable. Every settlement
 bumps the row's `retry_count` and stamps `last_retried_at`, the archived copy
 included.
 
+A settlement only settles the row the replay **read**. A parked command is one
+row, so a delivery of the event arriving while the replay runs refreshes that row
+in place; settling it anyway would archive a failure nobody retried, or overwrite
+it with the staler error the replay produced. The retry carries the row's
+`deliveries`/`last_parked_at` into its `WHERE` and reports `Superseded` for a row
+that moved — retry again to act on what is parked now
+([ADR-0023](docs/adr/0023-a-parked-command-is-one-row.md)). The bulk summary
+counts such a reaction as still failing, which it is.
+
 The summary counts reactions; `PolicyStatus::dead_letter_count` keeps counting
 **rows** (parked commands), so one broken two-command reaction reads as
 `dead_letter_count = 2`, `reactions_still_failing = 1`.
@@ -2594,6 +2603,7 @@ use replay_persistence::{DeadLetterRetry, DeadLetterDiscard};
 match runner.retry_dead_letter(id).await? {
     DeadLetterRetry::Resolved => { /* this row's command resolved: archived */ }
     DeadLetterRetry::StillFailing => { /* updated in place, still retryable */ }
+    DeadLetterRetry::Superseded => { /* a delivery re-parked it mid-replay */ }
     DeadLetterRetry::NotFound => { /* nothing matched the id */ }
 }
 
