@@ -130,7 +130,7 @@ async fn stored_cursor(pool: &PgPool, policy: &str) -> i64 {
 /// store appended — valid stream URN, type tag and payload — so what the Policy
 /// does with it is the Policy's real behaviour and not an artefact of the fixture.
 async fn clone_event_into(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, source: i64) -> i64 {
-    sqlx::query_scalar(
+    let position: i64 = sqlx::query_scalar(
         "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq, created) \
          SELECT gen_random_uuid(), data, metadata, stream_id, type, version + 1, \
                 stream_seq + 1, now() \
@@ -139,7 +139,21 @@ async fn clone_event_into(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, source
     .bind(source)
     .fetch_one(&mut **tx)
     .await
-    .expect("cloning an event must succeed")
+    .expect("cloning an event must succeed");
+
+    // The place the copy took is one the store has not issued, so the stream's counter has
+    // to catch up or the next append would ask for it again.
+    sqlx::query(
+        "UPDATE streams AS s SET stream_seq = e.stream_seq \
+           FROM events AS e \
+          WHERE e.global_position = $1 AND e.stream_id = s.id AND e.stream_seq > s.stream_seq",
+    )
+    .bind(position)
+    .execute(&mut **tx)
+    .await
+    .expect("settling the place counter must succeed");
+
+    position
 }
 
 /// Burn `count` sequence values the way an aborted append does, returning the first.

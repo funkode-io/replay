@@ -47,9 +47,9 @@ so the numbering is maintained the way `global_position`'s uniqueness and a stre
 `version` contiguity are maintained: by the one writer there is.
 [ADR-0012](0012-policy-cursor-is-an-operator-writable-control-surface.md) makes
 `policy_cursors` an operator-writable control surface precisely because the log is not
-one. The column has **no default**, so a write path that forgets it fails on the spot
-instead of taking a place that is held or leaving a hole — the check a trigger would have
-made unnecessary, at the cost of standing over every insert forever.
+one. The column has **no default**, which catches the narrower failure: a write path that
+*omits* the place fails on the spot. A path that supplies a *wrong* one would not be
+caught, where a trigger would have overwritten it — the trade taken below.
 
 Rejected alternatives:
 
@@ -62,11 +62,14 @@ Rejected alternatives:
   behind this Policy" query would have to aggregate over `events` rather than read one
   row per stream.
 - **Assign it in a `BEFORE INSERT` trigger.** It covers every insert path without anyone
-  having to remember, including ones that do not exist yet — and it costs a second
-  `UPDATE` of the `streams` row per event, since the trigger cannot reach the one
-  `append_event` already performs. With two write paths in one file and a `NOT NULL`
-  column with no default, a forgotten path fails loudly anyway, which is the same
-  guarantee without a trigger on the hot path.
+  having to remember, including ones that do not exist yet, and it overwrites a wrong
+  value as readily as a missing one — a strictly wider guarantee. It costs a second
+  `UPDATE` of the `streams` row per event, because the trigger cannot reach the one the
+  append already performs, and it stands on the hot path forever to defend against a third
+  write path that does not exist. With two writers in one file, `NOT NULL` catches the
+  realistic failure — someone adding a third path and forgetting — and a wrong value is
+  caught by the unique index the moment it collides. A third path must reimplement the
+  read-lock-increment, not merely supply a number.
 - **Add an eighth argument to `append_event` instead of a new function.** A defaulted
   argument makes every existing seven-argument call ambiguous between the two candidates,
   and dropping the seven-argument form fails every append from a process that has not
@@ -87,8 +90,17 @@ Rejected alternatives:
   previously paid one for the whole run — it holds the lock throughout, and a snapshot is
   a handful of rows.
 - A test fixture that writes to `events` directly now has to name a place, and six of them
-  did. That is the guarantee working: without the trigger, a path that forgets fails at
-  the first insert rather than corrupting a stream quietly.
+  did — the `NOT NULL` doing its job. It does not settle `streams.stream_seq`, though, so
+  those fixtures also call `common::places::settle`: a hand-written insert owes the
+  counter the same update the store performs, or the next append through the store asks
+  for a place the fixture has taken.
+- **Compaction is not compatible across a mixed-version fleet, and appends are.** An old
+  process appends through `append_event`, whose signature is unchanged, and is numbered
+  correctly by the new function underneath. Its `compact`, though, writes snapshot rows
+  with an `INSERT` naming no place, which this migration makes impossible; and a new
+  process's `compact` calls a function an un-migrated database lacks. Both fail loudly
+  rather than corrupting anything, and compaction is best-effort maintenance, but the
+  rollout has to quiesce it across the window (README).
 - Migration 0027 takes `events` offline for its duration. The README ("What compaction
   does to an event's numbers") states the cost; the decision here is that a log small
   enough to migrate in a window is worth an axis a Policy can trust, and that an online

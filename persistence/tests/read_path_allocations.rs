@@ -101,6 +101,7 @@ async fn seed_events(pool: &PgPool, stream_id: &str, events: impl Iterator<Item 
         .await
         .expect("failed to insert event");
     }
+    common::places::settle(pool).await;
 }
 
 async fn fetch_event_rows(pool: &PgPool, stream_id: &str) -> Vec<PgRow> {

@@ -1,27 +1,18 @@
 -- Give every event its place in its own stream (funkode-io/replay#224).
 --
--- `version` cannot be that place. Compaction renumbers a stream's live events from 1
--- (`compact`, steps 5-7), so `(stream_id, version)` names two different events over a
--- stream's lifetime. That renumbering is deliberate and stays: hydrating a compacted
--- aggregate always reads `1..N`, which is the point of the fast path. So the two axes
--- separate — `version` replays and restarts, `stream_seq` delivers and never restarts
--- (docs/adr/0023-a-stream-is-numbered-twice.md).
+-- Why a second axis rather than `version`, why a counter on `streams`, and why one
+-- function assigns it: docs/adr/0023-a-stream-is-numbered-twice.md. What it costs to run
+-- and in what order to deploy it: README, "What compaction does to an event's numbers".
 --
--- This is not an online migration: it rewrites every event row, and the `ADD COLUMN`
--- statements below hold ACCESS EXCLUSIVE on `streams` and `events` until the whole file
--- commits. The README ("What compaction does to an event's numbers") states what that
--- costs an operator.
---
--- The counter lives on `streams` rather than being derived from `MAX(events.stream_seq)`
--- so that funkode-io/replay#195's "which streams are behind" query reads one row per
--- stream. A constant default is catalog-only in PostgreSQL 11+, so this ALTER is cheap
--- where the one on `events` is not.
+-- A constant default is catalog-only in PostgreSQL 11+, so this ALTER rewrites nothing;
+-- what makes the file expensive is the backfill and the `SET NOT NULL` further down.
 ALTER TABLE streams
     ADD COLUMN IF NOT EXISTS stream_seq BIGINT NOT NULL DEFAULT 0;
 
--- No default, and `NOT NULL` once the backfill has run: an insert that does not name a
--- place fails, rather than taking one that is already held or leaving a hole. That is
--- what makes `append_event` the only way in without a trigger standing guard.
+-- No default, and `NOT NULL` once the backfill has run: an insert that names no place
+-- fails instead of writing a row with none. It catches a write path that forgot the
+-- column, not one that supplies a wrong number — the narrower of the two guarantees a
+-- trigger would have given (ADR-0023).
 ALTER TABLE events
     ADD COLUMN IF NOT EXISTS stream_seq BIGINT;
 
@@ -36,6 +27,8 @@ UPDATE events AS e
           FROM events
        ) AS numbered
  WHERE e.id = numbered.id
+   -- Only rows that have no place yet, so re-applying this file by hand leaves the
+   -- numbers it already handed out where they are.
    AND e.stream_seq IS NULL;
 
 -- One grouped pass rather than a lookup per stream: the index that would serve
@@ -62,20 +55,12 @@ ALTER TABLE events
 CREATE UNIQUE INDEX IF NOT EXISTS uidx_events_stream_seq
     ON events (stream_id, stream_seq);
 
--- One implementation writes an event, so that a stream's version and its place are
--- decided together and cannot drift apart (ADR-0023). Compaction's synthetic snapshot
--- rows come through it too — before this they were a second `INSERT INTO events` in
--- `compact`, and a second copy of the numbering rules.
+-- One implementation writes an event: compaction's snapshot rows come through it too,
+-- where they used to be a second `INSERT INTO events` in `compact` (ADR-0023).
 --
--- `write_event` rather than an eighth argument on `append_event`: a default argument
--- would make every existing seven-argument call ambiguous between the two candidates, and
--- dropping the seven-argument form would fail every append from a process that has not
--- been rolled yet. `append_event` stays exactly as it was and delegates, so the migration
--- can be applied before or after a deployment, as 0018 was.
---
--- The counter is read from the row the function already holds `FOR UPDATE` and written by
--- the `UPDATE` it already performs, so an append costs what it cost before: one row
--- version of the streams row, not two.
+-- `append_event` keeps its seven-argument signature and delegates, so an append from a
+-- process that has not been rolled yet still works against this schema. Compaction does
+-- not have that property — see the rollout order in the README.
 CREATE OR REPLACE FUNCTION write_event(
     p_id uuid,
     p_data jsonb,

@@ -1,12 +1,10 @@
 //! Every event carries its place in its stream (funkode-io/replay#224).
 //!
-//! `version` cannot be that place: compaction renumbers a stream's live events from 1,
-//! so `(stream_id, version)` names two different events over a stream's lifetime.
-//! `stream_seq` never resets, so it names one event for good — which is what
-//! funkode-io/replay#195 needs to ask "have I got everything for this stream?".
+//! Why the place cannot be `version`, and what maintains it:
+//! docs/adr/0023-a-stream-is-numbered-twice.md.
 //!
-//! The sequence is data only: nothing reads it yet, so these tests assert against the
-//! column rather than through any behaviour.
+//! The place is data only: nothing reads it yet, so these tests assert against the column
+//! rather than through any behaviour.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

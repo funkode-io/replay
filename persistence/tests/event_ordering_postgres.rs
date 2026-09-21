@@ -117,6 +117,7 @@ async fn insert_event(
     .execute(pool)
     .await
     .expect("seeding event row must succeed");
+    common::places::settle(pool).await;
 }
 
 /// A grant (v1) followed by a revoke (v2) whose `created` is *earlier* than the grant's

@@ -99,6 +99,7 @@ async fn time_travel_read_scans_the_created_index_postgres_test() {
     .execute(&pool)
     .await
     .expect("seeding events must succeed");
+    common::places::settle(&pool).await;
     sqlx::query("ANALYZE events")
         .execute(&pool)
         .await

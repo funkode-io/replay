@@ -326,6 +326,7 @@ async fn replay_keeps_events_that_share_created_and_version_postgres_test() {
         .await
         .expect("seeding event row must succeed");
     }
+    common::places::settle(&pool).await;
 
     let log = CallLog::default();
     let _store = replay_persistence::PostgresEventStore::builder(pool.clone())

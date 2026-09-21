@@ -1981,10 +1981,8 @@ place in the current live stream, not a place in the stream's history, and the s
 
 Each event therefore also carries `stream_seq`, its place in its own stream, which
 compaction continues rather than restarts — the snapshot rows take the numbers after the
-ones they archived. Both writers go through one function (`write_event`, which
-`append_event` delegates to), so the two numbers are decided together, and the column has
-no default, so a write that does not name a place is rejected rather than guessed at.
-Nothing reads it yet
+ones they archived. One function writes every event, so the two numbers are decided
+together. Nothing reads it yet
 ([ADR-0023](docs/adr/0023-a-stream-is-numbered-twice.md),
 [funkode-io/replay#195](https://github.com/funkode-io/replay/issues/195)).
 
@@ -1996,6 +1994,15 @@ both until the last one commits, so for its whole duration — the row-by-row ba
 waits, not just appends. Budget WAL and dead-tuple space of about one table copy, and run
 it in a maintenance window: on a large log a Policy poll blocks along with everything
 else, so a fleet will look stalled rather than slow.
+
+**Order the rollout: quiesce compaction, migrate, then deploy.** Appends survive a
+mixed-version fleet in both directions — `append_event` keeps its old signature and an
+old process's appends are numbered correctly by the new function underneath it.
+Compaction does not: an old process writes its snapshot rows with an `INSERT` that names
+no place, which this migration makes impossible, and a new process calls a function an
+un-migrated database does not have. Either way the failure is loud and nothing is
+corrupted — compaction is best-effort maintenance and the next run succeeds — but a
+scheduled compaction job should be paused across the window rather than left to error.
 
 A place, once given, is permanent. Nothing in the database enforces that: the event log
 is written by this library and by nothing else — `write_event` and the migrations — and

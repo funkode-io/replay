@@ -77,14 +77,19 @@ async fn insert_event_at(
         }
     };
 
-    sqlx::query(statement)
+    let written = sqlx::query(statement)
         .bind(uuid::Uuid::new_v4())
         .bind(stream_id)
         .bind(version)
         .bind(global_position)
         .execute(pool)
         .await
-        .map(|_| ())
+        .map(|_| ());
+
+    if written.is_ok() && matches!(schema, Schema::Current) {
+        common::places::settle(pool).await;
+    }
+    written
 }
 
 /// Which schema a seeding statement is written against.
