@@ -40,8 +40,10 @@ UPDATE events AS e
 
 -- One grouped pass rather than a lookup per stream: the index that would serve
 -- `MAX(stream_seq)` does not exist yet, and is not worth ordering this migration around.
+-- The join is an inner one, so a stream with no events keeps the counter it has rather
+-- than being reset to zero — which matters if this ever runs twice.
 UPDATE streams AS s
-   SET stream_seq = COALESCE(numbered.last_seq, 0)
+   SET stream_seq = numbered.last_seq
   FROM (
         SELECT stream_id, MAX(stream_seq) AS last_seq FROM events GROUP BY stream_id
        ) AS numbered
