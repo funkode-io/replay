@@ -10,7 +10,7 @@
 //! The library's behaviour under a real redelivery is in
 //! `policy_redelivery_parks_once.rs`; what is verified here is the schema.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sqlx::{PgPool, Row};
 use testcontainers_modules::{
     postgres,
@@ -75,7 +75,11 @@ impl Parked {
             command_name,
             dispatch_ordinal,
             error_message,
-            created_at,
+            // Truncated to what `timestamptz` stores: a staged time that cannot
+            // survive the round trip makes an assertion about which timestamp
+            // survived the collapse fail on the microseconds rather than on the
+            // migration. `Utc::now()` is nanosecond-resolution on Linux.
+            created_at: created_at.trunc_subsecs(6),
             deliveries: 1,
             retry_count: 0,
             last_retried_at: None,
@@ -84,7 +88,7 @@ impl Parked {
 
     fn retried(mut self, retry_count: i32, last_retried_at: DateTime<Utc>) -> Self {
         self.retry_count = retry_count;
-        self.last_retried_at = Some(last_retried_at);
+        self.last_retried_at = Some(last_retried_at.trunc_subsecs(6));
         self
     }
 }
@@ -263,8 +267,8 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
 
     let event = uuid::Uuid::new_v4();
     let other_event = uuid::Uuid::new_v4();
-    let first_failed = Utc::now() - Duration::hours(3);
-    let retried_at = Utc::now() - Duration::hours(2);
+    let first_failed = (Utc::now() - Duration::hours(3)).trunc_subsecs(6);
+    let retried_at = (Utc::now() - Duration::hours(2)).trunc_subsecs(6);
 
     // Three deliveries of one panicking reaction, the middle one settled by a
     // retry that left it still failing — the row an operator has already worked
@@ -420,7 +424,7 @@ async fn legacy_siblings_naming_one_command_are_kept_not_collapsed_postgres_test
         .expect("migrations up to the dedupe must succeed");
 
     let event = uuid::Uuid::new_v4();
-    let parked_at = Utc::now() - Duration::hours(1);
+    let parked_at = (Utc::now() - Duration::hours(1)).trunc_subsecs(6);
     let first = park(
         &pool,
         "legacy",
