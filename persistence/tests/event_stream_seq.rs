@@ -330,6 +330,56 @@ async fn two_events_of_a_stream_cannot_share_a_place_postgres_test() {
     );
 }
 
+/// A place is permanent. Moving an event to a *free* place would be accepted by the
+/// unique index and would strand the counter behind it, so the stream's next append
+/// collides and that stream stops accepting events for good — a corruption that looks
+/// like a successful statement.
+#[tokio::test]
+async fn an_event_keeps_the_place_it_was_given_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+    MIGRATOR.run(&pool).await.expect("migrations must succeed");
+
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+    let ledger = LedgerUrn::new("settled").unwrap();
+    let elsewhere = LedgerUrn::new("elsewhere").unwrap();
+    append(&cqrs, &ledger, LedgerCommand::AddTwice { amount: 10.0 }).await;
+    append(&cqrs, &elsewhere, LedgerCommand::Add { amount: 1.0 }).await;
+
+    let vacated = sqlx::query("UPDATE events SET stream_seq = 3 WHERE stream_seq = 2")
+        .execute(&pool)
+        .await;
+    assert!(
+        vacated.is_err(),
+        "moving an event to a free place is rejected: {vacated:?}"
+    );
+
+    let rehomed = sqlx::query("UPDATE events SET stream_id = $1 WHERE stream_seq = 2")
+        .bind(elsewhere.to_string())
+        .execute(&pool)
+        .await;
+    assert!(
+        rehomed.is_err(),
+        "moving an event to another stream is rejected: {rehomed:?}"
+    );
+
+    let rewound = sqlx::query("UPDATE streams SET stream_seq = 0 WHERE id = $1")
+        .bind(ledger.to_string())
+        .execute(&pool)
+        .await;
+    assert!(
+        rewound.is_err(),
+        "rewinding the counter by hand is rejected: {rewound:?}"
+    );
+
+    append(&cqrs, &ledger, LedgerCommand::Add { amount: 5.0 }).await;
+    let sequences = sequences(&pool).await;
+    assert_eq!(
+        sequences.values().cloned().collect::<Vec<_>>(),
+        vec![vec![1], vec![1, 2, 3]],
+        "so the stream still takes appends, at the place after its last: {sequences:?}"
+    );
+}
+
 /// Appends race for one stream. They serialise on the streams-row lock `append_event`
 /// takes, so the places they are given are contiguous and the order they commit in is
 /// the order they were numbered — the property funkode-io/replay#195 reads as

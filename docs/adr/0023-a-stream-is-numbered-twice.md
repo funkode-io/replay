@@ -39,6 +39,13 @@ not the caller took its lock first — an insert that bypasses `append_event` en
 numbered as correctly as one that does not. Holes *between* streams are not this axis's
 problem: there is no order between streams to break.
 
+A place is also permanent, which takes a second pair of triggers. An `UPDATE` that moved
+an event to a free place, or to another stream, would leave a hole behind it and strand
+the counter, so the next append would collide on the unique index and that stream would
+stop accepting events — a corruption that looks like a successful statement. Both are
+rejected, as is a write to `streams.stream_seq` from anywhere but the assigning trigger
+itself.
+
 Rejected alternatives:
 
 - **Stop resetting `version` and use it as the delivery axis.** It works, and it is a
@@ -48,7 +55,8 @@ Rejected alternatives:
   A concurrent writer would then collide on the unique index rather than wait on the row
   lock, and [#195](https://github.com/funkode-io/replay/issues/195)'s "which streams are
   behind this Policy" query would have to aggregate over `events` rather than read one
-  row per stream.- **Assign it in `append_event`.** That covers the appends and misses the other insert
+  row per stream.
+- **Assign it in `append_event`.** That covers the appends and misses the other insert
   paths — compaction's synthetic rows, and anything a deployment writes itself.
 
 ## Consequences
@@ -65,8 +73,15 @@ Rejected alternatives:
   later without changing what the column means.
 - Deleting events by hand now breaks a guarantee rather than just losing data: a stream's
   places would no longer be contiguous, and a Policy reading them would wait for one that
-  is never coming. ADR-0004 already rules out pruning archived events for a different
-  reason; this is a second.
+  is never coming. `DELETE` is deliberately **not** rejected the way an `UPDATE` is —
+  dropping a stream entirely is legitimate, and a row trigger cannot tell that from
+  dropping one event out of the middle. [#195](https://github.com/funkode-io/replay/issues/195)
+  therefore cannot treat a missing place as "not written yet" indefinitely; it needs a way
+  to tell a gap that will fill from one that never will. ADR-0004 already rules out
+  pruning archived events for a different reason; this is a second.
+- A migration that needs to renumber has to disable the triggers to do it
+  (`ALTER TABLE events DISABLE TRIGGER events_place_is_permanent`), which is the intended
+  friction: nothing renumbers a stream by accident.
 - Nothing reads the column yet. It is the expand half of
   [#171](https://github.com/funkode-io/replay/issues/171); the read is #195.
 

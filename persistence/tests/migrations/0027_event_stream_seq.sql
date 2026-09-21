@@ -86,3 +86,53 @@ DROP TRIGGER IF EXISTS events_assign_stream_seq ON events;
 CREATE TRIGGER events_assign_stream_seq
     BEFORE INSERT ON events
     FOR EACH ROW EXECUTE FUNCTION assign_stream_seq();
+
+-- A place is permanent, and assigning it is the trigger's business alone. Moving an event
+-- to a free place or to another stream leaves a hole behind it and strands the counter:
+-- the next append then collides on the unique index and that stream stops accepting
+-- events — a corruption that looks like a successful statement. Rewinding the counter by
+-- hand does the same. A migration that really has to renumber disables these triggers
+-- first, which is the intended friction.
+CREATE OR REPLACE FUNCTION reject_place_rewrite() RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    RAISE EXCEPTION
+      'an event keeps the place it was given: % #% cannot become % #%',
+      OLD.stream_id, OLD.stream_seq, NEW.stream_id, NEW.stream_seq;
+  END;
+$$;
+
+DROP TRIGGER IF EXISTS events_place_is_permanent ON events;
+
+CREATE TRIGGER events_place_is_permanent
+    BEFORE UPDATE ON events
+    FOR EACH ROW
+    WHEN (NEW.stream_seq IS DISTINCT FROM OLD.stream_seq
+          OR NEW.stream_id IS DISTINCT FROM OLD.stream_id)
+    EXECUTE FUNCTION reject_place_rewrite();
+
+-- `pg_trigger_depth()` is 2 or more when the counter is moved by `assign_stream_seq`
+-- above, and 1 when a statement moves it directly. That is the difference between the
+-- one writer allowed to touch it and every other.
+CREATE OR REPLACE FUNCTION reject_counter_rewrite() RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF pg_trigger_depth() < 2 THEN
+      RAISE EXCEPTION
+        'the place counter of stream % is the assigning trigger''s: % cannot become %',
+        OLD.id, OLD.stream_seq, NEW.stream_seq;
+    END IF;
+
+    RETURN NEW;
+  END;
+$$;
+
+DROP TRIGGER IF EXISTS streams_counter_is_assigned_not_written ON streams;
+
+CREATE TRIGGER streams_counter_is_assigned_not_written
+    BEFORE UPDATE ON streams
+    FOR EACH ROW
+    WHEN (NEW.stream_seq IS DISTINCT FROM OLD.stream_seq)
+    EXECUTE FUNCTION reject_counter_rewrite();

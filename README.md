@@ -1987,13 +1987,18 @@ stream, and a stream's numbers have no holes. Nothing reads it yet
 [funkode-io/replay#195](https://github.com/funkode-io/replay/issues/195)).
 
 Migration [0027](persistence/tests/migrations/0027_event_stream_seq.sql) backfills the
-column, and it is not an online migration. It runs as one transaction whose first
-statement takes ACCESS EXCLUSIVE on `events` and holds it until the last one commits, so
-for its whole duration — the row-by-row backfill, the `NOT NULL` scan and the unique
-index build — every reader and every writer of `events` waits, not just appends. Budget
-WAL and dead-tuple space of about one table copy, and run it in a maintenance window: on
-a large log a Policy poll blocks along with everything else, so a fleet will look stalled
-rather than slow.
+column, and it is not an online migration. It runs as one transaction that takes ACCESS
+EXCLUSIVE on `streams` in its first statement and on `events` in its second, and holds
+both until the last one commits, so for its whole duration — the row-by-row backfill, the
+`NOT NULL` scan and the unique index build — every reader and every writer of either table
+waits, not just appends. Budget WAL and dead-tuple space of about one table copy, and run
+it in a maintenance window: on a large log a Policy poll blocks along with everything
+else, so a fleet will look stalled rather than slow.
+
+A place, once given, is permanent: the migration also installs triggers that reject an
+`UPDATE` moving an event to another place or another stream, and one rewinding a stream's
+counter by hand. Either would strand the counter and stop that stream accepting events on
+its next append.
 
 ### Skipping unchanged streams (`needs_compaction`)
 
