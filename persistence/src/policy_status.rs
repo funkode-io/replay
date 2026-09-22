@@ -98,7 +98,10 @@ pub struct PolicyStatus {
     /// a million streams one event behind are the same `lag` and very different problems.
     pub streams_behind: i64,
     /// How far this Policy's search of the log has swept. Not progress — progress is per
-    /// stream — but it is what an operator resets to make a Policy search again.
+    /// stream — and not a control surface: a running worker reads this once when it takes
+    /// leadership and keeps it in memory, writing it only forwards, so an operator's reset
+    /// takes effect when that worker next starts. Places are the surface that is read
+    /// fresh every poll ([ADR-0012](../../docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
     pub discovered_through: i64,
     /// When the policy last advanced in any stream (staleness signal).
     pub last_checkpoint_at: DateTime<Utc>,

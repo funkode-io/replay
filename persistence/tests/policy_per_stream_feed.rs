@@ -116,11 +116,10 @@ async fn an_overtaken_write_is_delivered_when_it_commits_postgres_test() {
     let position = held.global_position;
     held.commit().await;
 
+    // Waited for, not asserted: the reaction fires before the checkpoint that records it,
+    // so reading the place the instant a dispatch appears is reading it one write early.
     harness.await_dispatch_caused_by(position).await;
-    assert!(
-        harness.has_passed(position).await,
-        "and once it commits it is delivered like any other event"
-    );
+    harness.await_passed(position).await;
 
     harness.shutdown().await;
 }
@@ -210,6 +209,13 @@ async fn a_streams_events_are_delivered_in_its_own_order_postgres_test() {
         }
     }
 
+    assert_eq!(
+        delivered.len(),
+        STREAMS,
+        "every stream must have been delivered something, or the order assertions below \
+         pass by having nothing to check"
+    );
+
     for (stream, tags) in delivered {
         let expected: Vec<String> = (0..EVENTS)
             .map(|event| format!("{stream}-{event}"))
@@ -237,7 +243,11 @@ async fn an_operator_moves_a_place_on_a_running_daemon_postgres_test() {
     harness.await_dispatch_caused_by(ping.global_position).await;
     let delivered_once = harness.dispatches().await.len();
 
-    harness.move_place_to(&ping.stream_id, 0).await;
+    // Waits for the place to be written before moving it, not merely for the reaction to
+    // fire: a rewind to exactly the place the running poll started from is one the poll's
+    // own checkpoint cannot tell from its own progress, and it is overwritten
+    // (funkode-io/replay#234).
+    harness.redeliver(&ping).await;
 
     harness
         .observe("the policy to react to the same event twice", || async {

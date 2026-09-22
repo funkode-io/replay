@@ -854,7 +854,7 @@ impl PolicyRunner {
     /// already parked is never duplicated — and two concurrent retries of the
     /// same reaction settle it the same way, since the table now keys a parked
     /// command and the second insert leaves the first writer's row as it stands,
-    /// reported [`DeadLetterRetry::Superseded`] (ADR-0025).
+    /// reported [`DeadLetterRetry::Superseded`] (ADR-0024).
     ///
     /// Settling a row that already existed stamps its `retry_count` and
     /// `last_retried_at`, the archived copy included, so what has already been
@@ -2826,24 +2826,38 @@ async fn drain_policy_once(
     // — on its own cadence — what the sweep has missed.
     let carried = std::mem::take(&mut progress.unfinished);
     let discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
-    let reconciled = if progress.reconcile_is_due() {
-        let examined =
-            streams_behind(pool, &name, &progress.reconciled_through, read_batch).await?;
-        progress.reconciled(&examined, read_batch);
-        write_reconciled(pool, &name, &progress.reconciled_through).await?;
-        examined
+    let reconciling = progress.reconcile_is_due();
+    let examined = if reconciling {
+        streams_behind(pool, &name, &progress.reconciled_through, read_batch).await?
     } else {
         Vec::new()
     };
 
     // The poll looks at `read_batch` streams, taken a slot at a time from each source in
-    // turn. Filling from the carried queue first and letting the others have what is left
-    // starves them outright: `read_batch` continuously-busy streams refill that queue
-    // every poll, and a quiet stream the sweep passed would be nominated by the
-    // reconciliation for ever without once being read. Round-robin bounds every source's
-    // share at a third of the batch when all three are offering, which is what makes
-    // "dropped for want of room" a delay rather than a hole.
-    let streams = share_the_poll(read_batch, [carried, discovered.streams, reconciled]);
+    // turn, starting at a different source each time. Filling from the carried queue
+    // first and letting the others have what is left starves them outright: `read_batch`
+    // continuously-busy streams refill that queue every poll, and a quiet stream the
+    // sweep passed would be nominated by the reconciliation for ever without once being
+    // read. Round-robin bounds every source's share at a third of the batch, and moving
+    // the starting slot keeps that true for a batch too small to divide by three.
+    let page = examined.clone();
+    let Shared { taken, left } = share_the_poll(
+        read_batch,
+        progress.share_from,
+        [carried, discovered.streams, examined],
+    );
+    let [carried_over, _, unexamined] = left;
+    progress.share_from += 1;
+
+    // The rotation advances only through the streams that got a slot. Advancing past the
+    // whole page would leave the rest of it behind a wrap, and if the front of the page
+    // stays behind — which is the case this exists for — the same prefix is admitted
+    // every pass and the streams after it are never read.
+    if reconciling {
+        progress.reconciled(&page, page.len() - unexamined.len(), read_batch);
+        write_reconciled(pool, &name, &progress.reconciled_through).await?;
+    }
+    let streams = taken;
 
     // The sweep has read this stretch of log whatever the streams in it turn out to owe,
     // and a stream left unfinished is remembered rather than re-swept for.
@@ -2986,27 +3000,46 @@ async fn drain_policy_once(
 
     // Final checkpoint: flush any stream advanced since the last periodic save.
     checkpoint_places(pool, &name, &advanced, &observed).await?;
-    unvisited.extend(unfinished);
-    progress.unfinished = unvisited;
+
+    // What the next poll starts from, oldest claim first: what this one could not fit,
+    // then what it did not reach, then what it read and may not have finished. Capped,
+    // because it is the one collection here that outlives a poll.
+    let mut carrying = carried_over;
+    carrying.extend(unvisited);
+    carrying.extend(unfinished);
+    carrying.truncate(read_batch as usize);
+    progress.unfinished = carrying;
 
     Ok(executed)
 }
 
-/// Fill a poll's candidate list from its sources a slot at a time, in the order given,
-/// skipping streams already taken.
+/// What one poll takes, and what each source still had to offer when it stopped.
+struct Shared<const N: usize> {
+    taken: Vec<String>,
+    /// Per source, in the order given: the candidates that got no slot. Each source's
+    /// caller decides what that means — carried forward, or left for the next pass.
+    left: [Vec<String>; N],
+}
+
+/// Fill a poll's candidate list from its sources a slot at a time, starting at `from` and
+/// wrapping, skipping streams already taken.
 ///
-/// Takes ownership because each source is consumed: a stream named twice costs one slot,
-/// not two, and the source that named it first keeps its turn.
-fn share_the_poll<const N: usize>(limit: u32, sources: [Vec<String>; N]) -> Vec<String> {
+/// Takes ownership because each source is consumed as far as it was used: a stream named
+/// twice costs one slot, not two, and the source that named it first keeps its turn. What
+/// is left is handed back rather than dropped, so no caller has to assume its candidates
+/// were read.
+///
+/// `from` moves the first turn between polls. With three sources and a batch of two, a
+/// fixed order would give the third source no slot at all — for ever, if the first two
+/// always have something to offer.
+fn share_the_poll<const N: usize>(limit: u32, from: usize, sources: [Vec<String>; N]) -> Shared<N> {
     let mut sources = sources.map(Vec::into_iter);
     let mut taken: Vec<String> = Vec::new();
 
-    while (taken.len() as u32) < limit {
+    'filling: while (taken.len() as u32) < limit {
         let mut offered = false;
-        for source in &mut sources {
-            if (taken.len() as u32) >= limit {
-                break;
-            }
+        for turn in 0..N {
+            let source = &mut sources[(from + turn) % N];
             for stream_id in source.by_ref() {
                 if !taken.contains(&stream_id) {
                     taken.push(stream_id);
@@ -3014,13 +3047,19 @@ fn share_the_poll<const N: usize>(limit: u32, sources: [Vec<String>; N]) -> Vec<
                     break;
                 }
             }
+            if (taken.len() as u32) >= limit {
+                break 'filling;
+            }
         }
         if !offered {
             break;
         }
     }
 
-    taken
+    Shared {
+        taken,
+        left: sources.map(Iterator::collect),
+    }
 }
 
 /// The runner's machinery for delivering events to **one** policy: the
@@ -3383,7 +3422,7 @@ enum Parking {
 /// the cursor — delivers the event again and parks the same command again. The
 /// `ON CONFLICT` refreshes the row that command already has with the error this
 /// delivery produced rather than leaving a second generation of rows behind
-/// (ADR-0025). It does **not** touch `created_at` (when the command first
+/// (ADR-0024). It does **not** touch `created_at` (when the command first
 /// failed) or the retry bookkeeping: a redelivery is not a [`retry_dead_letter`]
 /// — nobody invoked the control surface.
 ///
@@ -4010,7 +4049,10 @@ struct PolicyProgress {
     /// Streams this Policy is behind on that the last poll could not finish, so the next
     /// one looks at them whatever the sweep finds. Bounded by the poll's stream limit.
     unfinished: Vec<String>,
-    /// The stream id the last reconciliation examined, so the next one resumes after it.
+    /// Which source takes the first slot of the next poll. Rotating it is what keeps a
+    /// batch too small to divide between the three sources from shutting one out.
+    share_from: usize,
+    /// The stream id the last reconciliation admitted, so the next one resumes after it.
     /// Persisted, because a runner that restarts often would otherwise rotate from the
     /// start every time and never reach the end of the sort order.
     reconciled_through: String,
@@ -4019,7 +4061,9 @@ struct PolicyProgress {
     /// which is what makes a crash mid-backlog cost a cadence rather than a deployment.
     reconciled_at: Option<Instant>,
     /// How long the sweep is trusted on its own. This is the whole exposure of the
-    /// design: a write that commits below the sweep is delivered within one of these.
+    /// design: a write that commits below the sweep is delivered within one of these, or
+    /// within one full pass of the rotation when the Policy has more streams than the
+    /// reconciliation reads in a batch.
     reconcile_every: Duration,
 }
 
@@ -4038,6 +4082,7 @@ impl PolicyProgress {
         Ok(Self {
             swept_through,
             unfinished: Vec::new(),
+            share_from: 0,
             reconciled_through,
             reconciled_at: None,
             reconcile_every: resolve_reconcile_cadence(),
@@ -4050,14 +4095,22 @@ impl PolicyProgress {
             .is_none_or(|last| last.elapsed() >= self.reconcile_every)
     }
 
-    /// A short batch means the rotation reached the end of the streams, so the next pass
-    /// starts over: the empty string sorts before every id.
-    fn reconciled(&mut self, examined: &[String], limit: u32) {
+    /// Record a reconciliation: `page` is what it read, `admitted` how many of those the
+    /// poll had room for.
+    ///
+    /// The rotation stops at the last stream that got a slot and never passes one that
+    /// did not, so a page the poll could not fit is read again next cadence rather than
+    /// skipped. A page nobody could take leaves the rotation where it was; a page taken
+    /// whole and short of the limit is the end of a pass, and the next one starts over —
+    /// the empty string sorts before every id.
+    fn reconciled(&mut self, page: &[String], admitted: usize, limit: u32) {
         self.reconciled_at = Some(Instant::now());
-        self.reconciled_through = match examined.last() {
-            Some(last) if examined.len() as u32 == limit => last.clone(),
-            _ => String::new(),
-        };
+
+        if admitted == page.len() && (page.len() as u32) < limit {
+            self.reconciled_through = String::new();
+        } else if admitted > 0 {
+            self.reconciled_through = page[admitted - 1].clone();
+        }
     }
 }
 
@@ -5491,7 +5544,7 @@ mod progress_tests {
             vec!["urn:probe:a1".to_string(), "urn:probe:a2".to_string()],
             "a full batch of the streams that sort first"
         );
-        progress.reconciled(&first, 2);
+        progress.reconciled(&first, first.len(), 2);
         write_reconciled(&pool, POLICY, &progress.reconciled_through)
             .await
             .expect("writing the rotation must succeed");
@@ -5511,10 +5564,43 @@ mod progress_tests {
             vec!["urn:probe:z".to_string()],
             "the stream the first pass could not reach, with the first two still behind"
         );
-        progress.reconciled(&second, 2);
+        progress.reconciled(&second, second.len(), 2);
         assert_eq!(
             progress.reconciled_through, "",
             "a short batch is the end of the pass, and the next one starts over"
+        );
+    }
+
+    /// The rotation never passes a stream the poll had no room for.
+    ///
+    /// Advancing through the whole page is what made the first version of this a hole
+    /// rather than a delay: the poll admits its share of the page, and if the front of
+    /// the page is still behind next pass — which is the case the rotation exists for —
+    /// the same prefix is admitted every time and everything after it is stepped over
+    /// unread (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn the_rotation_stops_at_the_last_stream_that_got_a_slot_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        let page = vec![
+            "urn:probe:a".to_string(),
+            "urn:probe:b".to_string(),
+            "urn:probe:c".to_string(),
+        ];
+
+        progress.reconciled(&page, 1, 3);
+        assert_eq!(
+            progress.reconciled_through, "urn:probe:a",
+            "one slot means one stream, and the next pass resumes at the second"
+        );
+
+        progress.reconciled(&page, 0, 3);
+        assert_eq!(
+            progress.reconciled_through, "urn:probe:a",
+            "a page nobody had room for leaves the rotation where it was"
         );
     }
 

@@ -106,6 +106,13 @@ is owed is read from that stream's own sequence, which has no holes.
 - **`policy_cursors.position` is renamed `discovered_through`** and means where the search
   resumes, not what has been processed. A Policy's progress is no longer one number, and
   no column pretends otherwise.
+- **The compare-and-set compares a place, so it cannot see a rewind to the place the poll
+  started from.** "Unchanged since I looked" and "changed twice, back to where it was" are
+  the same value. An operator rewinding a stream to just before the event a poll is
+  delivering right now — the shape of "redeliver the one that just failed" — has the poll's
+  checkpoint overwrite it. The place reads forward again immediately, so an operator who
+  looks can tell and repeat; the library says nothing. A generation on the row closes it
+  (funkode-io/replay#234) and is not in this change.
 - **A runner learns it has been superseded one stream at a time**, where the old cursor
   told it once for the whole Policy. A lost compare-and-set abandons that stream for the
   poll and leaves the place where its new owner put it; the other streams in the batch

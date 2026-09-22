@@ -2193,7 +2193,7 @@ costs a scan of one row per stream, so it runs on a cadence rather than per poll
 
 | Setting | Default | What it bounds |
 |---------|---------|----------------|
-| `REPLAY_POLICY_RECONCILE_SECS` | 5 | How late a write that committed below the sweep can be delivered. Never how *whether*. |
+| `REPLAY_POLICY_RECONCILE_SECS` | 5 | How often the reconciliation runs. One cadence bounds the lateness of a write that committed below the sweep while the policy has no more streams than its read batch; beyond that the bound is one full pass, below. Never *whether*. |
 
 Lower it if that tail latency matters more than the scan; raise it if you have millions of
 streams and no long-running writes.
@@ -2248,7 +2248,10 @@ running process reinstates a value you replaced.
 
 Place writes are a compare-and-set against the value the poll started from, so a
 checkpoint can never reinstate a place that predates your update, and deleting a row
-cannot be undone by a poll recreating it. A runner that loses the race abandons **that
+cannot be undone by a poll recreating it. One gap, until
+[#234](https://github.com/funkode-io/replay/issues/234): a rewind to *exactly* the place a
+running poll started from is indistinguishable from that poll's own progress and is
+overwritten. Read the place back after moving it; if it ran forward again, move it again. A runner that loses the race abandons **that
 stream** for the poll — the others in its batch carry on — and picks your place up on the
 next one. Moving forward skips the events in between (they are never delivered); moving
 backward re-delivers them, which is safe under the same idempotency contract that
@@ -2580,7 +2583,7 @@ it builds.
 `idx_dead_letters_parked_command`
 ([0030](persistence/tests/migrations/0030_dead_letter_unique_command.sql)) is what
 makes a parked command **one row**
-([ADR-0025](docs/adr/0024-a-parked-command-is-one-row.md)). The park is written before the batched cursor
+([ADR-0024](docs/adr/0024-a-parked-command-is-one-row.md)). The park is written before the batched cursor
 checkpoint, so a crash in between — or an operator rewinding the cursor — delivers
 the event again; the park is an `ON CONFLICT DO UPDATE` against this key, which
 refreshes the error, counts the delivery in `deliveries` and stamps
@@ -2673,7 +2676,7 @@ its `WHERE`, and the command it parks *without*
 a row is guarded by the key itself — a row that appeared under it belongs to a
 writer no staler than this replay. Either way the retry reports `Superseded` and
 leaves the row alone — retry again to act on what is parked now
-([ADR-0025](docs/adr/0024-a-parked-command-is-one-row.md)). The bulk summary
+([ADR-0024](docs/adr/0024-a-parked-command-is-one-row.md)). The bulk summary
 counts such a reaction as still failing, which it is.
 
 The summary counts reactions; `PolicyStatus::dead_letter_count` keeps counting
@@ -2964,7 +2967,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `name` | Stable policy name (the cursor key). |
 | `lag` | Events written and not yet passed, summed over every stream this policy is behind on. Exact: it counts events, including the ones its filter will skip, and nothing else. |
 | `streams_behind` | How many streams that lag is spread across. One stream a million events behind and a million streams one event behind are the same `lag` and very different problems. |
-| `discovered_through` | How far this policy's search of the log has swept. Not progress — progress is per stream — but it is what you reset to make it search again. |
+| `discovered_through` | How far this policy's search of the log has swept. Not progress — progress is per stream — and not an operator control: a running worker reads it once per leadership term and keeps it in memory, so resetting it moves nothing until that worker restarts. To redeliver, move a place. |
 | `last_checkpoint_at` | When the policy last advanced in any stream (staleness signal). |
 | `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
@@ -3037,7 +3040,7 @@ None of the three stops a policy, and none of them needs an operator:
 |---------------|----------------------|
 | A write failed after taking a `global_position` | Nothing. The number is burned — `nextval` is not transactional — and a policy that reads no global order never looks at it. The place the write took in its stream *is* handed back, because that counter is a row and rolls back with the transaction. |
 | A write is still running | Its stream waits for it, and only its stream. Every other stream is delivered meanwhile. |
-| A write commits below a policy's sweep | It is delivered by the next reconciliation, within `REPLAY_POLICY_RECONCILE_SECS`. |
+| A write commits below a policy's sweep | It is delivered by the reconciliation: within `REPLAY_POLICY_RECONCILE_SECS` while the policy has no more streams than its read batch, and within one full pass of the rotation — `ceil(streams / read_batch_size)` cadences — beyond that. |
 
 This is the structural fix for
 [#164](https://github.com/funkode-io/replay/issues/164), where a burned position
