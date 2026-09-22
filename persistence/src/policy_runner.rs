@@ -5386,9 +5386,9 @@ mod cursor_tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap_or_else(|_| "?".to_string());
-            let embedded: Vec<i64> = sqlx::migrate!("./tests/migrations")
+            let embedded: Vec<String> = sqlx::migrate!("./tests/migrations")
                 .iter()
-                .map(|migration| migration.version)
+                .map(|migration| format!("{}:{}", migration.version, migration.description))
                 .collect();
             panic!(
                 "migrations must succeed: {error}\n  port: {port}\n  database: {database}\n  \
