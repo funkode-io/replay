@@ -105,10 +105,18 @@ like any transient failure and, once the retries are exhausted, recorded as kind
 `Timeout`.
 A delivery parks what its settling attempt failed on: a command that fails
 permanently is recorded once, however many attempts a retryable sibling forces.
+A row is one parked **command per reaction**, not per delivery: an event
+delivered again — after a crash between the park and the cursor checkpoint, or
+after a [Cursor move] — refreshes the row its command already has with the new
+error and counts the delivery, rather than parking a second copy
+([ADR-0024](docs/adr/0024-a-parked-command-is-one-row.md)). It is not a
+[Retry] and does not touch what one has tried.
 A row names the dispatch it is about — the [Aggregate] type, the URN of the
-instance the command was addressed to, and the command's **type** (its variant
+instance the command was addressed to, the command's **type** (its variant
 and payload are not recorded, as `Aggregate::Command` carries no `Debug` or
-`Serialize` bound) — so "which customer is stuck" is answerable from the table.
+`Serialize` bound), and its place in the reaction, which is what keeps two
+commands of one type to one instance apart — so "which customer is stuck" is
+answerable from the table.
 A reaction that panicked before building a dispatch has nothing to name, and its
 identity columns are null.
 A row also records what has been tried on it: how many times a [Retry] has

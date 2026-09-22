@@ -1,6 +1,9 @@
 # A panicking reaction is a permanent failure, contained at the event
 
-**Status:** accepted
+**Status:** accepted; the duplicate row a crash inside the checkpoint window
+leaves is no longer accepted —
+[ADR-0024](0024-a-parked-command-is-one-row.md) makes a parked command unique per
+reaction and turns the second park into a refresh. Everything else below stands.
 
 A `Policy` reaction is arbitrary user code the runner calls on the worker's own
 task. A panic in it — an unwrapped `None`, an index out of range, a malformed
@@ -77,6 +80,10 @@ catch. We make the delivery of one event the containment boundary.
   dead letter is an extraordinary event an operator reads by hand; showing the
   same one twice costs a moment's triage, while de-duplicating it costs a
   uniqueness constraint over every parking path.
+  **Superseded by [ADR-0024](0024-a-parked-command-is-one-row.md)**: the constraint
+  turned out to cost one `ON CONFLICT` in the one function that parks, and a retry
+  that settles every generation of a row (ADR-0021) made the duplicates the
+  library's bookkeeping rather than only an operator's reading.
 - Two things remain uncontained, and both are stated in `CONTEXT.md`'s
   non-guarantees: a panic inside a task the reaction **spawns itself**, which
   unwinds in its own task outside this boundary, and any panic in a binary built
