@@ -1423,6 +1423,61 @@ async fn a_retry_does_not_overwrite_a_row_a_delivery_parked_for_its_new_command_
     harness.shutdown().await;
 }
 
+/// A reaction with more rows than the settlement reads at once is still settled
+/// by one replay.
+///
+/// The group is read a page at a time (funkode-io/replay#228), and a page is
+/// the only thing that has to fit in memory — not the group. What must not
+/// change with it is what a retry settles: one replay, every row of the
+/// reaction, in one transaction (ADR-0021). Here the tail is rows an older
+/// version of the policy parked: the reaction as registered now does not emit
+/// those commands, so each resolves, and the one command it does emit is still
+/// failing.
+#[tokio::test]
+async fn a_group_bigger_than_a_page_is_settled_by_one_replay_postgres_test() {
+    /// Comfortably more than the runner reads at once, and enough that a second
+    /// page is not the last.
+    const RETIRED: usize = 250;
+
+    let reaction = Reaction::new();
+    let harness = PolicyDaemonHarness::start("group_pages", reaction.policy()).await;
+
+    let event = harness.ping("subject-1", ONE_COMMAND).await;
+    let parked = harness.await_dead_letters(1).await;
+    let live = parked[0].id;
+    harness.park_retired_commands(&event, RETIRED, 16).await;
+    let replays_before = reaction.replays();
+
+    assert_eq!(
+        harness.retry_parked_row(live).await,
+        DeadLetterRetry::StillFailing,
+        "the command the reaction still emits is still refused"
+    );
+
+    assert_eq!(
+        reaction.replays() - replays_before,
+        1,
+        "one reaction, one replay, however many rows it has"
+    );
+    assert_eq!(
+        (
+            harness.parked_row_count().await,
+            harness.archived_row_count("retried").await
+        ),
+        (1, RETIRED as i64),
+        "every row past the first page must be settled too: the retired ones \
+         archived, the live one left parked"
+    );
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        (after[0].id, after[0].retry_count),
+        (live, 1),
+        "and the live row carries the retry it just had, got {after:#?}"
+    );
+
+    harness.shutdown().await;
+}
+
 /// A retry that settles a row while another retry is replaying it is the third
 /// writer the settlement has to see.
 ///

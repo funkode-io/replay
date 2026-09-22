@@ -941,34 +941,34 @@ impl PolicyRunner {
             global_position: row.get("global_position"),
             event_id: row.get("event_id"),
         };
-        let settled = self.retry_reaction(reaction, OPERATION).await?;
+        let settled = self.retry_reaction(reaction, OPERATION, Some(id)).await?;
 
         // The row `id` names is normally in the group this replay settled; it is
         // absent when a concurrent discard took it out between the SELECT above
         // and the group read, which is the same nothing-to-do as an absent id.
-        Ok(settled
-            .into_iter()
-            .find_map(|(settled_id, outcome)| (settled_id == id).then_some(outcome))
-            .unwrap_or(DeadLetterRetry::NotFound))
+        Ok(settled.asked_about.unwrap_or(DeadLetterRetry::NotFound))
     }
 
     /// Replay one reaction and settle every row it parked.
     ///
     /// The group is read here rather than by the caller, so the by-id and the
-    /// bulk path settle exactly the same set. Returns what each row of the group
-    /// concluded, in the order the rows were parked.
+    /// bulk path settle exactly the same set. `asked_about` names the row a
+    /// by-id retry wants the outcome of: the group is **folded** rather than
+    /// returned, since it is not a set worth holding (funkode-io/replay#228).
     async fn retry_reaction(
         &self,
         reaction: ParkedReaction,
         operation: &'static str,
-    ) -> Result<Vec<(i64, DeadLetterRetry)>, replay::Error> {
-        // The group, before anything is re-executed: a reaction whose every row
-        // was discarded between the caller's read and this one has nothing left
-        // to settle, and replaying it would dispatch commands on behalf of rows
-        // an operator has just retired.
-        let rows = load_parked_reaction(&self.pool, &reaction).await?;
-        if rows.is_empty() {
-            return Ok(Vec::new());
+        asked_about: Option<i64>,
+    ) -> Result<ReactionSettlement, replay::Error> {
+        // The group as it stands before anything is re-executed, in a fixed
+        // number of bytes ([`GroupDigest`]). A reaction whose every row was
+        // discarded between the caller's read and this one has nothing left to
+        // settle, and replaying it would dispatch commands on behalf of rows an
+        // operator has just retired.
+        let before = group_digest(&self.pool, &reaction).await?;
+        if before.rows == 0 {
+            return Ok(ReactionSettlement::default());
         }
 
         let ParkedReaction {
@@ -1071,7 +1071,7 @@ impl PolicyRunner {
             }
         };
 
-        self.settle(&reaction, rows, replay).await
+        self.settle(&reaction, before, replay, asked_about).await
     }
 
     /// Settle each row of a reaction's group with what the replay concluded for
@@ -1082,79 +1082,95 @@ impl PolicyRunner {
     /// then failed would take a still-failing command out of the table with
     /// nothing put back: the drain is long past the event and would never park it
     /// again.
+    ///
+    /// The group is settled a page at a time and never held whole
+    /// (funkode-io/replay#228), so what guards it against a writer that moved it
+    /// while the replay ran is the group's [digest](GroupDigest) rather than a
+    /// per-row version: `before` is re-read here under the rows' own locks, and a
+    /// group that moved settles **nothing** — every row of it is reported
+    /// [`DeadLetterRetry::Superseded`], which is one reaction still failing.
     async fn settle(
         &self,
         reaction: &ParkedReaction,
-        rows: Vec<ParkedRow>,
+        before: GroupDigest,
         replay: Replay,
-    ) -> Result<Vec<(i64, DeadLetterRetry)>, replay::Error> {
+        asked_about: Option<i64>,
+    ) -> Result<ReactionSettlement, replay::Error> {
         let mut replay = replay;
-        let mut settled = Vec::with_capacity(rows.len());
+        let mut settled = ReactionSettlement::default();
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
-        // How many rows name each row's identity, read before any of them is
-        // settled: what tells a group of indistinguishable dispatches from a
-        // dispatch that parked no row at all.
-        let naming: Vec<usize> = rows
-            .iter()
-            .map(|row| match row.identity.as_ref() {
-                Some(identity) => rows
-                    .iter()
-                    .filter(|other| other.identity.as_ref() == Some(identity))
-                    .count(),
-                None => 0,
-            })
-            .collect();
+
+        // Under the locks, so what this reads is also what no one else can
+        // change until the settlement commits.
+        if lock_group(&mut tx, reaction).await? != before {
+            tracing::info!(
+                policy   = %reaction.policy_name,
+                event_id = %reaction.event_id,
+                "a reaction moved while its retry replayed it; settling none of \
+                 its rows, so the writer that moved it keeps what it wrote"
+            );
+            settled.any_still_failing = true;
+            if let Some(id) = asked_about {
+                settled.asked_about = Some(unsettled(&mut *tx, id).await?);
+            }
+            return Ok(settled);
+        }
 
         // Rows that name a command are settled first, whatever their ids. A row
         // that names none is judged by the replay *as a whole* and speaks for
         // every dispatch of it, so letting one go first — an upgrade's row is
         // older than the rows a later delivery parked, hence lower-numbered —
-        // would leave its neighbours nothing of their own to take.
-        let mut ordered: Vec<(ParkedRow, usize)> = rows.into_iter().zip(naming).collect();
-        ordered.sort_by_key(|(row, _)| row.identity.is_none());
-
-        for (row, rows_naming_it) in ordered {
-            let outcome = match row.identity.as_ref() {
-                // The command this row was parked for ran again: its own
-                // outcome settles it.
-                Some(identity) => replay.settlement_for(identity, rows_naming_it),
-                // The row names no command, so only the replay as a whole can
-                // settle it.
-                None => replay.verdict(),
+        // would leave its neighbours nothing of their own to take. That order is
+        // also what the pages walk, so a page boundary cannot reorder it.
+        let mut page = RowKeyset::start();
+        loop {
+            let rows = load_parked_page(&mut tx, reaction, page).await?;
+            let Some(last) = rows.last().map(RowKeyset::after) else {
+                break;
             };
+            let exhausted = (rows.len() as i64) < RETRY_ROW_PAGE_SIZE;
+            page = last;
 
-            let settlement = match outcome {
-                None => {
-                    if move_dead_letter_to_archive(&mut *tx, row.id, "retried", Some(row.version))
-                        .await?
-                    {
-                        DeadLetterRetry::Resolved
-                    } else {
-                        // Either a concurrent discard took the row out, or a
-                        // delivery re-parked it after the replay read it.
-                        unsettled(&mut *tx, row.id).await?
+            for row in rows {
+                let outcome = match row.identity.as_ref() {
+                    // The command this row was parked for ran again: its own
+                    // outcome settles it.
+                    Some(identity) => replay.settlement_for(identity, row.rows_naming_it),
+                    // The row names no command, so only the replay as a whole
+                    // can settle it.
+                    None => replay.verdict(),
+                };
+
+                // The group is locked and was verified unchanged, so every one
+                // of these statements matches its row; `unsettled` is the
+                // defence in depth for the day that stops being true.
+                let settlement = match outcome {
+                    None => {
+                        if move_dead_letter_to_archive(&mut *tx, row.id, "retried").await? {
+                            DeadLetterRetry::Resolved
+                        } else {
+                            unsettled(&mut *tx, row.id).await?
+                        }
                     }
-                }
-                Some(Settlement {
-                    error_kind,
-                    error_message,
-                }) => {
-                    if re_park_dead_letter(
-                        &mut *tx,
-                        row.id,
-                        &error_kind,
-                        &error_message,
-                        row.version,
-                    )
-                    .await?
-                    {
-                        DeadLetterRetry::StillFailing
-                    } else {
-                        unsettled(&mut *tx, row.id).await?
+                    Some(Settlement {
+                        error_kind,
+                        error_message,
+                    }) => {
+                        if re_park_dead_letter(&mut *tx, row.id, &error_kind, &error_message)
+                            .await?
+                        {
+                            DeadLetterRetry::StillFailing
+                        } else {
+                            unsettled(&mut *tx, row.id).await?
+                        }
                     }
-                }
-            };
-            settled.push((row.id, settlement));
+                };
+                settled.record(row.id, settlement, asked_about);
+            }
+
+            if exhausted {
+                break;
+            }
         }
 
         // A replay is the drain's equal, so it parks what failed: a dispatch
@@ -1164,10 +1180,10 @@ impl PolicyRunner {
         // now (ADR-0007). Without this it would be executed, fail, and leave
         // nothing behind while the retry reported the reaction resolved.
         //
-        // The row it had no version to guard is the row it is about to create,
-        // so the guard here is the key itself: a command that acquired a row
-        // while the replay ran has one from a writer whose error is no staler
-        // than this one's, and the insert leaves it as it stands.
+        // The locks cover the rows that existed; this one is a row that does
+        // not, so what guards it is the key itself: a command that acquired a
+        // row while the replay ran has one from a writer whose error is no
+        // staler than this one's, and the insert leaves it as it stands.
         for unclaimed in replay.unclaimed_failures() {
             let parked = write_dead_letter(
                 &mut *tx,
@@ -1182,7 +1198,6 @@ impl PolicyRunner {
                 },
             )
             .await?;
-            let id = parked.id;
             tracing::warn!(
                 policy    = %reaction.policy_name,
                 event_id  = %reaction.event_id,
@@ -1190,26 +1205,23 @@ impl PolicyRunner {
                 target    = %unclaimed.identity.target_stream_id,
                 command   = unclaimed.identity.command_name,
                 error     = %unclaimed.settlement.error_message,
-                dead_letter_id = id,
+                dead_letter_id = parked.id,
                 superseded = parked.conflicted,
                 "a retried reaction failed on a command it had not parked; parking it, \
                  or leaving the row another writer parked for it meanwhile"
             );
-            settled.push((
-                id,
+            settled.record(
+                parked.id,
                 if parked.conflicted {
                     DeadLetterRetry::Superseded
                 } else {
                     DeadLetterRetry::StillFailing
                 },
-            ));
+                asked_about,
+            );
         }
 
         tx.commit().await.map_err(crate::db_error)?;
-
-        // Back into the order the rows were parked in, which settling the
-        // identity-less ones last has just disturbed.
-        settled.sort_by_key(|(id, _)| *id);
 
         Ok(settled)
     }
@@ -1230,7 +1242,7 @@ impl PolicyRunner {
     /// Returns [`DeadLetterDiscard::NotFound`] when no active row matches `id`
     /// — a defined no-op, never a panic.
     pub async fn discard_dead_letter(&self, id: i64) -> Result<DeadLetterDiscard, replay::Error> {
-        if move_dead_letter_to_archive(&self.pool, id, "discarded", None).await? {
+        if move_dead_letter_to_archive(&self.pool, id, "discarded").await? {
             Ok(DeadLetterDiscard::Discarded)
         } else {
             Ok(DeadLetterDiscard::NotFound)
@@ -1288,19 +1300,11 @@ impl PolicyRunner {
             after = last;
 
             for reaction in page {
-                let settled = self.retry_reaction(reaction, OPERATION).await?;
+                let settled = self.retry_reaction(reaction, OPERATION, None).await?;
 
-                if settled.iter().any(|(_, outcome)| {
-                    matches!(
-                        outcome,
-                        DeadLetterRetry::StillFailing | DeadLetterRetry::Superseded
-                    )
-                }) {
+                if settled.any_still_failing {
                     summary.reactions_still_failing += 1;
-                } else if settled
-                    .iter()
-                    .any(|(_, outcome)| *outcome == DeadLetterRetry::Resolved)
-                {
+                } else if settled.any_resolved {
                     summary.reactions_resolved += 1;
                 }
                 // A group whose every row was taken concurrently settled
@@ -2419,37 +2423,108 @@ impl ReactionKeyset {
     }
 }
 
-/// One parked row, as the retry path needs it: which row, and which dispatch it
-/// was parked for.
+/// One parked row, as the retry path needs it: which row, which dispatch it was
+/// parked for, and how many rows of its group name that dispatch.
 struct ParkedRow {
     id: i64,
     /// The dispatch the row names. `None` where there is none to name: a row
     /// parked before the identity migration, or parked for a panic in `react`
     /// itself.
     identity: Option<ParkedIdentity>,
-    /// The row as the replay read it.
-    version: ParkedVersion,
+    /// How many rows of the **whole** group name the same dispatch — counted by
+    /// the database over the group, not by the caller over a page, since a page
+    /// can split an identity's rows and a count taken over half of them would
+    /// settle the other half by a rule that does not apply
+    /// ([`Replay::settlement_for`]).
+    rows_naming_it: usize,
 }
 
-/// What a settlement checks the row still says before it settles it.
+/// What a reaction's group looked like at a moment, in a fixed number of bytes.
 ///
-/// A retry reads a reaction's group, replays it, and settles each row after —
-/// seconds during which a delivery of the same event (a crash inside the
-/// checkpoint window, or a [Cursor move]) can re-park the same command in place.
-/// Settling by `id` alone would then archive a failure nobody retried, or
-/// overwrite it with the staler error the replay produced
-/// (funkode-io/replay#227). Every column an intervening writer moves is carried
-/// into the settlement's `WHERE` — a delivery moves `deliveries` and
-/// `last_parked_at`, another retry of the same reaction (ADR-0021) moves
-/// `retry_count` — so a row that changed is not settled; the caller hears
-/// [`DeadLetterRetry::Superseded`].
+/// A retry reads a reaction's rows, replays it, and settles them after — seconds
+/// during which a delivery of the same event (a crash inside the checkpoint
+/// window, or a [Cursor move]) can re-park one of its commands, and another
+/// operator's retry can settle one. Settling by `id` alone would then archive a
+/// failure nobody retried, or overwrite it with the staler error this replay
+/// produced (funkode-io/replay#227).
+///
+/// The group is too large to carry row by row (funkode-io/replay#228), so what a
+/// retry carries across the replay is this: aggregates over the whole group,
+/// read before it and re-read under the rows' locks before the settlement. Every
+/// write a concurrent writer can make moves one of them — a park bumps
+/// `deliveries` and `last_parked_at`, a settlement bumps `retries`, an insert or
+/// an archive moves `rows` — so a group that reads the same has not moved, and
+/// one that has not is the group the replay ran against.
 ///
 /// [Cursor move]: ../../CONTEXT.md#cursor-move
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct GroupDigest {
+    rows: i64,
+    deliveries: i64,
+    retries: i64,
+    last_parked_at: Option<DateTime<Utc>>,
+}
+
+/// Where the next page of a group's rows resumes: the last row the previous page
+/// settled, exclusive.
+///
+/// Ordered as the settlement must run — rows naming a command first, then by id
+/// — so paging cannot reorder what a page boundary happens to fall between.
 #[derive(Clone, Copy)]
-struct ParkedVersion {
-    deliveries: i32,
-    last_parked_at: DateTime<Utc>,
-    retry_count: i32,
+struct RowKeyset {
+    nameless: bool,
+    id: i64,
+}
+
+impl RowKeyset {
+    /// Before every row: `id` is a sequence value, so the lowest one a row can
+    /// carry is 1, and a row naming a command sorts before one that does not.
+    fn start() -> Self {
+        Self {
+            nameless: false,
+            id: 0,
+        }
+    }
+
+    fn after(row: &ParkedRow) -> Self {
+        Self {
+            nameless: row.identity.is_none(),
+            id: row.id,
+        }
+    }
+}
+
+/// What settling one reaction concluded, counted rather than listed.
+///
+/// The group can be larger than anything worth holding
+/// (funkode-io/replay#228), and neither caller needs it row by row: a bulk retry
+/// counts reactions, and a by-id retry wants the outcome of the one row it was
+/// asked about.
+#[derive(Default)]
+struct ReactionSettlement {
+    /// Whether any row of the group was archived `retried`.
+    any_resolved: bool,
+    /// Whether any row is still parked after the settlement — re-parked, parked
+    /// anew, or left to the writer that superseded this replay.
+    any_still_failing: bool,
+    /// What the row a by-id retry asked about concluded.
+    asked_about: Option<DeadLetterRetry>,
+}
+
+impl ReactionSettlement {
+    /// Fold one row's outcome in, keeping the one the caller asked about.
+    fn record(&mut self, id: i64, outcome: DeadLetterRetry, asked_about: Option<i64>) {
+        match outcome {
+            DeadLetterRetry::Resolved => self.any_resolved = true,
+            DeadLetterRetry::StillFailing | DeadLetterRetry::Superseded => {
+                self.any_still_failing = true
+            }
+            DeadLetterRetry::NotFound => {}
+        }
+        if asked_about == Some(id) {
+            self.asked_about = Some(outcome);
+        }
+    }
 }
 
 /// The dispatch a parked row names, read back off the row.
@@ -3608,33 +3683,24 @@ struct Parked {
 /// change outside the library, which the library cannot observe.
 /// [`PolicyRunner::discard_dead_letter`] is what takes a row out of play.
 ///
-/// Returns whether a row was still there to re-park **as the replay read it**: a
-/// concurrent discard leaves nothing to update, and a writer that moved the row
-/// in the meantime — a delivery that re-parked the command, another retry that
-/// settled it — leaves one whose error is no staler than this one (see
-/// [`ParkedVersion`]). The first is nothing to report; the second is a reaction
-/// still failing, reported as [`DeadLetterRetry::Superseded`] rather than by
-/// overwriting what that writer left.
+/// Returns whether a row was still there to re-park. Under the group's locks
+/// (see [`GroupDigest`]) that is always true; a `false` would mean a row left a
+/// locked group, which is reported rather than assumed away.
 async fn re_park_dead_letter(
     executor: impl sqlx::PgExecutor<'_>,
     id: i64,
     error_kind: &str,
     error_message: &str,
-    version: ParkedVersion,
 ) -> Result<bool, replay::Error> {
     let result = sqlx::query(
         "UPDATE policy_dead_letters \
          SET error_kind = $2, error_message = $3, \
              retry_count = retry_count + 1, last_retried_at = now() \
-         WHERE id = $1 AND deliveries = $4 AND last_parked_at = $5 \
-           AND retry_count = $6",
+         WHERE id = $1",
     )
     .bind(id)
     .bind(error_kind)
     .bind(error_message)
-    .bind(version.deliveries)
-    .bind(version.last_parked_at)
-    .bind(version.retry_count)
     .execute(executor)
     .await
     .map_err(crate::db_error)?;
@@ -3725,41 +3791,128 @@ async fn last_parked_position(
     .map_err(crate::db_error)
 }
 
-/// The rows one reaction parked, oldest first.
+/// What a reaction's group adds up to right now, read without locking anything.
 ///
-/// One row per command the reaction dispatches — the vector `react_erased`
-/// already materialises — no longer multiplied by the number of times the event
-/// was delivered: a parked command is one row, and a redelivery refreshes it
-/// (funkode-io/replay#220).
+/// Taken before the replay, and compared with [`lock_group`]'s reading after it:
+/// the group's stand-in for a per-row version ([`GroupDigest`]).
 ///
-/// **Not yet a number in the code.** On top of that vector sits the tail the
-/// dedupe migration could not prove duplicate and kept apart
-/// ([0029](../../persistence/tests/migrations/0029_dead_letter_dedupe.sql)): the
-/// old code's commands times the deliveries it saw. It is frozen at the moment
-/// the migration ran — every later park refreshes a row rather than adding one —
-/// and it shrinks as retries settle it, but nothing bounds it by a constant.
-/// Bounding the read over it is tracked by funkode-io/replay#228; a `LIMIT` is
-/// not the fix, because a retry settles every row of a reaction from one replay.
-/// `tests/bounded_queries.rs` carries the same reading as the review of record.
+/// Bounded by its shape: one row of four scalars, whatever the group holds.
 ///
 /// `global_position` is redundant with `event_id` — one event has one position —
 /// and is in the filter to make it a prefix match on
 /// `idx_dead_letters_policy_reaction`.
-async fn load_parked_reaction(
-    pool: &Pool<Postgres>,
+async fn group_digest(
+    executor: impl sqlx::PgExecutor<'_>,
     reaction: &ParkedReaction,
-) -> Result<Vec<ParkedRow>, replay::Error> {
-    let rows = sqlx::query(
-        "SELECT id, aggregate_name, target_stream_id, command_name, deliveries, \
-                 last_parked_at, retry_count \
+) -> Result<GroupDigest, replay::Error> {
+    let row = sqlx::query(
+        "SELECT count(*) AS rows, \
+                coalesce(sum(deliveries), 0) AS deliveries, \
+                coalesce(sum(retry_count), 0) AS retries, \
+                max(last_parked_at) AS last_parked_at \
          FROM policy_dead_letters \
-         WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
-         ORDER BY id ASC",
+         WHERE policy_name = $1 AND global_position = $2 AND event_id = $3",
     )
     .bind(&reaction.policy_name)
     .bind(reaction.global_position)
     .bind(reaction.event_id)
-    .fetch_all(pool)
+    .fetch_one(executor)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(GroupDigest {
+        rows: row.get("rows"),
+        deliveries: row.get("deliveries"),
+        retries: row.get("retries"),
+        last_parked_at: row.get("last_parked_at"),
+    })
+}
+
+/// The same reading, with every row of the group locked until the transaction
+/// ends.
+///
+/// The lock is what makes the comparison decisive rather than advisory: a writer
+/// that had already moved a row shows up in the numbers, and one that has not
+/// yet cannot move it behind the settlement's back — it waits, and applies its
+/// fresher failure on top of what this retry concluded.
+///
+/// The aggregate sits outside the locking sub-select because `FOR UPDATE` and
+/// aggregation cannot share a query level; the rows it locks are read but never
+/// returned, so this stays one row of four scalars however large the group is.
+async fn lock_group(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    reaction: &ParkedReaction,
+) -> Result<GroupDigest, replay::Error> {
+    let row = sqlx::query(
+        "SELECT count(*) AS rows, \
+                coalesce(sum(g.deliveries), 0) AS deliveries, \
+                coalesce(sum(g.retry_count), 0) AS retries, \
+                max(g.last_parked_at) AS last_parked_at \
+         FROM (SELECT deliveries, retry_count, last_parked_at \
+               FROM policy_dead_letters \
+               WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
+               ORDER BY id ASC \
+               FOR UPDATE) g",
+    )
+    .bind(&reaction.policy_name)
+    .bind(reaction.global_position)
+    .bind(reaction.event_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(GroupDigest {
+        rows: row.get("rows"),
+        deliveries: row.get("deliveries"),
+        retries: row.get("retries"),
+        last_parked_at: row.get("last_parked_at"),
+    })
+}
+
+/// One page of a reaction's rows, in the order they are settled: the rows naming
+/// a command first, oldest first within each.
+///
+/// Bounded by [`RETRY_ROW_PAGE_SIZE`]. A reaction's rows are one per command the
+/// current code dispatches — plus the tail an older version of the policy parked
+/// and the dedupe could not prove duplicate, which is the old code's commands
+/// times the deliveries it saw and is a number nothing in the code bounds
+/// (funkode-io/replay#228). Reading the group whole therefore held a table's
+/// worth of strings for a reaction an upgrade had inherited.
+///
+/// `rows_naming_it` is counted by the window over the **whole** group before the
+/// keyset narrows it to a page: it decides whether a row is settled in
+/// production order or shares a verdict with its indistinguishable siblings
+/// ([`Replay::settlement_for`]), and a count taken over a page would answer for
+/// the group.
+///
+/// `global_position` is redundant with `event_id` — one event has one position —
+/// and is in the filter to make it a prefix match on
+/// `idx_dead_letters_policy_reaction`.
+async fn load_parked_page(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    reaction: &ParkedReaction,
+    after: RowKeyset,
+) -> Result<Vec<ParkedRow>, replay::Error> {
+    let rows = sqlx::query(
+        "SELECT id, aggregate_name, target_stream_id, command_name, nameless, naming \
+         FROM (SELECT id, aggregate_name, target_stream_id, command_name, \
+                      (aggregate_name IS NULL OR target_stream_id IS NULL \
+                       OR command_name IS NULL) AS nameless, \
+                      count(*) OVER (PARTITION BY aggregate_name, target_stream_id, \
+                                                  command_name) AS naming \
+               FROM policy_dead_letters \
+               WHERE policy_name = $1 AND global_position = $2 AND event_id = $3) g \
+         WHERE (g.nameless, g.id) > ($4, $5) \
+         ORDER BY g.nameless ASC, g.id ASC \
+         LIMIT $6",
+    )
+    .bind(&reaction.policy_name)
+    .bind(reaction.global_position)
+    .bind(reaction.event_id)
+    .bind(after.nameless)
+    .bind(after.id)
+    .bind(RETRY_ROW_PAGE_SIZE)
+    .fetch_all(&mut **tx)
     .await
     .map_err(crate::db_error)?;
 
@@ -3769,6 +3922,7 @@ async fn load_parked_reaction(
             let aggregate_name: Option<String> = row.get("aggregate_name");
             let target_stream_id: Option<String> = row.get("target_stream_id");
             let command_name: Option<String> = row.get("command_name");
+            let naming: i64 = row.get("naming");
             ParkedRow {
                 id: row.get("id"),
                 identity: match (aggregate_name, target_stream_id, command_name) {
@@ -3781,11 +3935,7 @@ async fn load_parked_reaction(
                     }
                     _ => None,
                 },
-                version: ParkedVersion {
-                    deliveries: row.get("deliveries"),
-                    last_parked_at: row.get("last_parked_at"),
-                    retry_count: row.get("retry_count"),
-                },
+                rows_naming_it: naming as usize,
             }
         })
         .collect())
@@ -3799,12 +3949,10 @@ async fn load_parked_reaction(
 /// active set and preserved for audit atomically. Returns `true` when a row was
 /// moved, `false` when no active row matched.
 ///
-/// `version` is `Some` for a retry, which may only archive the row its replay
-/// read: a writer that moved the row in between — a delivery that re-parked the
-/// command, another retry that settled it — has put something newer in it, and
-/// archiving that `retried` retires a failure nobody retried ([`ParkedVersion`]).
-/// A discard passes `None` — it re-runs nothing, so what the row says now does
-/// not change what the operator asked to retire.
+/// What keeps a retry from archiving a row a delivery re-parked while the replay
+/// ran is the group's lock and digest ([`GroupDigest`]), taken before any row of
+/// it is settled — so this statement matches on `id` and nothing else, and a
+/// discard, which re-runs nothing and holds no group, uses the same one.
 ///
 /// A move with reason `retried` is a retry settling the row, so it stamps the
 /// retry bookkeeping the same way [`re_park_dead_letter`] does; a discard
@@ -3813,15 +3961,11 @@ async fn move_dead_letter_to_archive(
     executor: impl sqlx::PgExecutor<'_>,
     id: i64,
     reason: &str,
-    version: Option<ParkedVersion>,
 ) -> Result<bool, replay::Error> {
     let result = sqlx::query(
         "WITH moved AS ( \
              DELETE FROM policy_dead_letters \
              WHERE id = $1 \
-               AND ($3::int IS NULL OR deliveries = $3) \
-               AND ($4::timestamptz IS NULL OR last_parked_at = $4) \
-               AND ($5::int IS NULL OR retry_count = $5) \
              RETURNING id, policy_name, global_position, event_id, error_kind, \
                        error_message, created_at, aggregate_name, target_stream_id, \
                        command_name, retry_count, last_retried_at, dispatch_ordinal, \
@@ -3842,9 +3986,6 @@ async fn move_dead_letter_to_archive(
     )
     .bind(id)
     .bind(reason)
-    .bind(version.map(|v| v.deliveries))
-    .bind(version.map(|v| v.last_parked_at))
-    .bind(version.map(|v| v.retry_count))
     .execute(executor)
     .await
     .map_err(crate::db_error)?;
@@ -4363,6 +4504,14 @@ const DEFAULT_CHECKPOINT_BATCH_SIZE: u32 = 100;
 /// Raising it would buy nothing an operator can measure, and the round trip it
 /// saves is dwarfed by the replays each page performs.
 const RETRY_PAGE_SIZE: i64 = 100;
+
+/// Rows of one reaction's group read per page while it is settled.
+///
+/// Not a tunable either, and the same shape of bound as [`RETRY_PAGE_SIZE`]: it
+/// caps what a settlement holds, which is a row's identity strings. A retry
+/// settles every row of the reaction whatever this is (ADR-0025); the number
+/// only decides how many round trips that takes.
+const RETRY_ROW_PAGE_SIZE: i64 = 100;
 
 /// Environment variable that overrides the read-batch default.
 const READ_BATCH_SIZE_ENV_VAR: &str = "REPLAY_READ_BATCH_SIZE";
