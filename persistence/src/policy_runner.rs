@@ -2438,8 +2438,10 @@ struct ParkedRow {
 /// checkpoint window, or a [Cursor move]) can re-park the same command in place.
 /// Settling by `id` alone would then archive a failure nobody retried, or
 /// overwrite it with the staler error the replay produced
-/// (funkode-io/replay#227). Both columns a redelivery moves are carried into the
-/// settlement's `WHERE`, so a row that changed is not settled; the caller hears
+/// (funkode-io/replay#227). Every column an intervening writer moves is carried
+/// into the settlement's `WHERE` — a delivery moves `deliveries` and
+/// `last_parked_at`, another retry of the same reaction (ADR-0021) moves
+/// `retry_count` — so a row that changed is not settled; the caller hears
 /// [`DeadLetterRetry::Superseded`].
 ///
 /// [Cursor move]: ../../CONTEXT.md#cursor-move
@@ -2447,6 +2449,7 @@ struct ParkedRow {
 struct ParkedVersion {
     deliveries: i32,
     last_parked_at: DateTime<Utc>,
+    retry_count: i32,
 }
 
 /// The dispatch a parked row names, read back off the row.
@@ -3606,9 +3609,12 @@ struct Parked {
 /// [`PolicyRunner::discard_dead_letter`] is what takes a row out of play.
 ///
 /// Returns whether a row was still there to re-park **as the replay read it**: a
-/// concurrent discard leaves nothing to update, and a delivery that re-parked
-/// the command in the meantime leaves a row whose error is newer than this one
-/// (see [`ParkedVersion`]). Neither is a reaction still failing.
+/// concurrent discard leaves nothing to update, and a writer that moved the row
+/// in the meantime — a delivery that re-parked the command, another retry that
+/// settled it — leaves one whose error is no staler than this one (see
+/// [`ParkedVersion`]). The first is nothing to report; the second is a reaction
+/// still failing, reported as [`DeadLetterRetry::Superseded`] rather than by
+/// overwriting what that writer left.
 async fn re_park_dead_letter(
     executor: impl sqlx::PgExecutor<'_>,
     id: i64,
@@ -3620,13 +3626,15 @@ async fn re_park_dead_letter(
         "UPDATE policy_dead_letters \
          SET error_kind = $2, error_message = $3, \
              retry_count = retry_count + 1, last_retried_at = now() \
-         WHERE id = $1 AND deliveries = $4 AND last_parked_at = $5",
+         WHERE id = $1 AND deliveries = $4 AND last_parked_at = $5 \
+           AND retry_count = $6",
     )
     .bind(id)
     .bind(error_kind)
     .bind(error_message)
     .bind(version.deliveries)
     .bind(version.last_parked_at)
+    .bind(version.retry_count)
     .execute(executor)
     .await
     .map_err(crate::db_error)?;
@@ -3635,7 +3643,7 @@ async fn re_park_dead_letter(
 
 /// What a settlement that matched no row means: the row is gone (a concurrent
 /// discard), or it is still parked but is no longer the row the replay read (a
-/// delivery re-parked its command).
+/// delivery re-parked its command, or another retry settled it).
 ///
 /// Asked only on that path, so a settlement that lands stays one statement.
 async fn unsettled(
@@ -3732,7 +3740,8 @@ async fn load_parked_reaction(
     reaction: &ParkedReaction,
 ) -> Result<Vec<ParkedRow>, replay::Error> {
     let rows = sqlx::query(
-        "SELECT id, aggregate_name, target_stream_id, command_name, deliveries, last_parked_at \
+        "SELECT id, aggregate_name, target_stream_id, command_name, deliveries, \
+                 last_parked_at, retry_count \
          FROM policy_dead_letters \
          WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
          ORDER BY id ASC",
@@ -3765,6 +3774,7 @@ async fn load_parked_reaction(
                 version: ParkedVersion {
                     deliveries: row.get("deliveries"),
                     last_parked_at: row.get("last_parked_at"),
+                    retry_count: row.get("retry_count"),
                 },
             }
         })
@@ -3780,10 +3790,11 @@ async fn load_parked_reaction(
 /// moved, `false` when no active row matched.
 ///
 /// `version` is `Some` for a retry, which may only archive the row its replay
-/// read: a delivery that re-parked the command in between has put a newer
-/// failure in the row, and archiving it `retried` retires a failure nobody
-/// retried ([`ParkedVersion`]). A discard passes `None` — it re-runs nothing, so
-/// what the row says now does not change what the operator asked to retire.
+/// read: a writer that moved the row in between — a delivery that re-parked the
+/// command, another retry that settled it — has put something newer in it, and
+/// archiving that `retried` retires a failure nobody retried ([`ParkedVersion`]).
+/// A discard passes `None` — it re-runs nothing, so what the row says now does
+/// not change what the operator asked to retire.
 ///
 /// A move with reason `retried` is a retry settling the row, so it stamps the
 /// retry bookkeeping the same way [`re_park_dead_letter`] does; a discard
@@ -3800,6 +3811,7 @@ async fn move_dead_letter_to_archive(
              WHERE id = $1 \
                AND ($3::int IS NULL OR deliveries = $3) \
                AND ($4::timestamptz IS NULL OR last_parked_at = $4) \
+               AND ($5::int IS NULL OR retry_count = $5) \
              RETURNING id, policy_name, global_position, event_id, error_kind, \
                        error_message, created_at, aggregate_name, target_stream_id, \
                        command_name, retry_count, last_retried_at, dispatch_ordinal, \
@@ -3822,6 +3834,7 @@ async fn move_dead_letter_to_archive(
     .bind(reason)
     .bind(version.map(|v| v.deliveries))
     .bind(version.map(|v| v.last_parked_at))
+    .bind(version.map(|v| v.retry_count))
     .execute(executor)
     .await
     .map_err(crate::db_error)?;

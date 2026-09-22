@@ -2633,7 +2633,8 @@ A settlement only settles the row the replay **read**. A parked command is one
 row, so a delivery of the event arriving while the replay runs refreshes that row
 in place; settling it anyway would archive a failure nobody retried, or overwrite
 it with the staler error the replay produced. The retry carries the row's
-`deliveries`/`last_parked_at` into its `WHERE`, and the command it parks *without*
+`deliveries`/`last_parked_at` — and the `retry_count` another retry moves — into
+its `WHERE`, and the command it parks *without*
 a row is guarded by the key itself — a row that appeared under it belongs to a
 writer no staler than this replay. Either way the retry reports `Superseded` and
 leaves the row alone — retry again to act on what is parked now
@@ -2692,7 +2693,7 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
     command_name     TEXT,
     dispatch_ordinal INTEGER,
     deliveries       INTEGER     NOT NULL DEFAULT 1,  -- deliveries that parked it
-    last_parked_at   TIMESTAMPTZ NOT NULL DEFAULT now(), -- when the last of them did
+    last_parked_at   TIMESTAMPTZ DEFAULT now(), -- when the last of them did; NULL if archived before 0028
     retry_count      INTEGER     NOT NULL DEFAULT 0,  -- retries made, the settling one included
     last_retried_at  TIMESTAMPTZ
 );

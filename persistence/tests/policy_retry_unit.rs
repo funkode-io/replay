@@ -1423,6 +1423,57 @@ async fn a_retry_does_not_overwrite_a_row_a_delivery_parked_for_its_new_command_
     harness.shutdown().await;
 }
 
+/// A retry that settles a row while another retry is replaying it is the third
+/// writer the settlement has to see.
+///
+/// A delivery moves `deliveries` and `last_parked_at`; a retry moves
+/// `retry_count`. Carrying only the first pair would let the held replay settle a
+/// row another operator's retry had just settled — overwriting its error and
+/// counting a second settlement on a row that had moved (funkode-io/replay#227).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_does_not_settle_a_row_another_retry_settled_first_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = Arc::new(PolicyDaemonHarness::start("retry_vs_retry", reaction.policy()).await);
+
+    harness.ping("subject-1", ONE_COMMAND).await;
+    let parked = harness.await_dead_letters(1).await;
+    let id = parked[0].id;
+    assert_eq!(parked[0].retry_count, 0);
+
+    reaction.gate.arm();
+    let held = {
+        let harness = Arc::clone(&harness);
+        tokio::spawn(async move { harness.retry_parked_row(id).await })
+    };
+
+    // The second operator's retry runs to completion while the first waits in
+    // `react`: the command still fails, so it re-parks the row and stamps it.
+    reaction.gate.await_entered().await;
+    assert_eq!(
+        harness.retry_parked_row(id).await,
+        DeadLetterRetry::StillFailing,
+        "the retry that got there first settles the row it read"
+    );
+    reaction.gate.release();
+
+    assert_eq!(
+        held.await.expect("the held retry task must not panic"),
+        DeadLetterRetry::Superseded,
+        "and the one that was holding a stale read settles nothing"
+    );
+    let after = harness.dead_letters().await;
+    assert_eq!(
+        (after.len(), after[0].id, after[0].retry_count),
+        (1, id, 1),
+        "one settlement landed on the row, not two, got {after:#?}"
+    );
+
+    let Ok(harness) = Arc::try_unwrap(harness) else {
+        panic!("the retry task must have released the harness")
+    };
+    harness.shutdown().await;
+}
+
 /// A row that names no command is settled **after** the rows that do, whatever
 /// the ids say.
 ///

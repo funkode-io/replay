@@ -34,7 +34,7 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
 - **The key is the reaction and the dispatch within it**: `(policy_name,
   event_id, aggregate_name, target_stream_id, command_name, dispatch_ordinal)`,
   a unique index built `CONCURRENTLY`
-  ([0031](../../persistence/tests/migrations/0030_dead_letter_unique_command.sql)).
+  ([0030](../../persistence/tests/migrations/0030_dead_letter_unique_command.sql)).
   `global_position` is left out as redundant — one event has one position.
 
 - **The ordinal is what keeps a reaction's own repeats apart.** A reaction may
@@ -103,7 +103,8 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   row means a delivery arriving in that window refreshes a row the replay is
   about to settle, where it used to insert a generation of its own and leave the
   read row untouched. So the retry carries the row's `deliveries` and
-  `last_parked_at` into its `WHERE`: a row that moved is neither archived
+  `last_parked_at` — and the `retry_count` another retry of the same reaction
+  moves — into its `WHERE`: a row that moved is neither archived
   `retried` (retiring a failure nobody retried) nor overwritten with the staler
   error the replay produced, and the caller hears `DeadLetterRetry::Superseded`.
   The command a retry parks *without* a row has no version to carry, and the key
