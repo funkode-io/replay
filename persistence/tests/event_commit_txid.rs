@@ -201,7 +201,7 @@ async fn an_appended_event_carries_the_transaction_that_wrote_it_postgres_test()
     );
 }
 
-/// Compaction inserts its snapshot rows straight into `events`, bypassing `append_event`.
+/// Compaction writes its snapshot rows through `write_event` rather than appending them.
 /// They are stamped all the same, by the transaction that compacted.
 #[tokio::test]
 async fn compaction_stamps_the_snapshot_rows_it_writes_postgres_test() {

@@ -5,6 +5,7 @@
 
 pub mod alloc;
 pub mod migrations;
+pub mod places;
 pub mod policy_harness;
 pub mod postgres_image;
 pub mod report;

@@ -1972,6 +1972,52 @@ let archived = cqrs
     .await?;
 ```
 
+### What compaction does to an event's numbers
+
+Compaction restarts a stream's `version` at 1, so hydrating a compacted aggregate always
+replays `1..N`. That makes `version` a *replay* number: after a compaction it names a
+place in the current live stream, not a place in the stream's history, and the same
+`(stream_id, version)` pair recurs over a long-lived stream.
+
+Each event therefore also carries `stream_seq`, its place in its own stream, which
+compaction continues rather than restarts — the snapshot rows take the numbers after the
+ones they archived. One function writes every event, so the two numbers are decided
+together. Nothing reads it yet
+([ADR-0023](docs/adr/0023-a-stream-is-numbered-twice.md),
+[funkode-io/replay#195](https://github.com/funkode-io/replay/issues/195)).
+
+Migration [0027](persistence/tests/migrations/0027_event_stream_seq.sql) backfills the
+column, and it is not an online migration. It runs as one transaction that takes ACCESS
+EXCLUSIVE on `streams` in its first statement and on `events` in its second, and holds
+both until the last one commits, so for its whole duration — the row-by-row backfill, the
+`NOT NULL` scan and the unique index build — every reader and every writer of either table
+waits, not just appends. Budget WAL and dead-tuple space of about one table copy, and run
+it in a maintenance window: on a large log a Policy poll blocks along with everything
+else, so a fleet will look stalled rather than slow.
+
+**Order the rollout: quiesce writers, migrate, then deploy.** Two things fail if they
+overlap the migration, both loudly and neither corrupting anything:
+
+- **An append already inside `append_event` when the migration commits.** It keeps the
+  function body it entered with, which writes no place, and its insert is refused. A
+  command *issued* during the migration is fine — it waits and then calls the new
+  function — so this is specifically the write that was already in flight.
+- **Compaction, from either side of a mixed-version fleet.** An old process writes its
+  snapshot rows with an `INSERT` naming no place, which this migration makes impossible;
+  a new process calls a function an un-migrated database does not have. It is best-effort
+  maintenance, so the next run after the rollout succeeds.
+
+Appends from an old process are otherwise safe once the migration has landed:
+`append_event` keeps its signature and is numbered by the new function underneath it, so
+the fleet can be rolled at leisure.
+
+A place, once given, is permanent. Nothing in the database enforces that: the event log
+is written by this library and by nothing else — `write_event` and the migrations — and
+its invariants are maintained by that one writer, as `global_position`'s uniqueness and a
+stream's `version` contiguity always have been. Editing `events` with hand-written SQL
+breaks them. The row that *is* meant to be edited by hand is `policy_cursors`
+([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
+
 ### Skipping unchanged streams (`needs_compaction`)
 
 A maintenance job that compacts many streams on a schedule should not re-archive a

@@ -55,6 +55,19 @@ nothing. A position may be missing (a [Burned position]) but never repeated — 
 unique index enforces that (migration 0015).
 _Avoid_: offset, sequence number, event time.
 
+### Stream place
+
+The place an event holds in its own stream: `stream_seq`, assigned by `write_event` from
+a counter on the `streams` row and never reset
+([0027](persistence/tests/migrations/0027_event_stream_seq.sql)). Contiguous, unique per
+stream, and permanent — unlike a stream `version`, which compaction restarts at 1 so
+hydration reads `1..N`, making `(stream_id, version)` name two different events over time
+([ADR-0023](docs/adr/0023-a-stream-is-numbered-twice.md)). Permanence is the library's to
+keep, as it is for [Global position], and unlike a [Cursor move]
+([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
+Nothing reads it yet (funkode-io/replay#195).
+_Avoid_: stream sequence, stream version, offset, per-stream position.
+
 ### Policy feed
 
 The slice of the event log one [Policy] reads on a poll: every [Global position]
