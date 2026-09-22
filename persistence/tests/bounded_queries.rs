@@ -46,7 +46,7 @@ const REVIEWED: &[Reviewed] = &[
                         of streams behind, which is why a Policy far behind catches up \
                         over several cadences instead of in one allocation; the batch \
                         resumes after the last id it examined, so the bound costs a \
-                        rotation rather than leaving a stream unexamined (ADR-0024).",
+                        rotation rather than leaving a stream unexamined (ADR-0025).",
     },
     Reviewed {
         file: "src/policy_runner.rs",
@@ -77,14 +77,16 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "load_parked_reaction",
-        justification: "One reaction's rows: the commands it dispatches (the vector \
-                        `react_erased` already materialises) times the number of times \
-                        that event was delivered \u{2014} a dead letter is written before the \
-                        batched cursor checkpoint, so a crash in between re-parks the \
-                        reaction. A delivery is a crash or an operator's rewind, not a \
-                        row of data: bounded by the Policy's code and the process's \
-                        restarts, not by the table. The duplicate rows are their own \
-                        defect, funkode-io/replay#220.",
+        justification: "One reaction's rows: one per command it dispatches (the vector \
+                        `react_erased` already materialises), plus the rows parked for \
+                        that event before `idx_dead_letters_parked_command` keyed the \
+                        table (funkode-io/replay#220). That legacy tail is the old \
+                        code's commands times its deliveries, it is fixed at the moment \
+                        the migration runs \u{2014} every later park refreshes a row rather \
+                        than adding one \u{2014} and it is not a number in the code, which is \
+                        why bounding the read over it is tracked by \
+                        funkode-io/replay#228. Not bounded by the table: the rows of one \
+                        reaction, never of a policy's backlog.",
     },
     Reviewed {
         file: "src/policy_runner.rs",

@@ -19,6 +19,8 @@
 //!   as the events they wrote, each carrying the causation the runner stamps.
 //! - [`PolicyDaemonHarness::cursor`] — the policy's persisted position.
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
+//! - [`PolicyDaemonHarness::status`] — the policy as the status read model
+//!   reports it, which is what a consumer's health endpoint shows.
 //! - [`PolicyDaemonHarness::archived_dead_letters`] — the parked reactions that
 //!   have left the active set, and what settled them.
 //! - [`PolicyDaemonHarness::stopped_workers`] — the workers the runner gave up
@@ -46,10 +48,14 @@
 //! - [`PolicyDaemonHarness::retry_parked_row`] /
 //!   [`PolicyDaemonHarness::discard_parked_row`] — the same controls on one row,
 //!   by the id an operator reads off the table.
-//! - [`PolicyDaemonHarness::park_without_identity`] — a row as a release before
-//!   the identity migration parked it, which running code can no longer write.
-//! - [`PolicyDaemonHarness::park_again`] — the second copy of a parked row that a
-//!   redelivery leaves, the one thing about it a test cannot cause on demand.
+//! - [`PolicyDaemonHarness::park_without_identity`] /
+//!   [`PolicyDaemonHarness::park_panic_without_identity`] — a row as a release
+//!   before the identity migration parked it, which running code can no longer
+//!   write.
+//! - [`PolicyDaemonHarness::redeliver`] — the event delivered to the policy
+//!   again, by the cursor rewind that causes it in production.
+//! - [`PolicyDaemonHarness::park_again`] — a second row for one parked command,
+//!   as a release before the table had a key for one left behind.
 //!
 //! Tasks, channels and in-process state are deliberately absent.
 //!
@@ -90,8 +96,8 @@ use super::postgres_image::{postgres_container, POSTGRES_PORT};
 use replay_macros::define_aggregate;
 use replay_persistence::{
     Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, Liveness,
-    PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PostgresEventStore, StoppedWorker,
-    WorkerLiveness,
+    PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
+    PostgresEventStore, StoppedWorker, WorkerLiveness,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -281,6 +287,18 @@ pub struct DeadLetter {
     pub target_stream_id: Option<String>,
     /// Rust type name of the failing command.
     pub command_name: Option<String>,
+    /// The failing dispatch's index in the vector the reaction returned. `None`
+    /// on the same rows the other identity columns are null on; **negative** on
+    /// a row parked before the column existed, which names a command but not its
+    /// place, and was numbered apart by the dedupe migration.
+    pub dispatch_ordinal: Option<i32>,
+    /// Deliveries of the triggering event that parked this command. 1 until the
+    /// event is delivered again.
+    pub deliveries: i32,
+    /// When the command first failed — unmoved by a redelivery.
+    pub created_at: DateTime<Utc>,
+    /// When the last delivery parked it.
+    pub last_parked_at: DateTime<Utc>,
     /// Settlements a retry has made on this row — what has already been tried.
     pub retry_count: i32,
     /// When the last of them was made. `None` until the row is first retried.
@@ -293,11 +311,15 @@ pub struct DeadLetter {
 pub struct ArchivedDeadLetter {
     /// Id the row had in `policy_dead_letters`.
     pub dead_letter_id: i64,
-    /// Why it left: `retried` or `discarded`.
+    /// Why it left: `retried`, `discarded` or `superseded` (a duplicate
+    /// generation the dedupe migration retired).
     pub reason: String,
     pub aggregate_name: Option<String>,
     pub target_stream_id: Option<String>,
     pub command_name: Option<String>,
+    pub dispatch_ordinal: Option<i32>,
+    /// Deliveries that parked the command while the row was active.
+    pub deliveries: i32,
     /// Retries made on the row, the settlement that archived it included.
     pub retry_count: i32,
     /// When the last of them was made. `None` for a row no retry ever settled.
@@ -705,6 +727,45 @@ impl PolicyDaemonHarness {
         .expect("the operator's move must succeed");
     }
 
+    /// Deliver `event` to the policy again, by the move that causes a
+    /// redelivery in production: its stream's place rewound to just before it.
+    ///
+    /// The honest way to reach the window a park sits in. A dead letter is
+    /// written before the batched checkpoint, so a hard kill in between
+    /// redelivers every event since the last checkpoint; an operator rewinding
+    /// a place (ADR-0012) does the same deliberately, and is the half of it a
+    /// test can perform.
+    ///
+    /// Waits for the place to reach `event` before moving it, because that same
+    /// window is what a test races otherwise: a rewind written while the worker
+    /// still has the event in flight loses to the checkpoint that follows it —
+    /// the compare-and-set sees the place it expects and advances — and the
+    /// event is never delivered again.
+    pub async fn redeliver(&self, event: &AppendedEvent) {
+        let place = sqlx::query_scalar::<_, i64>("SELECT stream_seq FROM events WHERE id = $1")
+            .bind(event.event_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the event must have a place in its stream");
+
+        self.await_passed(event.global_position).await;
+        self.move_place_to(&event.stream_id, place - 1).await;
+    }
+
+    /// The policy's status as a consumer reads it off [`PolicyStatusStore`] —
+    /// the read model, not the tables it derives from.
+    ///
+    /// `None` before the policy has a cursor row, which is how the store reports
+    /// a policy that has never run.
+    pub async fn status(&self) -> Option<PolicyStatus> {
+        PolicyStatusStore::new(self.pool.clone())
+            .list()
+            .await
+            .expect("the status read model must be readable")
+            .into_iter()
+            .find(|status| status.name == self.policy_name)
+    }
+
     /// The workers the runner has given up on — what an operator sees when a
     /// policy has stopped for good rather than merely paused.
     pub fn stopped_workers(&self) -> Vec<StoppedWorker> {
@@ -848,8 +909,8 @@ impl PolicyDaemonHarness {
     pub async fn dead_letters(&self) -> Vec<DeadLetter> {
         let rows = sqlx::query(
             "SELECT id, global_position, event_id, error_kind, error_message, \
-                    aggregate_name, target_stream_id, command_name, \
-                    retry_count, last_retried_at \
+                    aggregate_name, target_stream_id, command_name, dispatch_ordinal, \
+                    deliveries, created_at, last_parked_at, retry_count, last_retried_at \
              FROM policy_dead_letters WHERE policy_name = $1 \
              ORDER BY id ASC LIMIT $2",
         )
@@ -869,6 +930,10 @@ impl PolicyDaemonHarness {
                 aggregate_name: row.get("aggregate_name"),
                 target_stream_id: row.get("target_stream_id"),
                 command_name: row.get("command_name"),
+                dispatch_ordinal: row.get("dispatch_ordinal"),
+                deliveries: row.get("deliveries"),
+                created_at: row.get("created_at"),
+                last_parked_at: row.get("last_parked_at"),
                 retry_count: row.get("retry_count"),
                 last_retried_at: row.get("last_retried_at"),
             })
@@ -885,6 +950,30 @@ impl PolicyDaemonHarness {
             "INSERT INTO policy_dead_letters \
                  (policy_name, global_position, event_id, error_kind, error_message) \
              VALUES ($1, $2, $3, 'Invalid Input', $4) RETURNING id",
+        )
+        .bind(&self.policy_name)
+        .bind(event.global_position)
+        .bind(event.event_id)
+        .bind(message)
+        .fetch_one(&self.pool)
+        .await
+        .expect("a pre-migration row must still be insertable")
+    }
+
+    /// A row as an older release parked it for a reaction that **panicked**:
+    /// no dispatch to name, and the kind that says the unwind settled the
+    /// delivery.
+    ///
+    /// The shape an upgrade really inherits with a null ordinal. The dedupe
+    /// migration numbers every other identity-less row apart, because only a
+    /// panic parks exactly one row per delivery; a panic's row keeps the null
+    /// ordinal the running code still writes, so it is the one an old release's
+    /// row and a new delivery can share (funkode-io/replay#220).
+    pub async fn park_panic_without_identity(&self, event: &AppendedEvent, message: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO policy_dead_letters \
+                 (policy_name, global_position, event_id, error_kind, error_message) \
+             VALUES ($1, $2, $3, 'Panic', $4) RETURNING id",
         )
         .bind(&self.policy_name)
         .bind(event.global_position)
@@ -914,13 +1003,16 @@ impl PolicyDaemonHarness {
         .expect("a pre-migration row must still be insertable")
     }
 
-    /// Park a second copy of `id`, the way a redelivery of its event does.
+    /// Park a second copy of `id`, the way a redelivery did before the table
+    /// had a key for a parked command (funkode-io/replay#220).
     ///
-    /// A dead letter is written before the batched cursor checkpoint, so a crash
-    /// in between — or an operator rewinding the cursor — parks the reaction's
-    /// rows again (funkode-io/replay#220). Copying the row is the one way to put
-    /// a test in front of that backlog: crashing a worker inside that window on
-    /// demand is not something an operator can do either.
+    /// The copy carries a **null** `dispatch_ordinal`, which is what makes it
+    /// insertable at all now that `idx_dead_letters_parked_command` exists: it
+    /// is a row of the shape a release before that migration wrote, next to the
+    /// row running code writes for the same command. That pair is what an
+    /// upgrade's backlog can still hold — the dedupe collapsed the duplicates
+    /// that existed when it ran, not the ones a pre-ordinal row and a later
+    /// delivery make afterwards — and a retry must still settle both.
     pub async fn park_again(&self, id: i64) -> i64 {
         sqlx::query_scalar(
             "INSERT INTO policy_dead_letters \
@@ -940,7 +1032,7 @@ impl PolicyDaemonHarness {
     pub async fn archived_dead_letters(&self) -> Vec<ArchivedDeadLetter> {
         let rows = sqlx::query(
             "SELECT dead_letter_id, reason, aggregate_name, target_stream_id, command_name, \
-                    retry_count, last_retried_at \
+                    dispatch_ordinal, deliveries, retry_count, last_retried_at \
              FROM discarded_dead_letters WHERE policy_name = $1 \
              ORDER BY id ASC LIMIT $2",
         )
@@ -957,6 +1049,8 @@ impl PolicyDaemonHarness {
                 aggregate_name: row.get("aggregate_name"),
                 target_stream_id: row.get("target_stream_id"),
                 command_name: row.get("command_name"),
+                dispatch_ordinal: row.get("dispatch_ordinal"),
+                deliveries: row.get("deliveries"),
                 retry_count: row.get("retry_count"),
                 last_retried_at: row.get("last_retried_at"),
             })

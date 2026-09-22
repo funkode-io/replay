@@ -10,7 +10,7 @@
 //! each stream is owed is read from `policy_stream_cursors` against the stream's own
 //! sequence, which has no holes. A stream the sweep missed is found by the reconciliation
 //! ([`crate::policy_runner`]), late rather than never
-//! ([ADR-0024](../../docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
+//! ([ADR-0025](../../docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
 //!
 //! Pure, so it needs no database.
 

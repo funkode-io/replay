@@ -17,6 +17,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -368,6 +369,13 @@ pub enum DeadLetterRetry {
     /// command the reaction had not parked before got a row of its own, untried.
     /// Either way no row was duplicated, and the row stays retryable.
     StillFailing,
+    /// Another writer parked this row's command while the replay ran — a
+    /// delivery of the event, or another retry of the same reaction — so what is
+    /// parked is not what this retry concluded, and is no staler than it. The
+    /// row is left as that writer wrote it: settling it would archive a failure
+    /// nobody retried, or overwrite it with an error from a replay that started
+    /// earlier (funkode-io/replay#227). Retry again to act on what is parked now.
+    Superseded,
     /// No dead-letter row matched the supplied id: nothing to do.
     NotFound,
 }
@@ -843,9 +851,10 @@ impl PolicyRunner {
     /// retry can make the reaction fail on a command it never parked; the retry
     /// parks it exactly as the drain would, and reports the reaction still
     /// failing. This is the only insert a retry makes: a row for a command
-    /// already parked is updated, never duplicated — and it is the one settlement
-    /// two concurrent retries of the same reaction can duplicate, since it is not
-    /// primary-key-scoped like the rest (funkode-io/replay#220).
+    /// already parked is never duplicated — and two concurrent retries of the
+    /// same reaction settle it the same way, since the table now keys a parked
+    /// command and the second insert leaves the first writer's row as it stands,
+    /// reported [`DeadLetterRetry::Superseded`] (ADR-0025).
     ///
     /// Settling a row that already existed stamps its `retry_count` and
     /// `last_retried_at`, the archived copy included, so what has already been
@@ -963,7 +972,7 @@ impl PolicyRunner {
                 policy_name,
                 dispatch_timeout: resolve_dispatch_timeout(policy.as_ref()),
             };
-            for dispatch in policy.react_erased(&raw) {
+            for (ordinal, dispatch) in policy.react_erased(&raw).into_iter().enumerate() {
                 if !self.executors.contains_key(&dispatch.target()) {
                     return Err(replay::Error::invalid_input(
                         "no services registered for the aggregate targeted by a policy dispatch",
@@ -973,7 +982,7 @@ impl PolicyRunner {
                     .with_context("aggregate", dispatch.aggregate_name()));
                 }
 
-                let identity = DispatchIdentity::of(&dispatch);
+                let identity = DispatchIdentity::of(ordinal, &dispatch);
                 concluded.dispatching(identity.clone());
                 let outcome = match delivery
                     .execute_dispatch_within(global_position, &raw, dispatch)
@@ -1068,26 +1077,32 @@ impl PolicyRunner {
 
             let settlement = match outcome {
                 None => {
-                    if move_dead_letter_to_archive(&mut *tx, row.id, "retried").await? {
+                    if move_dead_letter_to_archive(&mut *tx, row.id, "retried", Some(row.version))
+                        .await?
+                    {
                         DeadLetterRetry::Resolved
                     } else {
-                        // A concurrent discard removed the row between the group
-                        // read and the archive move: nothing was archived with
-                        // reason `retried`, so report it as NotFound.
-                        DeadLetterRetry::NotFound
+                        // Either a concurrent discard took the row out, or a
+                        // delivery re-parked it after the replay read it.
+                        unsettled(&mut *tx, row.id).await?
                     }
                 }
                 Some(Settlement {
                     error_kind,
                     error_message,
                 }) => {
-                    if re_park_dead_letter(&mut *tx, row.id, &error_kind, &error_message).await? {
+                    if re_park_dead_letter(
+                        &mut *tx,
+                        row.id,
+                        &error_kind,
+                        &error_message,
+                        row.version,
+                    )
+                    .await?
+                    {
                         DeadLetterRetry::StillFailing
                     } else {
-                        // Same concurrent discard as the archive branch, from
-                        // the other side: there is no row left to re-park, so
-                        // there is no reaction still failing to report.
-                        DeadLetterRetry::NotFound
+                        unsettled(&mut *tx, row.id).await?
                     }
                 }
             };
@@ -1100,17 +1115,26 @@ impl PolicyRunner {
         // retry, which is the whole point of replaying the reaction as defined
         // now (ADR-0007). Without this it would be executed, fail, and leave
         // nothing behind while the retry reported the reaction resolved.
+        //
+        // The row it had no version to guard is the row it is about to create,
+        // so the guard here is the key itself: a command that acquired a row
+        // while the replay ran has one from a writer whose error is no staler
+        // than this one's, and the insert leaves it as it stands.
         for unclaimed in replay.unclaimed_failures() {
-            let id = write_dead_letter(
+            let parked = write_dead_letter(
                 &mut *tx,
-                &reaction.policy_name,
-                reaction.global_position,
-                reaction.event_id,
-                Some(&unclaimed.identity),
-                &unclaimed.settlement.error_kind,
-                &unclaimed.settlement.error_message,
+                DeadLetterWrite {
+                    policy_name: &reaction.policy_name,
+                    global_position: reaction.global_position,
+                    event_id: reaction.event_id,
+                    identity: Some(&unclaimed.identity),
+                    error_kind: &unclaimed.settlement.error_kind,
+                    error_message: &unclaimed.settlement.error_message,
+                    parking: Parking::Retry,
+                },
             )
             .await?;
+            let id = parked.id;
             tracing::warn!(
                 policy    = %reaction.policy_name,
                 event_id  = %reaction.event_id,
@@ -1119,9 +1143,18 @@ impl PolicyRunner {
                 command   = unclaimed.identity.command_name,
                 error     = %unclaimed.settlement.error_message,
                 dead_letter_id = id,
-                "a retried reaction failed on a command it had not parked; parking it"
+                superseded = parked.conflicted,
+                "a retried reaction failed on a command it had not parked; parking it, \
+                 or leaving the row another writer parked for it meanwhile"
             );
-            settled.push((id, DeadLetterRetry::StillFailing));
+            settled.push((
+                id,
+                if parked.conflicted {
+                    DeadLetterRetry::Superseded
+                } else {
+                    DeadLetterRetry::StillFailing
+                },
+            ));
         }
 
         tx.commit().await.map_err(crate::db_error)?;
@@ -1149,7 +1182,7 @@ impl PolicyRunner {
     /// Returns [`DeadLetterDiscard::NotFound`] when no active row matches `id`
     /// — a defined no-op, never a panic.
     pub async fn discard_dead_letter(&self, id: i64) -> Result<DeadLetterDiscard, replay::Error> {
-        if move_dead_letter_to_archive(&self.pool, id, "discarded").await? {
+        if move_dead_letter_to_archive(&self.pool, id, "discarded", None).await? {
             Ok(DeadLetterDiscard::Discarded)
         } else {
             Ok(DeadLetterDiscard::NotFound)
@@ -1209,10 +1242,12 @@ impl PolicyRunner {
             for reaction in page {
                 let settled = self.retry_reaction(reaction, OPERATION).await?;
 
-                if settled
-                    .iter()
-                    .any(|(_, outcome)| *outcome == DeadLetterRetry::StillFailing)
-                {
+                if settled.iter().any(|(_, outcome)| {
+                    matches!(
+                        outcome,
+                        DeadLetterRetry::StillFailing | DeadLetterRetry::Superseded
+                    )
+                }) {
                     summary.reactions_still_failing += 1;
                 } else if settled
                     .iter()
@@ -2261,14 +2296,27 @@ struct DispatchIdentity {
     aggregate_name: &'static str,
     target_stream_id: String,
     command_name: &'static str,
+    /// The dispatch's index in the vector the reaction returned.
+    ///
+    /// What keeps a reaction's own repeats apart in the table: two commands of
+    /// one type to one instance are two parked commands, and the key that makes
+    /// a redelivery refresh a row rather than insert one must not merge them
+    /// (funkode-io/replay#220). It is not what matches a row to a replayed
+    /// dispatch — [`ParkedIdentity::names`] is, and it stays blind to the
+    /// ordinal so a row parked before this column existed is matched the same
+    /// way as one parked after.
+    ordinal: i32,
 }
 
 impl DispatchIdentity {
-    fn of(dispatch: &Dispatch) -> Self {
+    fn of(ordinal: usize, dispatch: &Dispatch) -> Self {
         Self {
             aggregate_name: dispatch.aggregate_name(),
             target_stream_id: dispatch.target_stream_id().to_string(),
             command_name: dispatch.command_name(),
+            // A reaction returning more than 2^31 dispatches has exhausted
+            // memory long before it reaches the ordinal's range.
+            ordinal: i32::try_from(ordinal).unwrap_or(i32::MAX),
         }
     }
 }
@@ -2322,6 +2370,29 @@ struct ParkedRow {
     /// parked before the identity migration, or parked for a panic in `react`
     /// itself.
     identity: Option<ParkedIdentity>,
+    /// The row as the replay read it.
+    version: ParkedVersion,
+}
+
+/// What a settlement checks the row still says before it settles it.
+///
+/// A retry reads a reaction's group, replays it, and settles each row after —
+/// seconds during which a delivery of the same event (a crash inside the
+/// checkpoint window, or a [Cursor move]) can re-park the same command in place.
+/// Settling by `id` alone would then archive a failure nobody retried, or
+/// overwrite it with the staler error the replay produced
+/// (funkode-io/replay#227). Every column an intervening writer moves is carried
+/// into the settlement's `WHERE` — a delivery moves `deliveries` and
+/// `last_parked_at`, another retry of the same reaction (ADR-0021) moves
+/// `retry_count` — so a row that changed is not settled; the caller hears
+/// [`DeadLetterRetry::Superseded`].
+///
+/// [Cursor move]: ../../CONTEXT.md#cursor-move
+#[derive(Clone, Copy)]
+struct ParkedVersion {
+    deliveries: i32,
+    last_parked_at: DateTime<Utc>,
+    retry_count: i32,
 }
 
 /// The dispatch a parked row names, read back off the row.
@@ -3029,12 +3100,15 @@ impl Delivery<'_> {
                 self.park(global_position, raw, attempt).await?;
                 write_dead_letter(
                     self.pool,
-                    policy_name,
-                    global_position,
-                    raw.id,
-                    in_flight.as_ref(),
-                    PANIC_ERROR_KIND,
-                    &message,
+                    DeadLetterWrite {
+                        policy_name,
+                        global_position,
+                        event_id: raw.id,
+                        identity: in_flight.as_ref(),
+                        error_kind: PANIC_ERROR_KIND,
+                        error_message: &message,
+                        parking: Parking::Delivery,
+                    },
                 )
                 .await?;
                 Ok(0)
@@ -3086,8 +3160,8 @@ impl Delivery<'_> {
             let mut executed = 0usize;
             let mut need_retry = false;
 
-            for dispatch in dispatches {
-                let identity = DispatchIdentity::of(&dispatch);
+            for (ordinal, dispatch) in dispatches.into_iter().enumerate() {
+                let identity = DispatchIdentity::of(ordinal, &dispatch);
                 pending.dispatching(identity.clone());
                 let outcome = self
                     .execute_dispatch_within(global_position, raw, dispatch)
@@ -3169,12 +3243,15 @@ impl Delivery<'_> {
             );
             write_dead_letter(
                 self.pool,
-                self.policy_name,
-                global_position,
-                raw.id,
-                Some(&identity),
-                &failure.error_kind(),
-                &failure.to_string(),
+                DeadLetterWrite {
+                    policy_name: self.policy_name,
+                    global_position,
+                    event_id: raw.id,
+                    identity: Some(&identity),
+                    error_kind: &failure.error_kind(),
+                    error_message: &failure.to_string(),
+                    parking: Parking::Delivery,
+                },
             )
             .await?;
         }
@@ -3263,6 +3340,35 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+/// One parked command, as [`write_dead_letter`] writes it: which reaction, which
+/// dispatch of it, and what that dispatch failed with.
+struct DeadLetterWrite<'a> {
+    policy_name: &'a str,
+    global_position: i64,
+    event_id: uuid::Uuid,
+    /// The dispatch the row names. `None` only where there is none to name: a
+    /// panic in `react` itself, which fails before it has built one.
+    identity: Option<&'a DispatchIdentity>,
+    error_kind: &'a str,
+    error_message: &'a str,
+    parking: Parking,
+}
+
+/// Why a row is being parked: which of the two writers is at the keyboard.
+///
+/// Both go through [`write_dead_letter`], and both may find the row already
+/// there — but only one of them is a delivery of the event. A retry that parks a
+/// command the reaction had not parked is racing another retry of the same
+/// reaction, not watching the event arrive again, and must not say it was
+/// delivered again (funkode-io/replay#227).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Parking {
+    /// The drain parked it, for the delivery it is settling.
+    Delivery,
+    /// A retry parked it, for a command the reaction had not parked before.
+    Retry,
+}
+
 /// Write a dead-letter record for a reaction that could not be completed.
 ///
 /// `error_kind` is the [`replay::ErrorKind`] of a returned error, or
@@ -3271,20 +3377,63 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// `identity` names the dispatch that failed. `None` only where there is no
 /// dispatch to name — a panic in `react` itself, which fails before it has built
 /// one — and the row's identity columns stay null.
+///
+/// **One row per parked command per reaction.** The park is written before the
+/// batched cursor checkpoint, so a crash in between — or an operator rewinding
+/// the cursor — delivers the event again and parks the same command again. The
+/// `ON CONFLICT` refreshes the row that command already has with the error this
+/// delivery produced rather than leaving a second generation of rows behind
+/// (ADR-0025). It does **not** touch `created_at` (when the command first
+/// failed) or the retry bookkeeping: a redelivery is not a [`retry_dead_letter`]
+/// — nobody invoked the control surface.
+///
+/// Only a [`Parking::Delivery`] writes anything to a row that already exists. A
+/// [`Parking::Retry`] parks a command the reaction had not parked, so a row
+/// under that key means another writer got there first — a delivery of the
+/// event, or another retry of the same reaction (ADR-0021) — and this retry's
+/// error is not newer than theirs. It leaves the row untouched and says so in
+/// [`Parked::conflicted`], which the caller reports as
+/// [`DeadLetterRetry::Superseded`]. The failure is not lost either way: the row
+/// is a row for that command, parked and active.
+///
+/// `clock_timestamp()`, not `now()`, and never backwards: `now()` is fixed at
+/// transaction start, and a retry parks inside one, so a settlement that began
+/// earlier can commit later and would otherwise stamp the recency signal a live
+/// delivery has already moved.
+///
+/// [`retry_dead_letter`]: PolicyRunner::retry_dead_letter
 async fn write_dead_letter(
     executor: impl sqlx::PgExecutor<'_>,
-    policy_name: &str,
-    global_position: i64,
-    event_id: uuid::Uuid,
-    identity: Option<&DispatchIdentity>,
-    error_kind: &str,
-    error_message: &str,
-) -> Result<i64, replay::Error> {
-    sqlx::query_scalar(
+    park: DeadLetterWrite<'_>,
+) -> Result<Parked, replay::Error> {
+    let DeadLetterWrite {
+        policy_name,
+        global_position,
+        event_id,
+        identity,
+        error_kind,
+        error_message,
+        parking,
+    } = park;
+    let row = sqlx::query(
         "INSERT INTO policy_dead_letters \
          (policy_name, global_position, event_id, error_kind, error_message, \
-          aggregate_name, target_stream_id, command_name) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+          aggregate_name, target_stream_id, command_name, dispatch_ordinal, \
+          last_parked_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp()) \
+         ON CONFLICT (policy_name, event_id, aggregate_name, target_stream_id, \
+                      command_name, dispatch_ordinal) \
+         DO UPDATE SET error_kind = CASE WHEN $10 THEN EXCLUDED.error_kind \
+                           ELSE policy_dead_letters.error_kind END, \
+                       error_message = CASE WHEN $10 THEN EXCLUDED.error_message \
+                           ELSE policy_dead_letters.error_message END, \
+                       deliveries = policy_dead_letters.deliveries \
+                           + CASE WHEN $10 THEN 1 ELSE 0 END, \
+                       last_parked_at = CASE WHEN $10 \
+                           THEN GREATEST(policy_dead_letters.last_parked_at, \
+                                         clock_timestamp()) \
+                           ELSE policy_dead_letters.last_parked_at END \
+         RETURNING id, xmax <> 0 AS conflicted",
     )
     .bind(policy_name)
     .bind(global_position)
@@ -3294,9 +3443,26 @@ async fn write_dead_letter(
     .bind(identity.map(|i| i.aggregate_name))
     .bind(identity.map(|i| i.target_stream_id.as_str()))
     .bind(identity.map(|i| i.command_name))
+    .bind(identity.map(|i| i.ordinal))
+    .bind(parking == Parking::Delivery)
     .fetch_one(executor)
     .await
-    .map_err(crate::db_error)
+    .map_err(crate::db_error)?;
+
+    Ok(Parked {
+        id: row.get("id"),
+        conflicted: row.get("conflicted"),
+    })
+}
+
+/// What a park wrote.
+///
+/// `conflicted` is read off `xmax`, which an `ON CONFLICT` insert leaves at 0 on
+/// the row it inserted and at the updating transaction's id on a row it found:
+/// the one thing `RETURNING` can say about which of the two happened.
+struct Parked {
+    id: i64,
+    conflicted: bool,
 }
 
 /// Update a parked dead letter in place with the failure a retry just produced,
@@ -3307,27 +3473,60 @@ async fn write_dead_letter(
 /// change outside the library, which the library cannot observe.
 /// [`PolicyRunner::discard_dead_letter`] is what takes a row out of play.
 ///
-/// Returns whether a row was still there to re-park: a concurrent discard
-/// leaves nothing to update, which is not a reaction still failing.
+/// Returns whether a row was still there to re-park **as the replay read it**: a
+/// concurrent discard leaves nothing to update, and a writer that moved the row
+/// in the meantime — a delivery that re-parked the command, another retry that
+/// settled it — leaves one whose error is no staler than this one (see
+/// [`ParkedVersion`]). The first is nothing to report; the second is a reaction
+/// still failing, reported as [`DeadLetterRetry::Superseded`] rather than by
+/// overwriting what that writer left.
 async fn re_park_dead_letter(
     executor: impl sqlx::PgExecutor<'_>,
     id: i64,
     error_kind: &str,
     error_message: &str,
+    version: ParkedVersion,
 ) -> Result<bool, replay::Error> {
     let result = sqlx::query(
         "UPDATE policy_dead_letters \
          SET error_kind = $2, error_message = $3, \
              retry_count = retry_count + 1, last_retried_at = now() \
-         WHERE id = $1",
+         WHERE id = $1 AND deliveries = $4 AND last_parked_at = $5 \
+           AND retry_count = $6",
     )
     .bind(id)
     .bind(error_kind)
     .bind(error_message)
+    .bind(version.deliveries)
+    .bind(version.last_parked_at)
+    .bind(version.retry_count)
     .execute(executor)
     .await
     .map_err(crate::db_error)?;
     Ok(result.rows_affected() > 0)
+}
+
+/// What a settlement that matched no row means: the row is gone (a concurrent
+/// discard), or it is still parked but is no longer the row the replay read (a
+/// delivery re-parked its command, or another retry settled it).
+///
+/// Asked only on that path, so a settlement that lands stays one statement.
+async fn unsettled(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: i64,
+) -> Result<DeadLetterRetry, replay::Error> {
+    let still_parked: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM policy_dead_letters WHERE id = $1)")
+            .bind(id)
+            .fetch_one(executor)
+            .await
+            .map_err(crate::db_error)?;
+
+    Ok(if still_parked {
+        DeadLetterRetry::Superseded
+    } else {
+        DeadLetterRetry::NotFound
+    })
 }
 
 /// One page of the reactions a policy has parked, in the order they happened,
@@ -3393,13 +3592,20 @@ async fn last_parked_position(
 
 /// The rows one reaction parked, oldest first.
 ///
-/// Bounded by the commands one reaction dispatches — the vector `react_erased`
-/// already materialises — times the number of times that event was delivered:
-/// the dead letter is written before the batched cursor checkpoint, so a crash
-/// in between (or an operator rewinding the cursor) parks the reaction's rows
-/// again. A delivery is a crash or a rewind, not a row of data, so this cannot
-/// grow with the table; the duplicate rows are their own defect
+/// One row per command the reaction dispatches — the vector `react_erased`
+/// already materialises — no longer multiplied by the number of times the event
+/// was delivered: a parked command is one row, and a redelivery refreshes it
 /// (funkode-io/replay#220).
+///
+/// **Not yet a number in the code.** On top of that vector sits the tail the
+/// dedupe migration could not prove duplicate and kept apart
+/// ([0029](../../persistence/tests/migrations/0029_dead_letter_dedupe.sql)): the
+/// old code's commands times the deliveries it saw. It is frozen at the moment
+/// the migration ran — every later park refreshes a row rather than adding one —
+/// and it shrinks as retries settle it, but nothing bounds it by a constant.
+/// Bounding the read over it is tracked by funkode-io/replay#228; a `LIMIT` is
+/// not the fix, because a retry settles every row of a reaction from one replay.
+/// `tests/bounded_queries.rs` carries the same reading as the review of record.
 ///
 /// `global_position` is redundant with `event_id` — one event has one position —
 /// and is in the filter to make it a prefix match on
@@ -3409,7 +3615,8 @@ async fn load_parked_reaction(
     reaction: &ParkedReaction,
 ) -> Result<Vec<ParkedRow>, replay::Error> {
     let rows = sqlx::query(
-        "SELECT id, aggregate_name, target_stream_id, command_name \
+        "SELECT id, aggregate_name, target_stream_id, command_name, deliveries, \
+                 last_parked_at, retry_count \
          FROM policy_dead_letters \
          WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
          ORDER BY id ASC",
@@ -3439,6 +3646,11 @@ async fn load_parked_reaction(
                     }
                     _ => None,
                 },
+                version: ParkedVersion {
+                    deliveries: row.get("deliveries"),
+                    last_parked_at: row.get("last_parked_at"),
+                    retry_count: row.get("retry_count"),
+                },
             }
         })
         .collect())
@@ -3446,11 +3658,18 @@ async fn load_parked_reaction(
 
 /// Move a dead letter out of the active `policy_dead_letters` table into the
 /// `discarded_dead_letters` archive in a single statement, recording why it
-/// left (`reason`: `retried` or `discarded`).
+/// left (`reason`: `retried`, `discarded`).
 ///
 /// The `DELETE ... RETURNING` feeds the `INSERT` so the row is removed from the
 /// active set and preserved for audit atomically. Returns `true` when a row was
-/// moved, `false` when no active row matched `id`.
+/// moved, `false` when no active row matched.
+///
+/// `version` is `Some` for a retry, which may only archive the row its replay
+/// read: a writer that moved the row in between — a delivery that re-parked the
+/// command, another retry that settled it — has put something newer in it, and
+/// archiving that `retried` retires a failure nobody retried ([`ParkedVersion`]).
+/// A discard passes `None` — it re-runs nothing, so what the row says now does
+/// not change what the operator asked to retire.
 ///
 /// A move with reason `retried` is a retry settling the row, so it stamps the
 /// retry bookkeeping the same way [`re_park_dead_letter`] does; a discard
@@ -3459,28 +3678,38 @@ async fn move_dead_letter_to_archive(
     executor: impl sqlx::PgExecutor<'_>,
     id: i64,
     reason: &str,
+    version: Option<ParkedVersion>,
 ) -> Result<bool, replay::Error> {
     let result = sqlx::query(
         "WITH moved AS ( \
              DELETE FROM policy_dead_letters \
              WHERE id = $1 \
+               AND ($3::int IS NULL OR deliveries = $3) \
+               AND ($4::timestamptz IS NULL OR last_parked_at = $4) \
+               AND ($5::int IS NULL OR retry_count = $5) \
              RETURNING id, policy_name, global_position, event_id, error_kind, \
                        error_message, created_at, aggregate_name, target_stream_id, \
-                       command_name, retry_count, last_retried_at \
+                       command_name, retry_count, last_retried_at, dispatch_ordinal, \
+                       deliveries, last_parked_at \
          ) \
          INSERT INTO discarded_dead_letters \
              (dead_letter_id, policy_name, global_position, event_id, error_kind, \
               error_message, created_at, reason, aggregate_name, target_stream_id, \
-              command_name, retry_count, last_retried_at) \
+              command_name, retry_count, last_retried_at, dispatch_ordinal, \
+              deliveries, last_parked_at) \
          SELECT id, policy_name, global_position, event_id, error_kind, \
                 error_message, created_at, $2, aggregate_name, target_stream_id, \
                 command_name, \
                 retry_count + (CASE WHEN $2 = 'retried' THEN 1 ELSE 0 END), \
-                CASE WHEN $2 = 'retried' THEN now() ELSE last_retried_at END \
+                CASE WHEN $2 = 'retried' THEN now() ELSE last_retried_at END, \
+                dispatch_ordinal, deliveries, last_parked_at \
          FROM moved",
     )
     .bind(id)
     .bind(reason)
+    .bind(version.map(|v| v.deliveries))
+    .bind(version.map(|v| v.last_parked_at))
+    .bind(version.map(|v| v.retry_count))
     .execute(executor)
     .await
     .map_err(crate::db_error)?;
@@ -3544,7 +3773,7 @@ async fn sweep_for_streams(
 /// committed below a position the sweep had already passed. No index answers a comparison
 /// between two tables' columns, so it scans one row per stream and is bounded by `limit`
 /// rather than by an index — which is why it runs on a cadence and the sweep runs on every
-/// poll (ADR-0024).
+/// poll (ADR-0025).
 ///
 /// It resumes after the last id it examined instead of restarting at the lowest, because
 /// `limit` is a batch and not a snapshot: a Policy with `limit` permanently-behind streams
@@ -3768,7 +3997,7 @@ async fn execute_dispatch(
 /// The per-stream places are the progress. The sweep position is a hint that says where
 /// to look next — never what has been delivered — so losing it, resetting it or running
 /// past an uncommitted write costs a search, not an event
-/// ([ADR-0024](../../docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
+/// ([ADR-0025](../../docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
 ///
 /// The places are not held in memory between polls. Each poll loads the places of the
 /// streams it is about to read, which bounds what this struct holds by the poll's own
@@ -5094,10 +5323,36 @@ mod progress_tests {
             .await
             .expect("failed to create the postgres pool");
 
-        sqlx::migrate!("./tests/migrations")
-            .run(&pool)
+        // A migration that fails here says which database it was talking to and
+        // what both sides held. The failure this is for: a branch adding a
+        // migration while another branch adds one under the same number, which
+        // only the merge sees — the set embeds both, the second insert takes a
+        // 23505 on `_sqlx_migrations`, and "migrations must succeed" alone sends
+        // the reader looking for a broken migration rather than a collision.
+        if let Err(error) = sqlx::migrate!("./tests/migrations").run(&pool).await {
+            // `string_agg` rather than a `fetch_all`: `tests/bounded_queries.rs`
+            // reviews every `fetch_all` call site in this file, and a diagnostic
+            // is not worth an entry in that review.
+            let applied: Option<String> = sqlx::query_scalar(
+                "SELECT string_agg(version::text, ', ' ORDER BY version) FROM _sqlx_migrations",
+            )
+            .fetch_one(&pool)
             .await
-            .expect("migrations must succeed");
+            .unwrap_or_default();
+            let database: String = sqlx::query_scalar("SELECT current_database()")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|_| "?".to_string());
+            let embedded: Vec<String> = sqlx::migrate!("./tests/migrations")
+                .iter()
+                .map(|migration| format!("{}:{}", migration.version, migration.description))
+                .collect();
+            panic!(
+                "migrations must succeed: {error}\n  port: {port}\n  database: {database}\n  \
+                 applied: {}\n  embedded: {embedded:?}",
+                applied.unwrap_or_else(|| "none".to_string())
+            );
+        }
 
         (pool, container)
     }

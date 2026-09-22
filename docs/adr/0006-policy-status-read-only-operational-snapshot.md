@@ -1,6 +1,6 @@
 # Policy status is a read-only operational snapshot, not a projection
 
-**Status:** accepted; its fields were replaced by [ADR-0024](0024-a-policy-tracks-its-position-per-stream.md). The decision below — a read-only operational snapshot, derived from the operational tables, reporting progress and not liveness — stands. What it reports changed with the position it reports on: `lag` is an exact count of events over the streams a Policy is behind on, `streams_behind` says how widely it is spread, and `position`, `head`, `next_position`, `missing_position` and `PolicyCondition::Blocked` are gone with the global order they described (funkode-io/replay#196).
+**Status:** accepted; its fields were replaced by [ADR-0025](0025-a-policy-tracks-its-position-per-stream.md). The decision below — a read-only operational snapshot, derived from the operational tables, reporting progress and not liveness — stands. What it reports changed with the position it reports on: `lag` is an exact count of events over the streams a Policy is behind on, `streams_behind` says how widely it is spread, and `position`, `head`, `next_position`, `missing_position` and `PolicyCondition::Blocked` are gone with the global order they described (funkode-io/replay#196).
 
 Policies are checkpointed background subscribers (ADR-0003): they store a
 `global_position` cursor, advance at-least-once, and on permanent failure write a

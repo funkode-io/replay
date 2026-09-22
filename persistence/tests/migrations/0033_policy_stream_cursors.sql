@@ -2,7 +2,7 @@
 --
 -- Why per stream rather than over the log, what the two discovery paths cost and how a
 -- write that commits below the hint is still delivered:
--- docs/adr/0024-a-policy-tracks-its-position-per-stream.md. What to stop before running
+-- docs/adr/0025-a-policy-tracks-its-position-per-stream.md. What to stop before running
 -- this: README, "Upgrading a running Policy to per-stream cursors".
 
 CREATE TABLE IF NOT EXISTS policy_stream_cursors (

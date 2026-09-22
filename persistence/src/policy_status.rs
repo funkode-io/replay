@@ -40,7 +40,7 @@ use sqlx::{Pool, Postgres};
 ///
 /// There is no `Blocked`: a Policy reads each stream over a sequence that has no holes,
 /// so there is no position it can be parked in front of
-/// ([ADR-0024](../../docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
+/// ([ADR-0025](../../docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyCondition {
     /// No dead letters and no lag: fully healthy and up to date.
@@ -102,9 +102,18 @@ pub struct PolicyStatus {
     pub discovered_through: i64,
     /// When the policy last advanced in any stream (staleness signal).
     pub last_checkpoint_at: DateTime<Utc>,
-    /// Number of dead-letter rows recorded for this policy.
+    /// Number of parked commands recorded for this policy: one row per command
+    /// per reaction, not per delivery of the triggering event.
     pub dead_letter_count: i64,
-    /// Timestamp of the most recent dead-letter row, if any.
+    /// The latest parking among the commands this policy still has parked, and
+    /// `None` when it has none: the aggregate reads the active table, so a
+    /// policy whose every row has been retried or discarded reports `None`
+    /// however recently it parked.
+    ///
+    /// The last *parking*, not the oldest row's creation: a redelivery that
+    /// re-parks a command already parked refreshes its row rather than adding
+    /// one (funkode-io/replay#220), and a reaction failing on every delivery
+    /// must not read like one that failed once and stopped.
     pub last_dead_letter_at: Option<DateTime<Utc>>,
     /// Derived condition: [`PolicyCondition::Degraded`] when `dead_letter_count > 0`,
     /// otherwise [`PolicyCondition::Working`] when `lag > 0`, otherwise
@@ -135,12 +144,13 @@ impl PolicyStatusStore {
     ///
     /// The result is produced by a **single** SQL read: a per-policy `LATERAL` over
     /// `streams` against that policy's places, and a per-policy `LATERAL` aggregate over
-    /// `policy_dead_letters`. The dead-letter lateral is filtered by `pc.name`, so it uses
-    /// the `(policy_name, created_at)` index.
+    /// `policy_dead_letters`. The dead-letter lateral is filtered by `pc.name` and reads
+    /// `last_parked_at`, which `idx_dead_letters_policy_created_parked` carries as a
+    /// payload column, so it stays an index-only scan (funkode-io/replay#227).
     ///
     /// The event log is never scanned, but the frontier lateral reads one row per stream
     /// per policy, because no index can answer a comparison between two tables' columns
-    /// (ADR-0024). That is affordable for a status endpoint scraped every few seconds and
+    /// (ADR-0025). That is affordable for a status endpoint scraped every few seconds and
     /// would not be on every poll, which is why the runner does not use it that way.
     pub async fn list(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
         let rows = sqlx::query(
@@ -166,8 +176,8 @@ impl PolicyStatusStore {
             ) f ON TRUE
             LEFT JOIN LATERAL (
                 SELECT
-                    COUNT(*)        AS dead_letter_count,
-                    MAX(created_at) AS last_dead_letter_at
+                    COUNT(*)             AS dead_letter_count,
+                    MAX(last_parked_at)  AS last_dead_letter_at
                 FROM policy_dead_letters
                 WHERE policy_name = pc.name
             ) dl ON TRUE

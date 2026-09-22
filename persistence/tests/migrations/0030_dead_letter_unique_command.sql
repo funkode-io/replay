@@ -1,0 +1,72 @@
+-- no-transaction
+--
+-- A parked command is one row, whatever redelivers its event.
+--
+-- Parking was an unconditional INSERT and nothing in the schema said otherwise,
+-- so every delivery of an event left a fresh generation of rows for one
+-- reaction: same command, same error, its own id (funkode-io/replay#220). The
+-- park is now an ON CONFLICT DO UPDATE against this key, which refreshes the
+-- error and stamps the delivery instead of inserting.
+--
+-- The key is what identifies a parked command: the reaction (`policy_name`,
+-- `event_id`) and the dispatch within it (`aggregate_name`, `target_stream_id`,
+-- `command_name`, `dispatch_ordinal`). `global_position` is left out as
+-- redundant — one event has one position. The ordinal is what keeps a reaction's
+-- own repeats apart: two commands of one type to one instance are two parked
+-- commands, and must stay two rows.
+--
+-- NULLS NOT DISTINCT (PostgreSQL 15, the crate's floor) so the key also covers
+-- the rows whose ordinal is null. After 0029 that is one shape only: a panic in
+-- `react`, which fails before any dispatch exists and names none, so its whole
+-- identity is null. Those collapse per `(policy_name, event_id)`, which is
+-- exactly right — that case parks one row per delivery — and it is how the
+-- running code goes on refreshing the same panic. The other null-identity rows,
+-- parked before 0024's migration, do *not* collapse: 0029 gave each a distinct
+-- negative ordinal, because a group of them is either a redelivery's duplicate
+-- or several distinct commands and the table cannot tell. Without NULLS NOT
+-- DISTINCT, Postgres treats every null as distinct and the panic rows — the one
+-- shape that is provably one per delivery — would be the one shape that kept
+-- duplicating.
+--
+-- CONCURRENTLY, because the table is the daemon's write path and a plain build
+-- would lock out parking for as long as the migration runs; that cannot run
+-- inside a transaction, hence `-- no-transaction` and one statement in this
+-- file. No IF NOT EXISTS: a concurrent build that fails leaves an *invalid*
+-- index behind, and IF NOT EXISTS would step over it and report success with no
+-- key enforced (0019, 0020, 0026). 0015 records how to tell an invalid leftover
+-- from a live index and how to clear one.
+--
+-- Recovering a failed build: drop the invalid index and run this again — but
+-- only once the duplicate it failed on is gone, and the writer making them with
+-- it. A replica still running the old code parks null-ordinal rows after 0029 is
+-- recorded as applied, and a second one for the same command is a duplicate this
+-- build will fail on every time; rebuilding without clearing them is a loop. So:
+-- stop the old writers, run 0029's phase 1 by hand (it numbers below the
+-- synthetic ordinals already in each group, so a second pass is safe), then
+-- rebuild.
+--
+-- Rollout: apply this with the release that parks through `ON CONFLICT`, before
+-- that release runs. A binary that predates it cannot use the key — its park is
+-- an unconditional INSERT — so a replica still running the old code while this
+-- index exists takes a 23505 on the one thing the key forbids for *it*:
+-- re-parking a command it has already parked itself. That fails the poll rather
+-- than the row, and the parked failure it could not write is the one already in
+-- the table. The same window can make the build itself fail on a duplicate that
+-- old writer created; the build is then re-run, which is why it must not be
+-- stepped over.
+--
+-- What a rolling deploy does leave is a sibling, not a conflict: the old binary
+-- writes no `dispatch_ordinal`, and a null ordinal is distinct from the 0 the
+-- new binary writes for the same command, so the two rows coexist. That is the
+-- residue 0029's header describes from the other end — the dedupe collapses what
+-- existed when it ran, not what a pre-ordinal writer and a later delivery make
+-- afterwards — and a retry settles both, because `ParkedIdentity::names` matches
+-- a row to a replayed dispatch without the ordinal. An old binary retrying or
+-- discarding a *new* row also archives it without the 0028 columns, which loses
+-- `dispatch_ordinal`, `deliveries` and `last_parked_at` from the audit copy only:
+-- nothing reads them back. Quiescing the old replicas avoids both; neither is
+-- worth an outage.
+CREATE UNIQUE INDEX CONCURRENTLY idx_dead_letters_parked_command
+    ON policy_dead_letters (policy_name, event_id, aggregate_name, target_stream_id,
+                            command_name, dispatch_ordinal)
+    NULLS NOT DISTINCT;

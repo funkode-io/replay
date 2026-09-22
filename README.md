@@ -22,14 +22,15 @@ claim. The features that hold it up:
 - **13** — every event is stamped with the transaction that wrote it, in the `xid8` type
   PostgreSQL 13 added
   ([0018](persistence/tests/migrations/0018_event_commit_txid.sql));
-- **15** — `NULLS NOT DISTINCT`, which the next schema change needs: a parked dead letter
-  must be unique per command per reaction, over an identity that is nullable for a
-  reaction with no dispatch to name, and before 15 a unique index treats those rows as
-  all different (funkode-io/replay#220).
+- **15** — `NULLS NOT DISTINCT`, which keeps a parked dead letter unique per command
+  per reaction over an identity that is nullable for a reaction with no dispatch to
+  name ([0030](persistence/tests/migrations/0030_dead_letter_unique_command.sql));
+  before 15 a unique index treats those rows as all different
+  (funkode-io/replay#220).
 
-The promise moves ahead of that change rather than with it, so a deployment learns which
-server it needs before the migration that needs it. 13 and 14 are both out of upstream
-support either way.
+The promise moved ahead of that change rather than with it, so a deployment learned
+which server it needed before the migration that needs it. 13 and 14 are both out of
+upstream support either way.
 
 The integration suite runs against 15 itself — the floor is what is promised, so the
 floor is what is verified — and the pinned image tag lives in
@@ -2181,7 +2182,7 @@ A policy's position is **one row per stream** in `policy_stream_cursors`, holdin
 place it has reached in that stream. Nothing orders one stream against another: a policy
 reads each stream in that stream's own order, and a write that is slow, stuck or rolled
 back delays the stream it is writing to and no other
-([ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
+([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
 
 Which streams to look at is found two ways. Every poll sweeps the log past
 `policy_cursors.discovered_through` for streams with new events — indexed, and bounded by
@@ -2535,15 +2536,23 @@ CREATE TABLE IF NOT EXISTS policy_dead_letters (
     aggregate_name   TEXT,                   -- Rust type name of the target aggregate
     target_stream_id TEXT,                   -- URN of the instance the command was sent to
     command_name     TEXT,                   -- Rust type name of the command
+    dispatch_ordinal INTEGER,                -- the dispatch's place in the reaction
+    deliveries       INTEGER     NOT NULL DEFAULT 1,  -- deliveries that parked this command
+    last_parked_at   TIMESTAMPTZ NOT NULL DEFAULT now(), -- when the last of them did
     retry_count      INTEGER     NOT NULL DEFAULT 0,  -- settlements a retry has made on this row
     last_retried_at  TIMESTAMPTZ             -- when the last of them was made
 );
 
-CREATE INDEX IF NOT EXISTS idx_dead_letters_policy
-    ON policy_dead_letters (policy_name, created_at DESC);
+CREATE INDEX CONCURRENTLY idx_dead_letters_policy_created_parked
+    ON policy_dead_letters (policy_name, created_at DESC) INCLUDE (last_parked_at);
 
 CREATE INDEX CONCURRENTLY idx_dead_letters_policy_reaction
     ON policy_dead_letters (policy_name, global_position, event_id, id);
+
+CREATE UNIQUE INDEX CONCURRENTLY idx_dead_letters_parked_command
+    ON policy_dead_letters (policy_name, event_id, aggregate_name, target_stream_id,
+                            command_name, dispatch_ordinal)
+    NULLS NOT DISTINCT;
 ```
 
 The three identity columns are captured on the `Dispatch` itself, so a policy
@@ -2567,6 +2576,39 @@ access path a retry uses: `(policy_name, created_at DESC)` answers "what failed
 recently", not "which rows belong to this reaction". Built `CONCURRENTLY`, like
 every index this schema adds to a populated table, so parking keeps working while
 it builds.
+
+`idx_dead_letters_parked_command`
+([0030](persistence/tests/migrations/0030_dead_letter_unique_command.sql)) is what
+makes a parked command **one row**
+([ADR-0025](docs/adr/0024-a-parked-command-is-one-row.md)). The park is written before the batched cursor
+checkpoint, so a crash in between — or an operator rewinding the cursor — delivers
+the event again; the park is an `ON CONFLICT DO UPDATE` against this key, which
+refreshes the error, counts the delivery in `deliveries` and stamps
+`last_parked_at`, leaving `created_at` and the retry bookkeeping alone. A
+redelivery is not a retry. `dispatch_ordinal` is in the key because a reaction may
+emit the same command type to the same instance twice: those are two parked
+commands and keep two rows. `NULLS NOT DISTINCT` (the reason the floor is
+PostgreSQL 15) extends the key to rows with no dispatch to name, which collapse
+per `(policy_name, event_id)`. A row parked before the ordinal existed names its
+command but not its place — and one parked before the identity columns existed
+names nothing at all — so the migration cannot tell a redelivery's duplicate from
+two different commands: those rows are numbered apart with a **negative** ordinal
+rather than collapsed. Only a panicking reaction's row is collapsed by
+[0029](persistence/tests/migrations/0029_dead_letter_dedupe.sql), because a panic
+settles the delivery by unwinding and so parks exactly one row per delivery: the
+newest parking is kept and the rest archived with reason `superseded`.
+
+Apply these migrations with the release that parks through `ON CONFLICT`, before
+it runs: a replica still on the previous version parks with a plain INSERT and
+takes a `23505` if it re-parks a command it has already parked. That fails the
+poll, not the record — the row it could not write is the one already there.
+
+`PolicyStatus::last_dead_letter_at` reads `MAX(last_parked_at)`, not
+`MAX(created_at)`: a reaction failing on every delivery must not read like one
+that failed once and stopped. `idx_dead_letters_policy_created_parked`
+([0031](persistence/tests/migrations/0031_dead_letter_status_index.sql), which
+replaces `idx_dead_letters_policy`) carries that column as an index payload, so
+the status poll stays index-only.
 
 **Triage queries:**
 
@@ -2594,6 +2636,12 @@ SELECT * FROM policy_dead_letters WHERE error_kind = 'Timeout';
 SELECT policy_name, target_stream_id, retry_count, last_retried_at, error_message
 FROM   policy_dead_letters
 ORDER  BY retry_count DESC;
+
+-- Commands failing on every delivery: parked once, but parked again and again
+SELECT policy_name, target_stream_id, command_name, deliveries, last_parked_at
+FROM   policy_dead_letters
+WHERE  deliveries > 1
+ORDER  BY deliveries DESC;
 ```
 
 #### Retrying and discarding dead letters
@@ -2603,7 +2651,7 @@ band. None take an advisory lock or move the policy cursor:
 
 | Method | Reaction | Outcome |
 |--------|----------|---------|
-| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), or `NotFound`. |
+| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), `Superseded` (another writer parked that command while the replay ran, and its row was left as it stands), or `NotFound`. |
 | `discard_dead_letter(id)` | None — pure bookkeeping: no `react`, no command, no new event. | `Discarded` or `NotFound`. |
 | `retry_policy_dead_letters(name)` | Bulk: groups the policy's parked rows by the reaction they came from and replays each **once**, oldest-first. | `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing }`. |
 
@@ -2616,6 +2664,18 @@ ones that still fail keep their own error and stay retryable. Every settlement
 bumps the row's `retry_count` and stamps `last_retried_at`, the archived copy
 included.
 
+A settlement only settles the row the replay **read**. A parked command is one
+row, so a delivery of the event arriving while the replay runs refreshes that row
+in place; settling it anyway would archive a failure nobody retried, or overwrite
+it with the staler error the replay produced. The retry carries the row's
+`deliveries`/`last_parked_at` — and the `retry_count` another retry moves — into
+its `WHERE`, and the command it parks *without*
+a row is guarded by the key itself — a row that appeared under it belongs to a
+writer no staler than this replay. Either way the retry reports `Superseded` and
+leaves the row alone — retry again to act on what is parked now
+([ADR-0025](docs/adr/0024-a-parked-command-is-one-row.md)). The bulk summary
+counts such a reaction as still failing, which it is.
+
 The summary counts reactions; `PolicyStatus::dead_letter_count` keeps counting
 **rows** (parked commands), so one broken two-command reaction reads as
 `dead_letter_count = 2`, `reactions_still_failing = 1`.
@@ -2627,6 +2687,7 @@ use replay_persistence::{DeadLetterRetry, DeadLetterDiscard};
 match runner.retry_dead_letter(id).await? {
     DeadLetterRetry::Resolved => { /* this row's command resolved: archived */ }
     DeadLetterRetry::StillFailing => { /* updated in place, still retryable */ }
+    DeadLetterRetry::Superseded => { /* another writer parked it mid-replay */ }
     DeadLetterRetry::NotFound => { /* nothing matched the id */ }
 }
 
@@ -2660,11 +2721,14 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
     error_kind       TEXT        NOT NULL,
     error_message    TEXT        NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL,   -- when the dead letter was written
-    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded'
+    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded' | 'superseded'
     discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     aggregate_name   TEXT,                   -- identity the row carried, kept as-is
     target_stream_id TEXT,
     command_name     TEXT,
+    dispatch_ordinal INTEGER,
+    deliveries       INTEGER     NOT NULL DEFAULT 1,  -- deliveries that parked it
+    last_parked_at   TIMESTAMPTZ DEFAULT now(), -- when the last of them did; NULL if archived before 0028
     retry_count      INTEGER     NOT NULL DEFAULT 0,  -- retries made, the settling one included
     last_retried_at  TIMESTAMPTZ
 );
@@ -2672,6 +2736,10 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
 CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy
     ON discarded_dead_letters (policy_name, discarded_at DESC);
 ```
+
+`superseded` is the third way out, and the only one no operator asked for: the
+duplicate generations the dedupe migration retired when a parked command became
+unique.
 
 #### `A::Error: Into<replay::Error>` migration note
 
@@ -2906,7 +2974,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 inflate it and another policy's traffic does not appear in it. It is computed by scanning
 one row per stream, which is affordable for a status endpoint scraped every few seconds and
 would not be on every poll — which is why the runner does not find its work this way
-([ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
+([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
 
 When you need a **stable cut** of the log — the largest position `H` such that every
 position in `1..=H` is present, e.g. to freeze a version at publish time — use
@@ -2946,7 +3014,7 @@ exists. A `CaughtUp` policy whose worker died looks exactly like one that is idl
 
 ### Upgrading a running Policy to per-stream cursors
 
-Migration [0028](persistence/tests/migrations/0028_policy_stream_cursors.sql) carries every
+Migration [0033](persistence/tests/migrations/0033_policy_stream_cursors.sql) carries every
 running policy over at exactly what it has processed: for each stream, the place it had
 reached by the position its cursor stopped at. Nothing is redelivered and nothing is
 skipped.
