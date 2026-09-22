@@ -69,8 +69,11 @@ is owed is read from that stream's own sequence, which has no holes.
   not give: it bought the same correctness by making every Policy wait for the oldest
   in-flight write in the whole instance (funkode-io/replay#214).
 - **A write that commits below the sweep is delivered late, not never — and the lateness
-  is a number.** At most one reconciliation cadence. The watermark's equivalent bound was
-  the duration of the longest transaction, which is not a number anyone configures.
+  is a number.** One reconciliation cadence when the Policy has no more streams than its
+  read batch, and one full pass of the rotation — `ceil(streams / read_batch_size)`
+  cadences — when it has more, because the reconciliation examines a batch at a time. The
+  watermark's equivalent bound was the duration of the longest transaction, which is not a
+  number anyone configures.
 - **There is no hole to detect, so the machinery that detected holes is gone**:
   `burned_position.rs` and its `pg_locks` probe, `policy_feed.rs` and its gap truncation,
   `policy_blocked.rs` and its rate gate, `PolicyCondition::Blocked`, and the cursor's

@@ -2751,39 +2751,28 @@ async fn drain_policy_once(
     // laid out.
     let filter = policy.stream_filter();
 
-    // Three sources, in the order that costs least: what the last poll could not finish,
-    // what the sweep just found, and — on its own cadence — what the sweep has missed.
-    //
-    // Capped at `read_batch` streams, and the carried ones come first, so this is a queue
-    // that rotates rather than a list that grows: the poll takes from the front and puts
-    // what it could not finish at the back (below). A nomination dropped for want of room
-    // is found again — by the sweep if the stream gains an event, by the rotating
-    // reconciliation otherwise — so the cap costs a delay, never a delivery.
-    let mut streams = std::mem::take(&mut progress.unfinished);
-    streams.truncate(read_batch as usize);
+    // Three sources: what the last poll could not finish, what the sweep just found, and
+    // — on its own cadence — what the sweep has missed.
+    let carried = std::mem::take(&mut progress.unfinished);
     let discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
-    for stream_id in discovered.streams {
-        if streams.len() as u32 >= read_batch {
-            break;
-        }
-        if !streams.contains(&stream_id) {
-            streams.push(stream_id);
-        }
-    }
-    if progress.reconcile_is_due() {
+    let reconciled = if progress.reconcile_is_due() {
         let examined =
             streams_behind(pool, &name, &progress.reconciled_through, read_batch).await?;
-        for stream_id in &examined {
-            if streams.len() as u32 >= read_batch {
-                break;
-            }
-            if !streams.contains(stream_id) {
-                streams.push(stream_id.clone());
-            }
-        }
         progress.reconciled(&examined, read_batch);
         write_reconciled(pool, &name, &progress.reconciled_through).await?;
-    }
+        examined
+    } else {
+        Vec::new()
+    };
+
+    // The poll looks at `read_batch` streams, taken a slot at a time from each source in
+    // turn. Filling from the carried queue first and letting the others have what is left
+    // starves them outright: `read_batch` continuously-busy streams refill that queue
+    // every poll, and a quiet stream the sweep passed would be nominated by the
+    // reconciliation for ever without once being read. Round-robin bounds every source's
+    // share at a third of the batch when all three are offering, which is what makes
+    // "dropped for want of room" a delay rather than a hole.
+    let streams = share_the_poll(read_batch, [carried, discovered.streams, reconciled]);
 
     // The sweep has read this stretch of log whatever the streams in it turn out to owe,
     // and a stream left unfinished is remembered rather than re-swept for.
@@ -2930,6 +2919,37 @@ async fn drain_policy_once(
     progress.unfinished = unvisited;
 
     Ok(executed)
+}
+
+/// Fill a poll's candidate list from its sources a slot at a time, in the order given,
+/// skipping streams already taken.
+///
+/// Takes ownership because each source is consumed: a stream named twice costs one slot,
+/// not two, and the source that named it first keeps its turn.
+fn share_the_poll<const N: usize>(limit: u32, sources: [Vec<String>; N]) -> Vec<String> {
+    let mut sources = sources.map(Vec::into_iter);
+    let mut taken: Vec<String> = Vec::new();
+
+    while (taken.len() as u32) < limit {
+        let mut offered = false;
+        for source in &mut sources {
+            if (taken.len() as u32) >= limit {
+                break;
+            }
+            for stream_id in source.by_ref() {
+                if !taken.contains(&stream_id) {
+                    taken.push(stream_id);
+                    offered = true;
+                    break;
+                }
+            }
+        }
+        if !offered {
+            break;
+        }
+    }
+
+    taken
 }
 
 /// The runner's machinery for delivering events to **one** policy: the
@@ -3694,12 +3714,16 @@ async fn checkpoint_places(
     let kept: HashSet<String> = kept.into_iter().map(|row| row.get("stream_id")).collect();
 
     // What `PolicyStatus::last_checkpoint_at` is measured from: the Policy processed
-    // something, whichever stream it was.
-    sqlx::query("UPDATE policy_cursors SET updated_at = now() WHERE name = $1")
-        .bind(name)
-        .execute(pool)
-        .await
-        .map_err(crate::db_error)?;
+    // something, whichever stream it was. A batch whose every write lost its
+    // compare-and-set processed nothing that stands, so it leaves the stamp alone rather
+    // than reporting an outage as fresh progress.
+    if !kept.is_empty() {
+        sqlx::query("UPDATE policy_cursors SET updated_at = now() WHERE name = $1")
+            .bind(name)
+            .execute(pool)
+            .await
+            .map_err(crate::db_error)?;
+    }
 
     Ok(kept)
 }

@@ -163,18 +163,17 @@ async fn a_streams_events_are_delivered_in_its_own_order_postgres_test() {
     })
     .await;
 
-    // Appends to one stream serialise on its row; appends to different streams race.
-    let tags: Vec<(String, String)> = (0..STREAMS)
-        .flat_map(|stream| {
-            (0..EVENTS).map(move |event| (format!("ordered-{stream}"), format!("{stream}-{event}")))
-        })
-        .collect();
-    let appending: Vec<_> = tags
-        .iter()
-        .map(|(stream, tag)| harness.ping(stream, tag))
-        .collect();
-    for append in appending {
-        append.await;
+    // Joined, not collected and awaited one at a time: each round appends to all four
+    // streams at once, so the positions they take in the log are interleaved in an order
+    // nobody chose. One append in flight per stream, because two concurrent *first*
+    // appends to one stream race on creating its `streams` row (funkode-io/replay#232) —
+    // a defect in the write path, and not what this test is about.
+    for event in 0..EVENTS {
+        let round: Vec<(String, String)> = (0..STREAMS)
+            .map(|stream| (format!("ordered-{stream}"), format!("{stream}-{event}")))
+            .collect();
+        futures::future::join_all(round.iter().map(|(stream, tag)| harness.ping(stream, tag)))
+            .await;
     }
 
     // The Policy also walks the streams its own echoes land in; what this test is about
