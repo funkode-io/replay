@@ -59,11 +59,26 @@ code (funkode-io/replay#228).
   still failing, which it is. The alternative — settling the rows that did not
   move — needs the per-row versions this change exists to stop reading.
 
-- **The count that decides how a row is matched is taken over the group**, by a
-  window function, before the keyset narrows it to a page. Whether a row is
-  settled in production order or shares a verdict with its indistinguishable
-  siblings is a question about the reaction (ADR-0021), and a count taken over a
-  page would answer it for the page.
+- **The count that decides how a row is matched is taken over the group**,
+  once, before the walk — and only for the identities the replay dispatched. A
+  row naming a command the replay did not run is settled without the number, so
+  the count is bounded by the reaction's dispatch vector rather than by the
+  group's distinct identities. Counting per page instead is quadratic in the tail
+  this change exists to make readable, whether by a window function or by a
+  second query.
+
+- **The pages are the index's own order**, `id` ascending under the
+  `(policy_name, global_position, event_id, id)` prefix, walked twice: the rows
+  naming a command, then the rows naming none, which is the order ADR-0021
+  settles them in. One walk ordered by an expression would sort the group on
+  every page.
+
+- **A group an operator emptied is not a group that moved.** A concurrent
+  [Discard] that takes the last row leaves nothing to settle and nothing to be
+  wrong about, so the settlement proceeds: every failure the replay found is one
+  no row speaks for, and parking those is what a retry does (ADR-0021). Refusing
+  here would leave nothing to retry — a reaction with no rows is not enumerable,
+  and the drain is long past the event.
 
 - **The outcome is folded, not listed.** `retry_reaction` returns whether any row
   resolved, whether any is still failing, and the outcome of the one row a by-id
@@ -105,9 +120,9 @@ code (funkode-io/replay#228).
   moved the group is a writer that ran this same reaction: a delivery parks every
   command that failed for it, and another retry parks its own unclaimed failures,
   so the failure is recorded by the writer that is current rather than by this
-  stale replay. When the mover was a [Discard] instead, nothing records it and
-  the reaction is reported still failing: the next retry parks it, if it still
-  fails.
+  stale replay. The rows that remain keep the reaction enumerable, so the next
+  retry settles it; the one case with no rows left — a discard emptying the group
+  — is settled here rather than deferred, per the decision above.
 
 - **A retry holds row locks over the whole group for the length of its
   settlement**, rather than taking them one row at a time as it writes. The

@@ -1141,64 +1141,72 @@ impl PolicyRunner {
         let mut replay = replay;
         let mut settled = ReactionSettlement::default();
         let (mut tx, locked) = begin_settlement(&self.pool, reaction).await?;
-        if locked != before {
+        // A group emptied under the replay has no row to settle and no row to
+        // mismatch about: every failure the replay found is one nothing speaks
+        // for, and parking those is what the loop below is. Leaving it to "the
+        // next retry" would leave nothing to retry — a discarded reaction is not
+        // enumerable, and the drain is long past the event.
+        if locked != before && locked.rows > 0 {
             return Ok(None);
         }
 
-        // Rows that name a command are settled first, whatever their ids. A row
-        // that names none is judged by the replay *as a whole* and speaks for
-        // every dispatch of it, so letting one go first — an upgrade's row is
-        // older than the rows a later delivery parked, hence lower-numbered —
-        // would leave its neighbours nothing of their own to take. That order is
-        // also what the pages walk, so a page boundary cannot reorder it.
-        let mut page = RowKeyset::start();
-        loop {
-            let rows = load_parked_page(&mut tx, reaction, page).await?;
-            let Some(last) = rows.last().map(RowKeyset::after) else {
-                break;
-            };
-            let exhausted = (rows.len() as i64) < RETRY_ROW_PAGE_SIZE;
-            page = last;
+        // Which rows of the group name each dispatch the replay ran, read once
+        // under the lock: a count over a page would answer for the page
+        // ([`Replay::settlement_for`]).
+        let naming = count_rows_naming(&mut tx, reaction, &replay.dispatched()).await?;
 
-            for row in rows {
-                let outcome = match row.identity.as_ref() {
-                    // The command this row was parked for ran again: its own
-                    // outcome settles it.
-                    Some(identity) => replay.settlement_for(identity, row.rows_naming_it),
-                    // The row names no command, so only the replay as a whole
-                    // can settle it.
-                    None => replay.verdict(),
+        for phase in [GroupPhase::Naming, GroupPhase::Nameless] {
+            let mut after = 0;
+            loop {
+                let rows = load_parked_page(&mut tx, reaction, phase, after).await?;
+                let Some(last) = rows.last().map(|row| row.id) else {
+                    break;
                 };
+                let exhausted = (rows.len() as i64) < RETRY_ROW_PAGE_SIZE;
+                after = last;
 
-                // The group is locked and was verified unchanged, so every one
-                // of these statements matches its row; `unsettled` is the
-                // defence in depth for the day that stops being true.
-                let settlement = match outcome {
-                    None => {
-                        if move_dead_letter_to_archive(&mut *tx, row.id, "retried").await? {
-                            DeadLetterRetry::Resolved
-                        } else {
-                            unsettled(&mut *tx, row.id).await?
+                for row in rows {
+                    let outcome = match row.identity.as_ref() {
+                        // The command this row was parked for ran again: its own
+                        // outcome settles it.
+                        Some(identity) => {
+                            replay.settlement_for(identity, rows_naming(&naming, identity))
                         }
-                    }
-                    Some(Settlement {
-                        error_kind,
-                        error_message,
-                    }) => {
-                        if re_park_dead_letter(&mut *tx, row.id, &error_kind, &error_message)
-                            .await?
-                        {
-                            DeadLetterRetry::StillFailing
-                        } else {
-                            unsettled(&mut *tx, row.id).await?
-                        }
-                    }
-                };
-                settled.record(row.id, settlement, asked_about);
-            }
+                        // The row names no command, so only the replay as a
+                        // whole can settle it.
+                        None => replay.verdict(),
+                    };
 
-            if exhausted {
-                break;
+                    // The group is locked and was verified unchanged, so every
+                    // one of these statements matches its row; `unsettled` is
+                    // the defence in depth for the day that stops being true.
+                    let settlement = match outcome {
+                        None => {
+                            if move_dead_letter_to_archive(&mut *tx, row.id, "retried").await? {
+                                DeadLetterRetry::Resolved
+                            } else {
+                                unsettled(&mut *tx, row.id).await?
+                            }
+                        }
+                        Some(Settlement {
+                            error_kind,
+                            error_message,
+                        }) => {
+                            if re_park_dead_letter(&mut *tx, row.id, &error_kind, &error_message)
+                                .await?
+                            {
+                                DeadLetterRetry::StillFailing
+                            } else {
+                                unsettled(&mut *tx, row.id).await?
+                            }
+                        }
+                    };
+                    settled.record(row.id, settlement, asked_about);
+                }
+
+                if exhausted {
+                    break;
+                }
             }
         }
 
@@ -2452,20 +2460,14 @@ impl ReactionKeyset {
     }
 }
 
-/// One parked row, as the retry path needs it: which row, which dispatch it was
-/// parked for, and how many rows of its group name that dispatch.
+/// One parked row, as the retry path needs it: which row, and which dispatch it
+/// was parked for.
 struct ParkedRow {
     id: i64,
     /// The dispatch the row names. `None` where there is none to name: a row
     /// parked before the identity migration, or parked for a panic in `react`
     /// itself.
     identity: Option<ParkedIdentity>,
-    /// How many rows of the **whole** group name the same dispatch — counted by
-    /// the database over the group, not by the caller over a page, since a page
-    /// can split an identity's rows and a count taken over half of them would
-    /// settle the other half by a rule that does not apply
-    /// ([`Replay::settlement_for`]).
-    rows_naming_it: usize,
 }
 
 /// What a reaction's group looked like at a moment, in a fixed number of bytes.
@@ -2507,31 +2509,61 @@ impl GroupDigest {
     }
 }
 
-/// Where the next page of a group's rows resumes: the last row the previous page
-/// settled, exclusive.
-///
-/// Ordered as the settlement must run — rows naming a command first, then by id
-/// — so paging cannot reorder what a page boundary happens to fall between.
-#[derive(Clone, Copy)]
-struct RowKeyset {
-    nameless: bool,
-    id: i64,
+/// How many rows of the group name `identity`, from the counts read before the
+/// walk. Absent means no row of the group names a dispatch the replay ran, which
+/// [`Replay::settlement_for`] resolves without the number.
+fn rows_naming(counts: &[(ParkedIdentity, usize)], identity: &ParkedIdentity) -> usize {
+    counts
+        .iter()
+        .find_map(|(named, count)| (named == identity).then_some(*count))
+        .unwrap_or(0)
 }
 
-impl RowKeyset {
-    /// Before every row: `id` is a sequence value, so the lowest one a row can
-    /// carry is 1, and a row naming a command sorts before one that does not.
-    fn start() -> Self {
-        Self {
-            nameless: false,
-            id: 0,
-        }
-    }
+/// Which half of a group a page comes from.
+///
+/// Rows that name a command are settled first, whatever their ids: a row that
+/// names none is judged by the replay *as a whole* and speaks for every dispatch
+/// of it, so letting one go first — an upgrade's row is older than the rows a
+/// later delivery parked, hence lower-numbered — would leave its neighbours
+/// nothing of their own to take (ADR-0021).
+///
+/// Two walks rather than one ordered by "names a command": an expression in the
+/// `ORDER BY` is a sort of the group on every page, where `id` alone is the
+/// index's own order.
+#[derive(Clone, Copy)]
+enum GroupPhase {
+    Naming,
+    Nameless,
+}
 
-    fn after(row: &ParkedRow) -> Self {
-        Self {
-            nameless: row.identity.is_none(),
-            id: row.id,
+impl GroupPhase {
+    /// The page query this phase reads with.
+    ///
+    /// Written out twice rather than composed: sqlx takes only a `'static` query
+    /// string, which is the rule that keeps a query from being assembled out of
+    /// anything a caller supplies.
+    fn page(self) -> &'static str {
+        match self {
+            Self::Naming => {
+                "SELECT id, aggregate_name, target_stream_id, command_name \
+                 FROM policy_dead_letters \
+                 WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
+                   AND id > $4 \
+                   AND aggregate_name IS NOT NULL AND target_stream_id IS NOT NULL \
+                   AND command_name IS NOT NULL \
+                 ORDER BY id ASC \
+                 LIMIT $5"
+            }
+            Self::Nameless => {
+                "SELECT id, aggregate_name, target_stream_id, command_name \
+                 FROM policy_dead_letters \
+                 WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
+                   AND id > $4 \
+                   AND (aggregate_name IS NULL OR target_stream_id IS NULL \
+                        OR command_name IS NULL) \
+                 ORDER BY id ASC \
+                 LIMIT $5"
+            }
         }
     }
 }
@@ -2810,6 +2842,22 @@ impl Replay {
                 })
             })
             .collect()
+    }
+
+    /// The dispatches this replay ran, distinct: what the group is counted
+    /// against, and all of it that a count can be about.
+    fn dispatched(&self) -> Vec<DispatchIdentity> {
+        let mut distinct: Vec<DispatchIdentity> = Vec::new();
+        for dispatch in self.concluded() {
+            if !distinct.iter().any(|seen| {
+                seen.aggregate_name == dispatch.identity.aggregate_name
+                    && seen.target_stream_id == dispatch.identity.target_stream_id
+                    && seen.command_name == dispatch.identity.command_name
+            }) {
+                distinct.push(dispatch.identity.clone());
+            }
+        }
+        distinct
     }
 
     fn concluded(&self) -> &[ReplayedDispatch] {
@@ -3927,8 +3975,7 @@ async fn begin_settlement<'a>(
     Ok((tx, digest))
 }
 
-/// One page of a reaction's rows, in the order they are settled: the rows naming
-/// a command first, oldest first within each.
+/// One page of a reaction's rows, oldest first, from one half of the group.
 ///
 /// Bounded by [`RETRY_ROW_PAGE_SIZE`]. A reaction's rows are one per command the
 /// current code dispatches — plus the tail an older version of the policy parked
@@ -3937,42 +3984,28 @@ async fn begin_settlement<'a>(
 /// (funkode-io/replay#228). Reading the group whole therefore held a table's
 /// worth of strings for a reaction an upgrade had inherited.
 ///
-/// `rows_naming_it` is counted by the window over the **whole** group before the
-/// keyset narrows it to a page: it decides whether a row is settled in
-/// production order or shares a verdict with its indistinguishable siblings
-/// ([`Replay::settlement_for`]), and a count taken over a page would answer for
-/// the group.
+/// Filter and order are the index's own (`idx_dead_letters_policy_reaction`, on
+/// `(policy_name, global_position, event_id, id)`), so a page is a range scan
+/// that resumes where the last one stopped rather than a sort of the group: a
+/// walk over a long tail stays linear in it.
 ///
 /// `global_position` is redundant with `event_id` — one event has one position —
-/// and is in the filter to make it a prefix match on
-/// `idx_dead_letters_policy_reaction`.
+/// and is in the filter to make that prefix match.
 async fn load_parked_page(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     reaction: &ParkedReaction,
-    after: RowKeyset,
+    phase: GroupPhase,
+    after: i64,
 ) -> Result<Vec<ParkedRow>, replay::Error> {
-    let rows = sqlx::query(
-        "SELECT id, aggregate_name, target_stream_id, command_name, nameless, naming \
-         FROM (SELECT id, aggregate_name, target_stream_id, command_name, \
-                      (aggregate_name IS NULL OR target_stream_id IS NULL \
-                       OR command_name IS NULL) AS nameless, \
-                      count(*) OVER (PARTITION BY aggregate_name, target_stream_id, \
-                                                  command_name) AS naming \
-               FROM policy_dead_letters \
-               WHERE policy_name = $1 AND global_position = $2 AND event_id = $3) g \
-         WHERE (g.nameless, g.id) > ($4, $5) \
-         ORDER BY g.nameless ASC, g.id ASC \
-         LIMIT $6",
-    )
-    .bind(&reaction.policy_name)
-    .bind(reaction.global_position)
-    .bind(reaction.event_id)
-    .bind(after.nameless)
-    .bind(after.id)
-    .bind(RETRY_ROW_PAGE_SIZE)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(crate::db_error)?;
+    let rows = sqlx::query(phase.page())
+        .bind(&reaction.policy_name)
+        .bind(reaction.global_position)
+        .bind(reaction.event_id)
+        .bind(after)
+        .bind(RETRY_ROW_PAGE_SIZE)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(crate::db_error)?;
 
     Ok(rows
         .into_iter()
@@ -3980,7 +4013,6 @@ async fn load_parked_page(
             let aggregate_name: Option<String> = row.get("aggregate_name");
             let target_stream_id: Option<String> = row.get("target_stream_id");
             let command_name: Option<String> = row.get("command_name");
-            let naming: i64 = row.get("naming");
             ParkedRow {
                 id: row.get("id"),
                 identity: match (aggregate_name, target_stream_id, command_name) {
@@ -3993,8 +4025,69 @@ async fn load_parked_page(
                     }
                     _ => None,
                 },
-                rows_naming_it: naming as usize,
             }
+        })
+        .collect())
+}
+
+/// How many rows of the group name each dispatch this replay ran.
+///
+/// Whether a row is settled in production order or shares a verdict with its
+/// indistinguishable siblings is a question about the whole reaction
+/// ([`Replay::settlement_for`]), so the count cannot be taken over a page. It is
+/// taken **once**, before the walk, and only for the identities the replay
+/// produced: a row naming a command this replay did not run is settled by
+/// [`Replay::unmatched`], which never asks. Bounded by the reaction's dispatch
+/// vector, which `react_erased` already materialises.
+///
+/// One index range scan over the group, where counting per page cost one for
+/// each page — quadratic in the tail this change exists to make readable.
+async fn count_rows_naming(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    reaction: &ParkedReaction,
+    dispatched: &[DispatchIdentity],
+) -> Result<Vec<(ParkedIdentity, usize)>, replay::Error> {
+    if dispatched.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let aggregates: Vec<&str> = dispatched.iter().map(|it| it.aggregate_name).collect();
+    let targets: Vec<&str> = dispatched
+        .iter()
+        .map(|it| it.target_stream_id.as_str())
+        .collect();
+    let commands: Vec<&str> = dispatched.iter().map(|it| it.command_name).collect();
+
+    let rows = sqlx::query(
+        "SELECT aggregate_name, target_stream_id, command_name, count(*) AS naming \
+         FROM policy_dead_letters \
+         WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
+           AND (aggregate_name, target_stream_id, command_name) \
+               IN (SELECT * FROM unnest($4::text[], $5::text[], $6::text[])) \
+         GROUP BY aggregate_name, target_stream_id, command_name",
+    )
+    .bind(&reaction.policy_name)
+    .bind(reaction.global_position)
+    .bind(reaction.event_id)
+    .bind(&aggregates)
+    .bind(&targets)
+    .bind(&commands)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let naming: i64 = row.get("naming");
+            (
+                ParkedIdentity {
+                    aggregate_name: row.get("aggregate_name"),
+                    target_stream_id: row.get("target_stream_id"),
+                    command_name: row.get("command_name"),
+                },
+                naming as usize,
+            )
         })
         .collect())
 }
@@ -5940,7 +6033,7 @@ mod settlement_tests {
     use sqlx::PgPool;
 
     use super::cursor_tests::start_postgres;
-    use super::{begin_settlement, group_digest, load_parked_page, ParkedReaction, RowKeyset};
+    use super::{begin_settlement, group_digest, load_parked_page, GroupPhase, ParkedReaction};
 
     const POLICY: &str = "settlement_under_test";
     const POSITION: i64 = 7;
@@ -5995,7 +6088,7 @@ mod settlement_tests {
         // which cover the rows that existed, and this is not one of them.
         park(&pool, &reaction, "Third").await;
 
-        let page = load_parked_page(&mut tx, &reaction, RowKeyset::start())
+        let page = load_parked_page(&mut tx, &reaction, GroupPhase::Naming, 0)
             .await
             .expect("the page must be readable");
         let commands: Vec<Option<&str>> = page

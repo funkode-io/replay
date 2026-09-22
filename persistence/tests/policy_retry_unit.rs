@@ -1423,6 +1423,60 @@ async fn a_retry_does_not_overwrite_a_row_a_delivery_parked_for_its_new_command_
     harness.shutdown().await;
 }
 
+/// A discard that empties a reaction while its retry replays does not swallow
+/// what the replay found.
+///
+/// The settlement refuses a group that moved under it (ADR-0025) — but a group
+/// an operator emptied has no row to settle and none to be wrong about, and the
+/// command the replay found failing is one nothing speaks for. Leaving it to
+/// "the next retry" would leave nothing to retry: a reaction with no rows is not
+/// enumerable, and the drain is long past the event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_discard_that_empties_a_group_does_not_swallow_what_the_replay_found_postgres_test() {
+    let reaction = Reaction::new();
+    let harness = Arc::new(PolicyDaemonHarness::start("discard_empties", reaction.policy()).await);
+
+    harness.ping("subject-1", ONE_COMMAND).await;
+    let parked = harness.await_dead_letters(1).await;
+    let discarded = parked[0].id;
+
+    reaction.gate.arm();
+    let held = {
+        let harness = Arc::clone(&harness);
+        tokio::spawn(async move { harness.retry_parked_row(discarded).await })
+    };
+
+    reaction.gate.await_entered().await;
+    assert_eq!(
+        harness.discard_parked_row(discarded).await,
+        DeadLetterDiscard::Discarded,
+        "the operator retires the row while the retry is replaying it"
+    );
+    reaction.gate.release();
+
+    assert_eq!(
+        held.await.expect("the held retry task must not panic"),
+        DeadLetterRetry::NotFound,
+        "the row the retry was asked about is gone"
+    );
+    let after = harness.dead_letters().await;
+    assert_eq!(after.len(), 1, "the failure is parked anew, got {after:#?}");
+    assert_eq!(
+        (
+            after[0].target_stream_id.as_deref(),
+            after[0].retry_count,
+            after[0].id == discarded
+        ),
+        (Some(urn_of(FIRST_SUBJECT).as_str()), 0, false),
+        "a row of its own, untried, for the command that failed: {after:#?}"
+    );
+
+    let Ok(harness) = Arc::try_unwrap(harness) else {
+        panic!("the retry task must have released the harness")
+    };
+    harness.shutdown().await;
+}
+
 /// A reaction with more rows than the settlement reads at once is still settled
 /// by one replay.
 ///

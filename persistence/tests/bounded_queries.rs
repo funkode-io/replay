@@ -52,6 +52,13 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/policy_runner.rs",
+        function: "count_rows_naming",
+        justification: "One row per distinct dispatch the replay ran, GROUP BY over the \
+                        identities it passes in: bounded by the vector `react_erased` \
+                        already materialises, never by the group it counts.",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
         function: "load_parked_reactions",
         justification: "SQL carries LIMIT RETRY_PAGE_SIZE (100). One page of a bulk \
                         retry's keyset walk over a policy's parked reactions, settled \
