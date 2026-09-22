@@ -12,9 +12,9 @@
 --
 -- INCLUDE rather than a second key column: nothing orders or filters on
 -- `last_parked_at`, it is only read, and a payload column keeps the index the
--- same shape for the triage query that does order on `created_at`. 0031 drops
+-- same shape for the triage query that does order on `created_at`. 0032 drops
 -- the index this one replaces.
 --
--- CONCURRENTLY, and no IF NOT EXISTS, for the reasons 0026 and 0029 state.
+-- CONCURRENTLY, and no IF NOT EXISTS, for the reasons 0026 and 0030 state.
 CREATE INDEX CONCURRENTLY idx_dead_letters_policy_created_parked
     ON policy_dead_letters (policy_name, created_at DESC) INCLUDE (last_parked_at);

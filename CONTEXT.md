@@ -109,7 +109,7 @@ A row is one parked **command per reaction**, not per delivery: an event
 delivered again — after a crash between the park and the cursor checkpoint, or
 after a [Cursor move] — refreshes the row its command already has with the new
 error and counts the delivery, rather than parking a second copy
-([ADR-0023](docs/adr/0023-a-parked-command-is-one-row.md)). It is not a
+([ADR-0024](docs/adr/0024-a-parked-command-is-one-row.md)). It is not a
 [Retry] and does not touch what one has tried.
 A row names the dispatch it is about — the [Aggregate] type, the URN of the
 instance the command was addressed to, the command's **type** (its variant

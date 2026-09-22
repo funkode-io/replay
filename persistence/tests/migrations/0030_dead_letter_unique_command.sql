@@ -32,10 +32,10 @@
 --
 -- Recovering a failed build: drop the invalid index and run this again — but
 -- only once the duplicate it failed on is gone, and the writer making them with
--- it. A replica still running the old code parks null-ordinal rows after 0028 is
+-- it. A replica still running the old code parks null-ordinal rows after 0029 is
 -- recorded as applied, and a second one for the same command is a duplicate this
 -- build will fail on every time; rebuilding without clearing them is a loop. So:
--- stop the old writers, run 0028's phase 1 by hand (it numbers below the
+-- stop the old writers, run 0029's phase 1 by hand (it numbers below the
 -- synthetic ordinals already in each group, so a second pass is safe), then
 -- rebuild.
 --
@@ -52,11 +52,11 @@
 -- What a rolling deploy does leave is a sibling, not a conflict: the old binary
 -- writes no `dispatch_ordinal`, and a null ordinal is distinct from the 0 the
 -- new binary writes for the same command, so the two rows coexist. That is the
--- residue 0028's header describes from the other end — the dedupe collapses what
+-- residue 0029's header describes from the other end — the dedupe collapses what
 -- existed when it ran, not what a pre-ordinal writer and a later delivery make
 -- afterwards — and a retry settles both, because `ParkedIdentity::names` matches
 -- a row to a replayed dispatch without the ordinal. An old binary retrying or
--- discarding a *new* row also archives it without the 0027 columns, which loses
+-- discarding a *new* row also archives it without the 0028 columns, which loses
 -- `dispatch_ordinal`, `deliveries` and `last_parked_at` from the audit copy only:
 -- nothing reads them back. Quiescing the old replicas avoids both; neither is
 -- worth an outage.

@@ -1,6 +1,6 @@
 -- no-transaction
 --
--- Drop the index 0030 replaces: `idx_dead_letters_policy_created_parked` has the
+-- Drop the index 0031 replaces: `idx_dead_letters_policy_created_parked` has the
 -- same key and carries `last_parked_at` as well, so every read that reached for
 -- this one reaches for that one, and keeping both would cost the park path a
 -- second index write for nothing (0016, 0021 dropped superseded indexes the same

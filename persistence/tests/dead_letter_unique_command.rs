@@ -26,11 +26,11 @@ const POSTGRES_PORT: u16 = 5432;
 /// The migration that adds the delivery columns: everything up to and including
 /// it is the schema a duplicated table is staged in, and the dedupe and the
 /// unique index are what the tests then run against it.
-const BEFORE_DEDUPE: i64 = 27;
+const BEFORE_DEDUPE: i64 = 28;
 
 /// The dedupe itself — the last migration that runs in a transaction, and the
 /// one an operator may have to run a second time by hand.
-const DEDUPE: i64 = 28;
+const DEDUPE: i64 = 29;
 
 /// An empty database — every test decides for itself how far to migrate it.
 async fn start_postgres() -> (ContainerAsync<postgres::Postgres>, PgPool) {
@@ -697,12 +697,12 @@ async fn the_status_aggregate_reads_only_the_index_postgres_test() {
 /// The dedupe's phase 1 can be run again, over rows an old writer parked after
 /// it first ran.
 ///
-/// 0029's build is what forbids a duplicate, and it is not applied in the same
+/// 0030's build is what forbids a duplicate, and it is not applied in the same
 /// transaction as the dedupe (it cannot be: `CONCURRENTLY`). A replica still
 /// running the code that parks without a `dispatch_ordinal` therefore has a
 /// window in which it can insert a fresh pair of null-ordinal rows for one
 /// command, which the build then fails on for as long as they are there.
-/// Re-running the phase by hand is the recovery 0029's header sends an operator
+/// Re-running the phase by hand is the recovery 0030's header sends an operator
 /// to, so it numbers below the synthetic ordinals already in the group instead
 /// of restarting at -1 and colliding with them.
 #[tokio::test]

@@ -24,7 +24,7 @@ claim. The features that hold it up:
   ([0018](persistence/tests/migrations/0018_event_commit_txid.sql));
 - **15** — `NULLS NOT DISTINCT`, which keeps a parked dead letter unique per command
   per reaction over an identity that is nullable for a reaction with no dispatch to
-  name ([0029](persistence/tests/migrations/0029_dead_letter_unique_command.sql));
+  name ([0030](persistence/tests/migrations/0030_dead_letter_unique_command.sql));
   before 15 a unique index treats those rows as all different
   (funkode-io/replay#220).
 
@@ -2543,9 +2543,9 @@ every index this schema adds to a populated table, so parking keeps working whil
 it builds.
 
 `idx_dead_letters_parked_command`
-([0029](persistence/tests/migrations/0029_dead_letter_unique_command.sql)) is what
+([0030](persistence/tests/migrations/0030_dead_letter_unique_command.sql)) is what
 makes a parked command **one row**
-([ADR-0023](docs/adr/0023-a-parked-command-is-one-row.md)). The park is written before the batched cursor
+([ADR-0024](docs/adr/0024-a-parked-command-is-one-row.md)). The park is written before the batched cursor
 checkpoint, so a crash in between — or an operator rewinding the cursor — delivers
 the event again; the park is an `ON CONFLICT DO UPDATE` against this key, which
 refreshes the error, counts the delivery in `deliveries` and stamps
@@ -2559,7 +2559,7 @@ command but not its place — and one parked before the identity columns existed
 names nothing at all — so the migration cannot tell a redelivery's duplicate from
 two different commands: those rows are numbered apart with a **negative** ordinal
 rather than collapsed. Only a panicking reaction's row is collapsed by
-[0028](persistence/tests/migrations/0028_dead_letter_dedupe.sql), because a panic
+[0029](persistence/tests/migrations/0029_dead_letter_dedupe.sql), because a panic
 settles the delivery by unwinding and so parks exactly one row per delivery: the
 newest parking is kept and the rest archived with reason `superseded`.
 
@@ -2571,7 +2571,7 @@ poll, not the record — the row it could not write is the one already there.
 `PolicyStatus::last_dead_letter_at` reads `MAX(last_parked_at)`, not
 `MAX(created_at)`: a reaction failing on every delivery must not read like one
 that failed once and stopped. `idx_dead_letters_policy_created_parked`
-([0030](persistence/tests/migrations/0030_dead_letter_status_index.sql), which
+([0031](persistence/tests/migrations/0031_dead_letter_status_index.sql), which
 replaces `idx_dead_letters_policy`) carries that column as an index payload, so
 the status poll stays index-only.
 
@@ -2637,7 +2637,7 @@ it with the staler error the replay produced. The retry carries the row's
 a row is guarded by the key itself — a row that appeared under it belongs to a
 writer no staler than this replay. Either way the retry reports `Superseded` and
 leaves the row alone — retry again to act on what is parked now
-([ADR-0023](docs/adr/0023-a-parked-command-is-one-row.md)). The bulk summary
+([ADR-0024](docs/adr/0024-a-parked-command-is-one-row.md)). The bulk summary
 counts such a reaction as still failing, which it is.
 
 The summary counts reactions; `PolicyStatus::dead_letter_count` keeps counting

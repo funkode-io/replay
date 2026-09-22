@@ -34,7 +34,7 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
 - **The key is the reaction and the dispatch within it**: `(policy_name,
   event_id, aggregate_name, target_stream_id, command_name, dispatch_ordinal)`,
   a unique index built `CONCURRENTLY`
-  ([0029](../../persistence/tests/migrations/0029_dead_letter_unique_command.sql)).
+  ([0031](../../persistence/tests/migrations/0030_dead_letter_unique_command.sql)).
   `global_position` is left out as redundant — one event has one position.
 
 - **The ordinal is what keeps a reaction's own repeats apart.** A reaction may
@@ -44,7 +44,7 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   is exactly that of the production-order matching ADR-0021 already relies on.
 
 - **Only a provable duplicate is retired.** A row parked after 0024 and before
-  0027 names its command but not its place; a row parked before 0024 names
+  0028 names its command but not its place; a row parked before 0024 names
   nothing at all, and n commands failing on one event parked n such rows (0024's
   own header). Either group is *either* a redelivery's duplicate or several
   distinct commands, and nothing recorded says which. The exception is a panic:
@@ -95,7 +95,7 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   once and stopped. `dead_letter_count` keeps counting parked commands and does
   not change units. The index the status read scans carries `last_parked_at` as a
   payload column
-  ([0030](../../persistence/tests/migrations/0030_dead_letter_status_index.sql)),
+  ([0031](../../persistence/tests/migrations/0031_dead_letter_status_index.sql)),
   so the poll a consumer's health endpoint makes on a timer stays index-only.
 
 - **A settlement settles the row it read.** A retry reads a reaction's group,
@@ -112,7 +112,7 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   now does not change what the operator asked to retire.
 
 - **The rows already duplicated are collapsed by the migration**
-  ([0028](../../persistence/tests/migrations/0028_dead_letter_dedupe.sql)), not by
+  ([0029](../../persistence/tests/migrations/0029_dead_letter_dedupe.sql)), not by
   the operator: these duplicates are the library's own, unlike the hand-written
   `events` positions 0014 refuses to clean. The newest generation survives with
   the earliest `created_at`, the summed `deliveries` and the group's retry
@@ -123,7 +123,7 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
 
 - **The migrations belong with the release, before it runs.** The park needs the
   key to conflict on, and a binary that predates it parks with an unconditional
-  INSERT. A replica still running the old code while 0029 exists takes a `23505`
+  INSERT. A replica still running the old code while 0030 exists takes a `23505`
   on the one thing the key forbids for *it* — re-parking a command it has already
   parked itself — which fails that poll rather than that row: the failure it
   could not write is the one already in the table. Against a row the *new* code
@@ -138,7 +138,7 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   transaction, and re-running a reaction whose commands partially succeeded is
   defined behaviour (ADR-0003). What the key removes is the row, not the work.
 
-- **A row parked before 0027 and a later delivery's row for the same command can
+- **A row parked before 0028 and a later delivery's row for the same command can
   still coexist**: the older row carries a synthetic negative ordinal, the newer
   one a dispatch's index, and nothing can merge them. So ADR-0021's shared-verdict
   settlement for rows a replay cannot tell apart is still load-bearing, and its

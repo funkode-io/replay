@@ -902,7 +902,7 @@ impl PolicyRunner {
     /// already parked is updated, never duplicated — and two concurrent retries
     /// of the same reaction settle it the same way, since the table now keys a
     /// parked command and the second insert refreshes the first
-    /// (ADR-0023).
+    /// (ADR-0024).
     ///
     /// Settling a row that already existed stamps its `retry_count` and
     /// `last_retried_at`, the archived copy included, so what has already been
@@ -3515,7 +3515,7 @@ enum Parking {
 /// the cursor — delivers the event again and parks the same command again. The
 /// `ON CONFLICT` refreshes the row that command already has with the error this
 /// delivery produced rather than leaving a second generation of rows behind
-/// (ADR-0023). It does **not** touch `created_at` (when the command first
+/// (ADR-0024). It does **not** touch `created_at` (when the command first
 /// failed) or the retry bookkeeping: a redelivery is not a [`retry_dead_letter`]
 /// — nobody invoked the control surface.
 ///
@@ -5373,15 +5373,21 @@ mod cursor_tests {
             .expect("failed to create the postgres pool");
 
         // A migration that fails here says which database it was talking to and
-        // what that database already had: eight of these run at once, each with
-        // its own container, and "migrations must succeed" alone cannot tell a
-        // broken migration from two of them meeting on one server.
+        // what both sides held. The failure this is for: a branch adding a
+        // migration while another branch adds one under the same number, which
+        // only the merge sees — the set embeds both, the second insert takes a
+        // 23505 on `_sqlx_migrations`, and "migrations must succeed" alone sends
+        // the reader looking for a broken migration rather than a collision.
         if let Err(error) = sqlx::migrate!("./tests/migrations").run(&pool).await {
-            let applied: Vec<i64> =
-                sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version ASC")
-                    .fetch_all(&pool)
-                    .await
-                    .unwrap_or_default();
+            // `string_agg` rather than a `fetch_all`: `tests/bounded_queries.rs`
+            // reviews every `fetch_all` call site in this file, and a diagnostic
+            // is not worth an entry in that review.
+            let applied: Option<String> = sqlx::query_scalar(
+                "SELECT string_agg(version::text, ', ' ORDER BY version) FROM _sqlx_migrations",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_default();
             let database: String = sqlx::query_scalar("SELECT current_database()")
                 .fetch_one(&pool)
                 .await
@@ -5392,7 +5398,8 @@ mod cursor_tests {
                 .collect();
             panic!(
                 "migrations must succeed: {error}\n  port: {port}\n  database: {database}\n  \
-                 applied: {applied:?}\n  embedded: {embedded:?}"
+                 applied: {}\n  embedded: {embedded:?}",
+                applied.unwrap_or_else(|| "none".to_string())
             );
         }
 

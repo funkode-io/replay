@@ -5,7 +5,7 @@
 -- (funkode-io/replay#220), no two rows may share the key it builds. Which of
 -- them are duplicates is a question the table can only answer for one shape:
 --
---   * A row parked after 0024 and before 0027 names its command but not its
+--   * A row parked after 0024 and before 0028 names its command but not its
 --     place in the reaction. Two of them are *either* a redelivery's duplicate
 --     or a reaction that legitimately emitted that command twice.
 --   * A row parked before 0024 names nothing at all, and n commands failing on
@@ -39,8 +39,8 @@
 -- Numbered *below* the lowest synthetic ordinal the group already carries, so
 -- the statement is re-runnable by hand. A replica still running the old code
 -- parks null-ordinal rows after this migration is recorded as applied, and a
--- second pair of them is a duplicate 0029's build then fails on; the recovery
--- 0029's header describes is to run this again once those writers are gone,
+-- second pair of them is a duplicate 0030's build then fails on; the recovery
+-- 0030's header describes is to run this again once those writers are gone,
 -- which a fixed -1 would answer with the ordinal an earlier run already used.
 -- On the first run no group has one, `lowest` is null, and the numbering is
 -- -1, -2, … as it reads.
