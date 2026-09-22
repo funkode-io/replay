@@ -1298,12 +1298,16 @@ impl PolicyRunner {
     /// only enumeration and ordering. It takes no advisory lock and never
     /// touches `policy_cursors`.
     ///
-    /// Returns a [`DeadLetterRetrySummary`] counting **reactions**: one whose
-    /// every row was archived is resolved, one with any row still parked is
-    /// still failing. The policy has fully recovered when
-    /// `reactions_still_failing == 0`. A policy with no parked dead letters is a
-    /// clean no-op (a zero summary), and so is a reaction whose rows were all
-    /// discarded concurrently: it is skipped without being replayed.
+    /// Returns a [`DeadLetterRetrySummary`] counting **reactions**, as this run
+    /// settled them: one whose every row was archived is resolved, one with any
+    /// row still parked is still failing. `reactions_still_failing == 0` says
+    /// the run settled everything it read, not that the table is empty now — a
+    /// delivery parking a command while the run walks, or one statement after it
+    /// returns, is a row the count cannot have seen. `PolicyStatus` is what
+    /// answers "is anything parked", and the next bulk retry picks it up. A
+    /// policy with no parked dead letters is a clean no-op (a zero summary), and
+    /// so is a reaction whose rows were all discarded concurrently: it is
+    /// skipped without being replayed.
     ///
     /// The backlog this drains is the one an outage leaves — one parked reaction
     /// per event the downstream refused — so the enumeration is **paged**:
