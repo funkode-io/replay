@@ -315,8 +315,8 @@ async fn replay_keeps_events_that_share_created_and_version_postgres_test() {
             .expect("seeding stream row must succeed");
 
         sqlx::query(
-            "INSERT INTO events (id, data, metadata, stream_id, type, version, created)
-             VALUES ($1, $2, '{}', $3, 'Added', 1, $4)",
+            "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq, created)
+             VALUES ($1, $2, '{}', $3, 'Added', 1, 1, $4)",
         )
         .bind(uuid::Uuid::new_v4())
         .bind(serde_json::json!({ "Added": { "amount": i as f64 } }))
@@ -326,6 +326,7 @@ async fn replay_keeps_events_that_share_created_and_version_postgres_test() {
         .await
         .expect("seeding event row must succeed");
     }
+    common::places::settle(&pool).await;
 
     let log = CallLog::default();
     let _store = replay_persistence::PostgresEventStore::builder(pool.clone())

@@ -88,8 +88,8 @@ async fn seed_events(pool: &PgPool, stream_id: &str, events: impl Iterator<Item 
 
     for (index, data) in events.enumerate() {
         sqlx::query(
-            "INSERT INTO events (id, data, metadata, stream_id, type, version) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq) \
+             VALUES ($1, $2, $3, $4, $5, $6, $6)",
         )
         .bind(Uuid::new_v4())
         .bind(&data)
@@ -101,6 +101,7 @@ async fn seed_events(pool: &PgPool, stream_id: &str, events: impl Iterator<Item 
         .await
         .expect("failed to insert event");
     }
+    common::places::settle(pool).await;
 }
 
 async fn fetch_event_rows(pool: &PgPool, stream_id: &str) -> Vec<PgRow> {
