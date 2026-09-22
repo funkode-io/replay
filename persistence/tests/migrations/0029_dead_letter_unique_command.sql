@@ -30,6 +30,15 @@
 -- key enforced (0019, 0020, 0026). 0015 records how to tell an invalid leftover
 -- from a live index and how to clear one.
 --
+-- Recovering a failed build: drop the invalid index and run this again — but
+-- only once the duplicate it failed on is gone, and the writer making them with
+-- it. A replica still running the old code parks null-ordinal rows after 0028 is
+-- recorded as applied, and a second one for the same command is a duplicate this
+-- build will fail on every time; rebuilding without clearing them is a loop. So:
+-- stop the old writers, run 0028's phase 1 by hand (it numbers below the
+-- synthetic ordinals already in each group, so a second pass is safe), then
+-- rebuild.
+--
 -- Rollout: apply this with the release that parks through `ON CONFLICT`, before
 -- that release runs. A binary that predates it cannot use the key — its park is
 -- an unconditional INSERT — so a replica still running the old code while this

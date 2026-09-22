@@ -24,44 +24,22 @@
 --                      `PolicyStatus.last_dead_letter_at` reads this rather than
 --                      `created_at`, which an in-place refresh never moves.
 --
--- Existing rows are one delivery each and were parked when they were created,
--- which is what the backfill says.
+-- The active table is backfilled and the archive is not, which is the whole of
+-- the difference between them. `policy_dead_letters.last_parked_at` is what a
+-- Policy's status reads its recency from, so a null there would mean "parked,
+-- time unknown" in a signal a consumer polls; its backfill and the `SET NOT
+-- NULL` it feeds scan the parked backlog an outage leaves, under ACCESS
+-- EXCLUSIVE, and that is the lock this migration is worth.
 --
--- The backfill and the `SET NOT NULL` it feeds scan both tables under ACCESS
--- EXCLUSIVE, unlike the concurrent index builds around them (0026, 0029): the
--- scan is over the parked backlog an outage leaves, not over `events`, and the
--- alternative — a nullable column — would put "parked, time unknown" in the
--- column a Policy's status reads its recency from.
---
--- The archive goes first, and the active table last, because this migration is
--- one transaction and every lock it takes is held to the end of it.
--- `discarded_dead_letters` retains history and can be far larger than the active
--- backlog, so scanning it after locking `policy_dead_letters` would hold the
--- daemon's parking path shut for the size of the audit trail. Reversed, the
--- parking table's ACCESS EXCLUSIVE spans the backlog-sized backfill only; what
--- the archive's own lock blocks meanwhile is [Retry] and [Discard], which an
--- operator invokes and a migration window may refuse.
-ALTER TABLE discarded_dead_letters
-    ADD COLUMN IF NOT EXISTS dispatch_ordinal INTEGER,
-    ADD COLUMN IF NOT EXISTS deliveries       INTEGER NOT NULL DEFAULT 1,
-    ADD COLUMN IF NOT EXISTS last_parked_at   TIMESTAMPTZ;
-
-UPDATE discarded_dead_letters SET last_parked_at = created_at WHERE last_parked_at IS NULL;
-
-ALTER TABLE discarded_dead_letters
-    ALTER COLUMN last_parked_at SET DEFAULT now(),
-    ALTER COLUMN last_parked_at SET NOT NULL;
-
--- A third way out of the active set: 'superseded', for a duplicate generation
--- the next migration retires. Not a [Retry] and not a [Discard] — nobody
--- invoked either — so it is named apart from both.
-ALTER TABLE discarded_dead_letters
-    DROP CONSTRAINT IF EXISTS discarded_dead_letters_reason_check;
-
-ALTER TABLE discarded_dead_letters
-    ADD CONSTRAINT discarded_dead_letters_reason_check
-    CHECK (reason IN ('retried', 'discarded', 'superseded'));
-
+-- `discarded_dead_letters` retains history and can be far larger than that
+-- backlog, and nothing reads the three columns back out of it — so the archive
+-- gets them nullable, which is a catalogue write and no scan at all. A null
+-- there says "archived before the column existed", which is true. Backfilling it
+-- would hold ACCESS EXCLUSIVE on the archive for the size of the audit trail,
+-- and this migration is one transaction: taking that lock *before* the active
+-- table's would also invert the order `move_dead_letter_to_archive` takes them
+-- in (active first, then archive) and let a concurrent [Retry] deadlock the
+-- migration. Same order as the runtime path, no long scan on the archive.
 ALTER TABLE policy_dead_letters
     ADD COLUMN IF NOT EXISTS dispatch_ordinal INTEGER,
     ADD COLUMN IF NOT EXISTS deliveries       INTEGER NOT NULL DEFAULT 1,
@@ -72,3 +50,24 @@ UPDATE policy_dead_letters SET last_parked_at = created_at WHERE last_parked_at 
 ALTER TABLE policy_dead_letters
     ALTER COLUMN last_parked_at SET DEFAULT now(),
     ALTER COLUMN last_parked_at SET NOT NULL;
+
+ALTER TABLE discarded_dead_letters
+    ADD COLUMN IF NOT EXISTS dispatch_ordinal INTEGER,
+    ADD COLUMN IF NOT EXISTS deliveries       INTEGER NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS last_parked_at   TIMESTAMPTZ DEFAULT now();
+
+-- A third way out of the active set: 'superseded', for a duplicate generation
+-- the next migration retires. Not a [Retry] and not a [Discard] — nobody
+-- invoked either — so it is named apart from both.
+--
+-- NOT VALID, so the constraint is a catalogue write rather than a scan of the
+-- archive under the lock this transaction already holds on the active table. It
+-- is enforced for every row written from here on; the rows already there passed
+-- the constraint it replaces, whose values this one is a superset of, so there
+-- is nothing for a validation pass to find.
+ALTER TABLE discarded_dead_letters
+    DROP CONSTRAINT IF EXISTS discarded_dead_letters_reason_check;
+
+ALTER TABLE discarded_dead_letters
+    ADD CONSTRAINT discarded_dead_letters_reason_check
+    CHECK (reason IN ('retried', 'discarded', 'superseded')) NOT VALID;

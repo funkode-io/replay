@@ -261,7 +261,13 @@ impl Policy for TwoCommandPolicy {
                 first(),
             ],
             RETARGETED => vec![if self.retargeted.load(Ordering::SeqCst) {
-                Self::refuse(SECOND_SUBJECT, SECOND_FAILURE)
+                // Stamped with the reaction call it came from, so a test can
+                // tell which writer's error a row is carrying: a park and the
+                // park that would overwrite it are otherwise the same text.
+                Self::refuse(
+                    SECOND_SUBJECT,
+                    &format!("{SECOND_FAILURE}-{}", self.reactions.load(Ordering::SeqCst)),
+                )
             } else {
                 Self::refuse(FIRST_SUBJECT, FIRST_FAILURE)
             }],
@@ -1337,6 +1343,78 @@ async fn a_replay_that_fails_does_not_overwrite_what_a_delivery_reparked_postgre
     assert!(
         after[0].deliveries == 2 && after[0].retry_count == 0,
         "the row is as the delivery left it, untried, got {after:#?}"
+    );
+
+    let Ok(harness) = Arc::try_unwrap(harness) else {
+        panic!("the retry task must have released the harness")
+    };
+    harness.shutdown().await;
+}
+
+/// A command a retry parks without a row of its own does not overwrite the row a
+/// delivery parked for it meanwhile.
+///
+/// The third settlement a retry makes, and the one with no version to carry: the
+/// row did not exist when the replay read the group, so what guards it is the
+/// key. A redelivery that parks that command first has written the error of a
+/// delivery that happened *after* this replay executed its dispatch, and the
+/// park leaves it exactly as it stands (funkode-io/replay#227).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_does_not_overwrite_a_row_a_delivery_parked_for_its_new_command_postgres_test() {
+    let reaction = Reaction::new();
+    let harness =
+        Arc::new(PolicyDaemonHarness::start("retry_unclaimed_race", reaction.policy()).await);
+
+    let event = harness.ping("subject-1", RETARGETED).await;
+    let parked = harness.await_dead_letters(1).await;
+    assert_eq!(parked[0].target_stream_id, Some(urn_of(FIRST_SUBJECT)));
+
+    // The deploy: the reaction now fails on a command with no row of its own,
+    // which this retry will have to park. The gate holds it after `react` has
+    // built that dispatch.
+    reaction.retargeted.store(true, Ordering::SeqCst);
+    reaction.gate.arm();
+    let retry = {
+        let harness = Arc::clone(&harness);
+        tokio::spawn(async move { harness.retry_parked().await })
+    };
+
+    // And the event is delivered again while the replay waits, so the daemon
+    // parks that same command first.
+    reaction.gate.await_entered().await;
+    harness.redeliver(&event).await;
+    let delivered = harness
+        .observe("the delivery parked the retargeted command", || async {
+            harness
+                .dead_letters()
+                .await
+                .into_iter()
+                .find(|row| row.target_stream_id == Some(urn_of(SECOND_SUBJECT)))
+        })
+        .await;
+    reaction.gate.release();
+    retry.await.expect("the retry task must not panic");
+
+    let after = harness.dead_letters().await;
+    let retargeted: Vec<&DeadLetter> = after
+        .iter()
+        .filter(|row| row.target_stream_id == Some(urn_of(SECOND_SUBJECT)))
+        .collect();
+    assert_eq!(
+        retargeted.len(),
+        1,
+        "one parked command, whoever wrote it: {after:#?}"
+    );
+    assert_eq!(
+        (
+            retargeted[0].id,
+            retargeted[0].error_message.as_str(),
+            retargeted[0].deliveries
+        ),
+        (delivered.id, delivered.error_message.as_str(), 1),
+        "the delivery's row, with the delivery's error: the replay that failed \
+         earlier does not get to write over it, and a retry never counts a \
+         delivery, got {after:#?}"
     );
 
     let Ok(harness) = Arc::try_unwrap(harness) else {

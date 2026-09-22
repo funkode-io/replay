@@ -36,27 +36,60 @@
 -- is also what a negative ordinal means when an operator reads one — "parked
 -- before the column existed", not "the -2nd command".
 --
+-- Numbered *below* the lowest synthetic ordinal the group already carries, so
+-- the statement is re-runnable by hand. A replica still running the old code
+-- parks null-ordinal rows after this migration is recorded as applied, and a
+-- second pair of them is a duplicate 0029's build then fails on; the recovery
+-- 0029's header describes is to run this again once those writers are gone,
+-- which a fixed -1 would answer with the ordinal an earlier run already used.
+-- On the first run no group has one, `lowest` is null, and the numbering is
+-- -1, -2, … as it reads.
+--
 -- A panic's row is left alone, null ordinal and all: it is what phase 2
 -- collapses, and it is how the running code parks the same panic again, so the
 -- key must go on matching it.
-UPDATE policy_dead_letters dl
-SET dispatch_ordinal = legacy.ordinal
-FROM (
+WITH unplaced AS (
     SELECT
         id,
-        -row_number() OVER (
+        policy_name,
+        event_id,
+        aggregate_name,
+        target_stream_id,
+        command_name,
+        row_number() OVER (
             PARTITION BY policy_name, event_id, aggregate_name, target_stream_id,
                          command_name
             ORDER BY id
-        )::int AS ordinal
+        ) AS place
     FROM policy_dead_letters
     WHERE dispatch_ordinal IS NULL
       AND NOT (aggregate_name IS NULL
                AND target_stream_id IS NULL
                AND command_name IS NULL
                AND error_kind = 'Panic')
-) legacy
-WHERE dl.id = legacy.id;
+),
+numbered AS (
+    SELECT
+        policy_name,
+        event_id,
+        aggregate_name,
+        target_stream_id,
+        command_name,
+        min(dispatch_ordinal) AS lowest
+    FROM policy_dead_letters
+    WHERE dispatch_ordinal < 0
+    GROUP BY policy_name, event_id, aggregate_name, target_stream_id, command_name
+)
+UPDATE policy_dead_letters dl
+SET dispatch_ordinal = (COALESCE(n.lowest, 0) - u.place)::int
+FROM unplaced u
+LEFT JOIN numbered n
+       ON n.policy_name = u.policy_name
+      AND n.event_id = u.event_id
+      AND n.aggregate_name IS NOT DISTINCT FROM u.aggregate_name
+      AND n.target_stream_id IS NOT DISTINCT FROM u.target_stream_id
+      AND n.command_name IS NOT DISTINCT FROM u.command_name
+WHERE dl.id = u.id;
 
 -- Phase 2. The generations a redelivery left of a panicking reaction. The newest
 -- *parking* survives — by `last_parked_at`, not by `id`: a row's id is taken when

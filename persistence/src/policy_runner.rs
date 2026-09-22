@@ -375,12 +375,12 @@ pub enum DeadLetterRetry {
     /// command the reaction had not parked before got a row of its own, untried.
     /// Either way no row was duplicated, and the row stays retryable.
     StillFailing,
-    /// A delivery of the event re-parked the row's command between the replay
-    /// reading the row and the settlement writing it, so what is parked now is a
-    /// newer failure than the one this retry replayed. The row is left as that
-    /// delivery wrote it: settling it would archive a failure nobody retried, or
-    /// overwrite it with a staler error (funkode-io/replay#227). Retry again to
-    /// act on what is parked now.
+    /// Another writer parked this row's command while the replay ran — a
+    /// delivery of the event, or another retry of the same reaction — so what is
+    /// parked is not what this retry concluded, and is no staler than it. The
+    /// row is left as that writer wrote it: settling it would archive a failure
+    /// nobody retried, or overwrite it with an error from a replay that started
+    /// earlier (funkode-io/replay#227). Retry again to act on what is parked now.
     Superseded,
     /// No dead-letter row matched the supplied id: nothing to do.
     NotFound,
@@ -1163,8 +1163,13 @@ impl PolicyRunner {
         // retry, which is the whole point of replaying the reaction as defined
         // now (ADR-0007). Without this it would be executed, fail, and leave
         // nothing behind while the retry reported the reaction resolved.
+        //
+        // The row it had no version to guard is the row it is about to create,
+        // so the guard here is the key itself: a command that acquired a row
+        // while the replay ran has one from a writer whose error is no staler
+        // than this one's, and the insert leaves it as it stands.
         for unclaimed in replay.unclaimed_failures() {
-            let id = write_dead_letter(
+            let parked = write_dead_letter(
                 &mut *tx,
                 DeadLetterWrite {
                     policy_name: &reaction.policy_name,
@@ -1177,6 +1182,7 @@ impl PolicyRunner {
                 },
             )
             .await?;
+            let id = parked.id;
             tracing::warn!(
                 policy    = %reaction.policy_name,
                 event_id  = %reaction.event_id,
@@ -1185,9 +1191,18 @@ impl PolicyRunner {
                 command   = unclaimed.identity.command_name,
                 error     = %unclaimed.settlement.error_message,
                 dead_letter_id = id,
-                "a retried reaction failed on a command it had not parked; parking it"
+                superseded = parked.conflicted,
+                "a retried reaction failed on a command it had not parked; parking it, \
+                 or leaving the row another writer parked for it meanwhile"
             );
-            settled.push((id, DeadLetterRetry::StillFailing));
+            settled.push((
+                id,
+                if parked.conflicted {
+                    DeadLetterRetry::Superseded
+                } else {
+                    DeadLetterRetry::StillFailing
+                },
+            ));
         }
 
         tx.commit().await.map_err(crate::db_error)?;
@@ -3504,10 +3519,14 @@ enum Parking {
 /// failed) or the retry bookkeeping: a redelivery is not a [`retry_dead_letter`]
 /// — nobody invoked the control surface.
 ///
-/// Only a [`Parking::Delivery`] counts a delivery and moves `last_parked_at`. A
-/// [`Parking::Retry`] that conflicts has lost a race with another retry of the
-/// same reaction (ADR-0021), which is not the event arriving again; it refreshes
-/// the error and nothing else.
+/// Only a [`Parking::Delivery`] writes anything to a row that already exists. A
+/// [`Parking::Retry`] parks a command the reaction had not parked, so a row
+/// under that key means another writer got there first — a delivery of the
+/// event, or another retry of the same reaction (ADR-0021) — and this retry's
+/// error is not newer than theirs. It leaves the row untouched and says so in
+/// [`Parked::conflicted`], which the caller reports as
+/// [`DeadLetterRetry::Superseded`]. The failure is not lost either way: the row
+/// is a row for that command, parked and active.
 ///
 /// `clock_timestamp()`, not `now()`, and never backwards: `now()` is fixed at
 /// transaction start, and a retry parks inside one, so a settlement that began
@@ -3518,7 +3537,7 @@ enum Parking {
 async fn write_dead_letter(
     executor: impl sqlx::PgExecutor<'_>,
     park: DeadLetterWrite<'_>,
-) -> Result<i64, replay::Error> {
+) -> Result<Parked, replay::Error> {
     let DeadLetterWrite {
         policy_name,
         global_position,
@@ -3528,7 +3547,7 @@ async fn write_dead_letter(
         error_message,
         parking,
     } = park;
-    sqlx::query_scalar(
+    let row = sqlx::query(
         "INSERT INTO policy_dead_letters \
          (policy_name, global_position, event_id, error_kind, error_message, \
           aggregate_name, target_stream_id, command_name, dispatch_ordinal, \
@@ -3536,15 +3555,17 @@ async fn write_dead_letter(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp()) \
          ON CONFLICT (policy_name, event_id, aggregate_name, target_stream_id, \
                       command_name, dispatch_ordinal) \
-         DO UPDATE SET error_kind = EXCLUDED.error_kind, \
-                       error_message = EXCLUDED.error_message, \
+         DO UPDATE SET error_kind = CASE WHEN $10 THEN EXCLUDED.error_kind \
+                           ELSE policy_dead_letters.error_kind END, \
+                       error_message = CASE WHEN $10 THEN EXCLUDED.error_message \
+                           ELSE policy_dead_letters.error_message END, \
                        deliveries = policy_dead_letters.deliveries \
                            + CASE WHEN $10 THEN 1 ELSE 0 END, \
                        last_parked_at = CASE WHEN $10 \
                            THEN GREATEST(policy_dead_letters.last_parked_at, \
                                          clock_timestamp()) \
                            ELSE policy_dead_letters.last_parked_at END \
-         RETURNING id",
+         RETURNING id, xmax <> 0 AS conflicted",
     )
     .bind(policy_name)
     .bind(global_position)
@@ -3558,7 +3579,22 @@ async fn write_dead_letter(
     .bind(parking == Parking::Delivery)
     .fetch_one(executor)
     .await
-    .map_err(crate::db_error)
+    .map_err(crate::db_error)?;
+
+    Ok(Parked {
+        id: row.get("id"),
+        conflicted: row.get("conflicted"),
+    })
+}
+
+/// What a park wrote.
+///
+/// `conflicted` is read off `xmax`, which an `ON CONFLICT` insert leaves at 0 on
+/// the row it inserted and at the updating transaction's id on a row it found:
+/// the one thing `RETURNING` can say about which of the two happened.
+struct Parked {
+    id: i64,
+    conflicted: bool,
 }
 
 /// Update a parked dead letter in place with the failure a retry just produced,

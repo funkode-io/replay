@@ -74,12 +74,15 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   `retry_count` / `last_retried_at` are untouched: nobody invoked the control
   surface.
 
-- **Only a delivery counts as one.** The same `ON CONFLICT` catches a retry that
-  parks a command the reaction had not parked and loses the race to another retry
-  of the same reaction (ADR-0021). That is not the event arriving again, so it
-  refreshes the error and leaves `deliveries` and `last_parked_at` alone —
-  otherwise two operators clicking retry would fabricate a redelivery that never
-  happened.
+- **Only a delivery writes to a row that already exists.** The same `ON CONFLICT`
+  catches a retry that parks a command the reaction had not parked and finds a
+  row under that key — another retry of the same reaction (ADR-0021), or a
+  delivery that parked it while the replay ran. Either way that writer's error is
+  no staler than this one's and its row is left exactly as it stands: `deliveries`
+  and `last_parked_at` too, since a retry is not the event arriving again, and
+  two operators clicking retry must not fabricate a redelivery that never
+  happened. The retry reports `Superseded` for it. The failure is not lost: the
+  row is a row for that command, parked and active.
 
 - **The stamp is `clock_timestamp()`, and never moves backwards.** `now()` is
   fixed at transaction start and a retry parks inside a transaction, so a
@@ -103,8 +106,10 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   `last_parked_at` into its `WHERE`: a row that moved is neither archived
   `retried` (retiring a failure nobody retried) nor overwritten with the staler
   error the replay produced, and the caller hears `DeadLetterRetry::Superseded`.
-  A [Discard] carries no version — it re-runs nothing, so what the row says now
-  does not change what the operator asked to retire.
+  The command a retry parks *without* a row has no version to carry, and the key
+  is its guard: the insert leaves whatever row appeared under that key alone. A
+  [Discard] carries no version either — it re-runs nothing, so what the row says
+  now does not change what the operator asked to retire.
 
 - **The rows already duplicated are collapsed by the migration**
   ([0028](../../persistence/tests/migrations/0028_dead_letter_dedupe.sql)), not by

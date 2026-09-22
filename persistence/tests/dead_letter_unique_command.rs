@@ -11,14 +11,14 @@
 //! `policy_redelivery_parks_once.rs`; what is verified here is the schema.
 
 use chrono::{DateTime, Duration, SubsecRound, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, Executor, PgPool, Row};
 use testcontainers_modules::{
     postgres,
     testcontainers::{runners::AsyncRunner, ContainerAsync},
 };
 
 mod common;
-use common::migrations::{through as migrations_through, MIGRATOR};
+use common::migrations::{self, through as migrations_through, MIGRATOR};
 use common::postgres_image::postgres_container;
 
 const POSTGRES_PORT: u16 = 5432;
@@ -27,6 +27,10 @@ const POSTGRES_PORT: u16 = 5432;
 /// it is the schema a duplicated table is staged in, and the dedupe and the
 /// unique index are what the tests then run against it.
 const BEFORE_DEDUPE: i64 = 27;
+
+/// The dedupe itself — the last migration that runs in a transaction, and the
+/// one an operator may have to run a second time by hand.
+const DEDUPE: i64 = 28;
 
 /// An empty database — every test decides for itself how far to migrate it.
 async fn start_postgres() -> (ContainerAsync<postgres::Postgres>, PgPool) {
@@ -688,4 +692,74 @@ async fn the_status_aggregate_reads_only_the_index_postgres_test() {
         "and the index it supersedes must be dropped, not left to cost the park \
          path a second write: {indexes:?}"
     );
+}
+
+/// The dedupe's phase 1 can be run again, over rows an old writer parked after
+/// it first ran.
+///
+/// 0029's build is what forbids a duplicate, and it is not applied in the same
+/// transaction as the dedupe (it cannot be: `CONCURRENTLY`). A replica still
+/// running the code that parks without a `dispatch_ordinal` therefore has a
+/// window in which it can insert a fresh pair of null-ordinal rows for one
+/// command, which the build then fails on for as long as they are there.
+/// Re-running the phase by hand is the recovery 0029's header sends an operator
+/// to, so it numbers below the synthetic ordinals already in the group instead
+/// of restarting at -1 and colliding with them.
+#[tokio::test]
+async fn the_dedupe_can_be_run_again_over_rows_parked_after_it_postgres_test() {
+    let (_container, pool) = start_postgres().await;
+    migrations_through(BEFORE_DEDUPE)
+        .run(&pool)
+        .await
+        .expect("migrations up to the dedupe must succeed");
+
+    let event = uuid::Uuid::new_v4();
+    let parked_at = Utc::now();
+    for message in ["delivery 1", "delivery 2"] {
+        park(
+            &pool,
+            "rerun",
+            &Parked::of(event, Some("app::Charge"), None, message, parked_at),
+        )
+        .await
+        .expect("staging what the old code parked");
+    }
+
+    migrations_through(DEDUPE)
+        .run(&pool)
+        .await
+        .expect("the dedupe must run against a duplicated table");
+
+    // The old writer, still up, parks the same command twice more: null ordinals
+    // again, and a duplicate of each other.
+    for message in ["delivery 3", "delivery 4"] {
+        park(
+            &pool,
+            "rerun",
+            &Parked::of(event, Some("app::Charge"), None, message, parked_at),
+        )
+        .await
+        .expect("an old writer's park is still an unconditional INSERT");
+    }
+
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(migrations::sql(DEDUPE))))
+        .await
+        .expect("the dedupe must be re-runnable by hand");
+
+    let ordinals: Vec<Option<i32>> = active(&pool, "rerun")
+        .await
+        .iter()
+        .map(|row| row.get("dispatch_ordinal"))
+        .collect();
+    assert_eq!(
+        ordinals,
+        vec![Some(-1), Some(-2), Some(-3), Some(-4)],
+        "the second pass numbers below the first's, so no two rows share a key"
+    );
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("and the index builds over what the second pass separated");
+    assert_eq!(invalid_indexes(&pool).await, Vec::<String>::new());
 }
