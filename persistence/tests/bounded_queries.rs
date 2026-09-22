@@ -44,22 +44,35 @@ const REVIEWED: &[Reviewed] = &[
         justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
                         (default 100). Bounded by the tunable rather than by the number \
                         of streams behind, which is why a Policy far behind catches up \
-                        over several polls instead of in one allocation (ADR-0024).",
+                        over several cadences instead of in one allocation; the batch \
+                        resumes after the last id it examined, so the bound costs a \
+                        rotation rather than leaving a stream unexamined (ADR-0024).",
     },
     Reviewed {
         file: "src/policy_runner.rs",
         function: "places_of",
         justification: "One row per stream named in the poll's candidate list, which \
-                        `sweep_for_streams` and `streams_behind` each bound by \
-                        read_batch_size.",
+                        `drain_policy_once` truncates to read_batch_size whatever the \
+                        sweep, the reconciliation and the last poll's leftovers offer.",
     },
     Reviewed {
         file: "src/policy_runner.rs",
         function: "read_stream",
-        justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
-                        (default 100). One stream's events past its place, and not \
-                        bounded by the policy's stream filter, which selects what is \
-                        delivered from the batch rather than what is read (ADR-0013).",
+        justification: "SQL carries LIMIT $limit, what is left of the poll's event \
+                        budget: the policy's resolved read_batch_size (default 100), \
+                        spent across the streams the poll looks at rather than per \
+                        stream. One stream's events past its place, and not bounded by \
+                        the policy's stream filter, which selects what is delivered from \
+                        the batch rather than what is read (ADR-0013).",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "checkpoint_places",
+        justification: "RETURNING one id per place written, and the places written are \
+                        the streams the poll advanced: bounded by the candidate list, \
+                        which `drain_policy_once` truncates to read_batch_size. Read \
+                        back rather than counted because the caller needs to know which \
+                        of the writes lost their compare-and-set.",
     },
     Reviewed {
         file: "src/policy_runner.rs",

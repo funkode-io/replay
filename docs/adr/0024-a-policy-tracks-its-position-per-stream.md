@@ -92,27 +92,37 @@ is owed is read from that stream's own sequence, which has no holes.
   policies, so an append's cost would scale with how many there are.
 - **An operator's control surface moves** from `policy_cursors.position` to a place in
   `policy_stream_cursors`, and gets finer: a redelivery can be forced for one stream
-  without rewinding the Policy over every other. The adoption machinery ADR-0012 needed —
-  refresh, compare-and-set, "superseded" — is gone with it, because places are read fresh
-  every poll rather than held in memory between them.
+  without rewinding the Policy over every other. The refresh machinery ADR-0012 needed is
+  gone with it, because places are read fresh every poll rather than held in memory
+  between them — but the compare-and-set stays, per stream: a poll writes a place only
+  where it still reads as the value that poll started from. Monotonicity alone would not
+  do, because the write it has to refuse is *lower* than the one the poll carries. An
+  operator rewinding a stream mid-batch against a monotonic write would see the runner
+  reinstate its higher place and undo the rewind silently, which is a control surface in
+  name only.
 - **`policy_cursors.position` is renamed `discovered_through`** and means where the search
   resumes, not what has been processed. A Policy's progress is no longer one number, and
   no column pretends otherwise.
-- **A runner that has lost its leadership is no longer told so by its own writes.** The
-  cursor's compare-and-set used to fail for a superseded runner, which stopped its batch
-  (ADR-0012); the per-stream write is monotonic instead, so a stale runner cannot pull a
-  place backwards but does run its batch to the end, duplicating dispatches for the
-  overlap. Delivery is at-least-once and reactions are idempotent by contract
-  ([ADR-0003](0003-policies-as-checkpointed-background-subscribers.md)), so this costs
-  duplicate work rather than correctness — but it is a wider window than the CAS gave,
-  and the advisory lock is now the only thing narrowing it.
-- **The reconciliation takes the first `limit` streams by id**, so under a backlog wider
-  than one batch the streams sorting late are reached only as the earlier ones catch up.
-  They cannot be starved outright — the sweep walks `global_position` without skipping, so
-  a stream with *new* events is nominated regardless of its name — but a stream whose only
-  pending work is a write the sweep passed waits its turn. Ordering by lag instead would
-  move the bias rather than remove it; the queue is normally empty, and its length is the
-  thing to watch.
+- **A runner learns it has been superseded one stream at a time**, where the old cursor
+  told it once for the whole Policy. A lost compare-and-set abandons that stream for the
+  poll and leaves the place where its new owner put it; the other streams in the batch
+  carry on. Delivery is at-least-once and reactions are idempotent by contract
+  ([ADR-0003](0003-policies-as-checkpointed-background-subscribers.md)), so the overlap
+  costs duplicate work rather than correctness.
+- **Every bound in the design is a rotation, because every bound is a batch.** The
+  reconciliation resumes after the last stream id it examined and wraps; the poll's
+  candidate list is capped at the read batch and puts the streams it could not finish at
+  the back. Both exist for the same reason: a batch taken from the front of a fixed order
+  returns the same entries for ever if the entries at the front never leave, so a
+  continuously-busy set of streams would hide a quiet one behind it — a stream whose only
+  pending work is a write the sweep passed, which no future event will nominate. Rotating
+  turns "hidden while the system is busy" into "examined within one pass", which is
+  `ceil(streams / batch)` cadences and a number an operator can compute.
+- **`read_batch_size` is a budget for the drain, spent across streams** rather than
+  applied to each. A Policy owed work in a hundred streams reads the same number of events
+  per poll as one owed work in a single stream, so the knob still bounds how long a poll
+  runs — which is what a shutdown, a leadership change and a dispatch-timeout budget all
+  wait on.
 - **Ordering across streams is no longer promised, because it never held.** A Policy sees
   each stream in that stream's order; between streams it sees whatever the sweep found
   first. Anything that needs two streams ordered against each other needs them to be one

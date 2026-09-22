@@ -5086,6 +5086,81 @@ impl replay_persistence::Policy for SmallBatchPolicy {
     }
 }
 
+/// `read_batch_size` is a budget for the whole drain, not one per stream.
+///
+/// Three streams of two events each with `read_batch_size = 2`: a drain spends its budget
+/// on the first stream it looks at, and the streams it did not reach are carried to the
+/// next poll rather than read as well. Without the shared budget one drain reads
+/// `batch × streams` events, which is not what the knob says and not what a shutdown or a
+/// leadership change can wait for (funkode-io/replay#231 review).
+///
+/// It also pins the rotation: the stream a drain could not finish goes to the back of the
+/// queue, so each drain moves a *different* stream and none of them is starved by the
+/// first one being busy.
+#[tokio::test]
+async fn policy_read_batch_is_one_budget_across_streams_postgres_test() {
+    let container = postgres_container().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    let accounts: Vec<BankAccountUrn> = (1..=3)
+        .map(|n| BankAccountUrn::new(format!("budget-{n}")).unwrap())
+        .collect();
+    for account in &accounts {
+        for _ in 0..2 {
+            cqrs.execute::<BankAccount>(
+                account,
+                meta.clone(),
+                BankAccountCommand::Deposit {
+                    effective_on: date,
+                    amount: 10.0,
+                },
+                &(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(SmallBatchPolicy { batch: 2 })
+        .build();
+
+    let mut delivered = Vec::new();
+    for _ in 0..3 {
+        runner.drain().await.expect("drain must succeed");
+        delivered.push(
+            common::places::all(&pg_pool, "small_batch_policy")
+                .await
+                .iter()
+                .map(|(_, seq)| *seq)
+                .sum::<i64>(),
+        );
+    }
+
+    assert_eq!(
+        delivered,
+        vec![2, 4, 6],
+        "two events per drain, however many streams are owed"
+    );
+}
+
 /// Policy with explicit batch sizes for checkpoint testing.
 struct CheckpointBatchPolicy {
     read_batch: u32,

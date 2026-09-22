@@ -11,7 +11,7 @@
 //! later slices that build on this substrate.
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -2753,20 +2753,36 @@ async fn drain_policy_once(
 
     // Three sources, in the order that costs least: what the last poll could not finish,
     // what the sweep just found, and — on its own cadence — what the sweep has missed.
+    //
+    // Capped at `read_batch` streams, and the carried ones come first, so this is a queue
+    // that rotates rather than a list that grows: the poll takes from the front and puts
+    // what it could not finish at the back (below). A nomination dropped for want of room
+    // is found again — by the sweep if the stream gains an event, by the rotating
+    // reconciliation otherwise — so the cap costs a delay, never a delivery.
     let mut streams = std::mem::take(&mut progress.unfinished);
+    streams.truncate(read_batch as usize);
     let discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
     for stream_id in discovered.streams {
+        if streams.len() as u32 >= read_batch {
+            break;
+        }
         if !streams.contains(&stream_id) {
             streams.push(stream_id);
         }
     }
     if progress.reconcile_is_due() {
-        for stream_id in streams_behind(pool, &name, read_batch).await? {
-            if !streams.contains(&stream_id) {
-                streams.push(stream_id);
+        let examined =
+            streams_behind(pool, &name, &progress.reconciled_through, read_batch).await?;
+        for stream_id in &examined {
+            if streams.len() as u32 >= read_batch {
+                break;
+            }
+            if !streams.contains(stream_id) {
+                streams.push(stream_id.clone());
             }
         }
-        progress.reconciled();
+        progress.reconciled(&examined, read_batch);
+        write_reconciled(pool, &name, &progress.reconciled_through).await?;
     }
 
     // The sweep has read this stretch of log whatever the streams in it turn out to owe,
@@ -2792,18 +2808,40 @@ async fn drain_policy_once(
     // One entry per stream advanced since the last flush, so this is bounded by the
     // number of streams this poll looked at, which `read_batch` bounds in turn.
     let mut advanced: Vec<(String, i64)> = Vec::new();
+    // The queue the next poll starts from, in two halves: what this poll's budget never
+    // reached, then what it read and may not have finished. A stream written to faster
+    // than it is read goes to the back every time rather than holding the front.
+    let mut unvisited: Vec<String> = Vec::new();
     let mut unfinished: Vec<String> = Vec::new();
+    // What the poll observed each place to be, which is what its checkpoints are written
+    // against: a place that has moved underneath this poll belongs to an operator or to
+    // another runner, and this one's arithmetic about it is stale.
+    let mut observed = places.clone();
+    // `read_batch_size` is a budget for the drain, not for each stream: spent across the
+    // streams in order, so one poll reads what the knob says however many streams it
+    // looks at. What the budget does not reach is carried, not lost.
+    let mut budget = read_batch;
 
-    for stream_id in &streams {
-        let place = places.get(stream_id).copied().unwrap_or_default();
-        let events = read_stream(pool, filter.clone(), stream_id, place, read_batch).await?;
-        // A full batch means the stream has more; it is looked at again next poll rather
-        // than drained here, so one busy stream cannot hold up every other.
-        if events.len() as u32 == read_batch {
-            unfinished.push(stream_id.clone());
+    for (index, stream_id) in streams.iter().enumerate() {
+        if budget == 0 {
+            unvisited.extend(streams[index..].iter().cloned());
+            break;
         }
 
+        let place = places.get(stream_id).copied().unwrap_or_default();
+        let events = read_stream(pool, filter.clone(), stream_id, place, budget).await?;
+        // A full read means the stream may have more; it is looked at again next poll
+        // rather than drained here, so one busy stream cannot hold up every other. It
+        // goes to the *back* of the queue — ahead of nothing it was ahead of — because a
+        // stream written to faster than it is read would otherwise hold the front of the
+        // queue for good and starve everything behind it.
+        if events.len() as u32 == budget {
+            unfinished.push(stream_id.clone());
+        }
+        budget -= events.len() as u32;
+
         let mut reached = place;
+        let mut superseded = false;
         for event in events {
             if let Some(raw) = event.delivered {
                 let depth = event_causation_depth(&raw);
@@ -2853,9 +2891,32 @@ async fn drain_policy_once(
             if events_since_checkpoint >= checkpoint_size {
                 let mut flushing = std::mem::take(&mut advanced);
                 flushing.push((stream_id.clone(), reached));
-                checkpoint_places(pool, &name, &flushing).await?;
+                let kept = checkpoint_places(pool, &name, &flushing, &observed).await?;
+                for (stream, seq) in &flushing {
+                    if kept.contains(stream) {
+                        observed.insert(stream.clone(), *seq);
+                    }
+                }
                 events_since_checkpoint = 0;
+                if !kept.contains(stream_id) {
+                    superseded = true;
+                    break;
+                }
             }
+        }
+
+        // A stream whose place moved under the poll is left where its new owner put it:
+        // nothing is written for it, and it is not carried, because the next poll reads
+        // the place afresh and resumes from there.
+        if superseded {
+            tracing::info!(
+                policy    = %name,
+                stream_id = %stream_id,
+                "policy place moved underneath this poll; abandoning the stream and \
+                 resuming from the place that is stored"
+            );
+            unfinished.retain(|carried| carried != stream_id);
+            continue;
         }
 
         if reached > place {
@@ -2864,8 +2925,9 @@ async fn drain_policy_once(
     }
 
     // Final checkpoint: flush any stream advanced since the last periodic save.
-    checkpoint_places(pool, &name, &advanced).await?;
-    progress.unfinished = unfinished;
+    checkpoint_places(pool, &name, &advanced, &observed).await?;
+    unvisited.extend(unfinished);
+    progress.unfinished = unvisited;
 
     Ok(executed)
 }
@@ -3455,24 +3517,35 @@ async fn sweep_for_streams(
     ))
 }
 
-/// The streams this Policy is behind on, compared head to cursor.
+/// The streams this Policy is behind on, compared head to cursor, taking the batch that
+/// sorts after `after`.
 ///
 /// This is the correctness half: it finds what the sweep missed, which is any write that
 /// committed below a position the sweep had already passed. No index answers a comparison
 /// between two tables' columns, so it scans one row per stream and is bounded by `limit`
 /// rather than by an index — which is why it runs on a cadence and the sweep runs on every
 /// poll (ADR-0024).
+///
+/// It resumes after the last id it examined instead of restarting at the lowest, because
+/// `limit` is a batch and not a snapshot: a Policy with `limit` permanently-behind streams
+/// low in the sort order would otherwise return those same ids every time, and a quiet
+/// stream sorting after them — one whose only write the sweep passed, so no future event
+/// will nominate it — would never be examined again. Rotating bounds that at one pass over
+/// the streams, which is `ceil(streams / limit)` cadences.
 async fn streams_behind(
     pool: &Pool<Postgres>,
     name: &str,
+    after: &str,
     limit: u32,
 ) -> Result<Vec<String>, replay::Error> {
     let rows = sqlx::query(
         "SELECT s.id FROM streams s \
          LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
-         WHERE s.stream_seq > COALESCE(c.stream_seq, 0) ORDER BY s.id LIMIT $2",
+         WHERE s.id > $2 AND s.stream_seq > COALESCE(c.stream_seq, 0) \
+         ORDER BY s.id LIMIT $3",
     )
     .bind(name)
+    .bind(after)
     .bind(limit as i64)
     .fetch_all(pool)
     .await
@@ -3564,39 +3637,61 @@ struct StreamEvent {
     delivered: Option<PersistedEvent<Value>>,
 }
 
-/// Record how far the Policy has got in each stream it advanced.
+/// Record how far the Policy has got in each stream it advanced, and report back which
+/// of those writes the Policy still owned.
 ///
-/// One statement for the batch, and monotonic: a place never moves backwards, so a
-/// checkpoint from a runner that has since lost its leadership cannot pull a stream back
-/// over events another has already delivered. An operator moving a place *back* to force
-/// a redelivery wins anyway — the runner reloads places every poll, and this write only
-/// refuses values below what is stored.
+/// One statement for the batch, and a compare-and-set per stream: a place is written only
+/// where it still reads as the value this poll started from. Monotonicity alone would not
+/// do, because the write it has to refuse is *lower* than the one it carries — an
+/// operator rewinding a stream to force a redelivery (ADR-0012) against a poll that is
+/// mid-batch, whose higher place would otherwise reinstate itself and undo the rewind
+/// silently. The same set-and-check tells a runner that has lost its leadership that it
+/// has, which is the only signal it gets.
+///
+/// Deleting the row is the other half of that control surface, so a place the poll saw at
+/// something is written only where a row is still there to compare with. Otherwise the
+/// insert would find no conflict and recreate what the operator removed.
 async fn checkpoint_places(
     pool: &Pool<Postgres>,
     name: &str,
     places: &[(String, i64)],
-) -> Result<(), replay::Error> {
+    observed: &HashMap<String, i64>,
+) -> Result<HashSet<String>, replay::Error> {
     if places.is_empty() {
-        return Ok(());
+        return Ok(HashSet::new());
     }
 
     let streams: Vec<String> = places.iter().map(|(stream, _)| stream.clone()).collect();
     let seqs: Vec<i64> = places.iter().map(|(_, seq)| *seq).collect();
+    let from: Vec<i64> = places
+        .iter()
+        .map(|(stream, _)| observed.get(stream).copied().unwrap_or_default())
+        .collect();
 
-    sqlx::query(
+    let kept = sqlx::query(
         "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
-         SELECT $1, stream_id, stream_seq FROM UNNEST($2::text[], $3::bigint[]) \
-              AS incoming(stream_id, stream_seq) \
+         SELECT $1, stream_id, stream_seq FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) \
+              AS incoming(stream_id, stream_seq, observed) \
+          WHERE incoming.observed = 0 \
+             OR EXISTS (SELECT 1 FROM policy_stream_cursors held \
+                         WHERE held.policy = $1 AND held.stream_id = incoming.stream_id) \
          ON CONFLICT (policy, stream_id) DO UPDATE \
              SET stream_seq = EXCLUDED.stream_seq, updated_at = now() \
-           WHERE policy_stream_cursors.stream_seq < EXCLUDED.stream_seq",
+           WHERE policy_stream_cursors.stream_seq \
+                 = (SELECT observed FROM UNNEST($2::text[], $4::bigint[]) \
+                         AS was(stream_id, observed) \
+                     WHERE was.stream_id = policy_stream_cursors.stream_id) \
+         RETURNING stream_id",
     )
     .bind(name)
     .bind(&streams)
     .bind(&seqs)
-    .execute(pool)
+    .bind(&from)
+    .fetch_all(pool)
     .await
     .map_err(crate::db_error)?;
+
+    let kept: HashSet<String> = kept.into_iter().map(|row| row.get("stream_id")).collect();
 
     // What `PolicyStatus::last_checkpoint_at` is measured from: the Policy processed
     // something, whichever stream it was.
@@ -3606,7 +3701,7 @@ async fn checkpoint_places(
         .await
         .map_err(crate::db_error)?;
 
-    Ok(())
+    Ok(kept)
 }
 
 async fn execute_dispatch(
@@ -3662,6 +3757,10 @@ struct PolicyProgress {
     /// Streams this Policy is behind on that the last poll could not finish, so the next
     /// one looks at them whatever the sweep finds. Bounded by the poll's stream limit.
     unfinished: Vec<String>,
+    /// The stream id the last reconciliation examined, so the next one resumes after it.
+    /// Persisted, because a runner that restarts often would otherwise rotate from the
+    /// start every time and never reach the end of the sort order.
+    reconciled_through: String,
     /// When the frontier was last compared with the places. `None` until the first
     /// reconciliation, so a worker that has just been elected does one straight away —
     /// which is what makes a crash mid-backlog cost a cadence rather than a deployment.
@@ -3678,14 +3777,15 @@ impl PolicyProgress {
         name: &str,
         start_at: StartAt,
     ) -> Result<Self, replay::Error> {
-        let swept_through = match read_sweep(pool, name).await? {
-            Some(swept_through) => swept_through,
-            None => bootstrap(pool, name, start_at).await?,
+        let (swept_through, reconciled_through) = match read_sweep(pool, name).await? {
+            Some(progress) => progress,
+            None => (bootstrap(pool, name, start_at).await?, String::new()),
         };
 
         Ok(Self {
             swept_through,
             unfinished: Vec::new(),
+            reconciled_through,
             reconciled_at: None,
             reconcile_every: resolve_reconcile_cadence(),
         })
@@ -3697,8 +3797,14 @@ impl PolicyProgress {
             .is_none_or(|last| last.elapsed() >= self.reconcile_every)
     }
 
-    fn reconciled(&mut self) {
+    /// A short batch means the rotation reached the end of the streams, so the next pass
+    /// starts over: the empty string sorts before every id.
+    fn reconciled(&mut self, examined: &[String], limit: u32) {
         self.reconciled_at = Some(Instant::now());
+        self.reconciled_through = match examined.last() {
+            Some(last) if examined.len() as u32 == limit => last.clone(),
+            _ => String::new(),
+        };
     }
 }
 
@@ -3725,13 +3831,21 @@ fn resolve_reconcile_cadence() -> Duration {
         .map_or(DEFAULT_RECONCILE_CADENCE, Duration::from_secs)
 }
 
-/// Read how far a Policy has swept, or `None` when it has no row yet.
-async fn read_sweep(pool: &Pool<Postgres>, name: &str) -> Result<Option<i64>, replay::Error> {
-    sqlx::query_scalar::<_, i64>("SELECT discovered_through FROM policy_cursors WHERE name = $1")
-        .bind(name)
-        .fetch_optional(pool)
-        .await
-        .map_err(crate::db_error)
+/// Read how far a Policy has swept and where its rotation left off, or `None` when it has
+/// no row yet.
+async fn read_sweep(
+    pool: &Pool<Postgres>,
+    name: &str,
+) -> Result<Option<(i64, String)>, replay::Error> {
+    let row = sqlx::query(
+        "SELECT discovered_through, reconciled_through FROM policy_cursors WHERE name = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(row.map(|row| (row.get("discovered_through"), row.get("reconciled_through"))))
 }
 
 /// Create a Policy's row, and for [`StartAt::Now`] the places that mean "from here".
@@ -3801,7 +3915,9 @@ async fn bootstrap(
 
     // A concurrent runner may have won the insert with a sweep position of its own; that
     // row is the Policy's, not this process's opinion of it.
-    Ok(read_sweep(pool, name).await?.unwrap_or(swept_through))
+    Ok(read_sweep(pool, name)
+        .await?
+        .map_or(swept_through, |(swept, _)| swept))
 }
 
 /// Record how far discovery has swept.
@@ -3823,6 +3939,23 @@ async fn write_sweep(
     .execute(pool)
     .await
     .map_err(crate::db_error)?;
+    Ok(())
+}
+
+/// Record where the rotation left off, so a restart resumes the pass rather than
+/// restarting it. Unconditional, unlike the sweep: the rotation wraps, so "backwards" is
+/// where it is meant to go once per pass.
+async fn write_reconciled(
+    pool: &Pool<Postgres>,
+    name: &str,
+    reconciled_through: &str,
+) -> Result<(), replay::Error> {
+    sqlx::query("UPDATE policy_cursors SET reconciled_through = $2 WHERE name = $1")
+        .bind(name)
+        .bind(reconciled_through)
+        .execute(pool)
+        .await
+        .map_err(crate::db_error)?;
     Ok(())
 }
 
@@ -4897,14 +5030,16 @@ mod pinned_session_tests {
 /// on a busy machine.
 #[cfg(test)]
 mod progress_tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
     use testcontainers_modules::postgres;
     use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 
-    use super::{checkpoint_places, places_of, streams_behind, PolicyProgress, StartAt};
+    use super::{
+        checkpoint_places, places_of, streams_behind, write_reconciled, PolicyProgress, StartAt,
+    };
 
     const POLICY: &str = "progress_under_test";
 
@@ -4985,7 +5120,7 @@ mod progress_tests {
             "no place is stored, and no place means the start of the stream"
         );
         assert_eq!(
-            streams_behind(&pool, POLICY, 10).await.unwrap(),
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
             "so both streams are behind"
         );
@@ -5012,7 +5147,10 @@ mod progress_tests {
             "and the stream is recorded where it already is"
         );
         assert!(
-            streams_behind(&pool, POLICY, 10).await.unwrap().is_empty(),
+            streams_behind(&pool, POLICY, "", 10)
+                .await
+                .unwrap()
+                .is_empty(),
             "nothing written before it started is owed to it"
         );
     }
@@ -5030,9 +5168,74 @@ mod progress_tests {
         append_events(&pool, "urn:probe:after", 2).await;
 
         assert_eq!(
-            streams_behind(&pool, POLICY, 10).await.unwrap(),
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
             vec!["urn:probe:after".to_string()],
             "the new stream is behind; the one that predates the Policy is not"
+        );
+    }
+
+    /// Checkpoint one stream, telling the write what the caller last saw there.
+    async fn checkpoint(pool: &PgPool, stream: &str, from: i64, to: i64) -> HashSet<String> {
+        checkpoint_places(
+            pool,
+            POLICY,
+            &[(stream.to_string(), to)],
+            &HashMap::from([(stream.to_string(), from)]),
+        )
+        .await
+        .expect("checkpointing must succeed")
+    }
+
+    /// The reconciliation rotates, so a stream sorting after a batch that never catches
+    /// up is still examined.
+    ///
+    /// Restarting at the lowest id every cadence is what made this a hole rather than a
+    /// delay: `limit` permanently-behind streams below it would return the same ids for
+    /// ever, and a quiet stream — one whose only write the sweep passed, so no future
+    /// event will nominate it — would never be compared again
+    /// (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn the_reconciliation_rotates_past_streams_that_stay_behind_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        for stream in ["urn:probe:a1", "urn:probe:a2", "urn:probe:z"] {
+            append_events(&pool, stream, 1).await;
+        }
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        let first = streams_behind(&pool, POLICY, &progress.reconciled_through, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            vec!["urn:probe:a1".to_string(), "urn:probe:a2".to_string()],
+            "a full batch of the streams that sort first"
+        );
+        progress.reconciled(&first, 2);
+        write_reconciled(&pool, POLICY, &progress.reconciled_through)
+            .await
+            .expect("writing the rotation must succeed");
+
+        // A restart resumes the pass rather than starting it again, which is why the
+        // rotation is persisted and not held in memory.
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        assert_eq!(progress.reconciled_through, "urn:probe:a2");
+
+        let second = streams_behind(&pool, POLICY, &progress.reconciled_through, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            vec!["urn:probe:z".to_string()],
+            "the stream the first pass could not reach, with the first two still behind"
+        );
+        progress.reconciled(&second, 2);
+        assert_eq!(
+            progress.reconciled_through, "",
+            "a short batch is the end of the pass, and the next one starts over"
         );
     }
 
@@ -5046,47 +5249,114 @@ mod progress_tests {
             .await
             .expect("loading must succeed");
 
-        checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 2)])
-            .await
-            .expect("checkpointing must succeed");
+        checkpoint(&pool, "urn:probe:a", 0, 2).await;
 
         assert_eq!(
-            streams_behind(&pool, POLICY, 10).await.unwrap(),
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string()],
             "two of three places processed is still behind"
         );
 
-        checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 3)])
-            .await
-            .expect("checkpointing must succeed");
+        checkpoint(&pool, "urn:probe:a", 2, 3).await;
 
         assert!(
-            streams_behind(&pool, POLICY, 10).await.unwrap().is_empty(),
+            streams_behind(&pool, POLICY, "", 10)
+                .await
+                .unwrap()
+                .is_empty(),
             "caught up with the last place written"
         );
     }
 
-    /// A checkpoint never pulls a stream backwards. Two runners for one Policy is a
-    /// leadership fault, not a licence to redeliver what the other has passed.
+    /// A checkpoint is written only where the place still reads as the value its poll
+    /// started from. Two runners for one Policy is a leadership fault, and the one whose
+    /// view is stale is told so rather than allowed to write over the other.
     #[tokio::test]
-    async fn a_place_written_from_behind_is_refused_postgres_test() {
+    async fn a_checkpoint_from_a_stale_view_is_refused_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 5).await;
         PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
 
-        checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 4)])
-            .await
-            .expect("checkpointing must succeed");
-        checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 2)])
-            .await
-            .expect("checkpointing must succeed");
+        checkpoint(&pool, "urn:probe:a", 0, 4).await;
+        let kept = checkpoint(&pool, "urn:probe:a", 0, 2).await;
 
+        assert!(
+            kept.is_empty(),
+            "the write loses, and its runner is told it lost"
+        );
         assert_eq!(
             places(&pool, &["urn:probe:a"]).await,
             HashMap::from([("urn:probe:a".to_string(), 4)]),
             "the stale write is dropped, not applied"
+        );
+    }
+
+    /// The reason the write compares rather than only refusing to go backwards: an
+    /// operator rewinding a stream mid-poll writes a place *below* the one the poll is
+    /// carrying, so a monotonic write would reinstate the higher value and undo the
+    /// rewind without a word (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn an_operator_rewinding_mid_poll_is_not_overwritten_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 0, 10).await;
+
+        // The poll is mid-batch: it read the place as 10 and has since delivered to 15.
+        let observed = HashMap::from([("urn:probe:a".to_string(), 10)]);
+
+        sqlx::query(
+            "UPDATE policy_stream_cursors SET stream_seq = 3 \
+             WHERE policy = $1 AND stream_id = $2",
+        )
+        .bind(POLICY)
+        .bind("urn:probe:a")
+        .execute(&pool)
+        .await
+        .expect("the operator's move must succeed");
+
+        let kept = checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 15)], &observed)
+            .await
+            .expect("checkpointing must succeed");
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert_eq!(
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 3)]),
+            "and the operator's rewind stands"
+        );
+    }
+
+    /// Deleting a place is the documented way to redeliver a stream from its first event
+    /// (README, "Moving a policy on a running system"), so a poll mid-batch must not
+    /// recreate the row it deleted — which is what an insert with nothing to conflict
+    /// with would do.
+    #[tokio::test]
+    async fn an_operator_deleting_a_place_mid_poll_is_not_overwritten_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 0, 10).await;
+
+        sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
+            .bind(POLICY)
+            .bind("urn:probe:a")
+            .execute(&pool)
+            .await
+            .expect("the operator's delete must succeed");
+
+        let kept = checkpoint(&pool, "urn:probe:a", 10, 15).await;
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and the stream is still at the beginning, where the delete left it"
         );
     }
 
@@ -5100,9 +5370,7 @@ mod progress_tests {
         PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 5)])
-            .await
-            .expect("checkpointing must succeed");
+        checkpoint(&pool, "urn:probe:a", 0, 5).await;
 
         sqlx::query(
             "UPDATE policy_stream_cursors SET stream_seq = $1 \
@@ -5121,7 +5389,7 @@ mod progress_tests {
             "the next poll reads what the operator wrote"
         );
         assert_eq!(
-            streams_behind(&pool, POLICY, 10).await.unwrap(),
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string()],
             "and the stream is owed its last three events again"
         );
@@ -5175,7 +5443,7 @@ mod progress_tests {
             "and the stream is seeded where it was in that same snapshot"
         );
         assert_eq!(
-            streams_behind(&pool, POLICY, 10).await.unwrap(),
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string()],
             "so the event that committed in the window is owed"
         );

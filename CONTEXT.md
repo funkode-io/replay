@@ -80,7 +80,9 @@ arrive in order, so the feed has no holes to reason about
 Which streams to read is found two ways: a sweep of the log by [Global position] every
 poll, which is fast and may pass a write that had not committed yet, and a reconciliation
 on a cadence, which compares every stream's head with the Policy's place and catches what
-the sweep passed. The sweep nominates streams; it never decides what is owed.
+the sweep passed. The sweep nominates streams; it never decides what is owed. Both take a
+batch and resume where the last one stopped, so "bounded" costs a rotation rather than a
+stream nobody looks at.
 
 A `stream_filter` decides what a Policy *reacts to*, never how far it *gets*: an excluded
 event advances the place and fires nothing, like a compaction snapshot

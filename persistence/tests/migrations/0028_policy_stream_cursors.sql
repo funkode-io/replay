@@ -39,3 +39,10 @@ ALTER TABLE policy_cursors RENAME COLUMN position TO discovered_through;
 -- the log's global order total. A Policy that reads no global order has nothing for it to
 -- qualify.
 ALTER TABLE policy_cursors DROP COLUMN IF EXISTS commit_txid;
+
+-- Where the reconciliation left off. It examines one batch of streams at a time, so it
+-- resumes after the last id it looked at and wraps at the end: without that it restarts
+-- at the lowest id every time, and a permanently-behind batch of low ids would hide a
+-- quiet stream from it for good.
+ALTER TABLE policy_cursors
+    ADD COLUMN IF NOT EXISTS reconciled_through TEXT NOT NULL DEFAULT '';

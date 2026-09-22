@@ -2197,6 +2197,17 @@ costs a scan of one row per stream, so it runs on a cadence rather than per poll
 Lower it if that tail latency matters more than the scan; raise it if you have millions of
 streams and no long-running writes.
 
+The reconciliation examines `read_batch_size` streams per cadence and **resumes where it
+left off**, wrapping at the end, so a policy with more streams than that takes
+`ceil(streams / read_batch_size)` cadences to compare all of them — that is the worst case
+for a write the sweep passed, not the 5 seconds above.
+
+`read_batch_size` is one budget for a whole poll, spent across the streams that poll looks
+at — not a batch per stream. A policy owed work in a hundred streams reads the same number
+of events per poll as one owed work in a single stream; the streams a poll does not reach
+go to the front of the next poll's queue, and a stream it could not finish goes to the
+back, so a stream written to faster than it can be read never holds up the rest.
+
 Each policy has a **stable name** that keys both tables. On first registration it is
 bootstrapped according to `start_at()`:
 
@@ -2234,10 +2245,11 @@ The leader picks the move up **on its next poll**, because it reads its places f
 poll rather than holding them in memory between polls. There is no window in which a
 running process reinstates a value you replaced.
 
-Cursor writes are a compare-and-set against the value the runner last read, so a
-checkpoint can never reinstate a position that predates your update; a runner
-that loses the race adopts your position and abandons the rest of its batch.
-Moving forward skips the events in between (they are never delivered); moving
+Place writes are a compare-and-set against the value the poll started from, so a
+checkpoint can never reinstate a place that predates your update, and deleting a row
+cannot be undone by a poll recreating it. A runner that loses the race abandons **that
+stream** for the poll — the others in its batch carry on — and picks your place up on the
+next one. Moving forward skips the events in between (they are never delivered); moving
 backward re-delivers them, which is safe under the same idempotency contract that
 covers crash re-delivery. See
 [ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md).
