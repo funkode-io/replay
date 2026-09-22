@@ -16,11 +16,17 @@
 -- commands, and must stay two rows.
 --
 -- NULLS NOT DISTINCT (PostgreSQL 15, the crate's floor) so the key also covers
--- the rows whose identity is null — parked before 0024's migration, or parked
--- for a panic in `react`, which fails before any dispatch exists. Those collapse
--- per `(policy_name, event_id)`, which is exactly right: that case parks one row
--- per delivery. Without it Postgres treats every null as distinct and those rows
--- would keep duplicating.
+-- the rows whose ordinal is null. After 0029 that is one shape only: a panic in
+-- `react`, which fails before any dispatch exists and names none, so its whole
+-- identity is null. Those collapse per `(policy_name, event_id)`, which is
+-- exactly right — that case parks one row per delivery — and it is how the
+-- running code goes on refreshing the same panic. The other null-identity rows,
+-- parked before 0024's migration, do *not* collapse: 0029 gave each a distinct
+-- negative ordinal, because a group of them is either a redelivery's duplicate
+-- or several distinct commands and the table cannot tell. Without NULLS NOT
+-- DISTINCT, Postgres treats every null as distinct and the panic rows — the one
+-- shape that is provably one per delivery — would be the one shape that kept
+-- duplicating.
 --
 -- CONCURRENTLY, because the table is the daemon's write path and a plain build
 -- would lock out parking for as long as the migration runs; that cannot run

@@ -109,7 +109,10 @@ pub struct PolicyStatus {
     /// Number of parked commands recorded for this policy: one row per command
     /// per reaction, not per delivery of the triggering event.
     pub dead_letter_count: i64,
-    /// When this policy last parked a command, if it ever has.
+    /// The latest parking among the commands this policy still has parked, and
+    /// `None` when it has none: the aggregate reads the active table, so a
+    /// policy whose every row has been retried or discarded reports `None`
+    /// however recently it parked.
     ///
     /// The last *parking*, not the oldest row's creation: a redelivery that
     /// re-parks a command already parked refreshes its row rather than adding

@@ -32,13 +32,17 @@
 -- EXCLUSIVE, and that is the lock this migration is worth.
 --
 -- `discarded_dead_letters` retains history and can be far larger than that
--- backlog, and nothing reads the three columns back out of it — so the archive
--- gets them nullable, which is a catalogue write and no scan at all. A null
--- there says "archived before the column existed", which is true. Backfilling it
--- would hold ACCESS EXCLUSIVE on the archive for the size of the audit trail,
--- and this migration is one transaction: taking that lock *before* the active
--- table's would also invert the order `move_dead_letter_to_archive` takes them
--- in (active first, then archive) and let a concurrent [Retry] deadlock the
+-- backlog, and nothing reads the three columns back out of it — so it takes
+-- `dispatch_ordinal` and `last_parked_at` nullable and `deliveries` NOT NULL
+-- DEFAULT 1, all three a catalogue write and no scan at all (PostgreSQL 11 and
+-- up store a non-volatile default rather than rewriting the table). A null in
+-- the first two says "archived before the column existed", which is true; the
+-- default in `deliveries` reads every such row as one delivery, which is what a
+-- row archived before the column was counted as. Backfilling instead would hold
+-- ACCESS EXCLUSIVE on the archive for the size of the audit trail, and this
+-- migration is one transaction: taking that lock *before* the active table's
+-- would also invert the order `move_dead_letter_to_archive` takes them in
+-- (active first, then archive) and let a concurrent [Retry] deadlock the
 -- migration. Same order as the runtime path, no long scan on the archive.
 ALTER TABLE policy_dead_letters
     ADD COLUMN IF NOT EXISTS dispatch_ordinal INTEGER,
