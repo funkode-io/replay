@@ -1,15 +1,12 @@
-// The PostgreSQL image tag, written once for the two places that pin it.
+// The PostgreSQL image tag, written once for the two places that pin it: an in-`src`
+// test module cannot import from `tests/`, and the hand-kept copies drifted — #223
+// raised the floor to 15 and left `cursor_tests` on 13 (funkode-io/replay#226).
 //
-// `include!`d by `tests/common/postgres_image.rs` and by the `cursor_tests` module in
-// `src/policy_runner.rs`. An in-`src` test module cannot import from `tests/`, so the
-// two pins were kept equal by hand and drifted: #223 raised the floor to 15 and left
-// `cursor_tests` on 13 (funkode-io/replay#226). Neither file is the other's parent, so
-// the shared definition sits at the crate root.
-//
-// Not a module — nothing declares `mod postgres_tag;` — and both `include!` sites are
-// `cfg(test)`, so this compiles only when the tests do. Line comments throughout: an
-// included file is expanded in item position, where `//!` would be an inner attribute
-// and fail to compile.
+// `include!`d rather than declared as a `#[path]` module: a `mod` inside an inline
+// `mod cursor_tests` resolves its path against `src/policy_runner/cursor_tests/`, a
+// directory that does not exist, so the link would be spelled `../../../` and rot on
+// the next rename. Line comments only — an included file is spliced in item position,
+// where `//!` is an inner attribute and does not compile.
 
 /// Image tag pinning the PostgreSQL release the suite runs against.
 ///
