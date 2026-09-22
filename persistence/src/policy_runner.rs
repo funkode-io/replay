@@ -899,10 +899,10 @@ impl PolicyRunner {
     /// retry can make the reaction fail on a command it never parked; the retry
     /// parks it exactly as the drain would, and reports the reaction still
     /// failing. This is the only insert a retry makes: a row for a command
-    /// already parked is updated, never duplicated — and two concurrent retries
-    /// of the same reaction settle it the same way, since the table now keys a
-    /// parked command and the second insert refreshes the first
-    /// (ADR-0024).
+    /// already parked is never duplicated — and two concurrent retries of the
+    /// same reaction settle it the same way, since the table now keys a parked
+    /// command and the second insert leaves the first writer's row as it stands,
+    /// reported [`DeadLetterRetry::Superseded`] (ADR-0024).
     ///
     /// Settling a row that already existed stamps its `retry_count` and
     /// `last_retried_at`, the archived copy included, so what has already been
@@ -3727,10 +3727,20 @@ async fn last_parked_position(
 
 /// The rows one reaction parked, oldest first.
 ///
-/// Bounded by the commands one reaction dispatches — the vector `react_erased`
-/// already materialises. No longer multiplied by the number of times the event
+/// One row per command the reaction dispatches — the vector `react_erased`
+/// already materialises — no longer multiplied by the number of times the event
 /// was delivered: a parked command is one row, and a redelivery refreshes it
 /// (funkode-io/replay#220).
+///
+/// **Not yet a number in the code.** On top of that vector sits the tail the
+/// dedupe migration could not prove duplicate and kept apart
+/// ([0029](../../persistence/tests/migrations/0029_dead_letter_dedupe.sql)): the
+/// old code's commands times the deliveries it saw. It is frozen at the moment
+/// the migration ran — every later park refreshes a row rather than adding one —
+/// and it shrinks as retries settle it, but nothing bounds it by a constant.
+/// Bounding the read over it is tracked by funkode-io/replay#228; a `LIMIT` is
+/// not the fix, because a retry settles every row of a reaction from one replay.
+/// `tests/bounded_queries.rs` carries the same reading as the review of record.
 ///
 /// `global_position` is redundant with `event_id` — one event has one position —
 /// and is in the filter to make it a prefix match on
