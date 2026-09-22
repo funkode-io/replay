@@ -6,9 +6,10 @@
 //
 // `include!`d rather than declared as a `#[path]` module: a `mod` inside an inline
 // `mod cursor_tests` resolves its path against `src/policy_runner/cursor_tests/`, a
-// directory that does not exist, so the link would be spelled `../../../` and rot on
-// the next rename. Line comments only — an included file is spliced in item position,
-// where `//!` is an inner attribute and does not compile.
+// directory that does not exist, so the link would be spelled
+// `../../infrastructure/postgres_tag.rs` and rot on the next rename. Line comments only
+// — an included file is spliced in item position, where `//!` is an inner attribute and
+// does not compile.
 
 /// Image tag pinning the PostgreSQL release the suite runs against.
 ///
