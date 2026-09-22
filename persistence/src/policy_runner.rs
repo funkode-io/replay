@@ -5140,7 +5140,7 @@ mod cursor_tests {
     // The server the suite is verified against. Shared with
     // `tests/common/postgres_image.rs`, which this module cannot import, rather than
     // copied: the copy drifted two majors behind the floor (funkode-io/replay#226).
-    include!("../postgres_tag.rs");
+    include!("infrastructure/postgres_tag.rs");
 
     async fn start_postgres() -> (PgPool, ContainerAsync<postgres::Postgres>) {
         let container = postgres::Postgres::default()

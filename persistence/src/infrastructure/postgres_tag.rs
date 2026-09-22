@@ -1,6 +1,8 @@
 // The PostgreSQL image tag, written once for the two places that pin it: an in-`src`
 // test module cannot import from `tests/`, and the hand-kept copies drifted — #223
-// raised the floor to 15 and left `cursor_tests` on 13 (funkode-io/replay#226).
+// raised the floor to 15 and left `cursor_tests` on 13 (funkode-io/replay#226). Which
+// server the Postgres adapter is verified against is an infrastructure fact, so it
+// lives beside the adapter rather than at the crate root.
 //
 // `include!`d rather than declared as a `#[path]` module: a `mod` inside an inline
 // `mod cursor_tests` resolves its path against `src/policy_runner/cursor_tests/`, a
