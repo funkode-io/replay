@@ -33,7 +33,10 @@ support either way.
 
 The integration suite runs against 15 itself — the floor is what is promised, so the
 floor is what is verified — and the pinned image tag lives in
-`persistence/tests/common/postgres_image.rs`.
+`persistence/src/infrastructure/postgres_tag.rs`, included by the two test modules that
+pin a version: `tests/common/postgres_image.rs` and `cursor_tests` in
+`src/policy_runner.rs`. The one test that deliberately takes whatever server it is given
+says so where it starts the container.
 
 The core `es-replay` crate has no database requirement at all, and is the half that runs
 on WASM.
