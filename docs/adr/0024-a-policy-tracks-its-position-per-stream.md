@@ -98,6 +98,21 @@ is owed is read from that stream's own sequence, which has no holes.
 - **`policy_cursors.position` is renamed `discovered_through`** and means where the search
   resumes, not what has been processed. A Policy's progress is no longer one number, and
   no column pretends otherwise.
+- **A runner that has lost its leadership is no longer told so by its own writes.** The
+  cursor's compare-and-set used to fail for a superseded runner, which stopped its batch
+  (ADR-0012); the per-stream write is monotonic instead, so a stale runner cannot pull a
+  place backwards but does run its batch to the end, duplicating dispatches for the
+  overlap. Delivery is at-least-once and reactions are idempotent by contract
+  ([ADR-0003](0003-policies-as-checkpointed-background-subscribers.md)), so this costs
+  duplicate work rather than correctness — but it is a wider window than the CAS gave,
+  and the advisory lock is now the only thing narrowing it.
+- **The reconciliation takes the first `limit` streams by id**, so under a backlog wider
+  than one batch the streams sorting late are reached only as the earlier ones catch up.
+  They cannot be starved outright — the sweep walks `global_position` without skipping, so
+  a stream with *new* events is nominated regardless of its name — but a stream whose only
+  pending work is a write the sweep passed waits its turn. Ordering by lag instead would
+  move the bias rather than remove it; the queue is normally empty, and its length is the
+  thing to watch.
 - **Ordering across streams is no longer promised, because it never held.** A Policy sees
   each stream in that stream's order; between streams it sees whatever the sweep found
   first. Anything that needs two streams ordered against each other needs them to be one

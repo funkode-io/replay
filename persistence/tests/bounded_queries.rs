@@ -57,9 +57,9 @@ const REVIEWED: &[Reviewed] = &[
         file: "src/policy_runner.rs",
         function: "read_stream",
         justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
-                        (default 100). One stream's events past its place — nor bounded \
-                        by the policy's stream filter, which selects what is delivered \
-                        from the batch rather than what is read (ADR-0013).",
+                        (default 100). One stream's events past its place, and not \
+                        bounded by the policy's stream filter, which selects what is \
+                        delivered from the batch rather than what is read (ADR-0013).",
     },
     Reviewed {
         file: "src/policy_runner.rs",

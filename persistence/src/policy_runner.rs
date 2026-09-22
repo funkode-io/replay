@@ -3406,8 +3406,8 @@ async fn move_dead_letter_to_archive(
     Ok(result.rows_affected() > 0)
 }
 
-/// Load a single event by its primary key, shaped exactly like [`read_feed`]
-/// so it can be fed back into a policy's erased reaction during retry.
+/// Load a single event by its primary key, shaped exactly like [`read_stream`] delivers
+/// one, so it can be fed back into a policy's erased reaction during retry.
 async fn load_event_by_id(
     pool: &Pool<Postgres>,
     event_id: uuid::Uuid,
@@ -3598,8 +3598,8 @@ async fn checkpoint_places(
     .await
     .map_err(crate::db_error)?;
 
-    // What `blocked_for_secs` and `last_checkpoint_at` are measured from: the Policy
-    // processed something, whichever stream it was.
+    // What `PolicyStatus::last_checkpoint_at` is measured from: the Policy processed
+    // something, whichever stream it was.
     sqlx::query("UPDATE policy_cursors SET updated_at = now() WHERE name = $1")
         .bind(name)
         .execute(pool)
@@ -3747,16 +3747,28 @@ async fn read_sweep(pool: &Pool<Postgres>, name: &str) -> Result<Option<i64>, re
 /// A write in flight while this runs is not counted, so its events are delivered when it
 /// commits. That is the at-least-once side of the trade: a `Now` Policy may see an event
 /// from just before it started, and never misses one from just after.
+///
+/// The two reads it takes — where the log ends, and where each stream ends — have to be
+/// one snapshot, which is why this runs in a `REPEATABLE READ` transaction. Read
+/// separately, a write committing between them is seeded as processed while sitting above
+/// the position the search starts from: nominated by no sweep, owed by no place, and lost
+/// for good.
 async fn bootstrap(
     pool: &Pool<Postgres>,
     name: &str,
     start_at: StartAt,
 ) -> Result<i64, replay::Error> {
+    let mut tx = pool.begin().await.map_err(crate::db_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
+
     let swept_through = match start_at {
         StartAt::Beginning => 0,
         StartAt::Now => {
             sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(global_position) FROM events")
-                .fetch_one(pool)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(crate::db_error)?
                 .unwrap_or_default()
@@ -3770,7 +3782,7 @@ async fn bootstrap(
              ON CONFLICT DO NOTHING",
         )
         .bind(name)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(crate::db_error)?;
     }
@@ -3781,9 +3793,11 @@ async fn bootstrap(
     )
     .bind(name)
     .bind(swept_through)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(crate::db_error)?;
+
+    tx.commit().await.map_err(crate::db_error)?;
 
     // A concurrent runner may have won the insert with a sweep position of its own; that
     // row is the Policy's, not this process's opinion of it.
@@ -3946,7 +3960,8 @@ fn resolve_checkpoint_batch_size(policy: &dyn ErasedPolicy) -> u32 {
     DEFAULT_CHECKPOINT_BATCH_SIZE
 }
 
-/// Resolve the effective read-batch size (events fetched in a single `read_feed` call).
+/// Resolve the effective read-batch size: the most one poll reads of any one stream, and
+/// the most streams one poll looks at.
 ///
 /// Precedence: per-policy override → `REPLAY_READ_BATCH_SIZE` env var → default 100.
 /// Enforces the invariant `read_batch_size ≥ checkpoint_batch_size`.
@@ -5110,6 +5125,84 @@ mod progress_tests {
             vec!["urn:probe:a".to_string()],
             "and the stream is owed its last three events again"
         );
+    }
+
+    /// The two reads `StartAt::Now` takes are one snapshot, so a write that commits
+    /// between them is owed rather than lost.
+    ///
+    /// The interleaving is forced rather than raced for: locking `policy_stream_cursors`
+    /// holds the bootstrap between its read of the log's end and its read of each
+    /// stream's end, which is the window the bug lived in. Under a snapshot the stream is
+    /// seeded where it was, so the event that committed in the window sits above the
+    /// place *and* above the sweep, and the Policy is owed it. Read separately, the seed
+    /// would include that event while the search started below it: nominated by no sweep,
+    /// owed by no place.
+    #[tokio::test]
+    async fn a_write_committing_during_bootstrap_is_owed_not_lost_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 1).await;
+
+        // Hold the bootstrap at its second read.
+        let mut blocker = pool.begin().await.expect("beginning must succeed");
+        sqlx::query("LOCK TABLE policy_stream_cursors IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .expect("locking must succeed");
+
+        let bootstrapping = tokio::spawn({
+            let pool = pool.clone();
+            async move { PolicyProgress::load(&pool, POLICY, StartAt::Now).await }
+        });
+        await_blocked_on(&pool, "policy_stream_cursors").await;
+
+        // The write the old code lost: a stream that already existed, gaining an event
+        // while the bootstrap is between its two reads.
+        append_events(&pool, "urn:probe:a", 1).await;
+        blocker.commit().await.expect("releasing must succeed");
+
+        let progress = bootstrapping
+            .await
+            .expect("the bootstrap must finish")
+            .expect("loading must succeed");
+
+        assert_eq!(
+            progress.swept_through, 1,
+            "the search starts where the log ended when the snapshot was taken"
+        );
+        assert_eq!(
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 1)]),
+            "and the stream is seeded where it was in that same snapshot"
+        );
+        assert_eq!(
+            streams_behind(&pool, POLICY, 10).await.unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "so the event that committed in the window is owed"
+        );
+    }
+
+    /// Wait until something is queued behind a lock on `relation`.
+    async fn await_blocked_on(pool: &PgPool, relation: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                  WHERE c.relname = $1 AND NOT l.granted",
+            )
+            .bind(relation)
+            .fetch_one(pool)
+            .await
+            .expect("reading pg_locks must succeed");
+
+            if blocked > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing ever blocked on the lock on {relation}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// The sweep is a hint, so it is written unconditionally forwards and never

@@ -241,10 +241,6 @@ impl HeldPing {
 pub struct AppendedEvent {
     pub event_id: Uuid,
     pub global_position: i64,
-    /// The transaction that wrote it, as a Policy's cursor records it
-    /// (funkode-io/replay#194). Text, because `xid8` is an unsigned 64-bit counter sqlx
-    /// has no codec for.
-    pub commit_txid: String,
     pub stream_id: String,
 }
 
@@ -533,20 +529,17 @@ impl PolicyDaemonHarness {
             .expect("append must succeed");
 
         let stream_id = id.to_urn().to_string();
-        let row = sqlx::query(
-            "SELECT id, global_position, commit_txid::text AS commit_txid \
-             FROM events WHERE metadata->>($1::text) = $2",
-        )
-        .bind(PING_MARKER_KEY)
-        .bind(marker.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .expect("the appended event must be readable");
+        let row =
+            sqlx::query("SELECT id, global_position FROM events WHERE metadata->>($1::text) = $2")
+                .bind(PING_MARKER_KEY)
+                .bind(marker.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .expect("the appended event must be readable");
 
         AppendedEvent {
             event_id: row.get("id"),
             global_position: row.get("global_position"),
-            commit_txid: row.get("commit_txid"),
             stream_id,
         }
     }

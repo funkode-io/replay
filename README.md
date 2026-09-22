@@ -2907,10 +2907,17 @@ position in `1..=H` is present, e.g. to freeze a version at publish time — use
 | `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
 
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
-`"Degraded"`) for JSON/UI consumers. There is no `Blocked`: a policy reads each stream
-over a sequence with no holes in it, so there is no number it can be parked in front of.
-A policy that is not moving is lagging, `Degraded`, or not alive — and the third is
-`daemon.liveness()`, not this.
+`"Degraded"`) for JSON/UI consumers.
+
+> **Breaking, since the per-stream cursor.** `PolicyStatus` lost `position`, `head`,
+> `next_position` and `missing_position`, and `PolicyCondition` lost `Blocked`. Their
+> replacements are `lag` (now a count of events, not of positions), `streams_behind` and
+> `discovered_through`. `Blocked` has no replacement because it has no cause: a policy
+> reads each stream over a sequence with no holes in it, so there is no number it can be
+> parked in front of, and a write still in flight makes a policy *not behind at all* —
+> its events are invisible to every reader, including the one computing lag. A policy
+> that is not moving is lagging, `Degraded`, or not alive, and the third is
+> `daemon.liveness()`, not this.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only

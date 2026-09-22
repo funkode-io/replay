@@ -23,17 +23,22 @@ effects**. Therefore a **projection version bump ⇒ reset + replay**, but a
   defaulting to the *safe* `Now` (a newly registered policy does not retroactively
   fire commands across all history unless asked). `Beginning` is the deliberate
   backfill path. A version change never moves the position.
-- **Global cursor.** Policies are the first feature needing a total order over the
+- **Global cursor.** ~~Policies are the first feature needing a total order over the
   whole log. We add a `BIGSERIAL global_position` to `events` and read it with a
-  **high-water-mark** reader: advance only across a contiguous, gap-free prefix
-  (with a short visibility grace), so a sequence value that is assigned but not yet
-  committed by a concurrent append can never be skipped. We rejected an append-time
-  serializing lock (kills bulk-load write throughput) and a naive `created`/per-
-  stream `version` cursor (not a total order; skips and double-counts under clock
-  skew and concurrency). *Amended by
-  [ADR-0015](0015-policy-crosses-a-position-no-transaction-can-fill.md): this
-  assumed every hole eventually fills, and a position burned by an aborted append
-  never does.*
+  **high-water-mark** reader: advance only across a contiguous, gap-free prefix (with a
+  short visibility grace), so a sequence value that is assigned but not yet committed by a
+  concurrent append can never be skipped.~~ *Replaced by
+  [ADR-0024](0024-a-policy-tracks-its-position-per-stream.md): a Policy has no cursor over
+  the whole log. It records a place per stream and reads each stream in that stream's own
+  order, so there is no contiguous prefix to advance across and no grace to wait out. The
+  premise this decision rested on — that a Policy needs a total order — was wrong: events
+  of one stream must be ordered, and two streams need no order between them.* The
+  alternatives rejected here still are: an append-time serializing lock kills bulk-load
+  write throughput, and a `created`-based cursor skips and double-counts under clock skew.
+  A per-stream `version` cursor was rejected for not being a total order, which is right,
+  and for a second reason that outlived the first — compaction renumbers it
+  ([ADR-0023](0023-a-stream-is-numbered-twice.md)) — which is why `stream_seq` and not
+  `version` is what a Policy records.
 - **Delivery is at-least-once.** We do not chase exactly-once delivery (high cost,
   illusory across crash boundaries). Correctness comes from **idempotent aggregate
   commands** (at-least-once + idempotent consumer = effectively-once). The dedup key
