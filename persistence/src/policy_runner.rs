@@ -5137,11 +5137,10 @@ mod cursor_tests {
 
     const POLICY: &str = "cursor_under_test";
 
-    /// The server the suite is verified against, pinned as
-    /// `tests/common/postgres_image.rs` pins it — this module cannot reach that file,
-    /// and `xid8` does not exist before PostgreSQL 13, so an unpinned default would
-    /// fail here rather than run somewhere else.
-    const POSTGRES_TAG: &str = "13-alpine";
+    // The server the suite is verified against. Shared with
+    // `tests/common/postgres_image.rs`, which this module cannot import, rather than
+    // copied: the copy drifted two majors behind the floor (funkode-io/replay#226).
+    include!("../postgres_tag.rs");
 
     async fn start_postgres() -> (PgPool, ContainerAsync<postgres::Postgres>) {
         let container = postgres::Postgres::default()
