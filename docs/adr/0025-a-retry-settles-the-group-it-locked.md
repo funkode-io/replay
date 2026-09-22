@@ -40,6 +40,20 @@ code (funkode-io/replay#228).
   and one that has not yet cannot move it behind the settlement's back — it
   waits, and applies its fresher failure on top of what the retry concluded.
 
+- **The settlement reads one snapshot**, `REPEATABLE READ`, as a chunked rebuild
+  does ([ADR-0011](0011-inline-projections-flushed-in-bounded-chunks.md)). The locks cover the rows that exist; a command parked
+  *while* the settlement walks the group is a row nobody could have locked, and
+  at the default READ COMMITTED a later page would read it on a fresh snapshot
+  and settle it from a replay that ran before it existed. Digest and snapshot are
+  the two halves: the digest catches what moved while the replay ran, the
+  snapshot what moves while it settles.
+
+- **Postgres refusing the snapshot means the same thing as a digest mismatch.** A
+  `40001` is a writer having moved a row the settlement had to read consistently,
+  which is the definition of a group that moved, so it is classified as a
+  conflict (`db_error`) and reported `Superseded` rather than surfacing as a
+  database error that aborts a bulk retry's walk.
+
 - **A group that moved settles nothing.** Every row of it is reported
   `DeadLetterRetry::Superseded`, and the bulk summary counts the reaction as
   still failing, which it is. The alternative — settling the rows that did not
@@ -85,6 +99,16 @@ code (funkode-io/replay#228).
   next delivery is not about to overwrite — but it is coarser than ADR-0024's
   per-row guard, which could settle the rows that had not moved.
 
+- **A moved group parks nothing either**, including a command the replay found
+  failing that no row spoke for — the one row a retry inserts (ADR-0021). Under
+  the per-row guard that insert was independent of any other row's state. What
+  moved the group is a writer that ran this same reaction: a delivery parks every
+  command that failed for it, and another retry parks its own unclaimed failures,
+  so the failure is recorded by the writer that is current rather than by this
+  stale replay. When the mover was a [Discard] instead, nothing records it and
+  the reaction is reported still failing: the next retry parks it, if it still
+  fails.
+
 - **A retry holds row locks over the whole group for the length of its
   settlement**, rather than taking them one row at a time as it writes. The
   settlement is statements only — the replay is outside the transaction — so the
@@ -98,6 +122,10 @@ code (funkode-io/replay#228).
 - **The allocation budget is pinned by a test.**
   `tests/policy_retry_allocations.rs` settles a reaction with a thousand retired
   rows and asserts the peak live bytes stay near a page: ~0.19 MB paged against
-  ~1.55 MB when the group was read whole, on a ~0.6 MB budget.
+  ~1.55 MB when the group was read whole, on a ~0.6 MB budget. The snapshot is
+  pinned by `policy_runner.rs`'s `settlement_tests`, which parks a command while
+  a settlement holds its group and asserts no page of that settlement sees it.
+
+[Discard]: ../../CONTEXT.md#discard
 
 [digest]: ../../persistence/src/policy_runner.rs

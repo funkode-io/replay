@@ -1085,10 +1085,12 @@ impl PolicyRunner {
     ///
     /// The group is settled a page at a time and never held whole
     /// (funkode-io/replay#228), so what guards it against a writer that moved it
-    /// while the replay ran is the group's [digest](GroupDigest) rather than a
-    /// per-row version: `before` is re-read here under the rows' own locks, and a
+    /// is not a per-row version but the pair a snapshot and a digest make: the
+    /// [digest](GroupDigest) `before` catches what moved while the replay ran,
+    /// and the transaction's snapshot catches what moves while it settles. A
     /// group that moved settles **nothing** — every row of it is reported
-    /// [`DeadLetterRetry::Superseded`], which is one reaction still failing.
+    /// [`DeadLetterRetry::Superseded`], which is one reaction still failing
+    /// (ADR-0025).
     async fn settle(
         &self,
         reaction: &ParkedReaction,
@@ -1096,24 +1098,51 @@ impl PolicyRunner {
         replay: Replay,
         asked_about: Option<i64>,
     ) -> Result<ReactionSettlement, replay::Error> {
+        let moved = match self
+            .settle_unmoved(reaction, before, replay, asked_about)
+            .await
+        {
+            Ok(Some(settled)) => return Ok(settled),
+            // The group was already something else when the settlement read it.
+            Ok(None) => "before the settlement began",
+            // Postgres saw a writer move a row out from under the snapshot
+            // before this transaction could, and refused it the inconsistent
+            // read: the same conclusion, reached by the server.
+            Err(error) if error.kind() == replay::ErrorKind::Conflict => "while it was settling",
+            Err(error) => return Err(error),
+        };
+
+        tracing::info!(
+            policy   = %reaction.policy_name,
+            event_id = %reaction.event_id,
+            moved,
+            "a reaction moved while its retry replayed it; settling none of its \
+             rows, so the writer that moved it keeps what it wrote"
+        );
+        Ok(ReactionSettlement {
+            any_still_failing: true,
+            asked_about: match asked_about {
+                Some(id) => Some(unsettled(&self.pool, id).await?),
+                None => None,
+            },
+            ..Default::default()
+        })
+    }
+
+    /// The settlement itself, on one snapshot of a group nobody else is writing:
+    /// `Some` when it ran, `None` when the group had already moved.
+    async fn settle_unmoved(
+        &self,
+        reaction: &ParkedReaction,
+        before: GroupDigest,
+        replay: Replay,
+        asked_about: Option<i64>,
+    ) -> Result<Option<ReactionSettlement>, replay::Error> {
         let mut replay = replay;
         let mut settled = ReactionSettlement::default();
-        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
-
-        // Under the locks, so what this reads is also what no one else can
-        // change until the settlement commits.
-        if lock_group(&mut tx, reaction).await? != before {
-            tracing::info!(
-                policy   = %reaction.policy_name,
-                event_id = %reaction.event_id,
-                "a reaction moved while its retry replayed it; settling none of \
-                 its rows, so the writer that moved it keeps what it wrote"
-            );
-            settled.any_still_failing = true;
-            if let Some(id) = asked_about {
-                settled.asked_about = Some(unsettled(&mut *tx, id).await?);
-            }
-            return Ok(settled);
+        let (mut tx, locked) = begin_settlement(&self.pool, reaction).await?;
+        if locked != before {
+            return Ok(None);
         }
 
         // Rows that name a command are settled first, whatever their ids. A row
@@ -1223,7 +1252,7 @@ impl PolicyRunner {
 
         tx.commit().await.map_err(crate::db_error)?;
 
-        Ok(settled)
+        Ok(Some(settled))
     }
 
     /// Discard a parked dead letter without re-running its reaction.
@@ -2463,6 +2492,19 @@ struct GroupDigest {
     deliveries: i64,
     retries: i64,
     last_parked_at: Option<DateTime<Utc>>,
+}
+
+impl GroupDigest {
+    /// Read a digest off a row of the four aggregates, so the locked and
+    /// unlocked readings cannot drift into two different answers.
+    fn of(row: &sqlx::postgres::PgRow) -> Self {
+        Self {
+            rows: row.get("rows"),
+            deliveries: row.get("deliveries"),
+            retries: row.get("retries"),
+            last_parked_at: row.get("last_parked_at"),
+        }
+    }
 }
 
 /// Where the next page of a group's rows resumes: the last row the previous page
@@ -3820,23 +3862,18 @@ async fn group_digest(
     .await
     .map_err(crate::db_error)?;
 
-    Ok(GroupDigest {
-        rows: row.get("rows"),
-        deliveries: row.get("deliveries"),
-        retries: row.get("retries"),
-        last_parked_at: row.get("last_parked_at"),
-    })
+    Ok(GroupDigest::of(&row))
 }
 
-/// The same reading, with every row of the group locked until the transaction
-/// ends.
+/// The same four aggregates, over a group every row of which is locked until the
+/// transaction ends.
 ///
 /// The lock is what makes the comparison decisive rather than advisory: a writer
-/// that had already moved a row shows up in the numbers, and one that has not
-/// yet cannot move it behind the settlement's back — it waits, and applies its
+/// that had already moved a row shows up in the numbers, and one that has not yet
+/// cannot move it behind the settlement's back — it waits, and applies its
 /// fresher failure on top of what this retry concluded.
 ///
-/// The aggregate sits outside the locking sub-select because `FOR UPDATE` and
+/// The aggregates sit outside the locking sub-select because `FOR UPDATE` and
 /// aggregation cannot share a query level; the rows it locks are read but never
 /// returned, so this stays one row of four scalars however large the group is.
 async fn lock_group(
@@ -3845,9 +3882,9 @@ async fn lock_group(
 ) -> Result<GroupDigest, replay::Error> {
     let row = sqlx::query(
         "SELECT count(*) AS rows, \
-                coalesce(sum(g.deliveries), 0) AS deliveries, \
-                coalesce(sum(g.retry_count), 0) AS retries, \
-                max(g.last_parked_at) AS last_parked_at \
+                coalesce(sum(deliveries), 0) AS deliveries, \
+                coalesce(sum(retry_count), 0) AS retries, \
+                max(last_parked_at) AS last_parked_at \
          FROM (SELECT deliveries, retry_count, last_parked_at \
                FROM policy_dead_letters \
                WHERE policy_name = $1 AND global_position = $2 AND event_id = $3 \
@@ -3861,12 +3898,33 @@ async fn lock_group(
     .await
     .map_err(crate::db_error)?;
 
-    Ok(GroupDigest {
-        rows: row.get("rows"),
-        deliveries: row.get("deliveries"),
-        retries: row.get("retries"),
-        last_parked_at: row.get("last_parked_at"),
-    })
+    Ok(GroupDigest::of(&row))
+}
+
+/// Open the transaction a settlement runs in: one snapshot for every page it will
+/// read, every row of the group locked, and the digest that says whether this is
+/// still the group the replay ran against.
+///
+/// The snapshot is the half of the guard the locks cannot give. A command parked
+/// while the settlement walks the group is a row nobody could have locked, and
+/// under the default READ COMMITTED every page takes a fresh snapshot — so a
+/// later page would read that row and settle it from a replay that ran before it
+/// existed, which is the chunked-rebuild problem
+/// (`PostgresEventStoreBuilder::build`) in another table. Postgres requires the
+/// isolation level before the transaction's first query, and the lock is that
+/// query.
+async fn begin_settlement<'a>(
+    pool: &'a Pool<Postgres>,
+    reaction: &ParkedReaction,
+) -> Result<(sqlx::Transaction<'a, Postgres>, GroupDigest), replay::Error> {
+    let mut tx = pool.begin().await.map_err(crate::db_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
+
+    let digest = lock_group(&mut tx, reaction).await?;
+    Ok((tx, digest))
 }
 
 /// One page of a reaction's rows, in the order they are settled: the rows naming
@@ -5520,7 +5578,7 @@ mod cursor_tests {
     // copied: the copy drifted two majors behind the floor (funkode-io/replay#226).
     include!("infrastructure/postgres_tag.rs");
 
-    async fn start_postgres() -> (PgPool, ContainerAsync<postgres::Postgres>) {
+    pub(super) async fn start_postgres() -> (PgPool, ContainerAsync<postgres::Postgres>) {
         let container = postgres::Postgres::default()
             .with_tag(POSTGRES_TAG)
             .start()
@@ -5867,6 +5925,102 @@ mod cursor_tests {
             stored(&pool).await,
             expected,
             "and the row is left alone: there is nothing to complete"
+        );
+    }
+}
+
+/// What a settlement can see while it settles (funkode-io/replay#228).
+///
+/// Driven against a real database rather than through a daemon, for the reason
+/// [`cursor_tests`] is: a settlement reads its pages several statements apart, and
+/// a test that has to catch a running retry between two of them is a test that
+/// fails on a busy machine.
+#[cfg(test)]
+mod settlement_tests {
+    use sqlx::PgPool;
+
+    use super::cursor_tests::start_postgres;
+    use super::{begin_settlement, group_digest, load_parked_page, ParkedReaction, RowKeyset};
+
+    const POLICY: &str = "settlement_under_test";
+    const POSITION: i64 = 7;
+
+    /// A row parked for `command`, as an old version of the policy would have left
+    /// it. No event is involved: these tests are about what the settlement reads,
+    /// not about what a reaction dispatches.
+    async fn park(pool: &PgPool, reaction: &ParkedReaction, command: &str) {
+        sqlx::query(
+            "INSERT INTO policy_dead_letters \
+             (policy_name, global_position, event_id, error_kind, error_message, \
+              aggregate_name, target_stream_id, command_name, dispatch_ordinal, \
+              last_parked_at) \
+             VALUES ($1, $2, $3, 'Unavailable', 'parked', 'Probe', 'urn:probe:1', $4, \
+                     (SELECT coalesce(max(dispatch_ordinal), 0) + 1 \
+                      FROM policy_dead_letters WHERE policy_name = $1), now())",
+        )
+        .bind(&reaction.policy_name)
+        .bind(reaction.global_position)
+        .bind(reaction.event_id)
+        .bind(command)
+        .execute(pool)
+        .await
+        .expect("parking must succeed");
+    }
+
+    /// A command parked after the settlement began is not settled by it.
+    ///
+    /// The group's locks cannot cover a row nobody has written yet, so what keeps
+    /// it out of a later page is the settlement's snapshot. Under the default READ
+    /// COMMITTED each page reads a fresh one, and this row — parked by a delivery
+    /// with a failure of its own — would be settled from a replay that ran before
+    /// it existed.
+    #[tokio::test]
+    async fn a_page_does_not_see_a_command_parked_after_the_settlement_began_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let reaction = ParkedReaction {
+            policy_name: POLICY.to_string(),
+            global_position: POSITION,
+            event_id: uuid::Uuid::new_v4(),
+        };
+        park(&pool, &reaction, "First").await;
+        park(&pool, &reaction, "Second").await;
+
+        let (mut tx, locked) = begin_settlement(&pool, &reaction)
+            .await
+            .expect("the settlement must open");
+        assert_eq!(locked.rows, 2, "the group the settlement locked");
+
+        // The delivery that arrives while the settlement is walking the group.
+        // Its own connection, so it commits without waiting on the locks above —
+        // which cover the rows that existed, and this is not one of them.
+        park(&pool, &reaction, "Third").await;
+
+        let page = load_parked_page(&mut tx, &reaction, RowKeyset::start())
+            .await
+            .expect("the page must be readable");
+        let commands: Vec<Option<&str>> = page
+            .iter()
+            .map(|row| {
+                row.identity
+                    .as_ref()
+                    .map(|identity| identity.command_name.as_str())
+            })
+            .collect();
+
+        assert_eq!(
+            commands,
+            vec![Some("First"), Some("Second")],
+            "a settlement settles the group it locked, not what arrived after it"
+        );
+
+        drop(tx);
+        assert_eq!(
+            group_digest(&pool, &reaction)
+                .await
+                .expect("the digest must be readable")
+                .rows,
+            3,
+            "and the command parked meanwhile is in the table, for the next retry"
         );
     }
 }

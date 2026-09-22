@@ -19,9 +19,19 @@ pub fn ser_error(error: serde_json::Error) -> replay::Error {
 /// Classifying it here rather than only where this crate takes the stream row is
 /// what makes it retryable from an inline projection's own write too, since a
 /// projection handler maps its failures with this function.
+///
+/// A `40001` is the server refusing to show a `REPEATABLE READ` transaction a
+/// consistent answer because another one moved a row under its snapshot. A
+/// conflict rather than an internal error, by the same reasoning as an optimistic
+/// version check: nothing is broken, someone else got there first. The retry that
+/// settles a reaction under one snapshot (ADR-0025) reads it as exactly that.
 pub fn db_error(error: sqlx::Error) -> replay::Error {
     if crate::lock_wait::is_lock_not_available(&error) {
         return replay::Error::unavailable(format!("Row lock not available: {error}"))
+            .with_operation("database_operation");
+    }
+    if crate::lock_wait::has_code(&error, crate::lock_wait::SERIALIZATION_FAILURE) {
+        return replay::Error::conflict(format!("Serialization failure: {error}"))
             .with_operation("database_operation");
     }
     match error {
