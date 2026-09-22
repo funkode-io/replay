@@ -1,6 +1,6 @@
 # The persisted policy cursor is an operator-writable control surface
 
-**Status:** accepted
+**Status:** accepted; the surface moved. Since [ADR-0024](0024-a-policy-tracks-its-position-per-stream.md) a Policy's position is a row per stream in `policy_stream_cursors`, and that is what an operator writes — finer than what this ADR describes, since one stream can be redelivered without rewinding the Policy over the others. The decision below stands unchanged: the stored value is authoritative and a running leader adopts it. The machinery it needed does not, because places are read fresh every poll rather than held in memory between them.
 
 The leader loaded a Policy's cursor once per leadership term and kept it in
 memory for the whole term. `policy_cursors` was therefore a crash-recovery

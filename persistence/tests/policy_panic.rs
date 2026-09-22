@@ -98,13 +98,7 @@ async fn a_panicking_reaction_is_parked_and_the_policy_keeps_reacting_postgres_t
     let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
     assert_eq!(dispatched.event_type, "Echoed");
 
-    let cursor = harness
-        .await_cursor_at_least(panicked.global_position)
-        .await;
-    assert!(
-        cursor >= panicked.global_position,
-        "cursor {cursor} must have advanced past the event that panicked"
-    );
+    harness.await_passed(panicked.global_position).await;
     assert_eq!(
         harness.dead_letters().await.len(),
         1,
@@ -154,9 +148,7 @@ async fn a_restart_does_not_redeliver_the_panicking_event_postgres_test() {
 
     let panicked = harness.ping("subject-1", PANICS).await;
     harness.await_dead_letters(1).await;
-    harness
-        .await_cursor_at_least(panicked.global_position)
-        .await;
+    harness.await_passed(panicked.global_position).await;
 
     harness.restart().await;
 
@@ -270,13 +262,7 @@ async fn a_panic_inside_a_dispatched_command_handler_is_contained_too_postgres_t
     let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
     assert_eq!(dispatched.event_type, "Echoed");
 
-    let cursor = harness
-        .await_cursor_at_least(exploded.global_position)
-        .await;
-    assert!(
-        cursor >= exploded.global_position,
-        "cursor {cursor} must have advanced past the event whose handler panicked"
-    );
+    harness.await_passed(exploded.global_position).await;
     assert_eq!(
         harness.dead_letters().await.len(),
         1,

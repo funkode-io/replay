@@ -2172,44 +2172,64 @@ let daemon = runner.start_polling(Duration::from_secs(30));
 daemon.shutdown().await; // stops all tasks cleanly
 ```
 
-### Cursor checkpointing and bootstrap
+### How a policy tracks where it is
 
-Each policy has a **stable name** that acts as its cursor key in the
-`policy_cursors` table. On first registration the cursor is bootstrapped according
-to `start_at()`:
+A policy's position is **one row per stream** in `policy_stream_cursors`, holding the
+place it has reached in that stream. Nothing orders one stream against another: a policy
+reads each stream in that stream's own order, and a write that is slow, stuck or rolled
+back delays the stream it is writing to and no other
+([ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
+
+Which streams to look at is found two ways. Every poll sweeps the log past
+`policy_cursors.discovered_through` for streams with new events — indexed, and bounded by
+`read_batch_size`. That sweep is fast because it never waits: it passes positions it
+cannot see, including one held by a write still in flight. A reconciliation then compares
+every stream's head with the policy's place, catching exactly what the sweep passed. It
+costs a scan of one row per stream, so it runs on a cadence rather than per poll:
+
+| Setting | Default | What it bounds |
+|---------|---------|----------------|
+| `REPLAY_POLICY_RECONCILE_SECS` | 5 | How late a write that committed below the sweep can be delivered. Never how *whether*. |
+
+Lower it if that tail latency matters more than the scan; raise it if you have millions of
+streams and no long-running writes.
+
+Each policy has a **stable name** that keys both tables. On first registration it is
+bootstrapped according to `start_at()`:
 
 | `StartAt` | Behaviour |
 |-----------|-----------|
-| `StartAt::Now` (default) | Cursor begins at the current global head; only newly appended events are processed. Safe when you don't want to fire commands retroactively across existing history. |
-| `StartAt::Beginning` | Cursor begins at position 0; the full event history is drained once, then the policy follows live appends. Use this for backfill or projections derived from audit events. |
+| `StartAt::Now` (default) | Every existing stream is recorded at its current head, so only newly appended events are processed. Safe when you don't want to fire commands retroactively across existing history. This writes one row per existing stream, once. |
+| `StartAt::Beginning` | No places are recorded, and a stream with no place starts at its first event; the full history is drained once, then the policy follows live appends. Use this for backfill or projections derived from audit events. |
 
-The cursor is written to Postgres **at least every `checkpoint_batch_size` events**
-and unconditionally at the end of every drain pass. A crash after a command is
-executed but before the cursor is saved will re-deliver the triggering event.
-Correctness therefore depends on **idempotent command handling** keyed by
-causation identity in the target aggregate.
+Places are written to Postgres **at least every `checkpoint_batch_size` events** and
+unconditionally at the end of every drain pass. A crash after a command is executed but
+before the place is saved will re-deliver the triggering event. Correctness therefore
+depends on **idempotent command handling** keyed by causation identity in the target
+aggregate.
 
-### Moving a cursor on a running system
+### Moving a policy on a running system
 
-The `policy_cursors` row is an **operator-writable control surface**, not private
-runner state: you can reposition a policy against a live deployment with plain
-SQL, without restarting a process or dropping leadership.
+`policy_stream_cursors` is an **operator-writable control surface**, not private runner
+state: you can reposition a policy against a live deployment with plain SQL, without
+restarting a process or dropping leadership.
 
 ```sql
--- skip a position that can never be delivered, or rewind to re-deliver events
-UPDATE policy_cursors SET position = 264786, updated_at = now()
-WHERE name = 'price_fanout';
+-- re-deliver a stream from the place after this one
+UPDATE policy_stream_cursors SET stream_seq = 41, updated_at = now()
+WHERE policy = 'price_fanout' AND stream_id = 'urn:instrument:xyz';
+
+-- re-deliver a stream from its first event
+DELETE FROM policy_stream_cursors
+WHERE policy = 'price_fanout' AND stream_id = 'urn:instrument:xyz';
 ```
 
-The row also records the transaction that wrote the event at that position
-(`commit_txid`), which is the half the feed will be ordered by. You never write it:
-the runner derives it from the position you set, so the instruction stays the one
-column it has always been.
+One stream at a time, which is the point: a redelivery no longer rewinds the policy over
+every other stream to reach the one that needs it.
 
-The leader picks the new position up **the next time its feed comes back empty**
-— within one poll `interval` for an idle or stuck policy, and after it has caught
-up for a busy one. A policy with work to do pays nothing for this: the re-read
-happens only when there is nothing to process.
+The leader picks the move up **on its next poll**, because it reads its places fresh every
+poll rather than holding them in memory between polls. There is no window in which a
+running process reinstates a value you replaced.
 
 Cursor writes are a compare-and-set against the value the runner last read, so a
 checkpoint can never reinstate a position that predates your update; a runner
@@ -2842,18 +2862,15 @@ let statuses = PolicyStatusStore::new(pool.clone()).list().await?;
 
 for s in &statuses {
     println!(
-        "{:<20} {:<8} lag={} dead_letters={}",
-        s.name, s.condition, s.lag, s.dead_letter_count
+        "{:<20} {:<8} lag={} over {} streams dead_letters={}",
+        s.name, s.condition, s.lag, s.streams_behind, s.dead_letter_count
     );
 }
 
 // React to anything needing attention.
 let needs_attention: Vec<_> = statuses
     .iter()
-    .filter(|s| matches!(
-        s.condition,
-        PolicyCondition::Degraded | PolicyCondition::Blocked,
-    ))
+    .filter(|s| matches!(s.condition, PolicyCondition::Degraded))
     .collect();
 ```
 
@@ -2862,44 +2879,38 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | Field | Meaning |
 |-------|---------|
 | `name` | Stable policy name (the cursor key). |
-| `position` | Last processed `global_position`. |
-| `head` | Current global head (`MAX(global_position)`). |
-| `lag` | Positions still to process (`head - position`). |
-| `next_position` | Lowest `global_position` past the cursor that exists; `None` when nothing is left. |
-| `missing_position` | `position + 1` when that position is absent but a later one exists; otherwise `None`. |
-| `last_checkpoint_at` | When the cursor last advanced (staleness signal). |
+| `lag` | Events written and not yet passed, summed over every stream this policy is behind on. Exact: it counts events, including the ones its filter will skip, and nothing else. |
+| `streams_behind` | How many streams that lag is spread across. One stream a million events behind and a million streams one event behind are the same `lag` and very different problems. |
+| `discovered_through` | How far this policy's search of the log has swept. Not progress — progress is per stream — but it is what you reset to make it search again. |
+| `last_checkpoint_at` | When the policy last advanced in any stream (staleness signal). |
 | `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
 | `condition` | At-a-glance health label (see below). |
 
-`head` is the raw `MAX(global_position)`. Because `global_position` is a
-`BIGSERIAL` assigned at INSERT but only made visible at COMMIT, a higher position
-can commit before a lower one, so the head can momentarily contain gaps. A position
-that is present, though, names exactly one event: a unique index enforces it, so a
-cursor stepping position by position cannot step over an event. When you
-need a **stable cut** of the log — the largest position `H` such that every
-position in `1..=H` is present, e.g. to freeze a version at publish time — use
-`PostgresEventStore::contiguous_high_water_mark()` instead of `head`; replaying
-events with `global_position <= H` then observes the same set of events on every
-later read.
+`lag` is a subtraction per stream, so a position burned by a failed write does not
+inflate it and another policy's traffic does not appear in it. It is computed by scanning
+one row per stream, which is affordable for a status endpoint scraped every few seconds and
+would not be on every poll — which is why the runner does not find its work this way
+([ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
 
-`condition` is derived with a strict precedence — **a hole outranks dead letters,
-dead letters outrank lag**:
+When you need a **stable cut** of the log — the largest position `H` such that every
+position in `1..=H` is present, e.g. to freeze a version at publish time — use
+`PostgresEventStore::contiguous_high_water_mark()`; replaying events with
+`global_position <= H` then observes the same set of events on every later read.
+
+`condition` is derived with a strict precedence — **dead letters outrank lag**:
 
 | Condition | When | Meaning |
 |-----------|------|---------|
-| `Blocked` | `missing_position` is set | The feed stops at a position that does not exist; zero throughput. |
 | `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
 | `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
 | `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
 
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
-`"Degraded"`, `"Blocked"`) for JSON/UI consumers.
-
-An append in flight is indistinguishable from a permanent hole *in a single reading*,
-so a `Blocked` reading may clear on the next poll — either because the append landed,
-or because the runner established that nothing can land there and crossed it (see
-below). Alert on it persisting.
+`"Degraded"`) for JSON/UI consumers. There is no `Blocked`: a policy reads each stream
+over a sequence with no holes in it, so there is no number it can be parked in front of.
+A policy that is not moving is lagging, `Degraded`, or not alive — and the third is
+`daemon.liveness()`, not this.
 
 Only policies that have actually run appear: a registered-but-never-started policy
 has no `policy_cursors` row and is therefore absent from `list()`. The store only
@@ -2911,60 +2922,40 @@ derived from the operational tables, and no table can see whether a worker task
 exists. A `CaughtUp` policy whose worker died looks exactly like one that is idle
 — `daemon.liveness()` is what tells them apart.
 
-### What a blocked policy writes to the log
+### Upgrading a running Policy to per-stream cursors
 
-`PolicyStatusStore` answers "is anything blocked?" only when asked. A policy that
-stops in front of a hole also says so in the log, because in
-[#164](https://github.com/funkode-io/replay/issues/164) a healthy idle policy and a
-permanently blocked one produced byte-identical output: nothing.
+Migration [0028](persistence/tests/migrations/0028_policy_stream_cursors.sql) carries every
+running policy over at exactly what it has processed: for each stream, the place it had
+reached by the position its cursor stopped at. Nothing is redelivered and nothing is
+skipped.
 
-| Level | When | Fields |
-|-------|------|--------|
-| `debug` | every poll whose feed stops at a hole | `policy`, `cursor`, `expected`, `found` |
-| `warn` | positions were crossed because no transaction can fill them | `policy`, `cursor`, `skipped_from`, `skipped_to`, `skipped`, `next_position` |
-| `warn` | the hole has persisted longer than the escalation threshold | `policy`, `cursor`, `head`, `missing_position`, `next_position`, `blocked_for_secs` |
+**Stop the policy daemons, migrate, then deploy.** This migration renames
+`policy_cursors.position` and drops `policy_cursors.commit_txid`, so a process running the
+old code against the new schema fails on every poll — loudly, which is the point: the old
+code reads a global order that no longer means what it did, and failing is better than
+delivering from it. Appends and command handling are untouched; only policy workers need
+to be down.
 
-```text
-DEBUG replay_persistence::policy_runner: policy feed stops at a gap in global_position
-      policy=price_fanout cursor=264785 expected=264786 found=264787
-WARN  replay_persistence::policy_runner: policy feed skipped global_position values
-      that can never appear: … policy=price_fanout cursor=264785
-      skipped_from=264786 skipped_to=264786 skipped=1 next_position=264787
-WARN  replay_persistence::policy_runner: policy is blocked: its feed stops at a
-      global_position that does not exist yet. A transaction still holds it …
-      policy=price_fanout cursor=264785 head=264956 missing_position=264786
-      next_position=264787 blocked_for_secs=259200
-```
+The backfill joins the whole log once per policy, so budget it like a scan of `events`.
+It is the reason the window includes the migration rather than just the deployment.
 
-| Setting | Env var | Default |
-|---------|---------|---------|
-| How long a hole must persist before the first `warn`, and the minimum spacing between repeats | `REPLAY_BLOCKED_WARN_AFTER_SECS` | `30` |
+### A write that is slow, stuck or rolled back
 
-Alert on the `warn`. Two clocks meet in it, and they answer different questions:
+None of the three stops a policy, and none of them needs an operator:
 
-- **When to warn** is decided by how long *this hole* has been in front of the cursor,
-  measured in the running process. Below the threshold a missing position is an append
-  still committing, which the feed is designed to wait for, so a policy idle for an
-  hour that then waits on a commit stays silent.
-- **`blocked_for_secs`** is measured from `policy_cursors.updated_at` — the last time
-  the cursor advanced — so it survives restarts and leadership changes and reports the
-  age of the outage, not the age of the process.
+| What happened | What the policy does |
+|---------------|----------------------|
+| A write failed after taking a `global_position` | Nothing. The number is burned — `nextval` is not transactional — and a policy that reads no global order never looks at it. The place the write took in its stream *is* handed back, because that counter is a row and rolls back with the transaction. |
+| A write is still running | Its stream waits for it, and only its stream. Every other stream is delivered meanwhile. |
+| A write commits below a policy's sweep | It is delivered by the next reconciliation, within `REPLAY_POLICY_RECONCILE_SECS`. |
+
+This is the structural fix for
+[#164](https://github.com/funkode-io/replay/issues/164), where a burned position
+wedged a policy until an operator moved it by hand, and for
+[#214](https://github.com/funkode-io/replay/issues/214), where one long write delayed
+every policy in the deployment. The machinery that used to tell one kind of hole from
+another — a `pg_locks` probe, a rate-gated `blocked` warning, a `Blocked` status — is
+gone, along with the `REPLAY_BLOCKED_WARN_AFTER_SECS` knob that paced it.
 
 A caught-up idle policy logs nothing at all.
 
-### Why a hole no longer stops a policy for good
-
-`nextval` is not transactional: a `global_position` taken by an append that then
-aborts is burned, and no event can ever carry it. The runner tells that apart from an
-append still committing exactly, with no timeout — only a transaction that has
-already taken the position can write it, and such a transaction holds a lock on the
-sequence until it ends. A hole whose holders have all ended, and which is still
-missing when re-read afterwards, is crossed: the runner logs the `warn` above and
-moves the cursor past the whole burned run in one step
-([ADR-0015](docs/adr/0015-policy-crosses-a-position-no-transaction-can-fill.md)).
-
-So the second `warn` — `policy is blocked` — now reports a wait that is still
-legitimate: a long-running append, or a cursor an operator parked in front of a
-position that does not exist yet. Moving a parked cursor by hand remains supported
-and is still the tool for those; it is no longer the only way out of a burned
-position.

@@ -225,7 +225,7 @@ async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forc
 
     // The cursor moves only after the delivery has parked everything it is going
     // to park, so a count read afterwards is the final one.
-    harness.await_cursor_at_least(mixed.global_position).await;
+    harness.await_passed(mixed.global_position).await;
 
     let parked = harness.dead_letters().await;
     assert_one_row_per_failing_command(&parked, mixed.global_position);
@@ -241,9 +241,7 @@ async fn a_permanent_failure_is_parked_once_however_many_attempts_a_sibling_forc
     // Order must not matter: the same pair the other way round parks the same
     // two rows.
     let reversed = harness.ping("subject-2", REVERSED).await;
-    harness
-        .await_cursor_at_least(reversed.global_position)
-        .await;
+    harness.await_passed(reversed.global_position).await;
     let parked = harness.dead_letters().await;
     assert_one_row_per_failing_command(&parked, reversed.global_position);
 
@@ -264,9 +262,7 @@ async fn a_panic_parks_the_failures_the_attempt_produced_before_it_postgres_test
         PolicyDaemonHarness::start("park_panic", parking_policy(Arc::clone(&reactions))).await;
 
     let exploded = harness.ping("subject-1", PANIC_AFTER_PERMANENT).await;
-    harness
-        .await_cursor_at_least(exploded.global_position)
-        .await;
+    harness.await_passed(exploded.global_position).await;
 
     let parked = harness.dead_letters().await;
     let rows = parked_for(&parked, exploded.global_position);
@@ -300,9 +296,7 @@ async fn a_reaction_that_panics_on_a_retry_parks_the_panic_alone_postgres_test()
             .await;
 
     let panicked = harness.ping("subject-1", PANIC_ON_RETRY).await;
-    harness
-        .await_cursor_at_least(panicked.global_position)
-        .await;
+    harness.await_passed(panicked.global_position).await;
 
     let parked = harness.dead_letters().await;
     let rows = parked_for(&parked, panicked.global_position);
@@ -339,9 +333,7 @@ async fn a_delivery_without_a_retryable_sibling_parks_one_row_per_failing_comman
     let single = harness.ping("subject-2", ONE_PERMANENT).await;
     let exhausted = harness.ping("subject-3", ONE_RETRYABLE).await;
 
-    harness
-        .await_cursor_at_least(exhausted.global_position)
-        .await;
+    harness.await_passed(exhausted.global_position).await;
     let parked = harness.dead_letters().await;
 
     let both_rows = parked_for(&parked, both.global_position);

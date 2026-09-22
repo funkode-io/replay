@@ -250,8 +250,8 @@ async fn the_beat_keeps_arriving_while_a_reaction_hangs_postgres_test() {
         "a wedged worker is leading, not stopped: nothing has given up on it"
     );
     assert_eq!(
-        harness.cursor().await,
-        Some(0),
+        harness.places().await,
+        Vec::new(),
         "and it really is wedged: the reaction never returned, so nothing was checkpointed"
     );
 
@@ -363,7 +363,7 @@ async fn a_schema_without_the_heartbeat_columns_changes_nothing_postgres_test() 
     let ping = harness.ping("subject-1", "hello").await;
     let dispatched = harness.await_dispatch_caused_by(ping.global_position).await;
     assert_eq!(dispatched.event_type, "Echoed");
-    harness.await_cursor_at_least(ping.global_position).await;
+    harness.await_passed(ping.global_position).await;
 
     let leading = harness
         .await_liveness(harness.policy_name(), Liveness::Leading)

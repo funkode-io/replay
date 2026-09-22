@@ -1,6 +1,6 @@
 # A Policy's feed decides contiguity on unfiltered positions
 
-**Status:** accepted
+**Status:** superseded by [ADR-0024](0024-a-policy-tracks-its-position-per-stream.md), which removes contiguity from the feed altogether: a Policy reads each stream over that stream's own sequence, which has no holes to be contiguous across. What survives is the half this ADR is named for — **the filter decides delivery only, never how far a Policy gets** — now applied to one stream's events rather than to a window of positions.
 
 A [Policy](0003-policies-as-checkpointed-background-subscribers.md)'s cursor may only
 advance across a contiguous prefix of `global_position`: a position that was not read

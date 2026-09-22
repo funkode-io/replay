@@ -146,11 +146,7 @@ async fn a_hung_dispatch_is_parked_as_a_timeout_and_the_policy_keeps_reacting_po
     let dispatched = harness.await_dispatch_caused_by(next.global_position).await;
     assert_eq!(dispatched.event_type, "Echoed");
 
-    let cursor = harness.await_cursor_at_least(hung.global_position).await;
-    assert!(
-        cursor >= hung.global_position,
-        "cursor {cursor} must have advanced past the event whose dispatch hung"
-    );
+    harness.await_passed(hung.global_position).await;
     assert_eq!(
         harness.dead_letters().await.len(),
         1,
@@ -213,7 +209,7 @@ async fn a_dispatch_that_finishes_inside_its_timeout_is_unaffected_postgres_test
         "a dispatch inside its timeout must not be retried"
     );
 
-    harness.await_cursor_at_least(slow.global_position).await;
+    harness.await_passed(slow.global_position).await;
     assert!(
         harness.dead_letters().await.is_empty(),
         "a dispatch that finished in time must park nothing"

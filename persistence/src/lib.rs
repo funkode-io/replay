@@ -1,6 +1,4 @@
 mod aggregate_version;
-mod burned_position;
-mod commit_stamp;
 mod cqrs;
 mod error;
 mod filters;
@@ -9,8 +7,7 @@ mod inline_projection;
 mod lock_wait;
 mod persisted_event;
 mod policy;
-mod policy_blocked;
-mod policy_feed;
+mod policy_frontier;
 mod policy_liveness;
 mod policy_narration;
 mod policy_runner;

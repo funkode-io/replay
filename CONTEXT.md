@@ -64,21 +64,28 @@ stream, and permanent — unlike a stream `version`, which compaction restarts a
 hydration reads `1..N`, making `(stream_id, version)` name two different events over time
 ([ADR-0023](docs/adr/0023-a-stream-is-numbered-twice.md)). Permanence is the library's to
 keep, as it is for [Global position], and unlike a [Cursor move]
-([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
-Nothing reads it yet (funkode-io/replay#195).
+([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)). It is
+what a [Policy feed] is read and checkpointed over
+([ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
 _Avoid_: stream sequence, stream version, offset, per-stream position.
 
 ### Policy feed
 
-The slice of the event log one [Policy] reads on a poll: every [Global position]
-past its cursor, up to its read batch size, **before** its `stream_filter` is
-applied. Contiguity is decided on those unfiltered positions; an excluded position
-advances the cursor and fires nothing, like a compaction snapshot
-([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
-`stream_filter` decides what a Policy *reacts to*, never how far it *gets*. The
-feed stops at a position it has not read, which may be an append still in flight —
-unless it is a [Burned position], which it crosses. Stepping one position at a time
-is only safe because a position is held by exactly one event.
+What one [Policy] reads on a poll: for each stream it is behind on, that stream's events
+past its [Stream place] in that stream, in the stream's own order, up to its read batch
+size. Nothing orders one stream against another, and nothing waits — a stream's places
+arrive in order, so the feed has no holes to reason about
+([ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
+
+Which streams to read is found two ways: a sweep of the log by [Global position] every
+poll, which is fast and may pass a write that had not committed yet, and a reconciliation
+on a cadence, which compares every stream's head with the Policy's place and catches what
+the sweep passed. The sweep nominates streams; it never decides what is owed.
+
+A `stream_filter` decides what a Policy *reacts to*, never how far it *gets*: an excluded
+event advances the place and fires nothing, like a compaction snapshot
+([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md),
+[ADR-0004](docs/adr/0004-compaction-synthetic-event-marker-for-policy-feed.md)).
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation
@@ -153,17 +160,15 @@ _Avoid_: dismiss, drop, ignore.
 
 ### Cursor move
 
-The _controlling_ act of an operator repositioning a [Policy]'s stored cursor —
-the `policy_cursors` row that records how far it has processed — by writing the
-row directly while the system runs. The third controlling action alongside
-[Retry] and [Discard], and the coarsest: it moves the Policy itself rather than
-one parked reaction, skipping events when it moves forward and re-delivering
-them when it moves backward. The instruction is a position, as it has always
-been: the row also records the [Commit stamp] the Policy stopped in, and the
-runner derives that half from the position an operator writes. The running
-leader adopts the new position when its feed is empty, and never writes a
-position that predates the move
-([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
+The _controlling_ act of an operator repositioning a [Policy] by writing its
+`policy_stream_cursors` row directly while the system runs. The third controlling action
+alongside [Retry] and [Discard], and the coarsest: it moves the Policy itself rather than
+one parked reaction, skipping events when it moves forward and re-delivering them when it
+moves backward. The instruction is a [Stream place] in one stream, so a redelivery can be
+forced for that stream alone. The running leader adopts it on the next poll, because it
+reads its places fresh every poll rather than holding them between polls
+([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md),
+[ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)).
 _Avoid_: reset, seek, rewind (as a name for the act; a rewind is one direction of
 it).
 
@@ -177,22 +182,21 @@ state (an [Aggregate]'s rebuilt-from-stream state) and **not** a [Projection]
 _Observing_ a Policy's status (read-only) is a separate concern from
 _controlling_ a Policy (acting on its failures by [Retry] or [Discard] of a
 [Dead letter]). It reports the [Progress] axis only and says nothing about
-[Liveness]. It also tells a healthy idle Policy from a [Blocked policy].
+[Liveness]. Its `lag` is an exact count of events not yet passed, summed over the streams
+the Policy is behind on, and `streams_behind` says how widely that is spread — one stream
+a million events behind and a million streams one event behind are the same lag and very
+different problems.
 _Avoid_: state, policy state, health check.
 
 ### Blocked policy
 
-A [Policy] whose cursor sits in front of a `global_position` that does not exist
-while a later one does, so its feed yields nothing and it reacts to nothing.
-Distinct from _lagging_ (a backlog that is draining) and from `Degraded`
-(reactions parked while the Policy still advances): blocked means zero
-throughput. Whether it clears is not observable from one reading
-([ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md)). A
-blocked Policy is also visible without being asked: the runner traces the stop at
-`debug` and escalates to `warn` once the cursor has been parked longer than an
-in-flight append could explain. Since the runner crosses a [Burned position] on
-its own, a Policy that stays blocked is one waiting on an append that really is in
-flight.
+Retired. A Policy used to be able to sit in front of a `global_position` that did not
+exist and read nothing for ever (funkode-io/replay#164). It reads each stream over that
+stream's own sequence now, which has no holes, so there is no number it can be parked in
+front of and no `Blocked` condition to report
+([ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)). A Policy that is
+not moving is lagging, [Degraded](#policy-status), or not alive — three conditions with
+three different readings.
 _Avoid_: stuck, wedged, hung, stalled.
 
 ### Dispatch timeout
@@ -202,9 +206,9 @@ abandons it — per Policy, defaulting to 30s
 ([ADR-0018](docs/adr/0018-a-hung-dispatch-is-cut-loose-by-a-timeout.md)). It cuts
 loose a reaction that has *stopped*; a merely slow one raises the limit rather
 than being parked by it. Exceeding it is retryable, so a hang reaches the same
-[Dead letter] a dependency outage does. Distinct from a [Blocked policy] in both
-directions: a Policy held inside one reaction has a healthy feed in front of it,
-and a blocked one is not running a reaction at all.
+[Dead letter] a dependency outage does. A Policy held inside one reaction has a healthy
+feed in front of it and is not lagging for any reason the feed can see, which is why
+[Liveness] and not [Policy status] is what reports it.
 _Avoid_: deadline, SLA, watchdog, timeout (unqualified).
 
 ### Stream lock wait
@@ -222,12 +226,11 @@ _Avoid_: lock timeout (unqualified), statement timeout, deadlock detection.
 
 ### Burned position
 A `global_position` taken from the sequence by a transaction that then aborted.
-`nextval` is not transactional, so the value is never returned to the sequence and
-no event can ever carry it: the hole it leaves in the [Policy feed] is permanent,
-unlike the one an append still in flight leaves. The two are told apart exactly,
-by whether any running transaction still holds the position, and a Policy crosses
-a burned one by itself, naming it in a `warn`
-([ADR-0015](docs/adr/0015-policy-crosses-a-position-no-transaction-can-fill.md)).
+`nextval` is not transactional, so the value is never returned to the sequence and no
+event can ever carry it. It is a number nothing will ever hold, and since
+[ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md) nothing reads it as
+anything else: a [Policy feed] is ordered per stream, and a stream's places are handed
+back by a write that fails rather than burned. A [Stream place] has no equivalent.
 _Avoid_: gap, hole (as a name for the permanent kind), lost position, skipped
 position.
 
@@ -239,10 +242,11 @@ and written by every insert path
 ordering the [Policy feed] can trust without reasoning about holes: a transaction id
 can be compared against a snapshot of transactions that have ended, whereas a
 `global_position` can be a [Burned position]. Events that predate the stamp carry the
-sentinel `0`, which orders before every real id. A [Policy]'s cursor records the stamp
-it stopped in alongside the position
-([0022](persistence/tests/migrations/0022_policy_cursor_commit_txid.sql)); the feed
-itself still reads by position (funkode-io/replay#171).
+sentinel `0`, which orders before every real id. Nothing in the library reads it: the
+ordering it was carried for was the [Policy feed]'s, and that feed is ordered per stream
+now ([ADR-0024](docs/adr/0024-a-policy-tracks-its-position-per-stream.md)). It stays on
+the event as an operator's diagnostic — which write wrote this row, and what else that
+write wrote.
 _Avoid_: commit id, transaction number, xmin, sequence.
 
 ### Policy runner
@@ -324,10 +328,10 @@ _Avoid_: ping, keepalive, health check, liveness probe.
 
 The axis reporting how far a [Policy] has advanced through its feed and whether
 its reactions are completing — the axis [Policy status] observes, on which
-[Blocked policy] is a verdict and [Caught up] a transition. Derived from the operational
+[Caught up] is a transition. Derived from the operational
 tables alone, so any replica can read it, including one whose worker is a
 [Standby]. Independent of [Liveness] in both directions: a [Standby] is live and
-advances nothing, and the [Leader] of a [Blocked policy] is live and advances
+advances nothing, and a [Leader] whose reaction is wedged is live and advances
 nothing either.
 _Avoid_: advancement, catch-up rate, freshness.
 
