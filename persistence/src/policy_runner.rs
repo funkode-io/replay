@@ -5372,10 +5372,29 @@ mod cursor_tests {
             .await
             .expect("failed to create the postgres pool");
 
-        sqlx::migrate!("./tests/migrations")
-            .run(&pool)
-            .await
-            .expect("migrations must succeed");
+        // A migration that fails here says which database it was talking to and
+        // what that database already had: eight of these run at once, each with
+        // its own container, and "migrations must succeed" alone cannot tell a
+        // broken migration from two of them meeting on one server.
+        if let Err(error) = sqlx::migrate!("./tests/migrations").run(&pool).await {
+            let applied: Vec<i64> =
+                sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version ASC")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_default();
+            let database: String = sqlx::query_scalar("SELECT current_database()")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|_| "?".to_string());
+            let embedded: Vec<i64> = sqlx::migrate!("./tests/migrations")
+                .iter()
+                .map(|migration| migration.version)
+                .collect();
+            panic!(
+                "migrations must succeed: {error}\n  port: {port}\n  database: {database}\n  \
+                 applied: {applied:?}\n  embedded: {embedded:?}"
+            );
+        }
 
         (pool, container)
     }
