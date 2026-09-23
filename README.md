@@ -2109,7 +2109,10 @@ to it, so a read path's `event.data` is unchanged.
 
 A rule is therefore not given the triggering event's id, and cannot mint a causation key
 into the command it emits: duplicate deliveries are absorbed by **idempotent command
-shape**, keyed on domain data the rule can see.
+shape**, keyed on an identifier the triggering event carries — a payment reference, an
+order number, whatever names the operation upstream. Nothing in the envelope stands in
+for it: `created` comes from Postgres's transaction-stable `now()`, so every event of one
+append shares it.
 
 `react` is pure — it returns [`Dispatch`]es with no I/O. The runner automatically
 stamps causation metadata onto every dispatched command before executing it:
@@ -2238,8 +2241,8 @@ bootstrapped according to the registration's `starting_at`:
 Places are written to Postgres **at least every `checkpoint_batch_size` events** and
 unconditionally at the end of every drain pass. A crash after a command is executed but
 before the place is saved will re-deliver the triggering event. Correctness therefore
-depends on **idempotent command handling** in the target aggregate, keyed on domain data
-the reacting rule can see.
+depends on **idempotent command handling** in the target aggregate, keyed on an
+identifier the triggering event carries (see [Policies](#policies)).
 
 ### Moving a policy on a running system
 

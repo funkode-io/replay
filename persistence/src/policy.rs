@@ -30,7 +30,7 @@ pub enum StartAt {
 ///
 /// Supplied at registration rather than declared on the trait, so a closure policy can
 /// set the same knobs a `Policy` impl can. `None` leaves a tunable to the environment
-/// variable and built-in default named on each setter, resolved per drain.
+/// variable and built-in default named on each setter.
 #[derive(Debug, Clone, Default)]
 pub struct PolicySettings {
     stream_filter: StreamFilter,

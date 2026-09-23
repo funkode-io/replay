@@ -288,15 +288,21 @@ impl replay::Aggregate for IdempotentFeeAccount {
     }
 }
 
-/// The key a fee charge is deduplicated by: the deposit it is charging for, named from
-/// what a rule observes. A re-delivery of the same event yields the same key, which is
-/// what makes the command absorb it (at-least-once delivery, ADR-0003).
-fn charge_key(event: &ObservedEvent<BankAccountEvent>, amount: f64) -> String {
-    format!(
-        "{}@{}#{amount}",
-        event.stream_id,
-        event.created.to_rfc3339()
-    )
+/// The key a fee charge is deduplicated by in these fixtures: the deposit it is charging
+/// for, named from what a rule observes. A re-delivery of the same event yields the same
+/// key, which is what makes the command absorb it (at-least-once delivery, ADR-0003).
+///
+/// `(stream, date, amount)` is a key *here* only because no test appends two identical
+/// deposits to one account. It is not the recipe to copy: `created` is shared by every
+/// event of one append and a rule is not given the event's id, so a production key has to
+/// come from an identifier the event carries — as `deposit_fee_react` in
+/// `examples/global_position.rs` shows.
+fn fixture_charge_key(
+    event: &ObservedEvent<BankAccountEvent>,
+    operation_date: chrono::NaiveDate,
+    amount: f64,
+) -> String {
+    format!("{}@{operation_date}#{amount}", event.stream_id)
 }
 
 struct BankAccountStatement {
@@ -2242,9 +2248,21 @@ async fn global_position_live_query_and_inline_projection_agree_postgres_test() 
     }
 
     for (account, command) in [
-        (&checking, BankAccountCommand::Deposit { amount: 1_000.0 }),
+        (
+            &checking,
+            BankAccountCommand::Deposit {
+                amount: 1_000.0,
+                reference: "salary-2025-01".to_string(),
+            },
+        ),
         (&checking, BankAccountCommand::Withdraw { amount: 250.0 }),
-        (&savings, BankAccountCommand::Deposit { amount: 500.0 }),
+        (
+            &savings,
+            BankAccountCommand::Deposit {
+                amount: 500.0,
+                reference: "transfer-2025-01".to_string(),
+            },
+        ),
     ] {
         cqrs.execute::<BankAccount>(account, replay::Metadata::default(), command, &(), None)
             .await
@@ -2290,12 +2308,12 @@ struct WithdrawFeePolicyStartAtBeginning {
     fee: f64,
 }
 
-struct ChargeFeeWithCausationPolicy {
+struct ChargeFeeIdempotentlyPolicy {
     target: IdempotentFeeAccountUrn,
     fee: f64,
 }
 
-/// Same reaction as [`ChargeFeeWithCausationPolicy`], from the beginning of the log
+/// Same reaction as [`ChargeFeeIdempotentlyPolicy`], from the beginning of the log
 /// through a filter narrower than `all()` — the shape that used to wedge a policy on
 /// its first poll (funkode-io/replay#166).
 struct WatchedAccountFeePolicy {
@@ -2387,21 +2405,24 @@ impl replay_persistence::Policy for WithdrawFeePolicyStartAtBeginning {
     }
 }
 
-impl replay_persistence::Policy for ChargeFeeWithCausationPolicy {
+impl replay_persistence::Policy for ChargeFeeIdempotentlyPolicy {
     type Event = BankAccountEvent;
 
     fn name(&self) -> &str {
-        "charge_fee_with_causation_policy"
+        "charge_fee_idempotently_policy"
     }
 
     fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
-            BankAccountEvent::Deposited { amount, .. } => {
+            BankAccountEvent::Deposited {
+                operation_date,
+                amount,
+            } => {
                 vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
                     self.target.clone(),
                     IdempotentFeeAccountCommand::ChargeFee {
                         amount: self.fee,
-                        charge_key: charge_key(event, *amount),
+                        charge_key: fixture_charge_key(event, *operation_date, *amount),
                     },
                 )]
             }
@@ -2470,12 +2491,15 @@ impl replay_persistence::Policy for WatchedAccountFeePolicy {
         );
 
         match &event.data {
-            BankAccountEvent::Deposited { amount, .. } => {
+            BankAccountEvent::Deposited {
+                operation_date,
+                amount,
+            } => {
                 vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
                     self.target.clone(),
                     IdempotentFeeAccountCommand::ChargeFee {
                         amount: self.fee,
-                        charge_key: charge_key(event, *amount),
+                        charge_key: fixture_charge_key(event, *operation_date, *amount),
                     },
                 )]
             }
@@ -3053,7 +3077,7 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
 }
 
 #[tokio::test]
-async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test() {
+async fn policy_duplicate_delivery_is_absorbed_by_the_charge_key_postgres_test() {
     let container = postgres_container().start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -3087,7 +3111,7 @@ async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test(
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<IdempotentFeeAccount>(())
         .register_policy(
-            ChargeFeeWithCausationPolicy {
+            ChargeFeeIdempotentlyPolicy {
                 target: target.clone(),
                 fee: 5.0,
             },
@@ -3151,10 +3175,10 @@ async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test(
     );
 
     // Simulate redelivery by moving the policy back before the source event.
-    common::places::rewind_to_before(&pg_pool, "charge_fee_with_causation_policy", 2).await;
+    common::places::rewind_to_before(&pg_pool, "charge_fee_idempotently_policy", 2).await;
 
-    // Second delivery issues the same causation id, and the aggregate absorbs
-    // it as a no-op.
+    // Second delivery issues the same charge key, and the aggregate absorbs it as a
+    // no-op.
     assert_eq!(runner.drain().await.unwrap(), 1);
 
     let after_second = cqrs
@@ -3173,7 +3197,7 @@ async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test(
     assert_eq!(fee_event_count, 1);
 }
 
-/// Duplicate delivery proof using the example causation-guard recipe directly.
+/// Duplicate delivery proof using the example's idempotent-command recipe directly.
 ///
 /// Uses the exact `PolicyFeeLedger` aggregate and `deposit_fee_react` function
 /// exported from `global_position.rs` — the copy-pasteable recipe documented for
@@ -3234,7 +3258,10 @@ async fn policy_duplicate_delivery_example_recipe_postgres_test() {
     cqrs.execute::<BankAccount>(
         &source,
         replay::Metadata::default(),
-        BankAccountCommand::Deposit { amount: 1_000.0 },
+        BankAccountCommand::Deposit {
+            amount: 1_000.0,
+            reference: "dup-example-deposit".to_string(),
+        },
         &(),
         None,
     )
@@ -3267,7 +3294,7 @@ async fn policy_duplicate_delivery_example_recipe_postgres_test() {
 
     common::places::rewind_to_before(&pg_pool, DEPOSIT_FEE_POLICY_NAME, deposit_gp).await;
 
-    // Second delivery: causation guard in PolicyFeeLedger absorbs the duplicate.
+    // Second delivery: the charge key in PolicyFeeLedger absorbs the duplicate.
     let n: usize = runner.drain().await.unwrap();
     assert_eq!(n, 1);
     let after_second = cqrs
@@ -3276,7 +3303,7 @@ async fn policy_duplicate_delivery_example_recipe_postgres_test() {
         .unwrap();
     assert_eq!(
         after_second.balance, expected_balance,
-        "causation guard must prevent double-charging on redelivery"
+        "the charge key must prevent double-charging on redelivery"
     );
 
     // Exactly one FeeCharged event — no duplicate was persisted.
@@ -4179,9 +4206,9 @@ impl replay::Aggregate for AlwaysFailsAccount {
     }
 }
 
-/// Reacts to each deposit by charging a causation-guarded fee against a fixed
-/// `IdempotentFeeAccount`.  Re-running the reaction is safe: the aggregate
-/// absorbs a duplicate causation id as a no-op.
+/// Reacts to each deposit by charging a keyed fee against a fixed
+/// `IdempotentFeeAccount`.  Re-running the reaction is safe: the aggregate absorbs a
+/// charge it has already applied under the same key as a no-op.
 struct RetryFeePolicy {
     target: IdempotentFeeAccountUrn,
     fee: f64,
@@ -4196,12 +4223,15 @@ impl replay_persistence::Policy for RetryFeePolicy {
 
     fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
-            BankAccountEvent::Deposited { amount, .. } => {
+            BankAccountEvent::Deposited {
+                operation_date,
+                amount,
+            } => {
                 vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
                     self.target.clone(),
                     IdempotentFeeAccountCommand::ChargeFee {
                         amount: self.fee,
-                        charge_key: charge_key(event, *amount),
+                        charge_key: fixture_charge_key(event, *operation_date, *amount),
                     },
                 )]
             }
@@ -5545,6 +5575,7 @@ async fn global_position_closure_policy_charges_deposit_fee_postgres_test() {
         replay::Metadata::default(),
         BankAccountCommand::Deposit {
             amount: deposit_amount,
+            reference: "closure-recipe-deposit".to_string(),
         },
         &(),
         None,
@@ -5579,7 +5610,7 @@ async fn global_position_closure_policy_charges_deposit_fee_postgres_test() {
         ledger.balance
     );
 
-    // Second drain: idempotent — the causation guard absorbs the duplicate.
+    // Second drain: idempotent — the charge key absorbs the duplicate.
     let dispatched_again = runner.drain().await.expect("second drain must succeed");
     assert_eq!(
         dispatched_again, 0,

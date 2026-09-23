@@ -48,7 +48,9 @@ construction breaks — `PersistedEvent::of` and its withers are the replacement
 
 **Dropping `id` from a rule's view is deliberate.** A policy cannot mint a causation key
 into a command it emits, so at-least-once delivery is absorbed by **idempotent command
-shape** keyed on domain data, never by identity dedup. The identity route is closed at
+shape** keyed on an identifier the triggering event carries, never by identity dedup.
+Nothing else in the envelope is a substitute — `created` is Postgres's transaction-stable
+`now()`, shared by every event of one append. The identity route is closed at
 both ends anyway: neither `Aggregate::handle` nor `EventStream::apply` receives metadata,
 and infrastructure-side dedup on correlation ids is not a guarantee this library offers —
 only the application knows whether something genuinely happened twice. This follows the
@@ -81,8 +83,12 @@ path to `Cqrs` or any store.
 
 Every existing policy needs four mechanical edits: the envelope type in the `react`
 signature, `PersistedEvent` → `ObservedEvent`, the tunables moved out of the impl, and
-the registration call taking settings. A policy that read `event.id` needs an idempotency
-key of its own making.
+the registration call taking settings.
+
+A policy that read `event.id` needs its trigger to carry an operation identifier, and an
+event that carries none has to gain one — a real schema change, pushed onto the domain by
+this decision. That is the cost of the trade: the envelope cannot be narrowed to what a
+rule should read and also keep serving as a dedup key.
 
 The runner gained a seam it did not have: `PolicySettings` is data, so nothing of the
 consumer's runs while a worker prepares its drain. The supervision tests that used
