@@ -2553,32 +2553,25 @@ fn withdraw_fee_policy_react_is_pure() {
     let policy = WithdrawFeePolicy { fee: 5.0 };
     let stream_id: Urn = BankAccountUrn::new("pure-react-1").unwrap().into();
 
-    let deposit = PersistedEvent {
-        id: uuid::Uuid::new_v4(),
-        data: BankAccountEvent::Deposited {
+    let deposit = PersistedEvent::of(
+        stream_id.clone(),
+        BankAccountEvent::Deposited {
             operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             amount: 100.0,
         },
-        stream_id: stream_id.clone(),
-        r#type: "Deposited".to_string(),
-        version: 1,
-        created: chrono::Utc::now(),
-        metadata: replay::Metadata::default(),
-        aggregate_version: None,
-    };
+    );
 
     let dispatches = replay_persistence::Policy::react(&policy, &deposit);
     assert_eq!(dispatches.len(), 1);
     assert_eq!(dispatches[0].target(), TypeId::of::<BankAccount>());
 
-    let withdrawal = PersistedEvent {
-        data: BankAccountEvent::Withdrawn {
+    let withdrawal = PersistedEvent::of(
+        stream_id,
+        BankAccountEvent::Withdrawn {
             operation_date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
             amount: 5.0,
         },
-        r#type: "Withdrawn".to_string(),
-        ..deposit
-    };
+    );
 
     assert!(replay_persistence::Policy::react(&policy, &withdrawal).is_empty());
 }
