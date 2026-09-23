@@ -85,11 +85,11 @@ batch and resume where the last one stopped, so "bounded" costs a rotation rathe
 stream nobody looks at.
 
 Which streams a poll reads, in what order, how far its event budget gets and where that
-leaves the rotation is **one decision, taken before any I/O** (`PollPlan`): the poll asks
-it what to read next and tells it what each read yielded. It spans three sources, a
-candidate cap, a rotation cursor, a shared budget and a carried queue that truncates, so
-it is decided over its states by simulation rather than corner by corner
-(funkode-io/replay#243).
+leaves the rotation is **one decision, taken over what the two nomination queries
+returned and before a single event is read** (`PollPlan`): the poll asks it what to read
+next and tells it what each read yielded. It spans three sources, a candidate cap, a
+rotation cursor, a shared budget and a carried queue that truncates, so it is decided
+over its states by simulation rather than corner by corner (funkode-io/replay#243).
 
 A `stream_filter` decides what a Policy *reacts to*, never how far it *gets*: an excluded
 event advances the place and fires nothing, like a compaction snapshot

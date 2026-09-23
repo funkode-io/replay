@@ -94,8 +94,13 @@ pub(crate) struct PollPlan {
     carried_over: Vec<String>,
     /// What is left of the poll's event budget.
     budget: u32,
-    /// How far down `streams` the budget reached. A stream past this was named by a source
-    /// and never read, which is the difference the rotation turns on: a slot is not a read.
+    /// How far down `streams` the poll has been handed a stream to read. Ahead of
+    /// `visited` for exactly as long as that read is in flight.
+    at: usize,
+    /// How far down `streams` the budget reached and the read came back. A stream past
+    /// this was named by a source and never read — because the budget stopped short of it
+    /// or because its read failed — which is the difference the rotation turns on: a slot
+    /// is not a read.
     visited: usize,
     /// Streams this poll read a full budget's worth from, so they may have more. One
     /// entry per stream read, so the batch bounds it.
@@ -165,6 +170,7 @@ impl PollPlan {
             read_batch,
             carried_over,
             budget: read_batch,
+            at: 0,
             visited: 0,
             unfinished: Vec::new(),
             settled: false,
@@ -179,14 +185,15 @@ impl PollPlan {
 
     /// The next stream to read, or `None` when the list is done or the budget is spent.
     ///
-    /// Handing a stream out is what counts as reaching it: a stream the budget stopped
-    /// short of was never looked at, and the rotation must not pass it.
+    /// Handing a stream out is not reaching it: the read can fail, and the poll settles
+    /// even when it does. What counts as reached is what [`Self::read`] reports back, so
+    /// a stream whose read never returned is carried and the rotation stops short of it.
     pub(crate) fn turn(&mut self) -> Option<Turn> {
         if self.budget == 0 {
             return None;
         }
-        let stream_id = self.streams.get(self.visited)?.clone();
-        self.visited += 1;
+        let stream_id = self.streams.get(self.at)?.clone();
+        self.at += 1;
 
         Some(Turn {
             stream_id,
@@ -199,8 +206,9 @@ impl PollPlan {
     /// A full read means the stream may have more; it is looked at again next poll rather
     /// than drained here, so one busy stream cannot hold up every other.
     pub(crate) fn read(&mut self, events: u32) {
+        self.visited = self.at;
         if events == self.budget {
-            self.unfinished.push(self.streams[self.visited - 1].clone());
+            self.unfinished.push(self.streams[self.at - 1].clone());
         }
         self.budget -= events;
     }
@@ -261,8 +269,12 @@ impl PollPlan {
 /// which is the check the pure function cannot make for itself.
 impl Drop for PollPlan {
     fn drop(&mut self) {
+        // Not while another panic is unwinding through the poll: a second one from a
+        // `Drop` aborts the process, which would take the worker supervisor's restart
+        // ([`crate::policy_runner::supervise`]) with it — the containment this assertion
+        // is nowhere near important enough to break.
         debug_assert!(
-            self.settled,
+            self.settled || std::thread::panicking(),
             "a poll's plan must be settled before it is dropped: {} candidates, {} read",
             self.streams.len(),
             self.visited
@@ -510,6 +522,40 @@ mod settling_tests {
     #[should_panic(expected = "must be settled")]
     fn a_plan_dropped_without_settling_says_so() {
         drop(plan());
+    }
+
+    /// The stream a failed read was handed out for is one nobody read.
+    ///
+    /// Settling a poll that failed is what makes this a case at all: the read is in
+    /// flight between [`PollPlan::turn`] and [`PollPlan::read`], and counting the stream
+    /// as reached at the near end of that window would drop it from the carried queue and
+    /// let the rotation past it — a stream the sweep will never nominate again, examined
+    /// by nobody, which is the hole ADR-0026's rotation exists to close.
+    #[test]
+    fn a_read_that_never_came_back_is_carried_and_not_rotated_past() {
+        let mut plan = PollPlan::plan(Nominations {
+            carried: Vec::new(),
+            swept: Vec::new(),
+            examined: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            reconciling: true,
+            read_batch: 4,
+            share_from: 0,
+        });
+
+        let turn = plan.turn().expect("the page's first stream leads the poll");
+        assert_eq!(turn.stream_id, "urn:probe:a");
+        // No `read`: this is the poll whose `read_stream` returned an error.
+        let settled = plan.settle();
+
+        assert_eq!(
+            settled.carried,
+            vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            "both are still owed to the next poll"
+        );
+        assert_eq!(
+            settled.rotation, None,
+            "and the rotation stays where it was, because nothing was read"
+        );
     }
 }
 

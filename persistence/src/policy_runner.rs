@@ -3042,7 +3042,6 @@ async fn drain_policy_once(
 
     // Three sources: what the last poll could not finish, what the sweep just found, and
     // — on its own cadence — what the sweep has missed.
-    let carried = std::mem::take(&mut progress.unfinished);
     let discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
     let reconciling = progress.reconcile_is_due();
     let examined = if reconciling {
@@ -3055,8 +3054,12 @@ async fn drain_policy_once(
     // what order, how far its budget gets, where that leaves the rotation, and what the
     // next poll starts from. What is left here is the I/O those decisions are about
     // (funkode-io/replay#243).
+    //
+    // The carried queue is taken only now, once both queries have come back: taking it
+    // above would hand it to a `?` on either of them, and nothing would have it when the
+    // next poll asks.
     let mut plan = PollPlan::plan(Nominations {
-        carried,
+        carried: std::mem::take(&mut progress.unfinished),
         swept: discovered.streams,
         examined,
         reconciling,
