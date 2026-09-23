@@ -162,17 +162,34 @@ async fn a_streams_events_are_delivered_in_its_own_order_postgres_test() {
     })
     .await;
 
-    // Joined, not collected and awaited one at a time: each round appends to all four
-    // streams at once, so the positions they take in the log are interleaved in an order
-    // nobody chose. One append in flight per stream, because two concurrent *first*
-    // appends to one stream race on creating its `streams` row (funkode-io/replay#232) —
-    // a defect in the write path, and not what this test is about.
-    for event in 0..EVENTS {
-        let round: Vec<(String, String)> = (0..STREAMS)
-            .map(|stream| (format!("ordered-{stream}"), format!("{stream}-{event}")))
-            .collect();
-        futures::future::join_all(round.iter().map(|(stream, tag)| harness.ping(stream, tag)))
-            .await;
+    // Joined, not collected and awaited one at a time: every append is in flight at once,
+    // so the positions they take in the log are interleaved in an order nobody chose and
+    // several appends contend for each stream's row. Event-major, so that what a stream
+    // contends with first is the other streams.
+    let tags: Vec<(String, String)> = (0..EVENTS)
+        .flat_map(|event| {
+            (0..STREAMS)
+                .map(move |stream| (format!("ordered-{stream}"), format!("{stream}-{event}")))
+        })
+        .collect();
+    let appended =
+        futures::future::join_all(tags.iter().map(|(stream, tag)| harness.ping(stream, tag))).await;
+
+    // What order the race actually produced, per stream. Not the order the tags are
+    // numbered in: appends contending for one stream's row are granted it in an order
+    // nobody chose, and what the Policy owes is that order, not the test's.
+    let mut written: Vec<(String, Vec<(i64, String)>)> = Vec::new();
+    for ((_, tag), event) in tags.iter().zip(&appended) {
+        match written.iter_mut().find(|(id, _)| id == &event.stream_id) {
+            Some((_, events)) => events.push((event.global_position, tag.clone())),
+            None => written.push((
+                event.stream_id.clone(),
+                vec![(event.global_position, tag.clone())],
+            )),
+        }
+    }
+    for (_, events) in &mut written {
+        events.sort_by_key(|(position, _)| *position);
     }
 
     // The Policy also walks the streams its own echoes land in; what this test is about
@@ -217,12 +234,15 @@ async fn a_streams_events_are_delivered_in_its_own_order_postgres_test() {
     );
 
     for (stream, tags) in delivered {
-        let expected: Vec<String> = (0..EVENTS)
-            .map(|event| format!("{stream}-{event}"))
-            .collect();
+        let (_, events) = written
+            .iter()
+            .find(|(id, _)| id == &format!("urn:probe:ordered-{stream}"))
+            .expect("every delivered stream was written by this test");
+        let expected: Vec<String> = events.iter().map(|(_, tag)| tag.clone()).collect();
+
         assert_eq!(
             tags, expected,
-            "stream {stream} must be delivered in its own order, once each"
+            "stream {stream} must be delivered in the order it was written, once each"
         );
     }
 

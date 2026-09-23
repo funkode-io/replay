@@ -46,7 +46,7 @@ const REVIEWED: &[Reviewed] = &[
                         of streams behind, which is why a Policy far behind catches up \
                         over several cadences instead of in one allocation; the batch \
                         resumes after the last id it examined, so the bound costs a \
-                        rotation rather than leaving a stream unexamined (ADR-0025).",
+                        rotation rather than leaving a stream unexamined (ADR-0026).",
     },
     Reviewed {
         file: "src/policy_runner.rs",

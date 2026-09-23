@@ -40,7 +40,7 @@ use sqlx::{Pool, Postgres};
 ///
 /// There is no `Blocked`: a Policy reads each stream over a sequence that has no holes,
 /// so there is no position it can be parked in front of
-/// ([ADR-0025](../../docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+/// ([ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyCondition {
     /// No dead letters and no lag: fully healthy and up to date.
@@ -153,7 +153,7 @@ impl PolicyStatusStore {
     ///
     /// The event log is never scanned, but the frontier lateral reads one row per stream
     /// per policy, because no index can answer a comparison between two tables' columns
-    /// (ADR-0025). That is affordable for a status endpoint scraped every few seconds and
+    /// (ADR-0026). That is affordable for a status endpoint scraped every few seconds and
     /// would not be on every poll, which is why the runner does not use it that way.
     pub async fn list(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
         let rows = sqlx::query(

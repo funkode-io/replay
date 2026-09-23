@@ -2182,7 +2182,7 @@ A policy's position is **one row per stream** in `policy_stream_cursors`, holdin
 place it has reached in that stream. Nothing orders one stream against another: a policy
 reads each stream in that stream's own order, and a write that is slow, stuck or rolled
 back delays the stream it is writing to and no other
-([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
 Which streams to look at is found two ways. Every poll sweeps the log past
 `policy_cursors.discovered_through` for streams with new events — indexed, and bounded by
@@ -2990,7 +2990,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 inflate it and another policy's traffic does not appear in it. It is computed by scanning
 one row per stream, which is affordable for a status endpoint scraped every few seconds and
 would not be on every poll — which is why the runner does not find its work this way
-([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
 When you need a **stable cut** of the log — the largest position `H` such that every
 position in `1..=H` is present, e.g. to freeze a version at publish time — use
@@ -3030,7 +3030,7 @@ exists. A `CaughtUp` policy whose worker died looks exactly like one that is idl
 
 ### Upgrading a running Policy to per-stream cursors
 
-Migration [0033](persistence/tests/migrations/0033_policy_stream_cursors.sql) carries every
+Migration [0034](persistence/tests/migrations/0034_policy_stream_cursors.sql) carries every
 running policy over at exactly what it has processed: for each stream, the place it had
 reached by the position its cursor stopped at. Nothing is redelivered and nothing is
 skipped.

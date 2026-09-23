@@ -4168,7 +4168,7 @@ async fn sweep_for_streams(
 /// committed below a position the sweep had already passed. No index answers a comparison
 /// between two tables' columns, so it scans one row per stream and is bounded by `limit`
 /// rather than by an index — which is why it runs on a cadence and the sweep runs on every
-/// poll (ADR-0025).
+/// poll (ADR-0026).
 ///
 /// It resumes after the last id it examined instead of restarting at the lowest, because
 /// `limit` is a batch and not a snapshot: a Policy with `limit` permanently-behind streams
@@ -4404,7 +4404,7 @@ async fn execute_dispatch(
 /// The per-stream places are the progress. The sweep position is a hint that says where
 /// to look next — never what has been delivered — so losing it, resetting it or running
 /// past an uncommitted write costs a search, not an event
-/// ([ADR-0025](../../docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+/// ([ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 ///
 /// The places are not held in memory between polls. Each poll loads the places of the
 /// streams it is about to read, which bounds what this struct holds by the poll's own
@@ -6479,14 +6479,14 @@ mod progress_tests {
 /// What a settlement can see while it settles (funkode-io/replay#228).
 ///
 /// Driven against a real database rather than through a daemon, for the reason
-/// [`cursor_tests`] is: a settlement reads its pages several statements apart, and
+/// [`progress_tests`] is: a settlement reads its pages several statements apart, and
 /// a test that has to catch a running retry between two of them is a test that
 /// fails on a busy machine.
 #[cfg(test)]
 mod settlement_tests {
     use sqlx::PgPool;
 
-    use super::cursor_tests::start_postgres;
+    use super::progress_tests::start_postgres;
     use super::{
         begin_settlement, group_digest, load_parked_page, Cqrs, DispatchIdentity, GroupPhase,
         ParkedReaction, PolicyRunner, Replay, ReplayedDispatch, Settlement,
