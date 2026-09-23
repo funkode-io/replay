@@ -1,6 +1,6 @@
 # 27. The policy rule is core vocabulary; the machinery stays in persistence
 
-Date: 2026-09-29
+Date: 2026-09-23
 
 ## Status
 
@@ -21,9 +21,9 @@ sit under `src/infrastructure/` for exactly that reason, despite being domain ru
 
 The trait carried the rule and its operational knobs together: `stream_filter`,
 `start_at`, `read_batch_size`, `checkpoint_batch_size`, `dispatch_timeout` and
-`max_causation_depth` alongside `react`. None of them is reachable through
-`register_policy_fn`, so all 19 of those policies — every one of them registered as a
-closure — ran on defaults with no way to narrow their feed.
+`max_causation_depth` alongside `react`. `register_policy_fn` takes a `StartAt` argument
+and nothing else, so all 19 of those policies — every one of them registered as a closure
+— ran the other five on defaults, with no way to narrow their feed.
 
 `react` took `&PersistedEvent<E>`: eight fields, of which an inventory of those 19
 policies reads four. `data` and `stream_id` are read by all 19, `metadata` by 16 and
@@ -43,8 +43,10 @@ crate must keep building for `wasm32`.
 
 **`PersistedEvent` embeds `ObservedEvent` and derefs to it**, so `event.data`,
 `event.stream_id`, `event.metadata` and `event.created` keep working at every call site;
-`id`, `type`, `version` and `aggregate_version` stay on the outer struct. Struct-literal
-construction breaks — `PersistedEvent::of` and its withers are the replacement.
+`id`, `type`, `version` and `aggregate_version` stay on the outer struct. A flat struct
+literal stops compiling: a fixture replaces it with `PersistedEvent::of` and its withers,
+and an `EventStore` mapping a row keeps a literal, nesting the four observed fields in an
+`ObservedEvent` — `of` invents an id, a version and a `created`, which a store must not.
 
 **Dropping `id` from a rule's view is deliberate.** A policy cannot mint a causation key
 into a command it emits, so at-least-once delivery is absorbed by **idempotent command
