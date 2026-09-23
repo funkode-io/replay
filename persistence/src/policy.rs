@@ -9,6 +9,7 @@
 //! WASM runner. The server-side execution lives in the runner (native only).
 
 use std::any::{Any, TypeId};
+use std::fmt;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -39,8 +40,11 @@ pub enum StartAt {
 /// tokio types, so it stays WASM-ready.
 ///
 /// It also carries, in the open, the identity a parked [dead letter] is read by:
-/// the target stream's URN and the command's type name. Both are legible only
-/// here — past this point the pair is an opaque `Any`.
+/// the target stream's URN and the command's type name. A caller that knows the
+/// target aggregate type recovers the pair itself through [`Dispatch::parts`],
+/// which is what lets a `react` implementation be unit-tested. Runner behaviour
+/// is still asserted through operator-visible observations (ADR-0014), not by
+/// inspecting dispatches in process.
 ///
 /// [dead letter]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#dead-letter
 pub struct Dispatch {
@@ -69,8 +73,8 @@ impl Dispatch {
         Dispatch {
             target: TypeId::of::<A>(),
             aggregate_name: std::any::type_name::<A>(),
-            // Legible only here: past this point the pair is an opaque `Any`
-            // (funkode-io/replay#210).
+            // Taken eagerly: a parked dead letter is read by code that does not
+            // know `A` and so cannot call `parts` (funkode-io/replay#210).
             target_stream_id: id.clone().into(),
             command_name: std::any::type_name::<A::Command>(),
             payload: Box::new((id, command)),
@@ -109,6 +113,55 @@ impl Dispatch {
     /// `Serialize` bound, and adding one would break every consumer.
     pub fn command_name(&self) -> &'static str {
         self.command_name
+    }
+
+    /// Borrows the `(StreamId, Command)` pair this dispatch carries, when it
+    /// targets `A`.
+    ///
+    /// The match is on the target aggregate, not on the payload's shape: a
+    /// dispatch to another aggregate yields `None` even when that aggregate's
+    /// `StreamId` and `Command` types coincide with `A`'s.
+    ///
+    /// ```rust,ignore
+    /// let (id, command) = dispatch.parts::<FeeLedger>().unwrap();
+    /// assert_eq!(command, &FeeLedgerCommand::ChargeFee { amount: 25 });
+    /// ```
+    pub fn parts<A>(&self) -> Option<(&A::StreamId, &A::Command)>
+    where
+        A: Aggregate + 'static,
+        A::StreamId: 'static,
+        A::Command: 'static,
+    {
+        if self.target != TypeId::of::<A>() {
+            return None;
+        }
+        self.payload
+            .downcast_ref::<(A::StreamId, A::Command)>()
+            .map(|(id, command)| (id, command))
+    }
+
+    /// The optimistic-concurrency version the command is to be executed under.
+    pub fn expected_version(&self) -> Option<i64> {
+        self.expected_version
+    }
+
+    /// The user-defined metadata attached by [`Dispatch::with_metadata`], before
+    /// the runner merges causation metadata into it.
+    pub fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
+    }
+}
+
+impl fmt::Debug for Dispatch {
+    /// Prints the identity a dead letter is read by. The payload is omitted for
+    /// the reason given on [`Dispatch::command_name`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Dispatch")
+            .field("aggregate", &self.aggregate_name)
+            .field("command", &self.command_name)
+            .field("target_stream_id", &self.target_stream_id.to_string())
+            .field("expected_version", &self.expected_version)
+            .finish_non_exhaustive()
     }
 }
 
@@ -371,6 +424,48 @@ mod tests {
         }
     }
 
+    /// A second aggregate whose `StreamId` and `Command` types are *identical* to
+    /// `Account`'s, so a payload downcast alone cannot tell the two apart.
+    struct Shipment {
+        id: AccountUrn,
+    }
+
+    impl WithId for Shipment {
+        type StreamId = AccountUrn;
+
+        fn with_id(id: Self::StreamId) -> Self {
+            Shipment { id }
+        }
+
+        fn get_id(&self) -> &Self::StreamId {
+            &self.id
+        }
+    }
+
+    impl replay::EventStream for Shipment {
+        type Event = ShippingEvent;
+
+        fn stream_type() -> String {
+            "Shipment".to_string()
+        }
+
+        fn apply(&mut self, _event: Self::Event) {}
+    }
+
+    impl Aggregate for Shipment {
+        type Command = String;
+        type Error = replay::Error;
+        type Services = ();
+
+        async fn handle(
+            &self,
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> Result<Vec<Self::Event>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
     /// Reacts to every event it is given, echoing the reason it received so the
     /// test can prove the envelope reached `react` intact.
     struct FreezeNotifier;
@@ -445,11 +540,69 @@ mod tests {
         // The command was built from the deserialized payload and the borrowed
         // envelope's stream id, so both survived the erasure.
         let (id, command) = dispatches[0]
-            .payload
-            .downcast_ref::<(AccountUrn, String)>()
+            .parts::<Account>()
             .expect("dispatch must carry the aggregate's (id, command) pair");
         assert_eq!(id.0, raw.stream_id);
         assert_eq!(command, "fraud-review");
+    }
+
+    /// The assertion a policy unit test exists to make: which command, with what
+    /// payload, addressed to which instance.
+    #[test]
+    fn recovers_the_pair_a_dispatch_carries() {
+        let id = AccountUrn(UrnBuilder::new("account", "42").build().unwrap());
+        let dispatch = Dispatch::to::<Account>(id.clone(), "freeze".to_string());
+
+        let (recovered_id, command) = dispatch
+            .parts::<Account>()
+            .expect("the target aggregate's own pair must be recoverable");
+
+        assert_eq!(recovered_id, &id);
+        assert_eq!(command, "freeze");
+        assert_eq!(dispatch.expected_version(), None);
+        assert!(dispatch.metadata().is_none());
+    }
+
+    /// Metadata attached at construction reads back through the accessor.
+    #[test]
+    fn exposes_attached_metadata() {
+        let id = AccountUrn(UrnBuilder::new("account", "42").build().unwrap());
+        let dispatch = Dispatch::to::<Account>(id, "freeze".to_string())
+            .with_metadata(Metadata::from_json(json!({ "correlation": "c-1" })));
+
+        assert_eq!(
+            dispatch.metadata(),
+            Some(&Metadata::from_json(json!({ "correlation": "c-1" })))
+        );
+    }
+
+    /// The match is on the target aggregate, not the payload's shape: `Shipment`
+    /// carries the same `(AccountUrn, String)` pair and still yields `None`.
+    #[test]
+    fn refuses_the_pair_to_a_different_aggregate() {
+        let id = AccountUrn(UrnBuilder::new("account", "42").build().unwrap());
+        let dispatch = Dispatch::to::<Account>(id, "freeze".to_string());
+
+        assert!(dispatch.parts::<Shipment>().is_none());
+    }
+
+    /// `Debug` prints the dead-letter identity and nothing that would need a
+    /// `Debug` bound on `Aggregate::Command`.
+    #[test]
+    fn debug_names_the_aggregate_the_command_and_the_stream() {
+        let id = AccountUrn(UrnBuilder::new("account", "42").build().unwrap());
+        let dispatch = Dispatch::to::<Account>(id, "freeze".to_string());
+
+        let rendered = format!("{dispatch:?}");
+
+        assert!(rendered.contains("Account"), "{rendered}");
+        assert!(rendered.contains("String"), "{rendered}");
+        assert!(rendered.contains("urn:account:42"), "{rendered}");
+        assert!(rendered.contains("expected_version"), "{rendered}");
+        assert!(
+            !rendered.contains("freeze"),
+            "the payload must not be printed: {rendered}"
+        );
     }
 
     /// A payload that isn't this policy's event type is skipped: no reaction, and
