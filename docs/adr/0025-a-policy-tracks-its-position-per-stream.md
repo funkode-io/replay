@@ -116,7 +116,8 @@ is owed is read from that stream's own sequence, which has no holes.
   in the README rather than a constraint in the database — the same reason `updated_at`
   was never a candidate. A stale comparison can only refuse a checkpoint, never accept a
   wrong one, and a refused checkpoint costs a duplicate delivery, which the contract
-  already allows.
+  already allows. PostgreSQL recycles an `xid` only across freezing and wraparound, tens
+  of millions of transactions apart; the window compared here is one poll.
 - **A runner learns it has been superseded one stream at a time**, where the old cursor
   told it once for the whole Policy. A lost compare-and-set abandons that stream for the
   poll and leaves the place where its new owner put it; the other streams in the batch

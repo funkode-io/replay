@@ -1307,6 +1307,9 @@ pub struct HeldPlaceRow {
 impl HeldPlaceRow {
     /// Wait until a poll is queued behind this lock: it has delivered, and is trying to
     /// record what it delivered.
+    ///
+    /// A lock wait is not one of ADR-0014's observations and nothing asserts on it — it
+    /// sequences the test, which still asserts on what the policy dispatched.
     pub async fn await_a_checkpoint_waiting(&self) {
         let deadline = Instant::now() + OBSERVE_TIMEOUT;
         loop {
@@ -1334,9 +1337,12 @@ impl HeldPlaceRow {
 
     /// Rewind the place to `stream_seq` and let the waiting checkpoint through — the
     /// operator's move (ADR-0012), landing inside a poll's window.
+    ///
+    /// `stream_seq` and nothing else: an operator is not obliged to touch `updated_at`,
+    /// so a fix that needed them to would not be one.
     pub async fn rewind_to(mut self, stream_seq: i64) {
         sqlx::query(
-            "UPDATE policy_stream_cursors SET stream_seq = $1, updated_at = now() \
+            "UPDATE policy_stream_cursors SET stream_seq = $1 \
               WHERE policy = $2 AND stream_id = $3",
         )
         .bind(stream_seq)
