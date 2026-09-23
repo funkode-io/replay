@@ -102,15 +102,16 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   replays it, and writes the settlements after — and a parked command being one
   row means a delivery arriving in that window refreshes a row the replay is
   about to settle, where it used to insert a generation of its own and leave the
-  read row untouched. So the retry carries the row's `deliveries` and
-  `last_parked_at` — and the `retry_count` another retry of the same reaction
-  moves — into its `WHERE`: a row that moved is neither archived
-  `retried` (retiring a failure nobody retried) nor overwritten with the staler
-  error the replay produced, and the caller hears `DeadLetterRetry::Superseded`.
-  The command a retry parks *without* a row has no version to carry, and the key
-  is its guard: the insert leaves whatever row appeared under that key alone. A
-  [Discard] carries no version either — it re-runs nothing, so what the row says
-  now does not change what the operator asked to retire.
+  read row untouched. So a row that moved is neither archived `retried` (retiring
+  a failure nobody retried) nor overwritten with the staler error the replay
+  produced, and the caller hears `DeadLetterRetry::Superseded`. The command a
+  retry parks *without* a row is guarded by the key: the insert leaves whatever
+  row appeared under it alone. A [Discard] is guarded by neither — it re-runs
+  nothing, so what the row says now does not change what the operator asked to
+  retire. **How** a moved row is detected is no longer per-row: the version this
+  decision carried into each settlement's `WHERE` was the read that could not be
+  paged, and [ADR-0025](0025-a-retry-settles-the-group-it-locked.md) replaced it
+  with a digest of the whole group, taken under its locks.
 
 - **The rows already duplicated are collapsed by the migration**
   ([0029](../../persistence/tests/migrations/0029_dead_letter_dedupe.sql)), not by
@@ -145,12 +146,12 @@ parking path — is now one `ON CONFLICT` in the one function that parks.
   settlement for rows a replay cannot tell apart is still load-bearing, and its
   fabricated-duplicate tests still describe a table an upgrade can hold.
 
-- **One reaction's group is not yet bounded by a number in the code.** Keeping the
+- **One reaction's group was not bounded by a number in the code.** Keeping the
   ambiguous rows keeps their count, which is the old code's commands times the
   deliveries it saw. The tail is frozen at the migration — every later park
-  refreshes a row — but `load_parked_reaction` reads the group whole, and
-  `AGENTS.md` asks for a number. Tracked by funkode-io/replay#228; a `LIMIT` is
-  not the fix, because a retry settles every row of a reaction from one replay.
+  refreshes a row — but the group was read whole, and `AGENTS.md` asks for a
+  number. Settled by [ADR-0025](0025-a-retry-settles-the-group-it-locked.md): the
+  group is read a page at a time, and a retry still settles every row of it.
 
 - **A reaction that changes shape between two deliveries of one event can park
   the same command twice.** The ordinal is the dispatch's index, so inserting or

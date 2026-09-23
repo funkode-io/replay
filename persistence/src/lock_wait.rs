@@ -15,6 +15,10 @@ use sqlx::PgConnection;
 /// holds.
 pub(crate) const LOCK_NOT_AVAILABLE: &str = "55P03";
 
+/// Postgres `serialization_failure`: a transaction reading one snapshot over many
+/// statements found a row another transaction moved after it.
+pub(crate) const SERIALIZATION_FAILURE: &str = "40001";
+
 /// The largest `lock_timeout` PostgreSQL takes: the setting is an integer number
 /// of milliseconds, so anything past `i32::MAX` — about 24.8 days — is refused
 /// outright.

@@ -2674,17 +2674,23 @@ ones that still fail keep their own error and stay retryable. Every settlement
 bumps the row's `retry_count` and stamps `last_retried_at`, the archived copy
 included.
 
-A settlement only settles the row the replay **read**. A parked command is one
-row, so a delivery of the event arriving while the replay runs refreshes that row
-in place; settling it anyway would archive a failure nobody retried, or overwrite
-it with the staler error the replay produced. The retry carries the row's
-`deliveries`/`last_parked_at` — and the `retry_count` another retry moves — into
-its `WHERE`, and the command it parks *without*
-a row is guarded by the key itself — a row that appeared under it belongs to a
-writer no staler than this replay. Either way the retry reports `Superseded` and
-leaves the row alone — retry again to act on what is parked now
-([ADR-0024](docs/adr/0024-a-parked-command-is-one-row.md)). The bulk summary
-counts such a reaction as still failing, which it is.
+A settlement only settles the group the replay **read**. A parked command is one
+row, so a delivery of the event arriving while the replay runs refreshes a row the
+replay is about to settle; settling it anyway would archive a failure nobody
+retried, or overwrite it with the staler error the replay produced. So a retry
+carries a digest of the reaction's rows — how many there are, their summed
+`deliveries` and `retry_count`, their latest `last_parked_at` — and re-reads it
+with the rows locked before settling any of them: a group that moved settles
+nothing, and the command the retry parks *without* a row is guarded by the key
+itself ([ADR-0025](docs/adr/0025-a-retry-settles-the-group-it-locked.md)). Either
+way the retry reports `Superseded` and leaves the rows alone — retry again to act
+on what is parked now. The bulk summary counts such a reaction as still failing,
+which it is.
+
+The group is read a page at a time, so what a retry holds is a page of rows
+rather than everything one reaction has parked — which, after an upgrade, is the
+old code's commands times the deliveries they saw. Every row of the reaction is
+still settled, from one replay, in one transaction.
 
 The summary counts reactions; `PolicyStatus::dead_letter_count` keeps counting
 **rows** (parked commands), so one broken two-command reaction reads as
