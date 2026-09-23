@@ -2242,9 +2242,16 @@ WHERE policy = 'price_fanout' AND stream_id = 'urn:instrument:xyz';
 One stream at a time, which is the point: a redelivery no longer rewinds the policy over
 every other stream to reach the one that needs it.
 
-The leader picks the move up **on its next poll**, because it reads its places fresh every
-poll rather than holding them in memory between polls. There is no window in which a
-running process reinstates a value you replaced.
+**When the move takes effect** depends on how the stream comes to the leader's attention,
+because a place is only read for a stream that poll is looking at:
+
+| The stream you moved | When it is picked up |
+|---|---|
+| is still being written to | the next poll, on the sweep |
+| is quiet and the sweep has passed it | the next reconciliation — one `REPLAY_POLICY_RECONCILE_SECS`, or a full pass of the rotation (`ceil(streams / read_batch_size)` cadences) when the policy has more streams than its read batch |
+
+Places themselves are never held in memory between polls, so no running process carries a
+stale copy of one forward.
 
 Place writes are a compare-and-set against the row your poll read — compared by row
 version, so a checkpoint can never reinstate a place that predates your update, even when

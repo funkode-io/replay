@@ -11,6 +11,7 @@
 //! later slices that build on this substrate.
 
 use std::any::{Any, TypeId};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -352,6 +353,7 @@ impl PolicyRunnerBuilder {
             replica_id: self.replica_id,
             supervision: self.supervision,
             on_escalation: self.on_escalation,
+            drained: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -421,6 +423,14 @@ pub struct PolicyRunner {
     supervision: WorkerSupervision,
     /// What the consumer does about a worker this runner has given up on.
     on_escalation: EscalationHook,
+    /// Where each policy's search had got to at the end of the last [`Self::drain`].
+    ///
+    /// A daemon worker keeps this for its leadership term; a manual drain has no term, so
+    /// the runner keeps it instead. Dropping it between calls would reset the rotation
+    /// that shares a poll between its discovery sources, and a batch too small to divide
+    /// between them would then hand every slot to the same source for ever
+    /// (funkode-io/replay#231 review).
+    drained: tokio::sync::Mutex<HashMap<String, PolicyProgress>>,
 }
 
 /// Handle for background policy tasks spawned by [`PolicyRunner::start_polling`].
@@ -793,10 +803,21 @@ impl PolicyRunner {
 
     /// Manually drain every registered policy once.
     ///
-    /// For each policy: read the gap-free prefix of events past its cursor,
-    /// `react`, execute the returned dispatches through [`Cqrs`], and advance the
-    /// cursor — one event at a time, advancing only after that event's commands
-    /// have committed (at-least-once delivery; reactions must be idempotent).
+    /// For each policy: find the streams it is behind on, read each one's events past the
+    /// place it has reached, `react`, execute the returned dispatches through [`Cqrs`],
+    /// and advance that stream's place — one event at a time, advancing only after that
+    /// event's commands have committed (at-least-once delivery; reactions must be
+    /// idempotent).
+    ///
+    /// **The runner remembers where each policy's search had got to**, so repeated calls
+    /// behave like a daemon's successive polls: the streams one call could not finish are
+    /// looked at by the next, and the turn that shares a poll between the sweep and the
+    /// reconciliation carries on rather than restarting. A fresh runner starts the search
+    /// afresh — from what is stored, never from the beginning.
+    ///
+    /// Unlike a daemon's poll, this one always compares every stream's head with the
+    /// policy's places rather than doing it on a cadence, so a place moved by hand is
+    /// found by the very next call.
     ///
     /// Returns how many dispatches **committed** across all policies — a progress
     /// signal, not an audit. A delivery that fails does not contribute its
@@ -1476,14 +1497,29 @@ impl PolicyRunner {
 
     async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
         let name = policy.name().to_string();
-        let mut progress = PolicyProgress::load(&self.pool, &name, policy.start_at()).await?;
+        // Held across the drain: two manual drains of one policy at once would each work
+        // from the other's stale search state, and the second would undo the first's turn.
+        let mut drained = self.drained.lock().await;
+        let progress = match drained.entry(name.clone()) {
+            Entry::Occupied(kept) => kept.into_mut(),
+            Entry::Vacant(first) => {
+                first.insert(PolicyProgress::load(&self.pool, &name, policy.start_at()).await?)
+            }
+        };
+
+        // A manual drain always pays for the frontier scan, whatever the cadence says. The
+        // cadence bounds what a daemon's tight polling loop spends on a scan it mostly
+        // does not need; a call made by hand is one poll and has to be a whole one — an
+        // operator who moves a place and drains expects that drain to find it.
+        progress.reconcile_now();
+
         let max_depth = resolve_max_depth(policy);
         drain_policy_once(
             &self.cqrs,
             &self.pool,
             &self.executors,
             policy,
-            &mut progress,
+            progress,
             max_depth,
             &mut Reporting { narration: None },
         )
@@ -4137,6 +4173,11 @@ impl PolicyProgress {
         })
     }
 
+    /// Make the next poll pay for the frontier scan whatever the cadence says.
+    fn reconcile_now(&mut self) {
+        self.reconciled_at = None;
+    }
+
     /// Whether this poll pays for the frontier scan.
     fn reconcile_is_due(&self) -> bool {
         self.reconciled_at
@@ -4221,6 +4262,13 @@ async fn read_sweep(
 /// separately, a write committing between them is seeded as processed while sitting above
 /// the position the search starts from: nominated by no sweep, owed by no place, and lost
 /// for good.
+///
+/// The policy's row is claimed *before* anything is seeded, and a runner that loses the
+/// claim seeds nothing. Seeding first would let two runners bootstrapping at once combine
+/// one's sweep position with the other's places: the loser's seed for a stream created
+/// after the winner's snapshot conflicts with nothing, so it stands, and says a stream was
+/// processed through an event above where the winner's search starts
+/// (funkode-io/replay#231 review).
 async fn bootstrap(
     pool: &Pool<Postgres>,
     name: &str,
@@ -4231,6 +4279,24 @@ async fn bootstrap(
         .execute(&mut *tx)
         .await
         .map_err(crate::db_error)?;
+
+    // The claim, and the snapshot everything below is read in. A concurrent bootstrap
+    // queues here on the primary key and comes back empty-handed.
+    let claimed = sqlx::query(
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
+         VALUES ($1, 0, now()) ON CONFLICT (name) DO NOTHING RETURNING name",
+    )
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(crate::db_error)?;
+
+    if claimed.is_none() {
+        tx.rollback().await.map_err(crate::db_error)?;
+
+        // The row is the Policy's, not this process's opinion of it.
+        return Ok(read_sweep(pool, name).await?.map_or(0, |(swept, _)| swept));
+    }
 
     let swept_through = match start_at {
         StartAt::Beginning => 0,
@@ -4255,23 +4321,18 @@ async fn bootstrap(
         .map_err(crate::db_error)?;
     }
 
-    sqlx::query(
-        "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
-         VALUES ($1, $2, now()) ON CONFLICT (name) DO NOTHING",
-    )
-    .bind(name)
-    .bind(swept_through)
-    .execute(&mut *tx)
-    .await
-    .map_err(crate::db_error)?;
+    // The claim went in at 0 so that it could be made before the log was read; nobody has
+    // seen it yet, because it is this transaction's own uncommitted row.
+    sqlx::query("UPDATE policy_cursors SET discovered_through = $2 WHERE name = $1")
+        .bind(name)
+        .bind(swept_through)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
 
     tx.commit().await.map_err(crate::db_error)?;
 
-    // A concurrent runner may have won the insert with a sweep position of its own; that
-    // row is the Policy's, not this process's opinion of it.
-    Ok(read_sweep(pool, name)
-        .await?
-        .map_or(swept_through, |(swept, _)| swept))
+    Ok(swept_through)
 }
 
 /// Record how far discovery has swept.
@@ -5375,6 +5436,84 @@ mod pinned_session_tests {
     }
 }
 
+/// How one poll's candidate list is shared between the places it can come from.
+///
+/// Pure, so the cases that matter — a batch too small to divide between the sources, a
+/// source naming what another already named — are one assertion each rather than a
+/// database and a daemon.
+#[cfg(test)]
+mod sharing_tests {
+    use super::share_the_poll;
+
+    fn streams(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// One slot and three sources: the turn decides, and over three polls each source
+    /// gets one. Without the turn the same source takes the only slot for ever, which is
+    /// how a quiet stream the sweep passed stays undelivered (funkode-io/replay#231).
+    #[test]
+    fn a_batch_too_small_to_divide_gives_each_source_a_turn() {
+        let taken = |from| {
+            share_the_poll(
+                1,
+                from,
+                [
+                    streams(&["carried"]),
+                    streams(&["swept"]),
+                    streams(&["behind"]),
+                ],
+            )
+            .taken
+        };
+
+        assert_eq!(taken(0), streams(&["carried"]));
+        assert_eq!(taken(1), streams(&["swept"]));
+        assert_eq!(taken(2), streams(&["behind"]));
+        assert_eq!(taken(3), streams(&["carried"]), "the turn wraps");
+    }
+
+    /// Room for everyone: order follows the turn, and nothing is dropped.
+    #[test]
+    fn a_batch_with_room_takes_from_every_source() {
+        let shared = share_the_poll(
+            9,
+            1,
+            [
+                streams(&["carried"]),
+                streams(&["swept"]),
+                streams(&["behind"]),
+            ],
+        );
+
+        assert_eq!(shared.taken, streams(&["swept", "behind", "carried"]));
+        assert!(shared.left.iter().all(Vec::is_empty));
+    }
+
+    /// A stream two sources name costs one slot, and what no slot was found for is handed
+    /// back rather than dropped — the caller decides whether that means "carry it" or
+    /// "leave the rotation where it was".
+    #[test]
+    fn a_stream_named_twice_costs_one_slot_and_the_rest_is_handed_back() {
+        let shared = share_the_poll(
+            2,
+            0,
+            [
+                streams(&["both"]),
+                streams(&["both", "swept-only"]),
+                streams(&["behind-only"]),
+            ],
+        );
+
+        assert_eq!(shared.taken, streams(&["both", "swept-only"]));
+        assert_eq!(
+            shared.left,
+            [streams(&[]), streams(&[]), streams(&["behind-only"]),],
+            "the source that got no slot keeps its candidate"
+        );
+    }
+}
+
 /// What a Policy's places are, before a worker is anywhere near them
 /// (funkode-io/replay#195).
 ///
@@ -5392,8 +5531,8 @@ mod progress_tests {
     use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 
     use super::{
-        checkpoint_places, places_of, streams_behind, write_reconciled, Place, PolicyProgress,
-        StartAt,
+        bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, Place,
+        PolicyProgress, StartAt,
     };
 
     const POLICY: &str = "progress_under_test";
@@ -5872,6 +6011,49 @@ mod progress_tests {
             streams_behind(&pool, POLICY, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string()],
             "and the stream is owed its last three events again"
+        );
+    }
+
+    /// A bootstrap that loses the claim on the policy's row seeds no places.
+    ///
+    /// Seeding before claiming let two runners starting at once combine one's sweep
+    /// position with the other's places: a stream created after the winner's snapshot has
+    /// no seed from the winner, so the loser's — which says the stream is processed
+    /// through an event above where the winner's search starts — conflicts with nothing
+    /// and stands, and that event is delivered by nobody (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn a_bootstrap_that_loses_the_claim_seeds_nothing_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 3).await;
+
+        // The winner, at a point that predates the stream below.
+        sqlx::query(
+            "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
+             VALUES ($1, 0, now())",
+        )
+        .bind(POLICY)
+        .execute(&pool)
+        .await
+        .expect("the winning claim must succeed");
+
+        // `bootstrap` rather than `load`, which would see the row and never get here:
+        // this is the losing half of two runners that both found no row.
+        let swept_through = bootstrap(&pool, POLICY, StartAt::Now)
+            .await
+            .expect("bootstrapping must succeed");
+
+        assert_eq!(
+            swept_through, 0,
+            "the loser reads the winner's search position, not its own"
+        );
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and writes no places of its own, which would say this stream was processed"
+        );
+        assert_eq!(
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "so the stream is owed, as the winner's own bootstrap decided"
         );
     }
 
