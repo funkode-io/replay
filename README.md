@@ -2131,7 +2131,7 @@ stamps causation metadata onto every dispatched command before executing it:
 
 This metadata travels with the resulting events, enabling:
 
-- **Idempotency** — `causation.event_id` identifies the triggering event for an operator reading the resulting events. It is not offered to the target aggregate: `Aggregate::handle` receives no metadata, so a duplicate delivery is absorbed by the command's own shape.
+- **Diagnosis** — `causation.event_id` names the triggering event for an operator reading the resulting events, so a duplicate delivery can be recognised after the fact. It makes nothing safe: `Aggregate::handle` receives no metadata, so absorbing the duplicate is the command's job.
 - **Loop prevention** — the `depth` counter is incremented at each hop; the runner skips reactions once it reaches the configured limit (see [Loop prevention](#loop-prevention)).
 - **Observability** — every policy-driven event is traceable back to the original triggering event by `causation.event_id`.
 
