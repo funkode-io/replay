@@ -4013,11 +4013,15 @@ struct StreamEvent {
 /// The same set-and-check tells a runner that has lost its leadership that it has, which
 /// is the only signal it gets.
 ///
-/// Deleting the row is the other half of that control surface, so a place the poll saw at
-/// something is written only where a row is still there to compare with. Otherwise the
-/// insert would find no conflict and recreate what the operator removed. A poll that saw
-/// no row may insert, and its `NULL` version fails the comparison if the row has appeared
-/// since — which is right: it was somebody else who put it there.
+/// Deleting the row is the other half of that control surface, and what protects it is
+/// that a place the poll read is only ever *updated*: an update matches nothing where the
+/// row has gone. An upsert would not do, even guarded on the row existing, because the
+/// guard reads the snapshot the statement opened on: against a delete that had not
+/// committed when the statement started, the guard sees the row, the insert waits on the
+/// primary key, and once the delete commits there is nothing left to conflict with, so
+/// the operator's delete is undone by an insert (funkode-io/replay#236 review). A place
+/// the poll found *no* row for is only ever inserted, and loses to whoever created one in
+/// the meantime.
 async fn checkpoint_places(
     pool: &Pool<Postgres>,
     name: &str,
@@ -4036,19 +4040,26 @@ async fn checkpoint_places(
         .collect();
 
     let kept = sqlx::query(
-        "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
-         SELECT $1, stream_id, stream_seq FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) \
-              AS incoming(stream_id, stream_seq, observed) \
-          WHERE incoming.observed IS NULL \
-             OR EXISTS (SELECT 1 FROM policy_stream_cursors held \
-                         WHERE held.policy = $1 AND held.stream_id = incoming.stream_id) \
-         ON CONFLICT (policy, stream_id) DO UPDATE \
-             SET stream_seq = EXCLUDED.stream_seq, updated_at = now() \
-           WHERE policy_stream_cursors.xmin::text::bigint \
-                 = (SELECT observed FROM UNNEST($2::text[], $4::bigint[]) \
-                         AS was(stream_id, observed) \
-                     WHERE was.stream_id = policy_stream_cursors.stream_id) \
-         RETURNING stream_id, xmin::text::bigint AS written_by",
+        "WITH incoming AS ( \
+             SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) \
+                       AS i(stream_id, stream_seq, observed)), \
+         advanced AS ( \
+             UPDATE policy_stream_cursors c \
+                SET stream_seq = i.stream_seq, updated_at = now() \
+               FROM incoming i \
+              WHERE c.policy = $1 AND c.stream_id = i.stream_id \
+                AND i.observed IS NOT NULL \
+                AND c.xmin::text::bigint = i.observed \
+          RETURNING c.stream_id, c.xmin::text::bigint AS written_by), \
+         created AS ( \
+             INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+             SELECT $1, i.stream_id, i.stream_seq FROM incoming i \
+              WHERE i.observed IS NULL \
+             ON CONFLICT (policy, stream_id) DO NOTHING \
+          RETURNING stream_id, xmin::text::bigint AS written_by) \
+         SELECT stream_id, written_by FROM advanced \
+          UNION ALL \
+         SELECT stream_id, written_by FROM created",
     )
     .bind(name)
     .bind(&streams)
@@ -5979,6 +5990,62 @@ mod progress_tests {
         );
     }
 
+    /// The same delete, still open when the checkpoint starts — which is the interleaving
+    /// the committed one cannot reach (funkode-io/replay#236 review).
+    ///
+    /// A checkpoint that guarded an upsert on the row existing would read that guard from
+    /// the snapshot it opened on, where the row is still there, and then wait on the
+    /// primary key: by the time it goes in, the delete has committed and there is nothing
+    /// to conflict with, so the operator's delete is undone by an insert. The window is
+    /// forced rather than raced for — the checkpoint is made while the delete is open, and
+    /// the delete commits while the checkpoint waits.
+    #[tokio::test]
+    async fn an_operator_deleting_a_place_during_a_checkpoint_is_not_overwritten_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 10).await;
+
+        // The poll is mid-batch, holding the place it read before the delete.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
+        let mut deleting = pool.begin().await.expect("beginning must succeed");
+        let operator: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *deleting)
+            .await
+            .expect("the deleting backend must identify itself");
+        sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
+            .bind(POLICY)
+            .bind("urn:probe:a")
+            .execute(&mut *deleting)
+            .await
+            .expect("the operator's delete must succeed");
+
+        let checkpointing = tokio::spawn({
+            let pool = pool.clone();
+            let observed = observed.clone();
+            async move {
+                checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 15)], &observed)
+                    .await
+            }
+        });
+        await_blocked_by(&pool, operator).await;
+        deleting.commit().await.expect("committing must succeed");
+
+        let kept = checkpointing
+            .await
+            .expect("the checkpoint must finish")
+            .expect("checkpointing must succeed");
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and the stream is still at the beginning, where the delete left it"
+        );
+    }
+
     /// ADR-0012, moved to the table that now holds the position: an operator writes a
     /// place back and the Policy reads it on its next poll, because places are read fresh
     /// every poll rather than held in memory between them.
@@ -6130,6 +6197,30 @@ mod progress_tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "nothing ever blocked on the lock on {relation}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait until something is queued behind whatever `holder` is holding.
+    async fn await_blocked_by(pool: &PgPool, holder: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(holder)
+            .fetch_one(pool)
+            .await
+            .expect("reading who is blocked must succeed");
+
+            if blocked > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing ever blocked on what backend {holder} holds"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
