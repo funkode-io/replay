@@ -5161,6 +5161,77 @@ async fn policy_read_batch_is_one_budget_across_streams_postgres_test() {
     );
 }
 
+/// The reconciliation leads the poll it runs on, so a quiet stream the sweep has passed
+/// is read even when a busy stream is competing for the same slot.
+///
+/// With `read_batch_size = 1` there is one slot, and the sweep always has something to
+/// offer: whoever gets the slot by turn gets it every time. Leaving that to the turn made
+/// the guarantee depend on how the cadence divides into the poll interval, which is not a
+/// thing anybody configures deliberately (funkode-io/replay#231 review).
+#[tokio::test]
+async fn policy_reconciliation_leads_the_poll_it_runs_on_postgres_test() {
+    let container = postgres_container().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    // Named so the quiet one sorts first: the reconciliation reads a page of
+    // `read_batch_size` streams by id, and with a page of one the test would otherwise be
+    // about which name sorts first rather than about which source leads.
+    let quiet = BankAccountUrn::new("a-quiet").unwrap();
+    let busy = BankAccountUrn::new("z-busy").unwrap();
+    for account in [&quiet, &busy, &busy] {
+        cqrs.execute::<BankAccount>(
+            account,
+            meta.clone(),
+            BankAccountCommand::Deposit {
+                effective_on: date,
+                amount: 10.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // The state this exists for: the sweep has passed the quiet stream's only event, so
+    // no future event will nominate it and only the reconciliation can.
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) VALUES ($1, 1, now())",
+    )
+    .bind("small_batch_policy")
+    .execute(&pg_pool)
+    .await
+    .expect("the cursor row must insert");
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(SmallBatchPolicy { batch: 1 })
+        .build();
+
+    runner.drain().await.expect("drain must succeed");
+
+    assert_eq!(
+        common::places::all(&pg_pool, "small_batch_policy").await,
+        vec![(quiet.to_urn().to_string(), 1)],
+        "the one slot went to the stream only the reconciliation could nominate"
+    );
+}
+
 /// Policy with explicit batch sizes for checkpoint testing.
 struct CheckpointBatchPolicy {
     read_batch: u32,

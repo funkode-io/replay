@@ -72,22 +72,22 @@ is owed is read from that stream's own sequence, which has no holes.
   is a number.** This ADR owns that number; everything else quoting it links here.
 
   ```text
-  cadences ≤ sources × ceil(streams / read_batch_size)
+  cadences ≤ ceil(streams behind / streams read per cadence)
   ```
 
-  `REPLAY_POLICY_RECONCILE_SECS` (default 5s) is the cadence. `streams` is how many the
-  Policy is behind on at once, and `read_batch_size` (default 100) is how many the
-  reconciliation compares per cadence — hence the `ceil`, which is 1 for a Policy behind
-  on no more streams than its batch. `sources` is 3: the reconciliation shares each
-  poll's candidate slots with the streams the last poll could not finish and the streams
-  the sweep just found, taking one slot in turn, so a page can wait its turn before it
-  is read. Three is the worst case and applies only when the other two sources are also
-  full, which is a Policy that cannot keep up — in which case the cadence is not what is
-  making it late.
+  `REPLAY_POLICY_RECONCILE_SECS` (default 5s) is the cadence, and a Policy behind on no
+  more streams than it reads in one is inside a single one. What it reads per cadence is
+  between **one** and `read_batch_size`: the reconciliation leads the poll it runs on, so
+  its first candidate is always read, and how many more depends on what the poll's event
+  budget has left after them. A Policy keeping up reads the whole page and compares
+  everything it is behind on in `ceil(streams / read_batch_size)` cadences; one saturated
+  enough to spend its whole budget on the first stream advances one stream per cadence.
 
-  A Policy at its defaults, behind on fewer than a hundred streams, is inside 15 seconds.
-  The watermark's equivalent bound was the duration of the longest transaction in the
-  instance, which is not a number anyone configures.
+  The guarantee is the floor, not the ceiling: the rotation moves only through streams
+  that were **read**, so a page the budget never reached is compared again rather than
+  stepped over, and a Policy too far behind to keep up is late everywhere — not late
+  *here*. The watermark's equivalent bound was the duration of the longest transaction in
+  the instance, which is not a number anyone configures.
 - **There is no hole to detect, so the machinery that detected holes is gone**:
   `burned_position.rs` and its `pg_locks` probe, `policy_feed.rs` and its gap truncation,
   `policy_blocked.rs` and its rate gate, `PolicyCondition::Blocked`, and the cursor's

@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -3058,23 +3058,26 @@ async fn drain_policy_once(
     // sweep passed would be nominated by the reconciliation for ever without once being
     // read. Round-robin bounds every source's share at a third of the batch, and moving
     // the starting slot keeps that true for a batch too small to divide by three.
+    //
+    // Except on the poll a reconciliation runs, where it leads. Its candidates are the
+    // ones no other source will offer again — the sweep has passed them — and it only
+    // asks once a cadence, so the cost is one poll's turn to the other two. Leaving it to
+    // the turn made the guarantee depend on how the cadence divides into the poll
+    // interval: `share_from` moves per poll and a reconciliation samples it per cadence,
+    // so a cadence of three poll intervals would sample the same phase for ever
+    // (funkode-io/replay#231 review).
     let page = examined.clone();
     let Shared { taken, left } = share_the_poll(
         read_batch,
-        progress.share_from,
+        if reconciling {
+            RECONCILED
+        } else {
+            progress.share_from
+        },
         [carried, discovered.streams, examined],
     );
-    let [carried_over, _, unexamined] = left;
+    let [carried_over, _, _] = left;
     progress.share_from += 1;
-
-    // The rotation advances only through the streams that got a slot. Advancing past the
-    // whole page would leave the rest of it behind a wrap, and if the front of the page
-    // stays behind — which is the case this exists for — the same prefix is admitted
-    // every pass and the streams after it are never read.
-    if reconciling {
-        progress.reconciled(&page, page.len() - unexamined.len(), read_batch);
-        write_reconciled(pool, &name, &progress.reconciled_through).await?;
-    }
     let streams = taken;
 
     // The sweep has read this stretch of log whatever the streams in it turn out to owe,
@@ -3113,12 +3116,17 @@ async fn drain_policy_once(
     // streams in order, so one poll reads what the knob says however many streams it
     // looks at. What the budget does not reach is carried, not lost.
     let mut budget = read_batch;
+    // How far down the candidate list the budget reached. A stream past this was named by
+    // a source and never read, which is the difference the reconciliation's rotation
+    // turns on: a slot is not a read.
+    let mut visited = 0usize;
 
     for (index, stream_id) in streams.iter().enumerate() {
         if budget == 0 {
             unvisited.extend(streams[index..].iter().cloned());
             break;
         }
+        visited = index + 1;
 
         let place = places.get(stream_id).copied().unwrap_or_default().seq;
         let events = read_stream(pool, filter.clone(), stream_id, place, budget).await?;
@@ -3225,6 +3233,22 @@ async fn drain_policy_once(
     // Final checkpoint: flush any stream advanced since the last periodic save.
     checkpoint_places(pool, &name, &advanced, &observed).await?;
 
+    // The rotation advances through what this poll *read*, not through what it admitted:
+    // a candidate the event budget never reached is carried, and stepping the rotation
+    // over it would leave it for a full pass — or for ever, if the front of the page is
+    // always what the budget spends itself on. Contiguous from the front of the page,
+    // because the rotation is one id and cannot describe a hole in the middle.
+    if reconciling {
+        let read: HashSet<&String> = streams[..visited].iter().collect();
+        let read_through = page
+            .iter()
+            .take_while(|stream| read.contains(stream))
+            .count();
+
+        progress.reconciled(&page, read_through, read_batch);
+        write_reconciled(pool, &name, &progress.reconciled_through).await?;
+    }
+
     // What the next poll starts from, oldest claim first: what this one could not fit,
     // then what it did not reach, then what it read and may not have finished. Capped,
     // because it is the one collection here that outlives a poll.
@@ -3236,6 +3260,10 @@ async fn drain_policy_once(
 
     Ok(executed)
 }
+
+/// Which source the reconciliation is, in the array `drain_policy_once` shares a poll
+/// between. It leads on the poll it runs, so it is the one index that has to be named.
+const RECONCILED: usize = 2;
 
 /// What one poll takes, and what each source still had to offer when it stopped.
 struct Shared<const N: usize> {
@@ -4181,8 +4209,8 @@ async fn sweep_for_streams(
 /// low in the sort order would otherwise return those same ids every time, and a quiet
 /// stream sorting after them — one whose only write the sweep passed, so no future event
 /// will nominate it — would never be examined again. Rotating bounds that at one pass over
-/// the streams — `ceil(streams / limit)` cadences of its own, and up to three times that
-/// once it is sharing the poll's slots with the other two discovery sources
+/// the streams: `ceil(streams / limit)` cadences while the Policy is keeping up, and one
+/// stream a cadence at worst, because the poll it runs on gives it the first slot
 /// ([ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) owns the
 /// bound).
 async fn streams_behind(
@@ -4526,22 +4554,23 @@ impl PolicyProgress {
             .is_none_or(|last| last.elapsed() >= self.reconcile_every)
     }
 
-    /// Record a reconciliation: `page` is what it read, `admitted` how many of those the
-    /// poll had room for.
+    /// Record a reconciliation: `page` is the streams it compared, `read` how many of
+    /// them the poll went on to actually read, counted from the front.
     ///
-    /// The rotation stops at the last stream that got a slot and never passes one that
-    /// did not, so a page the poll could not fit is read again next cadence rather than
-    /// skipped. A page nobody could take leaves the rotation where it was. A page taken
-    /// whole and short of the limit — no page at all included, which is what the last
-    /// stream id looks like from the far side — is the end of a pass, and the next one
-    /// starts over: the empty string sorts before every id.
-    fn reconciled(&mut self, page: &[String], admitted: usize, limit: u32) {
+    /// The rotation stops at the last stream that was **read** and never passes one that
+    /// was not, so a page the poll admitted but its event budget never reached is
+    /// compared again next cadence rather than skipped. A page none of which was read
+    /// leaves the rotation where it was. A page read whole and short of the limit — no
+    /// page at all included, which is what the last stream id looks like from the far
+    /// side — is the end of a pass, and the next one starts over: the empty string sorts
+    /// before every id.
+    fn reconciled(&mut self, page: &[String], read: usize, limit: u32) {
         self.reconciled_at = Some(Instant::now());
 
-        if admitted == page.len() && (page.len() as u32) < limit {
+        if read == page.len() && (page.len() as u32) < limit {
             self.reconciled_through = String::new();
-        } else if admitted > 0 {
-            self.reconciled_through = page[admitted - 1].clone();
+        } else if read > 0 {
+            self.reconciled_through = page[read - 1].clone();
         }
     }
 }
@@ -5929,6 +5958,21 @@ mod rotation_tests {
     fn a_page_the_poll_could_not_fit_stops_where_the_room_ran_out() {
         let mut progress = at("");
         progress.reconciled(&page(&["urn:probe:a", "urn:probe:b", "urn:probe:c"]), 1, 3);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:a");
+    }
+
+    /// A page the poll admitted but never read is not stepped over either.
+    ///
+    /// The distinction the rotation turns on: winning a candidate slot is not being read,
+    /// because the poll's event budget can be spent before it reaches the stream. A slot
+    /// count is what this used to be given, so a busy stream earlier in the list could
+    /// eat the budget while the rotation moved past a quiet stream nobody looked at
+    /// (funkode-io/replay#231 review).
+    #[test]
+    fn a_page_admitted_but_not_read_is_compared_again() {
+        let mut progress = at("urn:probe:a");
+        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 0, 10);
 
         assert_eq!(progress.reconciled_through, "urn:probe:a");
     }
