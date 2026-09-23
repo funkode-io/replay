@@ -737,9 +737,9 @@ impl PolicyDaemonHarness {
     /// test can perform.
     ///
     /// Waits for the place to reach `event` before moving it, so that what follows is a
-    /// *re*delivery of something already reacted to once. The rewind itself needs no
-    /// window: a place written under a poll is refused whenever the poll wrote it
-    /// (funkode-io/replay#234).
+    /// *re*delivery of something already reacted to once. The rewind needs no window of
+    /// its own: a poll that checkpoints over it is refused, because the place it reads
+    /// back is no longer the row it started from (funkode-io/replay#234).
     pub async fn redeliver(&self, event: &AppendedEvent) {
         let place = sqlx::query_scalar::<_, i64>("SELECT stream_seq FROM events WHERE id = $1")
             .bind(event.event_id)
