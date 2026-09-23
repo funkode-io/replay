@@ -8,10 +8,11 @@
 -- rather than a silencing: without it the loser carries on with the version 0 it assumed
 -- while the winner is writing version 1, and the two events take the same place.
 --
--- The re-read sees the winner's row because the write path runs at READ COMMITTED; under
--- REPEATABLE READ it would read the snapshot it started from, find nothing, and insert
--- again. Anything that wraps an append in a stricter transaction reintroduces the
--- collision.
+-- The re-read sees the winner's row because the write path runs at READ COMMITTED,
+-- whose statement-level snapshot is taken after the winner committed. An append a
+-- consumer wraps in a REPEATABLE READ transaction of its own never reaches the re-read:
+-- the insert below is refused as a serialization failure (40001), which is retryable and
+-- is not the collision this replaces.
 CREATE OR REPLACE FUNCTION write_event(
     p_id uuid,
     p_data jsonb,

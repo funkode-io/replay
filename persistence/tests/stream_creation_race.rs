@@ -39,6 +39,10 @@ const LOCK_WAIT: Duration = Duration::from_millis(500);
 /// Postgres `lock_not_available`: the `lock_timeout` above fired.
 const LOCK_NOT_AVAILABLE: &str = "55P03";
 
+/// Postgres `serialization_failure`: the append's snapshot is older than the stream row
+/// it has to read.
+const SERIALIZATION_FAILURE: &str = "40001";
+
 async fn start_postgres() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
@@ -236,5 +240,58 @@ async fn the_loser_that_expected_a_new_stream_conflicts_postgres_test() {
         numbering(&pool).await,
         vec![(1, 1)],
         "so only the winner's event is in the log"
+    );
+}
+
+/// The deferring insert reads the winner's row, so it needs a snapshot taken after the
+/// winner committed: an append wrapped in a transaction the caller has set to
+/// `REPEATABLE READ` cannot have one, and the server refuses it as a serialization
+/// failure. The store takes its own transaction and leaves it at the default READ
+/// COMMITTED; this pins what a consumer who wraps an append in a stricter one gets —
+/// a retryable failure, not the collision this migration removed.
+#[tokio::test]
+async fn an_append_under_repeatable_read_cannot_serialise_postgres_test() {
+    let (pool, _container) = start_postgres().await;
+    MIGRATOR.run(&pool).await.expect("migrations must succeed");
+
+    let mut winner = pool.begin().await.expect("beginning the winner");
+    append(&mut winner, None)
+        .await
+        .expect("the first append must succeed");
+
+    let loser = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let mut loser = pool.begin().await.expect("beginning the loser");
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *loser)
+                .await
+                .expect("setting the isolation level must succeed");
+            // Any read fixes the snapshot, and it has to be fixed while the winner's row
+            // is still invisible — that is the situation being pinned.
+            sqlx::query("SELECT count(*) FROM streams")
+                .execute(&mut *loser)
+                .await
+                .expect("taking the snapshot must succeed");
+
+            append(&mut loser, None).await
+        }
+    });
+    await_blocked(&pool).await;
+
+    winner.commit().await.expect("committing the winner");
+    let refused = loser
+        .await
+        .expect("the blocked append must finish")
+        .expect_err("a snapshot older than the winner's row cannot append to that stream");
+
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|e| e.code())
+            .as_deref(),
+        Some(SERIALIZATION_FAILURE),
+        "the append is refused as a serialization failure, not as a duplicate key: \
+         {refused:?}"
     );
 }
