@@ -5232,6 +5232,77 @@ async fn policy_reconciliation_leads_the_poll_it_runs_on_postgres_test() {
     );
 }
 
+/// A rotation that has reached the end of the stream ids wraps, even across a poll that
+/// finds nothing to do.
+///
+/// The poll that ends a pass is an empty one by construction — the page past the last id
+/// is empty, so no source nominates anything and the poll returns early. A rotation
+/// recorded only on the path that reads a stream stays at the end for ever, and a stream
+/// sorting before it is never compared again (funkode-io/replay#231 review).
+#[tokio::test]
+async fn policy_reconciliation_wraps_across_an_empty_poll_postgres_test() {
+    let container = postgres_container().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("behind-the-cursor").unwrap();
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            amount: 10.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // A policy whose sweep has passed the only event, with its rotation where a finished
+    // pass leaves it: past every stream id, and past the one stream it is owed.
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, discovered_through, reconciled_through, updated_at)          VALUES ($1, 1, 'zzz', now())",
+    )
+    .bind("small_batch_policy")
+    .execute(&pg_pool)
+    .await
+    .expect("the cursor row must insert");
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(SmallBatchPolicy { batch: 2 })
+        .build();
+
+    // The first drain finds nothing — that is the poll that has to wrap the rotation.
+    runner.drain().await.expect("drain must succeed");
+    assert!(
+        common::places::all(&pg_pool, "small_batch_policy")
+            .await
+            .is_empty(),
+        "nothing sorts after the cursor, so the first poll reads nothing"
+    );
+
+    runner.drain().await.expect("drain must succeed");
+    assert_eq!(
+        common::places::all(&pg_pool, "small_batch_policy").await,
+        vec![(account.to_urn().to_string(), 1)],
+        "and the pass that started over finds the stream that was behind the cursor"
+    );
+}
+
 /// Policy with explicit batch sizes for checkpoint testing.
 struct CheckpointBatchPolicy {
     read_batch: u32,

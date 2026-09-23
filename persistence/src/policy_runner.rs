@@ -3088,6 +3088,16 @@ async fn drain_policy_once(
     }
 
     if streams.is_empty() {
+        // Nothing was nominated, so the page was empty — a source with anything to offer
+        // always wins a slot. An empty page is the end of a pass, and recording it here
+        // is what wraps the rotation: without it a cursor that has reached the last
+        // stream id queries past the end for ever, and a behind stream sorting before it
+        // is never compared again (funkode-io/replay#231 review).
+        if reconciling {
+            progress.reconciled(&page, 0, read_batch);
+            write_reconciled(pool, &name, &progress.reconciled_through).await?;
+        }
+
         reporting.tell(&name, Poll::Exhausted);
         return Ok(0);
     }
@@ -6197,6 +6207,50 @@ mod progress_tests {
         checkpoint_places(pool, POLICY, &[(stream.to_string(), to)], observed)
             .await
             .expect("checkpointing must succeed")
+    }
+
+    /// A rotation that has reached the end wraps even on a poll that finds nothing.
+    ///
+    /// The cursor past the last stream id is the state every pass ends in, and the page
+    /// it reads there is empty — which means no candidates, which means the poll returns
+    /// before it does anything. Recording the reconciliation only on the path that reads
+    /// a stream leaves the cursor there for ever, and a behind stream sorting before it
+    /// is never compared again (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn a_pass_that_ends_on_an_empty_poll_still_wraps_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 1).await;
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        // Where a finished pass leaves it, with the stream it is owed sorting before it.
+        progress.reconciled_through = "urn:probe:z".to_string();
+        write_reconciled(&pool, POLICY, &progress.reconciled_through)
+            .await
+            .expect("writing the rotation must succeed");
+
+        assert!(
+            streams_behind(&pool, POLICY, &progress.reconciled_through, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing sorts after the end, which is the state this is about"
+        );
+
+        progress.reconciled(&[], 0, 10);
+
+        assert_eq!(
+            progress.reconciled_through, "",
+            "an empty page ends the pass, whatever the poll went on to do"
+        );
+        assert_eq!(
+            streams_behind(&pool, POLICY, &progress.reconciled_through, 10)
+                .await
+                .unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "and the next pass finds the stream that was behind the cursor"
+        );
     }
 
     /// The reconciliation rotates, so a stream sorting after a batch that never catches
