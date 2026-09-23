@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use replay::{Aggregate, Metadata};
 
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
-use crate::policy_frontier::{discovered_from_sweep, Discovered, Nominations, PollPlan, Settled};
+use crate::policy_frontier::{discovered_from_sweep, Discovered, Nominations, PollPlan};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
 };
@@ -3108,10 +3108,10 @@ async fn drain_policy_once(
         // out what is left of it a stream at a time, and stops when it is spent. What the
         // budget does not reach is carried, not lost.
         while let Some(turn) = plan.turn() {
-            let stream_id = turn.stream_id;
-            let place = places.get(&stream_id).copied().unwrap_or_default().seq;
-            let events = read_stream(pool, filter.clone(), &stream_id, place, turn.budget).await?;
-            plan.read(events.len() as u32);
+            let stream_id = &turn.stream_id;
+            let place = places.get(stream_id).copied().unwrap_or_default().seq;
+            let events = read_stream(pool, filter.clone(), stream_id, place, turn.budget).await?;
+            plan.read(&turn, events.len() as u32);
 
             let mut reached = place;
             let mut superseded = false;
@@ -3177,7 +3177,7 @@ async fn drain_policy_once(
                         }
                     }
                     events_since_checkpoint = 0;
-                    if !kept.contains_key(&stream_id) {
+                    if !kept.contains_key(stream_id) {
                         superseded = true;
                         break;
                     }
@@ -3194,12 +3194,12 @@ async fn drain_policy_once(
                     "policy place moved underneath this poll; abandoning the stream and \
                      resuming from the place that is stored"
                 );
-                plan.abandoned();
+                plan.abandoned(&turn);
                 continue;
             }
 
             if reached > place {
-                advanced.push((stream_id, reached));
+                advanced.push((turn.stream_id, reached));
             }
         }
 
@@ -3210,24 +3210,29 @@ async fn drain_policy_once(
     }
     .await;
 
-    // What the poll decided, recorded: the queue the next one starts from, and — on the
-    // polls a reconciliation ran on — where its rotation got to. One call site, taken on
-    // every path, because the path this was missing from was the one that reads nothing,
-    // which is exactly the one a finished pass ends on (funkode-io/replay#231 review).
-    //
-    // A poll that failed settles too. Nothing here claims more than the poll did — the
-    // rotation moved only through streams it read — and dropping the decision on the way
-    // out would lose the carried queue this poll took ownership of, sending the streams
-    // that were waiting for it back to whatever the sweep happens to nominate next.
-    let rotation = if progress.settled(plan.settle()) {
-        write_reconciled(pool, &name, &progress.reconciled_through).await
-    } else {
-        Ok(())
-    };
+    let settled = plan.settle();
 
-    // The drain's own failure first: the rotation write is a consequence of what it did.
+    // The queue the next poll starts from, on every path out of this one — the failing
+    // one included. This poll took the queue off `progress` and nobody else has a copy,
+    // so dropping it here sends the streams that were waiting for it back to whatever the
+    // sweep happens to nominate next.
+    progress.unfinished = settled.carried;
+
+    // A poll that stopped on an error has not finished reading, so the cadence is not
+    // stamped and the rotation is not moved: the next poll reconciles again, over a page
+    // that no longer holds whatever this one did manage to read.
     let executed = drained?;
-    rotation?;
+
+    // One call site for the rotation, taken on every path a poll finishes by — the one
+    // that read nothing included, which is exactly the one a finished pass ends on
+    // (funkode-io/replay#231 review).
+    if settled.reconciled {
+        progress.reconciled_at = Some(Instant::now());
+        if let Some(through) = settled.rotation {
+            progress.reconciled_through = through;
+        }
+        write_reconciled(pool, &name, &progress.reconciled_through).await?;
+    }
 
     Ok(executed)
 }
@@ -4470,25 +4475,6 @@ impl PolicyProgress {
     fn reconcile_is_due(&self) -> bool {
         self.reconciled_at
             .is_none_or(|last| last.elapsed() >= self.reconcile_every)
-    }
-
-    /// Take what a poll decided ([`PollPlan::settle`]), and say whether the rotation has
-    /// to be persisted.
-    ///
-    /// The clock is here rather than in the decision: when the cadence is next due is the
-    /// one part of this a simulation must be able to drive itself, so the poll is *told*
-    /// whether a reconciliation is running and tells back that one ran.
-    fn settled(&mut self, settled: Settled) -> bool {
-        self.unfinished = settled.carried;
-
-        if settled.reconciled {
-            self.reconciled_at = Some(Instant::now());
-            if let Some(through) = settled.rotation {
-                self.reconciled_through = through;
-            }
-        }
-
-        settled.reconciled
     }
 }
 

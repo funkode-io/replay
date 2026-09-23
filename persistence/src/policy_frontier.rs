@@ -114,9 +114,14 @@ pub(crate) struct PollPlan {
 }
 
 /// The next stream to read, and what is left to read it with.
+///
+/// Carries the slot it came from, so what the poll reports back is about the stream the
+/// plan handed out and cannot be about a different one — or, when nothing was handed out
+/// at all, about no stream.
 pub(crate) struct Turn {
     pub(crate) stream_id: String,
     pub(crate) budget: u32,
+    at: usize,
 }
 
 /// What a finished poll leaves behind for the next one.
@@ -198,28 +203,28 @@ impl PollPlan {
         Some(Turn {
             stream_id,
             budget: self.budget,
+            at: self.at,
         })
     }
 
-    /// What the stream [`Self::turn`] just handed out yielded.
+    /// What the stream `turn` was handed out for yielded.
     ///
     /// A full read means the stream may have more; it is looked at again next poll rather
     /// than drained here, so one busy stream cannot hold up every other.
-    pub(crate) fn read(&mut self, events: u32) {
-        self.visited = self.at;
+    pub(crate) fn read(&mut self, turn: &Turn, events: u32) {
+        self.visited = turn.at;
         if events == self.budget {
-            self.unfinished.push(self.streams[self.at - 1].clone());
+            self.unfinished.push(turn.stream_id.clone());
         }
         self.budget -= events;
     }
 
-    /// The stream [`Self::turn`] just handed out belongs to somebody else now.
+    /// The stream `turn` was handed out for belongs to somebody else now.
     ///
     /// A place that moved under the poll is left where its new owner put it, and the
     /// stream is not carried: the next poll reads the place afresh and resumes from there.
-    pub(crate) fn abandoned(&mut self) {
-        let abandoned = self.streams[self.visited - 1].clone();
-        self.unfinished.retain(|stream| *stream != abandoned);
+    pub(crate) fn abandoned(&mut self, turn: &Turn) {
+        self.unfinished.retain(|stream| *stream != turn.stream_id);
     }
 
     /// What the poll leaves behind.
@@ -919,7 +924,7 @@ mod liveness_simulation {
                 stream.read_this_cadence = true;
                 stream.waited = 0;
                 read.push(format!("{}+{events}", turn.stream_id));
-                plan.read(events as u32);
+                plan.read(&turn, events as u32);
             }
 
             if read.len() < candidates {
@@ -957,7 +962,6 @@ mod liveness_simulation {
             ));
         }
 
-        /// Write what this poll's schedule says is written.
         /// Write what this poll's schedule says is written. A quiet stream is written to
         /// like any other; what makes it quiet is that its writes never reach the log the
         /// sweep reads.
