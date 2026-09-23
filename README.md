@@ -2059,7 +2059,7 @@ inherited for free.
 
 The `Policy` trait lives in `es-replay-persistence`. The implementor stays pure —
 `react` takes an event and returns commands with no I/O — while the
-[`PolicyRunner`] handles reading the feed, stamping causation metadata, persisting
+[`PolicyRunner`] handles reading each stream, stamping causation metadata, persisting
 cursors, and executing the [`Dispatch`]es.
 
 ### Implementing `Policy`
@@ -2432,7 +2432,7 @@ parks a dead letter for it), and any panic in a binary built with
 #### Restarting a worker that dies
 
 That table covers what the delivery of one event can contain. A worker can also
-die outright — a panic in the drain loop, in cursor I/O, in the feed read. The
+die outright — a panic in the drain loop, in place I/O, in the stream read. The
 runner restarts it on a budget; the restart resumes from the last durable
 checkpoint, so it costs at most a checkpoint's worth of re-delivery
 ([ADR-0017](docs/adr/0017-dead-policy-worker-restarted-on-a-budget.md)).
@@ -2799,9 +2799,9 @@ here), which satisfies the bound with the identity conversion.
 ### Reading each worker's liveness
 
 `daemon.liveness()` answers "is this worker running". `PolicyStatusStore` (below)
-answers "is this Policy moving". **Neither implies the other**: a standby replica
-runs and advances nothing, and a leader parked in front of a hole runs and
-advances nothing either. Liveness is known only to the process running the
+answers "is this Policy moving". **Neither implies the other**: a standby replica runs
+and advances nothing, and a leader whose every reaction is failing into the dead-letter
+table runs and advances plenty. Liveness is known only to the process running the
 workers, so it is published from memory and never derived from the tables
 ([ADR-0020](docs/adr/0020-liveness-is-published-from-memory-and-beaten-on-a-cadence.md)).
 
@@ -2934,41 +2934,40 @@ happened", not "nothing is known".
 
 | Record | When | Carries |
 |--------|------|---------|
-| `policy has work to do` | a poll reads a non-empty window, before any of it is dispatched | the policy |
+| `policy has work to do` | a poll finds a stream owing it something, before any of it is dispatched | the policy |
 | `policy is working through its backlog` | the first cursor advance at least 30 s after the previous record | events so far, elapsed |
-| `policy is caught up` | the first poll that finds the feed exhausted | events in the burst, elapsed |
+| `policy is caught up` | the first poll that finds nothing owed | events in the burst, elapsed |
 | `policy dispatch committed` | every dispatch that commits, at `debug` | event, aggregate, elapsed |
 
-The counts are feed positions the cursor advanced over, not reactions executed: a
-policy whose `stream_filter` excludes a whole window worked through it, and is
-not caught up until the feed is empty. The elapsed time runs from the read that
+The counts are places the policy advanced over, not reactions executed: a policy whose
+`stream_filter` excludes a whole stream worked through it, and is not caught up until
+nothing it is owed is left. The elapsed time runs from the read that
 found the work to the last position the burst advanced over, so the idle interval
 before the empty poll that notices is not charged to it — which also means the
 catch-up record arrives up to one poll interval late.
 
-Records are written as the cursor moves, not when a poll returns, so a batch
-whose dispatches take minutes still reports progress while it runs — and the
-opening record precedes the first reaction, so everything that reaction logs
-falls inside the bracket. A policy that
-stops in front of a hole is **not** caught up and does not say it is: the bracket
-stays open, and the blocked record (`warn`) is what names the stop. A worker held
-inside a single reaction narrates nothing at all — that is the liveness axis's
-question, and the heartbeat answers it from a task of its own.
+Records are written as the policy moves, not when a poll returns, so a batch whose
+dispatches take minutes still reports progress while it runs — and the opening record
+precedes the first reaction, so everything that reaction logs falls inside the bracket.
+A worker held inside a single reaction narrates nothing at all — that is the liveness
+axis's question, and the heartbeat answers it from a task of its own.
 
 Turn `debug` on for `replay_persistence::policy_runner` to see each dispatch that
 commits while you are looking at one policy; it is six figures of records for a
 large import, which is why it is off by default. A dispatch that is declined,
-retried or parked reports at its own level, and restarts, escalations and a
-policy parked in front of a hole are logged by the machinery that owns them
-(`warn` and `error`), not by this path.
+retried or parked reports at its own level, and restarts and escalations are logged by
+the machinery that owns them (`warn` and `error`), not by this path.
 
 ### Monitoring policy status
 
 A running policy is otherwise opaque: its cursor and dead letters live in
 internal tables. `PolicyStatusStore` turns them into a read-only health signal you
-can poll from a dashboard or health check. It is **not** a projection — it reads
-the operational tables (`policy_cursors`, the `events` head, and
-`policy_dead_letters`) in a **single** query and never scans the event log. See
+can poll from a dashboard or health check. It is **not** a projection — it reads the
+operational tables (`policy_cursors`, each stream's head against this policy's places in
+`policy_stream_cursors`, and `policy_dead_letters`) in a **single** query and never scans
+the event log. It reads one row per stream, which is affordable for a health check
+scraped every few seconds and is the reason the runner does not find its work this way.
+See
 [ADR-0006](docs/adr/0006-policy-status-read-only-operational-snapshot.md) for the
 rationale.
 
