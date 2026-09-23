@@ -4540,7 +4540,7 @@ impl PolicyProgress {
     ) -> Result<Self, replay::Error> {
         let (swept_through, reconciled_through) = match read_sweep(pool, name).await? {
             Some(progress) => progress,
-            None => (bootstrap(pool, name, start_at).await?, String::new()),
+            None => bootstrap(pool, name, start_at).await?,
         };
 
         Ok(Self {
@@ -4655,7 +4655,7 @@ async fn bootstrap(
     pool: &Pool<Postgres>,
     name: &str,
     start_at: StartAt,
-) -> Result<i64, replay::Error> {
+) -> Result<(i64, String), replay::Error> {
     let mut tx = pool.begin().await.map_err(crate::db_error)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
@@ -4676,8 +4676,12 @@ async fn bootstrap(
     if claimed.is_none() {
         tx.rollback().await.map_err(crate::db_error)?;
 
-        // The row is the Policy's, not this process's opinion of it.
-        return Ok(read_sweep(pool, name).await?.map_or(0, |(swept, _)| swept));
+        // Both halves come from the row, which is the Policy's and not this process's
+        // opinion of it. The rotation of a row that has just been claimed is empty, so
+        // reading it rather than assuming it changes nothing today — but a value that is
+        // right because of when it is read is one edit from being wrong
+        // (funkode-io/replay#231 review).
+        return Ok(read_sweep(pool, name).await?.unwrap_or_default());
     }
 
     let swept_through = match start_at {
@@ -4714,7 +4718,9 @@ async fn bootstrap(
 
     tx.commit().await.map_err(crate::db_error)?;
 
-    Ok(swept_through)
+    // The rotation starts at the beginning of the stream ids, which is what the row this
+    // transaction just inserted carries.
+    Ok((swept_through, String::new()))
 }
 
 /// Record how far discovery has swept.
@@ -6630,15 +6636,23 @@ mod progress_tests {
         .await
         .expect("the winning claim must succeed");
 
+        // The winner has a rotation of its own by now, mid-pass.
+        write_reconciled(&pool, POLICY, "urn:probe:m")
+            .await
+            .expect("the winner's rotation must write");
+
         // `bootstrap` rather than `load`, which would see the row and never get here:
         // this is the losing half of two runners that both found no row.
-        let swept_through = bootstrap(&pool, POLICY, StartAt::Now)
+        let progress = bootstrap(&pool, POLICY, StartAt::Now)
             .await
             .expect("bootstrapping must succeed");
 
         assert_eq!(
-            swept_through, 0,
-            "the loser reads the winner's search position, not its own"
+            progress,
+            (0, "urn:probe:m".to_string()),
+            "the loser takes both halves from the winner's row, not its own opinion of \
+             either: a rotation reset to the beginning would re-read the streams sorting \
+             first and could starve one sorting last"
         );
         assert!(
             places(&pool, &["urn:probe:a"]).await.is_empty(),
