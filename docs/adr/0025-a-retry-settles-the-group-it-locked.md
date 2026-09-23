@@ -95,6 +95,26 @@ code (funkode-io/replay#228).
   retry asked about. A `Vec<(id, outcome)>` over the group is the same unbounded
   buffer one call further up.
 
+## What can move a group, and what happens
+
+The guard is two halves and an exception, and the combinations are few enough to
+state. A writer is a **delivery** re-parking or parking, another **retry**
+settling, or an operator's **discard**.
+
+| When the writer commits | Group after | What the settlement does |
+| --- | --- | --- |
+| Before the digest is read | any | It is the group the replay ran against; settled normally |
+| After the digest, before `lock_group` | rows remain | Digest differs: settles nothing, reports `Superseded` |
+| After the digest, before `lock_group` | empty | Nothing to settle: the replay's failures are parked |
+| While `lock_group` waits for the row | rows remain | `40001`: settles nothing, reports `Superseded` |
+| While `lock_group` waits for the row | empty | `40001`, then the group reads empty: attempted again, the replay's failures are parked |
+| After the lock, on a row of the group | — | Impossible: the writer waits for the settlement to commit |
+| After the lock, inserting a new row | — | Outside the snapshot: not settled, left for the next retry |
+
+Each row of the table is a test: `settlement_tests` covers the snapshot, the
+`40001`, and the `40001` that empties the group; `policy_retry_unit`'s race tests
+cover the digest mismatches and the discard that empties the group.
+
 ## Rejected alternatives
 
 - **A `LIMIT` on the group read, settling only what fits.** One replay would

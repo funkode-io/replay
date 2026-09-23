@@ -1098,8 +1098,9 @@ impl PolicyRunner {
         replay: Replay,
         asked_about: Option<i64>,
     ) -> Result<ReactionSettlement, replay::Error> {
+        let mut replay = replay;
         let moved = match self
-            .settle_unmoved(reaction, before, replay, asked_about)
+            .settle_unmoved(reaction, before, &mut replay, asked_about)
             .await
         {
             Ok(Some(settled)) => return Ok(settled),
@@ -1107,8 +1108,28 @@ impl PolicyRunner {
             Ok(None) => "before the settlement began",
             // Postgres saw a writer move a row out from under the snapshot
             // before this transaction could, and refused it the inconsistent
-            // read: the same conclusion, reached by the server.
-            Err(error) if error.kind() == replay::ErrorKind::Conflict => "while it was settling",
+            // read: the same conclusion, reached by the server — except when
+            // what moved the group took the last row with it. Then there is
+            // nothing left to settle and nowhere else for this replay's
+            // failures to be recorded, so it is attempted once more against the
+            // group as it now stands. A rolled-back settlement claimed nothing.
+            Err(error) if error.kind() == replay::ErrorKind::Conflict => {
+                let emptied = group_digest(&self.pool, reaction).await?;
+                if emptied.rows == 0 {
+                    replay.forget_claims();
+                    match self
+                        .settle_unmoved(reaction, emptied, &mut replay, asked_about)
+                        .await
+                    {
+                        Ok(Some(settled)) => return Ok(settled),
+                        // Rows again: it is a moved group after all.
+                        Ok(None) => {}
+                        Err(again) if again.kind() == replay::ErrorKind::Conflict => {}
+                        Err(again) => return Err(again),
+                    }
+                }
+                "while it was settling"
+            }
             Err(error) => return Err(error),
         };
 
@@ -1135,10 +1156,9 @@ impl PolicyRunner {
         &self,
         reaction: &ParkedReaction,
         before: GroupDigest,
-        replay: Replay,
+        replay: &mut Replay,
         asked_about: Option<i64>,
     ) -> Result<Option<ReactionSettlement>, replay::Error> {
-        let mut replay = replay;
         let mut settled = ReactionSettlement::default();
         let (mut tx, locked) = begin_settlement(&self.pool, reaction).await?;
         // A group emptied under the replay has no row to settle and no row to
@@ -2832,20 +2852,29 @@ impl Replay {
 
     /// The failures no row spoke for: commands this reaction did not park
     /// before, which the retry has just watched fail.
-    fn unclaimed_failures(self) -> Vec<UnclaimedFailure> {
-        let concluded = match self {
-            Self::Ran(concluded) | Self::Panicked { concluded, .. } => concluded,
-        };
-        concluded
-            .into_iter()
+    ///
+    /// Borrowed rather than consumed, so a settlement that rolled back can be
+    /// attempted again from the same replay. Bounded by the dispatch vector, of
+    /// which this is the part nothing has settled.
+    fn unclaimed_failures(&self) -> Vec<UnclaimedFailure> {
+        self.concluded()
+            .iter()
             .filter(|dispatch| !dispatch.claimed)
             .filter_map(|dispatch| {
                 Some(UnclaimedFailure {
-                    identity: dispatch.identity,
-                    settlement: dispatch.outcome?,
+                    identity: dispatch.identity.clone(),
+                    settlement: dispatch.outcome.clone()?,
                 })
             })
             .collect()
+    }
+
+    /// Forget what has been claimed: the transaction that claimed it rolled
+    /// back, so no row in the table speaks for any of these dispatches.
+    fn forget_claims(&mut self) {
+        for dispatch in self.concluded_mut() {
+            dispatch.claimed = false;
+        }
     }
 
     fn concluded(&self) -> &[ReplayedDispatch] {
@@ -6032,7 +6061,10 @@ mod settlement_tests {
     use sqlx::PgPool;
 
     use super::cursor_tests::start_postgres;
-    use super::{begin_settlement, group_digest, load_parked_page, GroupPhase, ParkedReaction};
+    use super::{
+        begin_settlement, group_digest, load_parked_page, Cqrs, DispatchIdentity, GroupPhase,
+        ParkedReaction, PolicyRunner, Replay, ReplayedDispatch, Settlement,
+    };
 
     const POLICY: &str = "settlement_under_test";
     const POSITION: i64 = 7;
@@ -6099,9 +6131,10 @@ mod settlement_tests {
             tokio::spawn(async move { begin_settlement(&pool, &reaction).await.map(|_| ()) })
         };
 
-        // Long enough for the settlement to have taken its snapshot and be
-        // waiting on the lock; the delivery then commits under it.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // The settlement has taken its snapshot and is queued behind the
+        // delivery's row lock — read off `pg_locks` rather than slept for, so a
+        // busy machine delays the test instead of failing it.
+        await_blocked_on_a_row(&pool).await;
         delivery.commit().await.expect("the delivery must commit");
 
         let refused = settling
@@ -6115,6 +6148,122 @@ mod settlement_tests {
             "a group moved under the snapshot is a conflict, not a database \
              failure: {refused}"
         );
+    }
+
+    /// A discard that takes the last row while the settlement waits for its lock
+    /// does not swallow what the replay found.
+    ///
+    /// The refusal arrives as a `40001` rather than as a digest mismatch, so it
+    /// takes the branch that reports a moved group — and a group emptied that way
+    /// has nowhere left to record the failures this replay watched happen: the
+    /// reaction has no rows, so nothing enumerates it and the drain is long past
+    /// the event. The settlement is attempted once more against the empty group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_discard_that_wins_the_lock_does_not_swallow_the_replay_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let reaction = ParkedReaction {
+            policy_name: POLICY.to_string(),
+            global_position: POSITION,
+            event_id: uuid::Uuid::new_v4(),
+        };
+        park(&pool, &reaction, "First").await;
+
+        let runner =
+            PolicyRunner::builder(Cqrs::new(crate::PostgresEventStore::new(pool.clone()))).build();
+        let before = group_digest(&pool, &reaction)
+            .await
+            .expect("the digest must be readable");
+
+        // The operator's discard, holding the row's lock: a transaction here
+        // because the settlement has to be waiting on it when it commits, which
+        // is what turns the refusal into a serialization failure.
+        let mut discard = pool.begin().await.expect("the discard must begin");
+        sqlx::query("DELETE FROM policy_dead_letters WHERE policy_name = $1")
+            .bind(&reaction.policy_name)
+            .execute(&mut *discard)
+            .await
+            .expect("the discard must apply");
+
+        // What the replay found: a command the reaction now dispatches and no
+        // row was ever parked for — the one row a retry inserts (ADR-0021).
+        let replay = Replay::Ran(vec![ReplayedDispatch {
+            identity: DispatchIdentity {
+                aggregate_name: "Probe",
+                target_stream_id: "urn:probe:2".to_string(),
+                command_name: "Second",
+                ordinal: 0,
+            },
+            outcome: Some(Settlement {
+                error_kind: "Unavailable".to_string(),
+                error_message: "the command the replay found failing".to_string(),
+            }),
+            claimed: false,
+        }]);
+
+        let settling = {
+            let reaction = ParkedReaction {
+                policy_name: reaction.policy_name.clone(),
+                ..reaction
+            };
+            tokio::spawn(async move { runner.settle(&reaction, before, replay, None).await })
+        };
+
+        await_blocked_on_a_row(&pool).await;
+        discard.commit().await.expect("the discard must commit");
+
+        let settled = settling
+            .await
+            .expect("the settling task must not panic")
+            .expect("a settlement refused its snapshot must still return an outcome");
+        assert!(
+            settled.any_still_failing,
+            "the reaction is still failing: a command of it just did"
+        );
+
+        // `string_agg` rather than a `fetch_all`: `tests/bounded_queries.rs`
+        // reviews every `fetch_all` call site in this file, and a test's
+        // assertion is not worth an entry in that review.
+        let parked: Option<String> = sqlx::query_scalar(
+            "SELECT string_agg(command_name, ', ' ORDER BY id) \
+             FROM policy_dead_letters WHERE policy_name = $1",
+        )
+        .bind(&reaction.policy_name)
+        .fetch_one(&pool)
+        .await
+        .expect("the table must be readable");
+        assert_eq!(
+            parked.as_deref(),
+            Some("Second"),
+            "the failure the replay found is parked, and the discarded row stays gone"
+        );
+    }
+
+    /// Wait until something is queued behind a row lock somebody else holds.
+    ///
+    /// A waiter for a locked row queues on the *holder's transaction id* rather
+    /// than on the table (`tuple` while it takes its turn, `transactionid` while
+    /// it waits for the holder to end), so neither shows as an ungranted lock on
+    /// `policy_dead_letters` itself.
+    async fn await_blocked_on_a_row(pool: &PgPool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks \
+                  WHERE NOT granted AND locktype IN ('transactionid', 'tuple')",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("reading pg_locks must succeed");
+
+            if blocked > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the settlement never blocked on the delivery's row lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// A command parked after the settlement began is not settled by it.
