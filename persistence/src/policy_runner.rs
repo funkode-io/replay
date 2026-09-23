@@ -3972,9 +3972,11 @@ struct StreamEvent {
 /// silently. The same set-and-check tells a runner that has lost its leadership that it
 /// has, which is the only signal it gets.
 ///
-/// Deleting the row is the other half of that control surface, so a place the poll saw at
-/// something is written only where a row is still there to compare with. Otherwise the
-/// insert would find no conflict and recreate what the operator removed.
+/// Deleting the row is the other half of that control surface, so a place the poll *saw*
+/// is written only where a row is still there to compare with. Otherwise the insert would
+/// find no conflict and recreate what the operator removed. What decides that is whether
+/// the poll saw a row, not what number was in it: a stream at place 0 and a stream with no
+/// place are the same number and different things.
 async fn checkpoint_places(
     pool: &Pool<Postgres>,
     name: &str,
@@ -3991,14 +3993,23 @@ async fn checkpoint_places(
         .iter()
         .map(|(stream, _)| observed.get(stream).copied().unwrap_or_default())
         .collect();
+    // Whether the poll saw a *row*, which a place of 0 does not tell you: a stream at the
+    // beginning and a stream with no row are both 0, and only one of them may be created
+    // here. An operator's rewind to 0 is a row, and deleting it mid-poll must not be
+    // undone by this insert finding nothing to conflict with (funkode-io/replay#231).
+    let held: Vec<bool> = places
+        .iter()
+        .map(|(stream, _)| observed.contains_key(stream))
+        .collect();
 
     let kept = sqlx::query(
         "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
-         SELECT $1, stream_id, stream_seq FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) \
-              AS incoming(stream_id, stream_seq, observed) \
-          WHERE incoming.observed = 0 \
-             OR EXISTS (SELECT 1 FROM policy_stream_cursors held \
-                         WHERE held.policy = $1 AND held.stream_id = incoming.stream_id) \
+         SELECT $1, stream_id, stream_seq \
+           FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::bool[]) \
+              AS incoming(stream_id, stream_seq, observed, held) \
+          WHERE NOT incoming.held \
+             OR EXISTS (SELECT 1 FROM policy_stream_cursors kept \
+                         WHERE kept.policy = $1 AND kept.stream_id = incoming.stream_id) \
          ON CONFLICT (policy, stream_id) DO UPDATE \
              SET stream_seq = EXCLUDED.stream_seq, updated_at = now() \
            WHERE policy_stream_cursors.stream_seq \
@@ -4011,6 +4022,7 @@ async fn checkpoint_places(
     .bind(&streams)
     .bind(&seqs)
     .bind(&from)
+    .bind(&held)
     .fetch_all(pool)
     .await
     .map_err(crate::db_error)?;
@@ -4141,9 +4153,10 @@ impl PolicyProgress {
     ///
     /// The rotation stops at the last stream that got a slot and never passes one that
     /// did not, so a page the poll could not fit is read again next cadence rather than
-    /// skipped. A page nobody could take leaves the rotation where it was; a page taken
-    /// whole and short of the limit is the end of a pass, and the next one starts over —
-    /// the empty string sorts before every id.
+    /// skipped. A page nobody could take leaves the rotation where it was. A page taken
+    /// whole and short of the limit — no page at all included, which is what the last
+    /// stream id looks like from the far side — is the end of a pass, and the next one
+    /// starts over: the empty string sorts before every id.
     fn reconciled(&mut self, page: &[String], admitted: usize, limit: u32) {
         self.reconciled_at = Some(Instant::now());
 
@@ -5466,6 +5479,84 @@ mod sharing_tests {
     }
 }
 
+/// Where the reconciliation's rotation stops, which is a decision about a page of stream
+/// ids and nothing else.
+///
+/// Pure, so the cases live here rather than behind a container: what the rotation does
+/// with a page nobody had room for, and with no page at all, is the difference between a
+/// stream examined once a pass and a stream never examined again.
+#[cfg(test)]
+mod rotation_tests {
+    use std::time::Duration;
+
+    use super::PolicyProgress;
+
+    fn at(reconciled_through: &str) -> PolicyProgress {
+        PolicyProgress {
+            swept_through: 0,
+            unfinished: Vec::new(),
+            share_from: 0,
+            reconciled_through: reconciled_through.to_string(),
+            reconciled_at: None,
+            reconcile_every: Duration::from_secs(5),
+        }
+    }
+
+    fn page(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// The end of a pass: no page means nothing sorts after the rotation point, so the
+    /// next one starts over. Without this a rotation that reached the last stream id
+    /// queries past the end for ever, and a stream behind it is never compared again.
+    #[test]
+    fn a_page_with_nothing_in_it_ends_the_pass() {
+        let mut progress = at("urn:probe:z");
+        progress.reconciled(&page(&[]), 0, 100);
+
+        assert_eq!(progress.reconciled_through, "");
+    }
+
+    /// A page shorter than the batch is the last of a pass, for the same reason.
+    #[test]
+    fn a_short_page_taken_whole_ends_the_pass() {
+        let mut progress = at("urn:probe:a");
+        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 2, 100);
+
+        assert_eq!(progress.reconciled_through, "");
+    }
+
+    /// A full page taken whole carries on after it.
+    #[test]
+    fn a_full_page_taken_whole_advances_the_rotation() {
+        let mut progress = at("");
+        progress.reconciled(&page(&["urn:probe:a", "urn:probe:b"]), 2, 2);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:b");
+    }
+
+    /// The case the poll's own limit creates: the page was read, the poll had room for
+    /// some of it, and the rotation stops at the last stream that got a slot. Advancing
+    /// past the rest would step over them unread whenever the front of the page stays
+    /// behind, which is what the rotation exists for.
+    #[test]
+    fn a_page_the_poll_could_not_fit_stops_where_the_room_ran_out() {
+        let mut progress = at("");
+        progress.reconciled(&page(&["urn:probe:a", "urn:probe:b", "urn:probe:c"]), 1, 3);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:a");
+    }
+
+    /// And a page nobody had room for leaves it exactly where it was.
+    #[test]
+    fn a_page_with_no_room_at_all_leaves_the_rotation_alone() {
+        let mut progress = at("urn:probe:a");
+        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 0, 2);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:a");
+    }
+}
+
 /// What a Policy's places are, before a worker is anywhere near them
 /// (funkode-io/replay#195).
 ///
@@ -5647,15 +5738,23 @@ mod progress_tests {
     }
 
     /// Checkpoint one stream, telling the write what the caller last saw there.
-    async fn checkpoint(pool: &PgPool, stream: &str, from: i64, to: i64) -> HashSet<String> {
-        checkpoint_places(
-            pool,
-            POLICY,
-            &[(stream.to_string(), to)],
-            &HashMap::from([(stream.to_string(), from)]),
-        )
-        .await
-        .expect("checkpointing must succeed")
+    /// `from` is what the poll *saw*: `None` when it saw no row at all, which is what a
+    /// stream nobody has checkpointed looks like, and what decides whether this write may
+    /// create one.
+    async fn checkpoint(
+        pool: &PgPool,
+        stream: &str,
+        from: Option<i64>,
+        to: i64,
+    ) -> HashSet<String> {
+        let observed = match from {
+            Some(place) => HashMap::from([(stream.to_string(), place)]),
+            None => HashMap::new(),
+        };
+
+        checkpoint_places(pool, POLICY, &[(stream.to_string(), to)], &observed)
+            .await
+            .expect("checkpointing must succeed")
     }
 
     /// The reconciliation rotates, so a stream sorting after a batch that never catches
@@ -5711,39 +5810,6 @@ mod progress_tests {
         );
     }
 
-    /// The rotation never passes a stream the poll had no room for.
-    ///
-    /// Advancing through the whole page is what made the first version of this a hole
-    /// rather than a delay: the poll admits its share of the page, and if the front of
-    /// the page is still behind next pass — which is the case the rotation exists for —
-    /// the same prefix is admitted every time and everything after it is stepped over
-    /// unread (funkode-io/replay#231 review).
-    #[tokio::test]
-    async fn the_rotation_stops_at_the_last_stream_that_got_a_slot_postgres_test() {
-        let (pool, _container) = start_postgres().await;
-        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
-            .await
-            .expect("loading must succeed");
-
-        let page = vec![
-            "urn:probe:a".to_string(),
-            "urn:probe:b".to_string(),
-            "urn:probe:c".to_string(),
-        ];
-
-        progress.reconciled(&page, 1, 3);
-        assert_eq!(
-            progress.reconciled_through, "urn:probe:a",
-            "one slot means one stream, and the next pass resumes at the second"
-        );
-
-        progress.reconciled(&page, 0, 3);
-        assert_eq!(
-            progress.reconciled_through, "urn:probe:a",
-            "a page nobody had room for leaves the rotation where it was"
-        );
-    }
-
     /// A place records what has been processed, and the frontier is the difference
     /// between that and the stream's head.
     #[tokio::test]
@@ -5754,7 +5820,7 @@ mod progress_tests {
             .await
             .expect("loading must succeed");
 
-        checkpoint(&pool, "urn:probe:a", 0, 2).await;
+        checkpoint(&pool, "urn:probe:a", None, 2).await;
 
         assert_eq!(
             streams_behind(&pool, POLICY, "", 10).await.unwrap(),
@@ -5762,7 +5828,7 @@ mod progress_tests {
             "two of three places processed is still behind"
         );
 
-        checkpoint(&pool, "urn:probe:a", 2, 3).await;
+        checkpoint(&pool, "urn:probe:a", Some(2), 3).await;
 
         assert!(
             streams_behind(&pool, POLICY, "", 10)
@@ -5784,8 +5850,8 @@ mod progress_tests {
             .await
             .expect("loading must succeed");
 
-        checkpoint(&pool, "urn:probe:a", 0, 4).await;
-        let kept = checkpoint(&pool, "urn:probe:a", 0, 2).await;
+        checkpoint(&pool, "urn:probe:a", None, 4).await;
+        let kept = checkpoint(&pool, "urn:probe:a", None, 2).await;
 
         assert!(
             kept.is_empty(),
@@ -5809,7 +5875,7 @@ mod progress_tests {
         PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        checkpoint(&pool, "urn:probe:a", 0, 10).await;
+        checkpoint(&pool, "urn:probe:a", None, 10).await;
 
         // The poll is mid-batch: it read the place as 10 and has since delivered to 15.
         let observed = HashMap::from([("urn:probe:a".to_string(), 10)]);
@@ -5847,7 +5913,7 @@ mod progress_tests {
         PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        checkpoint(&pool, "urn:probe:a", 0, 10).await;
+        checkpoint(&pool, "urn:probe:a", None, 10).await;
 
         sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
             .bind(POLICY)
@@ -5856,12 +5922,53 @@ mod progress_tests {
             .await
             .expect("the operator's delete must succeed");
 
-        let kept = checkpoint(&pool, "urn:probe:a", 10, 15).await;
+        let kept = checkpoint(&pool, "urn:probe:a", Some(10), 15).await;
 
         assert!(kept.is_empty(), "the poll is told its view went stale");
         assert!(
             places(&pool, &["urn:probe:a"]).await.is_empty(),
             "and the stream is still at the beginning, where the delete left it"
+        );
+    }
+
+    /// The same, for a row an operator had already rewound to the beginning.
+    ///
+    /// A place of 0 and no place at all are the same number, so a write allowed to create
+    /// a row whenever it saw 0 recreates the one the operator has just deleted. What
+    /// decides is whether the poll saw a *row* (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn an_operator_deleting_a_place_it_had_rewound_to_zero_is_not_overwritten_postgres_test()
+    {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        // Rewound to the beginning by hand, then thought better of it and deleted.
+        sqlx::query(
+            "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) VALUES ($1, $2, 0)",
+        )
+        .bind(POLICY)
+        .bind("urn:probe:a")
+        .execute(&pool)
+        .await
+        .expect("the operator's rewind must succeed");
+
+        sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
+            .bind(POLICY)
+            .bind("urn:probe:a")
+            .execute(&pool)
+            .await
+            .expect("the operator's delete must succeed");
+
+        // The poll that was mid-batch when both happened: it saw the row at 0.
+        let kept = checkpoint(&pool, "urn:probe:a", Some(0), 15).await;
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and the row the operator deleted stays deleted"
         );
     }
 
@@ -5875,7 +5982,7 @@ mod progress_tests {
         PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        checkpoint(&pool, "urn:probe:a", 0, 5).await;
+        checkpoint(&pool, "urn:probe:a", None, 5).await;
 
         sqlx::query(
             "UPDATE policy_stream_cursors SET stream_seq = $1 \
