@@ -862,9 +862,10 @@ impl PolicyRunner {
     /// the drain's rows are, and the column counts retries made on a row, not
     /// executions of a command.
     ///
-    /// Re-execution safety comes from the causation guard (the command carries
-    /// the triggering event's id) plus the optimistic-concurrency check in
-    /// [`Cqrs::execute`], so retrying an already-applied reaction is a no-op.
+    /// Re-execution safety comes from the target's idempotent command shape (the
+    /// command carries a key the rule reads off the triggering event, ADR-0027) plus
+    /// the optimistic-concurrency check in [`Cqrs::execute`], so retrying an
+    /// already-applied reaction is a no-op.
     ///
     /// Returns the outcome for the row `id` names, and
     /// [`DeadLetterRetry::NotFound`] when no row matches it. Returns a clear
@@ -3422,9 +3423,9 @@ impl Delivery<'_> {
     /// an event costs at most one timeout per dispatch per attempt.
     ///
     /// **Re-react safety**: on retry the policy's `react` is called again for the
-    /// same event.  Because `react` is a pure function and the at-least-once +
-    /// causation-guard contract already guarantees idempotency, re-executing an
-    /// earlier dispatch that already succeeded is safe.
+    /// same event.  `react` is pure, and the same event yields the same dispatches —
+    /// including the idempotency key the command carries — so a target that absorbs a
+    /// repeated key sees an earlier successful dispatch as a no-op (ADR-0027).
     async fn execute_event_reactions(
         &self,
         policy: &RegisteredPolicy,

@@ -8,7 +8,13 @@ Accepted. Records the decisions of the PRD in
 [funkode-io/replay#244](https://github.com/funkode-io/replay/issues/244), implemented by
 [#237](https://github.com/funkode-io/replay/issues/237). Narrows
 [ADR-0003](0003-policies-as-checkpointed-background-subscribers.md), which described the
-Policy trait and its runner as one thing.
+Policy trait and its runner as one thing, and supersedes its dedup key: where 0003 — and
+[0007](0007-dead-letter-retry-reproduces-reaction-from-triggering-event.md),
+[0012](0012-policy-cursor-is-an-operator-writable-control-surface.md) and
+[0018](0018-a-hung-dispatch-is-cut-loose-by-a-timeout.md) after it — say re-execution is
+made safe by a **causation guard** keyed on the triggering event's identity, read
+**idempotent command shape** keyed on an identifier the event carries. The guarantee is
+unchanged; the key a rule can build is not.
 
 ## Context
 
