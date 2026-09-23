@@ -42,7 +42,9 @@ pub enum StartAt {
 /// It also carries, in the open, the identity a parked [dead letter] is read by:
 /// the target stream's URN and the command's type name. A caller that knows the
 /// target aggregate type recovers the pair itself through [`Dispatch::parts`],
-/// which is what lets a policy's reaction be asserted in a unit test.
+/// which is what lets a `react` implementation be unit-tested. Runner behaviour
+/// is still asserted through operator-visible observations (ADR-0014), not by
+/// inspecting dispatches in process.
 ///
 /// [dead letter]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#dead-letter
 pub struct Dispatch {
@@ -151,8 +153,8 @@ impl Dispatch {
 }
 
 impl fmt::Debug for Dispatch {
-    /// Prints the dead-letter identity only. The payload is omitted because
-    /// `Aggregate::Command` carries no `Debug` bound.
+    /// Prints the identity a dead letter is read by. The payload is omitted for
+    /// the reason given on [`Dispatch::command_name`].
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Dispatch")
             .field("aggregate", &self.aggregate_name)
