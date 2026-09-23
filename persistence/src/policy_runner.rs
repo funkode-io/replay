@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use replay::{Aggregate, Metadata};
 
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
-use crate::policy_frontier::{discovered_from_sweep, Discovered};
+use crate::policy_frontier::{discovered_from_sweep, Discovered, Nominations, PollPlan, Settled};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
 };
@@ -3051,34 +3051,19 @@ async fn drain_policy_once(
         Vec::new()
     };
 
-    // The poll looks at `read_batch` streams, taken a slot at a time from each source in
-    // turn, starting at a different source each time. Filling from the carried queue
-    // first and letting the others have what is left starves them outright: `read_batch`
-    // continuously-busy streams refill that queue every poll, and a quiet stream the
-    // sweep passed would be nominated by the reconciliation for ever without once being
-    // read. Round-robin bounds every source's share at a third of the batch, and moving
-    // the starting slot keeps that true for a batch too small to divide by three.
-    //
-    // Except on the poll a reconciliation runs, where it leads. Its candidates are the
-    // ones no other source will offer again — the sweep has passed them — and it only
-    // asks once a cadence, so the cost is one poll's turn to the other two. Leaving it to
-    // the turn made the guarantee depend on how the cadence divides into the poll
-    // interval: `share_from` moves per poll and a reconciliation samples it per cadence,
-    // so a cadence of three poll intervals would sample the same phase for ever
-    // (funkode-io/replay#231 review).
-    let page = examined.clone();
-    let Shared { taken, left } = share_the_poll(
+    // Everything this poll decides is decided in one place: which streams it reads and in
+    // what order, how far its budget gets, where that leaves the rotation, and what the
+    // next poll starts from. What is left here is the I/O those decisions are about
+    // (funkode-io/replay#243).
+    let mut plan = PollPlan::plan(Nominations {
+        carried,
+        swept: discovered.streams,
+        examined,
+        reconciling,
         read_batch,
-        if reconciling {
-            RECONCILED
-        } else {
-            progress.share_from
-        },
-        [carried, discovered.streams, examined],
-    );
-    let [carried_over, _, _] = left;
+        share_from: progress.share_from,
+    });
     progress.share_from += 1;
-    let streams = taken;
 
     // The sweep has read this stretch of log whatever the streams in it turn out to owe,
     // and a stream left unfinished is remembered rather than re-swept for.
@@ -3087,241 +3072,145 @@ async fn drain_policy_once(
         write_sweep(pool, &name, progress.swept_through).await?;
     }
 
-    if streams.is_empty() {
+    let executed = if plan.streams().is_empty() {
         // Nothing was nominated, so the page was empty — a source with anything to offer
-        // always wins a slot. An empty page is the end of a pass, and recording it here
-        // is what wraps the rotation: without it a cursor that has reached the last
-        // stream id queries past the end for ever, and a behind stream sorting before it
-        // is never compared again (funkode-io/replay#231 review).
-        if reconciling {
-            progress.reconciled(&page, 0, read_batch);
-            write_reconciled(pool, &name, &progress.reconciled_through).await?;
-        }
-
+        // always wins a slot. The poll is settled below all the same, which is what wraps
+        // the rotation: an empty page is the end of a pass, and a cursor that has reached
+        // the last stream id queries past the end for ever until something records that
+        // (funkode-io/replay#231 review).
         reporting.tell(&name, Poll::Exhausted);
-        return Ok(0);
-    }
+        0
+    } else {
+        let places = places_of(pool, &name, plan.streams()).await?;
 
-    let places = places_of(pool, &name, &streams).await?;
+        // The window is work, before any of it is done: a first reaction that takes
+        // minutes must run inside the bracket rather than before it.
+        reporting.tell(&name, Poll::Found { at: started });
 
-    // The window is work, before any of it is done: a first reaction that takes
-    // minutes must run inside the bracket rather than before it.
-    reporting.tell(&name, Poll::Found { at: started });
+        let mut executed = 0;
+        let mut events_since_checkpoint = 0u32;
+        // One entry per stream advanced since the last flush, so this is bounded by the
+        // number of streams this poll looked at, which `read_batch` bounds in turn.
+        let mut advanced: Vec<(String, i64)> = Vec::new();
+        // What the poll observed each place to be, which is what its checkpoints are
+        // written against: a place that has moved underneath this poll belongs to an
+        // operator or to another runner, and this one's arithmetic about it is stale.
+        let mut observed = places.clone();
 
-    let mut executed = 0;
-    let mut events_since_checkpoint = 0u32;
-    // One entry per stream advanced since the last flush, so this is bounded by the
-    // number of streams this poll looked at, which `read_batch` bounds in turn.
-    let mut advanced: Vec<(String, i64)> = Vec::new();
-    // The queue the next poll starts from, in two halves: what this poll's budget never
-    // reached, then what it read and may not have finished. A stream written to faster
-    // than it is read goes to the back every time rather than holding the front.
-    let mut unvisited: Vec<String> = Vec::new();
-    let mut unfinished: Vec<String> = Vec::new();
-    // What the poll observed each place to be, which is what its checkpoints are written
-    // against: a place that has moved underneath this poll belongs to an operator or to
-    // another runner, and this one's arithmetic about it is stale.
-    let mut observed = places.clone();
-    // `read_batch_size` is a budget for the drain, not for each stream: spent across the
-    // streams in order, so one poll reads what the knob says however many streams it
-    // looks at. What the budget does not reach is carried, not lost.
-    let mut budget = read_batch;
-    // How far down the candidate list the budget reached. A stream past this was named by
-    // a source and never read, which is the difference the reconciliation's rotation
-    // turns on: a slot is not a read.
-    let mut visited = 0usize;
+        // `read_batch_size` is a budget for the drain, not for each stream: the plan hands
+        // out what is left of it a stream at a time, and stops when it is spent. What the
+        // budget does not reach is carried, not lost.
+        while let Some(turn) = plan.turn() {
+            let stream_id = turn.stream_id;
+            let place = places.get(&stream_id).copied().unwrap_or_default().seq;
+            let events = read_stream(pool, filter.clone(), &stream_id, place, turn.budget).await?;
+            plan.read(events.len() as u32);
 
-    for (index, stream_id) in streams.iter().enumerate() {
-        if budget == 0 {
-            unvisited.extend(streams[index..].iter().cloned());
-            break;
-        }
-        visited = index + 1;
-
-        let place = places.get(stream_id).copied().unwrap_or_default().seq;
-        let events = read_stream(pool, filter.clone(), stream_id, place, budget).await?;
-        // A full read means the stream may have more; it is looked at again next poll
-        // rather than drained here, so one busy stream cannot hold up every other. It
-        // goes to the *back* of the queue — ahead of nothing it was ahead of — because a
-        // stream written to faster than it is read would otherwise hold the front of the
-        // queue for good and starve everything behind it.
-        if events.len() as u32 == budget {
-            unfinished.push(stream_id.clone());
-        }
-        budget -= events.len() as u32;
-
-        let mut reached = place;
-        let mut superseded = false;
-        for event in events {
-            if let Some(raw) = event.delivered {
-                let depth = event_causation_depth(&raw);
-                if depth >= max_depth {
-                    // Circuit breaker: the event's causation chain is too deep.
-                    // Skip reactions but keep advancing so the policy is not wedged.
-                    let (_, limit_source) = resolve_max_depth_with_source(policy);
-                    tracing::warn!(
-                        policy        = %name,
-                        event_id      = %raw.id,
-                        stream_id     = %raw.stream_id,
-                        global_position = event.global_position,
-                        stream_seq    = event.stream_seq,
-                        depth,
-                        max_depth,
-                        limit_source,
-                        causation_chain = ?parse_causation_info(&raw),
-                        "causation depth limit reached; skipping reaction to prevent runaway cascade"
-                    );
-                } else {
-                    // Real event within depth budget: deliver to the policy with
-                    // the full resilience policy (BRV advance, retry, dead-letter),
-                    // and with a panic in the reaction contained to this event.
-                    executed += delivery
-                        .react_to_event(policy, event.global_position, &raw)
-                        .await?;
-                }
-            }
-            // Always track in-memory place.
-            reached = event.stream_seq;
-            events_since_checkpoint += 1;
-            // Told as the Policy moves rather than when the poll returns: one poll's
-            // batch is dispatched event by event, each bounded only by the dispatch
-            // timeout and its retries, so a poll can outlast the progress cadence
-            // several times over.
-            reporting.tell(
-                &name,
-                Poll::Advanced {
-                    events: 1,
-                    at: Instant::now(),
-                },
-            );
-            // Write the persistent places every `checkpoint_size` events so that
-            // a crash re-processes at most `checkpoint_size - 1` events rather
-            // than the full drain batch (skip-safety: a place only advances past
-            // events whose reactions are already durably committed).
-            if events_since_checkpoint >= checkpoint_size {
-                let mut flushing = std::mem::take(&mut advanced);
-                flushing.push((stream_id.clone(), reached));
-                let kept = checkpoint_places(pool, &name, &flushing, &observed).await?;
-                for (stream, seq) in &flushing {
-                    if let Some(written_by) = kept.get(stream) {
-                        observed.insert(
-                            stream.clone(),
-                            Place {
-                                seq: *seq,
-                                written_by: Some(*written_by),
-                            },
+            let mut reached = place;
+            let mut superseded = false;
+            for event in events {
+                if let Some(raw) = event.delivered {
+                    let depth = event_causation_depth(&raw);
+                    if depth >= max_depth {
+                        // Circuit breaker: the event's causation chain is too deep.
+                        // Skip reactions but keep advancing so the policy is not wedged.
+                        let (_, limit_source) = resolve_max_depth_with_source(policy);
+                        tracing::warn!(
+                            policy        = %name,
+                            event_id      = %raw.id,
+                            stream_id     = %raw.stream_id,
+                            global_position = event.global_position,
+                            stream_seq    = event.stream_seq,
+                            depth,
+                            max_depth,
+                            limit_source,
+                            causation_chain = ?parse_causation_info(&raw),
+                            "causation depth limit reached; skipping reaction to prevent runaway cascade"
                         );
+                    } else {
+                        // Real event within depth budget: deliver to the policy with
+                        // the full resilience policy (BRV advance, retry, dead-letter),
+                        // and with a panic in the reaction contained to this event.
+                        executed += delivery
+                            .react_to_event(policy, event.global_position, &raw)
+                            .await?;
                     }
                 }
-                events_since_checkpoint = 0;
-                if !kept.contains_key(stream_id) {
-                    superseded = true;
-                    break;
+                // Always track in-memory place.
+                reached = event.stream_seq;
+                events_since_checkpoint += 1;
+                // Told as the Policy moves rather than when the poll returns: one poll's
+                // batch is dispatched event by event, each bounded only by the dispatch
+                // timeout and its retries, so a poll can outlast the progress cadence
+                // several times over.
+                reporting.tell(
+                    &name,
+                    Poll::Advanced {
+                        events: 1,
+                        at: Instant::now(),
+                    },
+                );
+                // Write the persistent places every `checkpoint_size` events so that
+                // a crash re-processes at most `checkpoint_size - 1` events rather
+                // than the full drain batch (skip-safety: a place only advances past
+                // events whose reactions are already durably committed).
+                if events_since_checkpoint >= checkpoint_size {
+                    let mut flushing = std::mem::take(&mut advanced);
+                    flushing.push((stream_id.clone(), reached));
+                    let kept = checkpoint_places(pool, &name, &flushing, &observed).await?;
+                    for (stream, seq) in &flushing {
+                        if let Some(written_by) = kept.get(stream) {
+                            observed.insert(
+                                stream.clone(),
+                                Place {
+                                    seq: *seq,
+                                    written_by: Some(*written_by),
+                                },
+                            );
+                        }
+                    }
+                    events_since_checkpoint = 0;
+                    if !kept.contains_key(&stream_id) {
+                        superseded = true;
+                        break;
+                    }
                 }
+            }
+
+            // A stream whose place moved under the poll is left where its new owner put
+            // it: nothing is written for it, and it is not carried, because the next poll
+            // reads the place afresh and resumes from there.
+            if superseded {
+                tracing::info!(
+                    policy    = %name,
+                    stream_id = %stream_id,
+                    "policy place moved underneath this poll; abandoning the stream and \
+                     resuming from the place that is stored"
+                );
+                plan.abandoned();
+                continue;
+            }
+
+            if reached > place {
+                advanced.push((stream_id, reached));
             }
         }
 
-        // A stream whose place moved under the poll is left where its new owner put it:
-        // nothing is written for it, and it is not carried, because the next poll reads
-        // the place afresh and resumes from there.
-        if superseded {
-            tracing::info!(
-                policy    = %name,
-                stream_id = %stream_id,
-                "policy place moved underneath this poll; abandoning the stream and \
-                 resuming from the place that is stored"
-            );
-            unfinished.retain(|carried| carried != stream_id);
-            continue;
-        }
+        // Final checkpoint: flush any stream advanced since the last periodic save.
+        checkpoint_places(pool, &name, &advanced, &observed).await?;
 
-        if reached > place {
-            advanced.push((stream_id.clone(), reached));
-        }
-    }
+        executed
+    };
 
-    // Final checkpoint: flush any stream advanced since the last periodic save.
-    checkpoint_places(pool, &name, &advanced, &observed).await?;
-
-    // The rotation advances through what this poll *read*, not through what it admitted:
-    // a candidate the event budget never reached is carried, and stepping the rotation
-    // over it would leave it for a full pass — or for ever, if the front of the page is
-    // always what the budget spends itself on. Contiguous from the front of the page,
-    // because the rotation is one id and cannot describe a hole in the middle.
-    if reconciling {
-        let read: HashSet<&String> = streams[..visited].iter().collect();
-        let read_through = page
-            .iter()
-            .take_while(|stream| read.contains(stream))
-            .count();
-
-        progress.reconciled(&page, read_through, read_batch);
+    // What the poll decided, recorded: the queue the next one starts from, and — on the
+    // polls a reconciliation ran on — where its rotation got to. One call site, on every
+    // path, because the path this was missing from was the one that reads nothing, which
+    // is exactly the one a finished pass ends on (funkode-io/replay#231 review).
+    if progress.settled(plan.settle()) {
         write_reconciled(pool, &name, &progress.reconciled_through).await?;
     }
 
-    // What the next poll starts from, oldest claim first: what this one could not fit,
-    // then what it did not reach, then what it read and may not have finished. Capped,
-    // because it is the one collection here that outlives a poll.
-    let mut carrying = carried_over;
-    carrying.extend(unvisited);
-    carrying.extend(unfinished);
-    carrying.truncate(read_batch as usize);
-    progress.unfinished = carrying;
-
     Ok(executed)
-}
-
-/// Which source the reconciliation is, in the array `drain_policy_once` shares a poll
-/// between. It leads on the poll it runs, so it is the one index that has to be named.
-const RECONCILED: usize = 2;
-
-/// What one poll takes, and what each source still had to offer when it stopped.
-struct Shared<const N: usize> {
-    taken: Vec<String>,
-    /// Per source, in the order given: the candidates that got no slot. Each source's
-    /// caller decides what that means — carried forward, or left for the next pass.
-    left: [Vec<String>; N],
-}
-
-/// Fill a poll's candidate list from its sources a slot at a time, starting at `from` and
-/// wrapping, skipping streams already taken.
-///
-/// Takes ownership because each source is consumed as far as it was used: a stream named
-/// twice costs one slot, not two, and the source that named it first keeps its turn. What
-/// is left is handed back rather than dropped, so no caller has to assume its candidates
-/// were read.
-///
-/// `from` moves the first turn between polls. With three sources and a batch of two, a
-/// fixed order would give the third source no slot at all — for ever, if the first two
-/// always have something to offer.
-fn share_the_poll<const N: usize>(limit: u32, from: usize, sources: [Vec<String>; N]) -> Shared<N> {
-    let mut sources = sources.map(Vec::into_iter);
-    let mut taken: Vec<String> = Vec::new();
-
-    'filling: while (taken.len() as u32) < limit {
-        let mut offered = false;
-        for turn in 0..N {
-            let source = &mut sources[(from + turn) % N];
-            for stream_id in source.by_ref() {
-                if !taken.contains(&stream_id) {
-                    taken.push(stream_id);
-                    offered = true;
-                    break;
-                }
-            }
-            if (taken.len() as u32) >= limit {
-                break 'filling;
-            }
-        }
-        if !offered {
-            break;
-        }
-    }
-
-    Shared {
-        taken,
-        left: sources.map(Iterator::collect),
-    }
 }
 
 /// The runner's machinery for delivering events to **one** policy: the
@@ -4564,24 +4453,23 @@ impl PolicyProgress {
             .is_none_or(|last| last.elapsed() >= self.reconcile_every)
     }
 
-    /// Record a reconciliation: `page` is the streams it compared, `read` how many of
-    /// them the poll went on to actually read, counted from the front.
+    /// Take what a poll decided ([`PollPlan::settle`]), and say whether the rotation has
+    /// to be persisted.
     ///
-    /// The rotation stops at the last stream that was **read** and never passes one that
-    /// was not, so a page the poll admitted but its event budget never reached is
-    /// compared again next cadence rather than skipped. A page none of which was read
-    /// leaves the rotation where it was. A page read whole and short of the limit — no
-    /// page at all included, which is what the last stream id looks like from the far
-    /// side — is the end of a pass, and the next one starts over: the empty string sorts
-    /// before every id.
-    fn reconciled(&mut self, page: &[String], read: usize, limit: u32) {
-        self.reconciled_at = Some(Instant::now());
+    /// The clock is here rather than in the decision: when the cadence is next due is the
+    /// one part of this a simulation must be able to drive itself, so the poll is *told*
+    /// whether a reconciliation is running and tells back that one ran.
+    fn settled(&mut self, settled: Settled) -> bool {
+        self.unfinished = settled.carried;
 
-        if read == page.len() && (page.len() as u32) < limit {
-            self.reconciled_through = String::new();
-        } else if read > 0 {
-            self.reconciled_through = page[read - 1].clone();
+        if settled.reconciled {
+            self.reconciled_at = Some(Instant::now());
+            if let Some(through) = settled.rotation {
+                self.reconciled_through = through;
+            }
         }
+
+        settled.reconciled
     }
 }
 
@@ -5832,177 +5720,6 @@ mod pinned_session_tests {
     }
 }
 
-/// How one poll's candidate list is shared between the places it can come from.
-///
-/// Pure, so the cases that matter — a batch too small to divide between the sources, a
-/// source naming what another already named — are one assertion each rather than a
-/// database and a daemon.
-#[cfg(test)]
-mod sharing_tests {
-    use super::share_the_poll;
-
-    fn streams(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| (*name).to_string()).collect()
-    }
-
-    /// One slot and three sources: the turn decides, and over three polls each source
-    /// gets one. Without the turn the same source takes the only slot for ever, which is
-    /// how a quiet stream the sweep passed stays undelivered (funkode-io/replay#231).
-    #[test]
-    fn a_batch_too_small_to_divide_gives_each_source_a_turn() {
-        let taken = |from| {
-            share_the_poll(
-                1,
-                from,
-                [
-                    streams(&["carried"]),
-                    streams(&["swept"]),
-                    streams(&["behind"]),
-                ],
-            )
-            .taken
-        };
-
-        assert_eq!(taken(0), streams(&["carried"]));
-        assert_eq!(taken(1), streams(&["swept"]));
-        assert_eq!(taken(2), streams(&["behind"]));
-        assert_eq!(taken(3), streams(&["carried"]), "the turn wraps");
-    }
-
-    /// Room for everyone: order follows the turn, and nothing is dropped.
-    #[test]
-    fn a_batch_with_room_takes_from_every_source() {
-        let shared = share_the_poll(
-            9,
-            1,
-            [
-                streams(&["carried"]),
-                streams(&["swept"]),
-                streams(&["behind"]),
-            ],
-        );
-
-        assert_eq!(shared.taken, streams(&["swept", "behind", "carried"]));
-        assert!(shared.left.iter().all(Vec::is_empty));
-    }
-
-    /// A stream two sources name costs one slot, and what no slot was found for is handed
-    /// back rather than dropped — the caller decides whether that means "carry it" or
-    /// "leave the rotation where it was".
-    #[test]
-    fn a_stream_named_twice_costs_one_slot_and_the_rest_is_handed_back() {
-        let shared = share_the_poll(
-            2,
-            0,
-            [
-                streams(&["both"]),
-                streams(&["both", "swept-only"]),
-                streams(&["behind-only"]),
-            ],
-        );
-
-        assert_eq!(shared.taken, streams(&["both", "swept-only"]));
-        assert_eq!(
-            shared.left,
-            [streams(&[]), streams(&[]), streams(&["behind-only"]),],
-            "the source that got no slot keeps its candidate"
-        );
-    }
-}
-
-/// Where the reconciliation's rotation stops, which is a decision about a page of stream
-/// ids and nothing else.
-///
-/// Pure, so the cases live here rather than behind a container: what the rotation does
-/// with a page nobody had room for, and with no page at all, is the difference between a
-/// stream examined once a pass and a stream never examined again.
-#[cfg(test)]
-mod rotation_tests {
-    use std::time::Duration;
-
-    use super::PolicyProgress;
-
-    fn at(reconciled_through: &str) -> PolicyProgress {
-        PolicyProgress {
-            swept_through: 0,
-            unfinished: Vec::new(),
-            share_from: 0,
-            reconciled_through: reconciled_through.to_string(),
-            reconciled_at: None,
-            reconcile_every: Duration::from_secs(5),
-        }
-    }
-
-    fn page(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| (*name).to_string()).collect()
-    }
-
-    /// The end of a pass: no page means nothing sorts after the rotation point, so the
-    /// next one starts over. Without this a rotation that reached the last stream id
-    /// queries past the end for ever, and a stream behind it is never compared again.
-    #[test]
-    fn a_page_with_nothing_in_it_ends_the_pass() {
-        let mut progress = at("urn:probe:z");
-        progress.reconciled(&page(&[]), 0, 100);
-
-        assert_eq!(progress.reconciled_through, "");
-    }
-
-    /// A page shorter than the batch is the last of a pass, for the same reason.
-    #[test]
-    fn a_short_page_taken_whole_ends_the_pass() {
-        let mut progress = at("urn:probe:a");
-        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 2, 100);
-
-        assert_eq!(progress.reconciled_through, "");
-    }
-
-    /// A full page taken whole carries on after it.
-    #[test]
-    fn a_full_page_taken_whole_advances_the_rotation() {
-        let mut progress = at("");
-        progress.reconciled(&page(&["urn:probe:a", "urn:probe:b"]), 2, 2);
-
-        assert_eq!(progress.reconciled_through, "urn:probe:b");
-    }
-
-    /// The case the poll's own limit creates: the page was read, the poll had room for
-    /// some of it, and the rotation stops at the last stream that got a slot. Advancing
-    /// past the rest would step over them unread whenever the front of the page stays
-    /// behind, which is what the rotation exists for.
-    #[test]
-    fn a_page_the_poll_could_not_fit_stops_where_the_room_ran_out() {
-        let mut progress = at("");
-        progress.reconciled(&page(&["urn:probe:a", "urn:probe:b", "urn:probe:c"]), 1, 3);
-
-        assert_eq!(progress.reconciled_through, "urn:probe:a");
-    }
-
-    /// A page the poll admitted but never read is not stepped over either.
-    ///
-    /// The distinction the rotation turns on: winning a candidate slot is not being read,
-    /// because the poll's event budget can be spent before it reaches the stream. A slot
-    /// count is what this used to be given, so a busy stream earlier in the list could
-    /// eat the budget while the rotation moved past a quiet stream nobody looked at
-    /// (funkode-io/replay#231 review).
-    #[test]
-    fn a_page_admitted_but_not_read_is_compared_again() {
-        let mut progress = at("urn:probe:a");
-        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 0, 10);
-
-        assert_eq!(progress.reconciled_through, "urn:probe:a");
-    }
-
-    /// And a page nobody had room for leaves it exactly where it was.
-    #[test]
-    fn a_page_with_no_room_at_all_leaves_the_rotation_alone() {
-        let mut progress = at("urn:probe:a");
-        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 0, 2);
-
-        assert_eq!(progress.reconciled_through, "urn:probe:a");
-    }
-}
-
 /// What a Policy's places are, before a worker is anywhere near them
 /// (funkode-io/replay#195).
 ///
@@ -6019,10 +5736,21 @@ mod progress_tests {
     use testcontainers_modules::postgres;
     use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 
+    use crate::policy_frontier::rotation_after;
+
     use super::{
         bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, Place,
         PolicyProgress, StartAt,
     };
+
+    /// Move the rotation the way a poll that compared `page` and read `read` of it would,
+    /// without a poll: these tests are about what the next `streams_behind` returns from
+    /// where the rotation lands.
+    fn rotate(progress: &mut PolicyProgress, page: &[String], read: usize, limit: u32) {
+        if let Some(through) = rotation_after(page, read, limit) {
+            progress.reconciled_through = through;
+        }
+    }
 
     const POLICY: &str = "progress_under_test";
 
@@ -6244,7 +5972,7 @@ mod progress_tests {
             "nothing sorts after the end, which is the state this is about"
         );
 
-        progress.reconciled(&[], 0, 10);
+        rotate(&mut progress, &[], 0, 10);
 
         assert_eq!(
             progress.reconciled_through, "",
@@ -6285,7 +6013,7 @@ mod progress_tests {
             vec!["urn:probe:a1".to_string(), "urn:probe:a2".to_string()],
             "a full batch of the streams that sort first"
         );
-        progress.reconciled(&first, first.len(), 2);
+        rotate(&mut progress, &first, first.len(), 2);
         write_reconciled(&pool, POLICY, &progress.reconciled_through)
             .await
             .expect("writing the rotation must succeed");
@@ -6305,7 +6033,7 @@ mod progress_tests {
             vec!["urn:probe:z".to_string()],
             "the stream the first pass could not reach, with the first two still behind"
         );
-        progress.reconciled(&second, second.len(), 2);
+        rotate(&mut progress, &second, second.len(), 2);
         assert_eq!(
             progress.reconciled_through, "",
             "a short batch is the end of the pass, and the next one starts over"

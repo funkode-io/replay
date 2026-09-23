@@ -88,6 +88,11 @@ is owed is read from that stream's own sequence, which has no holes.
   stepped over, and a Policy too far behind to keep up is late everywhere — not late
   *here*. The watermark's equivalent bound was the duration of the longest transaction in
   the instance, which is not a number anyone configures.
+
+  The floor is asserted rather than argued: `liveness_simulation` in
+  `persistence/src/policy_frontier.rs` replays sixty-four schedules against the poll's own
+  decision and fails if a behind stream goes unread for longer than this bound derived at
+  one read per cadence (funkode-io/replay#243).
 - **There is no hole to detect, so the machinery that detected holes is gone**:
   `burned_position.rs` and its `pg_locks` probe, `policy_feed.rs` and its gap truncation,
   `policy_blocked.rs` and its rate gate, `PolicyCondition::Blocked`, and the cursor's

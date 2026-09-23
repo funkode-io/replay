@@ -52,8 +52,8 @@ const REVIEWED: &[Reviewed] = &[
         file: "src/policy_runner.rs",
         function: "places_of",
         justification: "One row per stream named in the poll's candidate list, which \
-                        `drain_policy_once` truncates to read_batch_size whatever the \
-                        sweep, the reconciliation and the last poll's leftovers offer.",
+                        `PollPlan::plan` caps at read_batch_size whatever the sweep, \
+                        the reconciliation and the last poll's leftovers offer.",
     },
     Reviewed {
         file: "src/policy_runner.rs",
@@ -70,7 +70,7 @@ const REVIEWED: &[Reviewed] = &[
         function: "checkpoint_places",
         justification: "RETURNING one row per place written, and the places written are \
                         the streams the poll advanced: bounded by the candidate list, \
-                        which `drain_policy_once` truncates to read_batch_size. Read \
+                        which `PollPlan::plan` caps at read_batch_size. Read \
                         back rather than counted because the caller needs to know which \
                         of the writes lost their compare-and-set, and at what row \
                         version the ones that won now sit.",
