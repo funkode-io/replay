@@ -221,19 +221,7 @@ mod tests {
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: bank_account_urn.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 1,
-            created: chrono::Utc::now(),
-            metadata: BankAccountMetadata {
-                bank_account: bank_account_urn,
-            }
-            .into(),
-            aggregate_version: None,
-        };
+        let persisted_event = crate::PersistedEvent::of(bank_account_urn, event);
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
 
@@ -245,19 +233,7 @@ mod tests {
         let filter = super::StreamFilter::with_stream_id::<BankAccountStream>(&bank_account_urn);
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: bank_account_urn.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 1,
-            created: chrono::Utc::now(),
-            metadata: BankAccountMetadata {
-                bank_account: bank_account_urn,
-            }
-            .into(),
-            aggregate_version: None,
-        };
+        let persisted_event = crate::PersistedEvent::of(bank_account_urn, event);
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
 
@@ -269,19 +245,7 @@ mod tests {
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: bank_account_urn.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 1,
-            created: chrono::Utc::now(),
-            metadata: BankAccountMetadata {
-                bank_account: bank_account_urn,
-            }
-            .into(),
-            aggregate_version: None,
-        };
+        let persisted_event = crate::PersistedEvent::of(bank_account_urn, event);
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
 
@@ -294,16 +258,8 @@ mod tests {
         let filter = super::StreamFilter::with_metadata(metadata.clone());
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: metadata.bank_account.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 1,
-            created: chrono::Utc::now(),
-            metadata: metadata.into(),
-            aggregate_version: None,
-        };
+        let persisted_event =
+            crate::PersistedEvent::of(metadata.bank_account.clone(), event).with_metadata(metadata);
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
 
@@ -315,44 +271,21 @@ mod tests {
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: bank_account_urn.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 2,
-            created: chrono::Utc::now(),
-            metadata: BankAccountMetadata {
-                bank_account: bank_account_urn,
-            }
-            .into(),
-            aggregate_version: None,
-        };
+        let persisted_event = crate::PersistedEvent::of(bank_account_urn, event).with_version(2);
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
 
     // test an event pass filter `StreamFilter::CreatedAfter`
     #[test]
     fn test_created_after() {
-        let filter =
-            super::StreamFilter::created_after(chrono::Utc::now() - chrono::Duration::seconds(1));
+        let created = chrono::Utc::now();
+        let filter = super::StreamFilter::created_after(created - chrono::Duration::seconds(1));
         let event = BankAccountEvent::Deposited { amount: 123f64 };
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: bank_account_urn.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 1,
-            created: chrono::Utc::now(),
-            metadata: BankAccountMetadata {
-                bank_account: bank_account_urn,
-            }
-            .into(),
-            aggregate_version: None,
-        };
+        let persisted_event =
+            crate::PersistedEvent::of(bank_account_urn, event).with_created(created);
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
 
@@ -365,19 +298,7 @@ mod tests {
             .and(super::StreamFilter::after_version(1));
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: bank_account_urn.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 2,
-            created: chrono::Utc::now(),
-            metadata: BankAccountMetadata {
-                bank_account: bank_account_urn,
-            }
-            .into(),
-            aggregate_version: None,
-        };
+        let persisted_event = crate::PersistedEvent::of(bank_account_urn, event).with_version(2);
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
 
@@ -390,19 +311,7 @@ mod tests {
             .or(super::StreamFilter::after_version(1));
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: bank_account_urn.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 1,
-            created: chrono::Utc::now(),
-            metadata: BankAccountMetadata {
-                bank_account: bank_account_urn,
-            }
-            .into(),
-            aggregate_version: None,
-        };
+        let persisted_event = crate::PersistedEvent::of(bank_account_urn, event).with_version(1);
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
 
@@ -415,19 +324,7 @@ mod tests {
             .and(super::StreamFilter::after_version(1).not());
         let event = BankAccountEvent::Deposited { amount: 123f64 };
 
-        let persisted_event = crate::PersistedEvent {
-            id: uuid::Uuid::new_v4(),
-            data: event,
-            stream_id: bank_account_urn.clone().into(),
-            r#type: "BankAccountEvent".to_string(),
-            version: 1,
-            created: chrono::Utc::now(),
-            metadata: BankAccountMetadata {
-                bank_account: bank_account_urn,
-            }
-            .into(),
-            aggregate_version: None,
-        };
+        let persisted_event = crate::PersistedEvent::of(bank_account_urn, event).with_version(1);
 
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
     }
