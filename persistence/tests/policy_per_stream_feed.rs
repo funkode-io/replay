@@ -263,16 +263,72 @@ async fn an_operator_moves_a_place_on_a_running_daemon_postgres_test() {
     harness.await_dispatch_caused_by(ping.global_position).await;
     let delivered_once = harness.dispatches().await.len();
 
-    // Waits for the place to be written before moving it, not merely for the reaction to
-    // fire: a rewind to exactly the place the running poll started from is one the poll's
-    // own checkpoint cannot tell from its own progress, and it is overwritten
-    // (funkode-io/replay#234).
+    // Waits for the place to be written before moving it, so what the rewind asks for is
+    // a *re*delivery: an event this policy has already reacted to once.
     harness.redeliver(&ping).await;
 
     harness
         .observe("the policy to react to the same event twice", || async {
             (harness.dispatches().await.len() > delivered_once).then_some(())
         })
+        .await;
+
+    harness.shutdown().await;
+}
+
+/// The rewind an operator actually makes: back to just before the event that has only
+/// just failed — which is the place the poll delivering it started from
+/// (funkode-io/replay#234).
+///
+/// A checkpoint that compares the place it read cannot see this one at all: "nobody has
+/// written this since I read it" and "the operator wrote it and it says what it said" are
+/// the same value. The rewind is undone and the redelivery never happens.
+///
+/// The interleaving is forced rather than raced for. Holding the row lock on the place
+/// stops the poll at its checkpoint — the one moment where the operator's rewind and the
+/// poll's progress are both live — and the rewind is made from inside that window. Racing
+/// it is how this was found: the test above rewound the instant the reaction fired and
+/// failed about one run in four.
+#[tokio::test]
+async fn a_rewind_to_the_place_a_poll_started_from_survives_its_checkpoint_postgres_test() {
+    let harness = PolicyDaemonHarness::start("rewind_to_start", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+    })
+    .await;
+
+    // The place the next poll will start from: one event delivered, and recorded.
+    let first = harness.ping("rewind-me", "first").await;
+    harness.await_passed(first.global_position).await;
+    let started_from = harness
+        .place_in(&first.stream_id)
+        .await
+        .expect("the stream must have a place once its first event has been passed");
+
+    // In the checkpoint's way before the event it will checkpoint exists.
+    let place = harness.hold_place_row(&first.stream_id).await;
+
+    let failed = harness.ping("rewind-me", "again").await;
+    harness
+        .await_dispatch_caused_by(failed.global_position)
+        .await;
+    place.await_a_checkpoint_waiting().await;
+
+    // "Deliver that one again", made against a poll that is holding it.
+    place.rewind_to(started_from).await;
+
+    harness
+        .observe(
+            "the event the rewind asked for to be delivered again",
+            || async {
+                let delivered = harness
+                    .dispatches()
+                    .await
+                    .into_iter()
+                    .filter(|dispatch| dispatch.caused_by_position == failed.global_position)
+                    .count();
+                (delivered > 1).then_some(())
+            },
+        )
         .await;
 
     harness.shutdown().await;

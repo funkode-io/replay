@@ -98,21 +98,26 @@ is owed is read from that stream's own sequence, which has no holes.
   without rewinding the Policy over every other. The refresh machinery ADR-0012 needed is
   gone with it, because places are read fresh every poll rather than held in memory
   between them — but the compare-and-set stays, per stream: a poll writes a place only
-  where it still reads as the value that poll started from. Monotonicity alone would not
-  do, because the write it has to refuse is *lower* than the one the poll carries. An
-  operator rewinding a stream mid-batch against a monotonic write would see the runner
-  reinstate its higher place and undo the rewind silently, which is a control surface in
-  name only.
+  where the row is still the one it read. Monotonicity alone would not do, because the
+  write it has to refuse is *lower* than the one the poll carries. An operator rewinding a
+  stream mid-batch against a monotonic write would see the runner reinstate its higher
+  place and undo the rewind silently, which is a control surface in name only.
 - **`policy_cursors.position` is renamed `discovered_through`** and means where the search
   resumes, not what has been processed. A Policy's progress is no longer one number, and
   no column pretends otherwise.
-- **The compare-and-set compares a place, so it cannot see a rewind to the place the poll
-  started from.** "Unchanged since I looked" and "changed twice, back to where it was" are
-  the same value. An operator rewinding a stream to just before the event a poll is
-  delivering right now — the shape of "redeliver the one that just failed" — has the poll's
-  checkpoint overwrite it. The place reads forward again immediately, so an operator who
-  looks can tell and repeat; the library says nothing. A generation on the row closes it
-  (funkode-io/replay#234) and is not in this change.
+- **The compare-and-set compares the row version, not the place** — PostgreSQL's `xmin`,
+  read with the place and carried through the poll. A compared *place* answers the wrong
+  question: "unchanged since I looked" and "changed twice, back to where it was" are the
+  same value, so a rewind to just before the event a poll is delivering right now — the
+  shape of "redeliver the one that just failed" — was overwritten by that poll's own
+  checkpoint (funkode-io/replay#234). `xmin` moves on every write to the row, including
+  writes by an operator who has never heard of it. A column of our own would have to be
+  bumped by whoever writes the row, which for the operator's `UPDATE` means a convention
+  in the README rather than a constraint in the database — the same reason `updated_at`
+  was never a candidate. A stale comparison can only refuse a checkpoint, never accept a
+  wrong one, and a refused checkpoint costs a duplicate delivery, which the contract
+  already allows. PostgreSQL recycles an `xid` only across freezing and wraparound, tens
+  of millions of transactions apart; the window compared here is one poll.
 - **A runner learns it has been superseded one stream at a time**, where the old cursor
   told it once for the whole Policy. A lost compare-and-set abandons that stream for the
   poll and leaves the place where its new owner put it; the other streams in the batch
