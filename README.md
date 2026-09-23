@@ -2193,15 +2193,22 @@ costs a scan of one row per stream, so it runs on a cadence rather than per poll
 
 | Setting | Default | What it bounds |
 |---------|---------|----------------|
-| `REPLAY_POLICY_RECONCILE_SECS` | 5 | How often the reconciliation runs. One cadence bounds the lateness of a write that committed below the sweep while the policy has no more streams than its read batch; beyond that the bound is one full pass, below. Never *whether*. |
+| `REPLAY_POLICY_RECONCILE_SECS` | 5 | How often the reconciliation runs, and so the unit the delivery bound below is counted in. Never *whether*. |
 
 Lower it if that tail latency matters more than the scan; raise it if you have millions of
 streams and no long-running writes.
 
-The reconciliation examines `read_batch_size` streams per cadence and **resumes where it
-left off**, wrapping at the end, so a policy with more streams than that takes
-`ceil(streams / read_batch_size)` cadences to compare all of them — that is the worst case
-for a write the sweep passed, not the 5 seconds above.
+The reconciliation examines `read_batch_size` streams per cadence, **resumes where it left
+off** and wraps, and shares each poll's slots with the other two discovery sources. So the
+worst case for a write the sweep passed is not the 5 seconds above but
+
+```text
+3 × ceil(streams behind / read_batch_size) cadences
+```
+
+— 15 seconds at the defaults for a policy behind on fewer than a hundred streams. The
+reasoning, and when the 3 applies, is in
+[ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md).
 
 `read_batch_size` is one budget for a whole poll, spent across the streams that poll looks
 at — not a batch per stream. A policy owed work in a hundred streams reads the same number
@@ -2248,7 +2255,7 @@ because a place is only read for a stream that poll is looking at:
 | The stream you moved | When it is picked up |
 |---|---|
 | is still being written to | the next poll, on the sweep |
-| is quiet and the sweep has passed it | the next reconciliation — one `REPLAY_POLICY_RECONCILE_SECS`, or a full pass of the rotation (`ceil(streams / read_batch_size)` cadences) when the policy has more streams than its read batch |
+| is quiet and the sweep has passed it | the next reconciliation that reaches it — one `REPLAY_POLICY_RECONCILE_SECS` for a policy behind on no more streams than its read batch, and up to `3 × ceil(streams behind / read_batch_size)` cadences otherwise ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)) |
 
 Places themselves are never held in memory between polls, so no running process carries a
 stale copy of one forward.
@@ -2513,19 +2520,32 @@ kill.
 #### Reading a process that died without saying so
 
 An OOM kill leaves no log line of its own, so every election logs at `info` where
-the worker picks up:
+the worker picks up its search:
 
 ```text
-INFO policy worker is leading; resuming after its last checkpoint
-     policy=price_fanout resuming_after=264785 next_position=264786
+INFO policy worker is leading; resuming its search after its last sweep
+     policy=price_fanout swept_through=264785
 ```
 
-Once per election, not per event. In a crash loop the same `next_position`
-reappears on every restart, naming the event to look at:
+Once per election, not per event. `swept_through` is where discovery resumes, not
+what has been processed — in a crash loop it reappears unchanged on every restart,
+which says the worker is dying before it finishes a poll rather than which event is
+killing it. For that, read the places, which do record progress:
 
 ```sql
-SELECT * FROM events WHERE global_position = 264786;
+-- what the policy is behind on, worst first
+SELECT s.id, s.stream_seq - COALESCE(c.stream_seq, 0) AS owed
+FROM streams s
+LEFT JOIN policy_stream_cursors c ON c.policy = 'price_fanout' AND c.stream_id = s.id
+WHERE s.stream_seq > COALESCE(c.stream_seq, 0)
+ORDER BY owed DESC LIMIT 10;
+
+-- the next event the worst-off stream owes, which is the one to look at
+SELECT * FROM events WHERE stream_id = 'urn:instrument:xyz' AND stream_seq = 42;
 ```
+
+A place that does not move across restarts names the stream; the event after it is
+the one being died on.
 
 A position that advances between restarts means the opposite: the process is
 making progress and still dying, i.e. leaking rather than choking on one event.
@@ -3051,7 +3071,7 @@ None of the three stops a policy, and none of them needs an operator:
 |---------------|----------------------|
 | A write failed after taking a `global_position` | Nothing. The number is burned — `nextval` is not transactional — and a policy that reads no global order never looks at it. The place the write took in its stream *is* handed back, because that counter is a row and rolls back with the transaction. |
 | A write is still running | Its stream waits for it, and only its stream. Every other stream is delivered meanwhile. |
-| A write commits below a policy's sweep | It is delivered by the reconciliation: within `REPLAY_POLICY_RECONCILE_SECS` while the policy has no more streams than its read batch, and within one full pass of the rotation — `ceil(streams / read_batch_size)` cadences — beyond that. |
+| A write commits below a policy's sweep | It is delivered by the reconciliation, within `3 × ceil(streams behind / read_batch_size)` cadences of `REPLAY_POLICY_RECONCILE_SECS` — one cadence for a policy behind on no more streams than its read batch ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). |
 
 This is the structural fix for
 [#164](https://github.com/funkode-io/replay/issues/164), where a burned position

@@ -4181,7 +4181,10 @@ async fn sweep_for_streams(
 /// low in the sort order would otherwise return those same ids every time, and a quiet
 /// stream sorting after them — one whose only write the sweep passed, so no future event
 /// will nominate it — would never be examined again. Rotating bounds that at one pass over
-/// the streams, which is `ceil(streams / limit)` cadences.
+/// the streams — `ceil(streams / limit)` cadences of its own, and up to three times that
+/// once it is sharing the poll's slots with the other two discovery sources
+/// ([ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) owns the
+/// bound).
 async fn streams_behind(
     pool: &Pool<Postgres>,
     name: &str,
@@ -4483,9 +4486,10 @@ struct PolicyProgress {
     /// which is what makes a crash mid-backlog cost a cadence rather than a deployment.
     reconciled_at: Option<Instant>,
     /// How long the sweep is trusted on its own. This is the whole exposure of the
-    /// design: a write that commits below the sweep is delivered within one of these, or
-    /// within one full pass of the rotation when the Policy has more streams than the
-    /// reconciliation reads in a batch.
+    /// design: a write that commits below the sweep is delivered within a bounded number
+    /// of these, which
+    /// [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) states
+    /// and this is the unit of.
     reconcile_every: Duration,
 }
 

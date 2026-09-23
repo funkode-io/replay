@@ -69,11 +69,25 @@ is owed is read from that stream's own sequence, which has no holes.
   not give: it bought the same correctness by making every Policy wait for the oldest
   in-flight write in the whole instance (funkode-io/replay#214).
 - **A write that commits below the sweep is delivered late, not never — and the lateness
-  is a number.** One reconciliation cadence when the Policy has no more streams than its
-  read batch, and one full pass of the rotation — `ceil(streams / read_batch_size)`
-  cadences — when it has more, because the reconciliation examines a batch at a time. The
-  watermark's equivalent bound was the duration of the longest transaction, which is not a
-  number anyone configures.
+  is a number.** This ADR owns that number; everything else quoting it links here.
+
+  ```text
+  cadences ≤ sources × ceil(streams / read_batch_size)
+  ```
+
+  `REPLAY_POLICY_RECONCILE_SECS` (default 5s) is the cadence. `streams` is how many the
+  Policy is behind on at once, and `read_batch_size` (default 100) is how many the
+  reconciliation compares per cadence — hence the `ceil`, which is 1 for a Policy behind
+  on no more streams than its batch. `sources` is 3: the reconciliation shares each
+  poll's candidate slots with the streams the last poll could not finish and the streams
+  the sweep just found, taking one slot in turn, so a page can wait its turn before it
+  is read. Three is the worst case and applies only when the other two sources are also
+  full, which is a Policy that cannot keep up — in which case the cadence is not what is
+  making it late.
+
+  A Policy at its defaults, behind on fewer than a hundred streams, is inside 15 seconds.
+  The watermark's equivalent bound was the duration of the longest transaction in the
+  instance, which is not a number anyone configures.
 - **There is no hole to detect, so the machinery that detected holes is gone**:
   `burned_position.rs` and its `pg_locks` probe, `policy_feed.rs` and its gap truncation,
   `policy_blocked.rs` and its rate gate, `PolicyCondition::Blocked`, and the cursor's
@@ -131,8 +145,8 @@ is owed is read from that stream's own sequence, which has no holes.
   returns the same entries for ever if the entries at the front never leave, so a
   continuously-busy set of streams would hide a quiet one behind it — a stream whose only
   pending work is a write the sweep passed, which no future event will nominate. Rotating
-  turns "hidden while the system is busy" into "examined within one pass", which is
-  `ceil(streams / batch)` cadences and a number an operator can compute.
+  turns "hidden while the system is busy" into "examined within one pass", which is the
+  bound above and a number an operator can compute.
 - **`read_batch_size` is a budget for the drain, spent across streams** rather than
   applied to each. A Policy owed work in a hundred streams reads the same number of events
   per poll as one owed work in a single stream, so the knob still bounds how long a poll
