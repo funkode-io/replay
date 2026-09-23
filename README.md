@@ -2246,12 +2246,10 @@ The leader picks the move up **on its next poll**, because it reads its places f
 poll rather than holding them in memory between polls. There is no window in which a
 running process reinstates a value you replaced.
 
-Place writes are a compare-and-set against the value the poll started from, so a
-checkpoint can never reinstate a place that predates your update, and deleting a row
-cannot be undone by a poll recreating it. One gap, until
-[#234](https://github.com/funkode-io/replay/issues/234): a rewind to *exactly* the place a
-running poll started from is indistinguishable from that poll's own progress and is
-overwritten. Read the place back after moving it; if it ran forward again, move it again. A runner that loses the race abandons **that
+Place writes are a compare-and-set against the row your poll read — compared by row
+version, so a checkpoint can never reinstate a place that predates your update, even when
+you rewind to exactly the place the running poll started from. Deleting a row cannot be
+undone by a poll recreating it either. A runner that loses the race abandons **that
 stream** for the poll — the others in its batch carry on — and picks your place up on the
 next one. Moving forward skips the events in between (they are never delivered); moving
 backward re-delivers them, which is safe under the same idempotency contract that
