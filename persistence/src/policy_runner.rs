@@ -1153,7 +1153,7 @@ impl PolicyRunner {
         // Which rows of the group name each dispatch the replay ran, read once
         // under the lock: a count over a page would answer for the page
         // ([`Replay::settlement_for`]).
-        let naming = count_rows_naming(&mut tx, reaction, &replay.dispatched()).await?;
+        let naming = count_rows_naming(&mut tx, reaction, replay.concluded()).await?;
 
         for phase in [GroupPhase::Naming, GroupPhase::Nameless] {
             let mut after = 0;
@@ -2848,22 +2848,6 @@ impl Replay {
             .collect()
     }
 
-    /// The dispatches this replay ran, distinct: what the group is counted
-    /// against, and all of it that a count can be about.
-    fn dispatched(&self) -> Vec<DispatchIdentity> {
-        let mut distinct: Vec<DispatchIdentity> = Vec::new();
-        for dispatch in self.concluded() {
-            if !distinct.iter().any(|seen| {
-                seen.aggregate_name == dispatch.identity.aggregate_name
-                    && seen.target_stream_id == dispatch.identity.target_stream_id
-                    && seen.command_name == dispatch.identity.command_name
-            }) {
-                distinct.push(dispatch.identity.clone());
-            }
-        }
-        distinct
-    }
-
     fn concluded(&self) -> &[ReplayedDispatch] {
         match self {
             Self::Ran(concluded) | Self::Panicked { concluded, .. } => concluded,
@@ -4041,26 +4025,37 @@ async fn load_parked_page(
 /// ([`Replay::settlement_for`]), so the count cannot be taken over a page. It is
 /// taken **once**, before the walk, and only for the identities the replay
 /// produced: a row naming a command this replay did not run is settled by
-/// [`Replay::unmatched`], which never asks. Bounded by the reaction's dispatch
-/// vector, which `react_erased` already materialises.
+/// [`Replay::unmatched`], which never asks.
 ///
 /// One index range scan over the group, where counting per page cost one for
 /// each page — quadratic in the tail this change exists to make readable.
+///
+/// The arrays it binds borrow from `dispatched`, the vector `react_erased`
+/// already materialised, and the rows it reads back are one per distinct
+/// identity among them: bounded by what one reaction dispatches, never by the
+/// group it counts. Duplicates are left in rather than deduplicated into a
+/// fourth buffer — `IN` does not care.
 async fn count_rows_naming(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     reaction: &ParkedReaction,
-    dispatched: &[DispatchIdentity],
+    dispatched: &[ReplayedDispatch],
 ) -> Result<Vec<(ParkedIdentity, usize)>, replay::Error> {
     if dispatched.is_empty() {
         return Ok(Vec::new());
     }
 
-    let aggregates: Vec<&str> = dispatched.iter().map(|it| it.aggregate_name).collect();
+    let aggregates: Vec<&str> = dispatched
+        .iter()
+        .map(|it| it.identity.aggregate_name)
+        .collect();
     let targets: Vec<&str> = dispatched
         .iter()
-        .map(|it| it.target_stream_id.as_str())
+        .map(|it| it.identity.target_stream_id.as_str())
         .collect();
-    let commands: Vec<&str> = dispatched.iter().map(|it| it.command_name).collect();
+    let commands: Vec<&str> = dispatched
+        .iter()
+        .map(|it| it.identity.command_name)
+        .collect();
 
     let rows = sqlx::query(
         "SELECT aggregate_name, target_stream_id, command_name, count(*) AS naming \
@@ -6062,6 +6057,64 @@ mod settlement_tests {
         .execute(pool)
         .await
         .expect("parking must succeed");
+    }
+
+    /// A writer that moves a row while the settlement is taking its locks is the
+    /// same conclusion, reached by the server.
+    ///
+    /// `lock_group` waits for the row lock, and the update it was waiting for
+    /// commits after the settlement's snapshot: Postgres cannot show this
+    /// transaction a consistent row, so it refuses with a `40001`. Classified as
+    /// a conflict (`db_error`), which is what [`PolicyRunner::settle`] reports as
+    /// [`DeadLetterRetry::Superseded`] rather than letting a bulk retry's walk
+    /// abort on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_row_moved_while_the_settlement_locks_is_a_conflict_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let reaction = ParkedReaction {
+            policy_name: POLICY.to_string(),
+            global_position: POSITION,
+            event_id: uuid::Uuid::new_v4(),
+        };
+        park(&pool, &reaction, "First").await;
+
+        // The delivery that re-parks the row: it holds the row's lock, so the
+        // settlement's `FOR UPDATE` waits on it rather than reading around it.
+        let mut delivery = pool.begin().await.expect("the delivery must begin");
+        sqlx::query(
+            "UPDATE policy_dead_letters SET deliveries = deliveries + 1, \
+             last_parked_at = now() WHERE policy_name = $1",
+        )
+        .bind(&reaction.policy_name)
+        .execute(&mut *delivery)
+        .await
+        .expect("the re-park must apply");
+
+        let settling = {
+            let pool = pool.clone();
+            let reaction = ParkedReaction {
+                policy_name: reaction.policy_name.clone(),
+                ..reaction
+            };
+            tokio::spawn(async move { begin_settlement(&pool, &reaction).await.map(|_| ()) })
+        };
+
+        // Long enough for the settlement to have taken its snapshot and be
+        // waiting on the lock; the delivery then commits under it.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        delivery.commit().await.expect("the delivery must commit");
+
+        let refused = settling
+            .await
+            .expect("the settling task must not panic")
+            .expect_err("a settlement cannot lock a group that moved under it");
+
+        assert_eq!(
+            refused.kind(),
+            replay::ErrorKind::Conflict,
+            "a group moved under the snapshot is a conflict, not a database \
+             failure: {refused}"
+        );
     }
 
     /// A command parked after the settlement began is not settled by it.

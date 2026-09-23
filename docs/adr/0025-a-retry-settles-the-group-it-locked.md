@@ -73,12 +73,22 @@ code (funkode-io/replay#228).
   settles them in. One walk ordered by an expression would sort the group on
   every page.
 
-- **A group an operator emptied is not a group that moved.** A concurrent
-  [Discard] that takes the last row leaves nothing to settle and nothing to be
-  wrong about, so the settlement proceeds: every failure the replay found is one
-  no row speaks for, and parking those is what a retry does (ADR-0021). Refusing
-  here would leave nothing to retry — a reaction with no rows is not enumerable,
-  and the drain is long past the event.
+- **A group with nothing left in it is not a group that moved.** When the last
+  row leaves while the replay runs — a [Discard], or a concurrent retry archiving
+  it as resolved — there is nothing to settle and nothing to be wrong about, so
+  the settlement proceeds: every failure the replay found is one no row speaks
+  for, and parking those is what a retry does (ADR-0021's "a failure no row
+  speaks for is parked, as the drain would park it"). Refusing here would leave
+  nothing to retry — a reaction with no rows is not enumerable, and the drain is
+  long past the event.
+
+  The two ways of emptying are not told apart, deliberately: the only cheap
+  discriminator is the archive's `reason`, and `discarded_dead_letters` is a
+  growing audit table indexed by `(policy_name, discarded_at)` rather than by
+  reaction. Not telling them apart costs a concurrent retry that resolved the
+  last row being contradicted by this replay's failure for the same command —
+  an observation made by executing it, which the next retry clears if the command
+  is healthy. The other rule costs a failure nobody ever sees again.
 
 - **The outcome is folded, not listed.** `retry_reaction` returns whether any row
   resolved, whether any is still failing, and the outcome of the one row a by-id
@@ -121,8 +131,15 @@ code (funkode-io/replay#228).
   command that failed for it, and another retry parks its own unclaimed failures,
   so the failure is recorded by the writer that is current rather than by this
   stale replay. The rows that remain keep the reaction enumerable, so the next
-  retry settles it; the one case with no rows left — a discard emptying the group
-  — is settled here rather than deferred, per the decision above.
+  retry settles it; the one case with no rows left is settled here rather than
+  deferred, per the decision above.
+
+- **Two concurrent retries of one reaction can leave a row the later one thought
+  resolved**, when the later one emptied the group: it archived the last row as
+  resolved, and the other, having executed the same command and watched it fail,
+  parks it again. The row is honest, and a retry clears it if the command is
+  healthy now. What ADR-0021 refuses is the reverse — a retry that executes a
+  command, watches it fail permanently, and reports the reaction resolved.
 
 - **A retry holds row locks over the whole group for the length of its
   settlement**, rather than taking them one row at a time as it writes. The
@@ -138,8 +155,10 @@ code (funkode-io/replay#228).
   `tests/policy_retry_allocations.rs` settles a reaction with a thousand retired
   rows and asserts the peak live bytes stay near a page: ~0.19 MB paged against
   ~1.55 MB when the group was read whole, on a ~0.6 MB budget. The snapshot is
-  pinned by `policy_runner.rs`'s `settlement_tests`, which parks a command while
-  a settlement holds its group and asserts no page of that settlement sees it.
+  pinned by `policy_runner.rs`'s `settlement_tests`: one parks a command while a
+  settlement holds its group and asserts no page of it sees the new row, the
+  other holds a row's lock past the settlement's snapshot and asserts the
+  `40001` arrives as a conflict rather than as a database failure.
 
 [Discard]: ../../CONTEXT.md#discard
 
