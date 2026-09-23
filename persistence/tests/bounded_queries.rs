@@ -68,11 +68,12 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "checkpoint_places",
-        justification: "RETURNING one id per place written, and the places written are \
+        justification: "RETURNING one row per place written, and the places written are \
                         the streams the poll advanced: bounded by the candidate list, \
                         which `drain_policy_once` truncates to read_batch_size. Read \
                         back rather than counted because the caller needs to know which \
-                        of the writes lost their compare-and-set.",
+                        of the writes lost their compare-and-set, and at what row \
+                        version the ones that won now sit.",
     },
     Reviewed {
         file: "src/policy_runner.rs",

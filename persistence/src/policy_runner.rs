@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -3120,7 +3120,7 @@ async fn drain_policy_once(
             break;
         }
 
-        let place = places.get(stream_id).copied().unwrap_or_default();
+        let place = places.get(stream_id).copied().unwrap_or_default().seq;
         let events = read_stream(pool, filter.clone(), stream_id, place, budget).await?;
         // A full read means the stream may have more; it is looked at again next poll
         // rather than drained here, so one busy stream cannot hold up every other. It
@@ -3185,12 +3185,18 @@ async fn drain_policy_once(
                 flushing.push((stream_id.clone(), reached));
                 let kept = checkpoint_places(pool, &name, &flushing, &observed).await?;
                 for (stream, seq) in &flushing {
-                    if kept.contains(stream) {
-                        observed.insert(stream.clone(), *seq);
+                    if let Some(written_by) = kept.get(stream) {
+                        observed.insert(
+                            stream.clone(),
+                            Place {
+                                seq: *seq,
+                                written_by: Some(*written_by),
+                            },
+                        );
                     }
                 }
                 events_since_checkpoint = 0;
-                if !kept.contains(stream_id) {
+                if !kept.contains_key(stream_id) {
                     superseded = true;
                     break;
                 }
@@ -4198,15 +4204,32 @@ async fn streams_behind(
     Ok(rows.into_iter().map(|row| row.get("id")).collect())
 }
 
-/// Where the Policy has got to in each of `streams`. A stream with no row is at 0.
+/// A Policy's place in one stream, as a poll read it.
+///
+/// `written_by` is the transaction that last wrote the row — PostgreSQL's `xmin`, which
+/// every write to the row bumps whoever issues it. It is what a checkpoint compares, so
+/// that "nobody has written this since I read it" is a different fact from "somebody wrote
+/// it and it holds the value I read" (funkode-io/replay#234). `None` means the poll found
+/// no row, which is a stream at the beginning of itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Place {
+    seq: i64,
+    written_by: Option<i64>,
+}
+
+/// Where the Policy has got to in each of `streams`, and the row version it read that
+/// from. A stream with no row is at 0.
 async fn places_of(
     pool: &Pool<Postgres>,
     name: &str,
     streams: &[String],
-) -> Result<HashMap<String, i64>, replay::Error> {
+) -> Result<HashMap<String, Place>, replay::Error> {
+    // `xid` is 32 bits unsigned and has no `sqlx` decoding of its own, so it is read as
+    // the number it is. Nothing is done with the value but compare it for equality.
     let rows = sqlx::query(
-        "SELECT stream_id, stream_seq FROM policy_stream_cursors \
-         WHERE policy = $1 AND stream_id = ANY($2)",
+        "SELECT stream_id, stream_seq, xmin::text::bigint AS written_by \
+           FROM policy_stream_cursors \
+          WHERE policy = $1 AND stream_id = ANY($2)",
     )
     .bind(name)
     .bind(streams)
@@ -4216,7 +4239,15 @@ async fn places_of(
 
     Ok(rows
         .into_iter()
-        .map(|row| (row.get("stream_id"), row.get("stream_seq")))
+        .map(|row| {
+            (
+                row.get("stream_id"),
+                Place {
+                    seq: row.get("stream_seq"),
+                    written_by: Some(row.get("written_by")),
+                },
+            )
+        })
         .collect())
 }
 
@@ -4282,72 +4313,95 @@ struct StreamEvent {
 }
 
 /// Record how far the Policy has got in each stream it advanced, and report back which
-/// of those writes the Policy still owned.
+/// of those writes the Policy still owned — and at what row version, so the poll can go
+/// on checkpointing the streams it kept.
 ///
 /// One statement for the batch, and a compare-and-set per stream: a place is written only
-/// where it still reads as the value this poll started from. Monotonicity alone would not
-/// do, because the write it has to refuse is *lower* than the one it carries — an
-/// operator rewinding a stream to force a redelivery (ADR-0012) against a poll that is
-/// mid-batch, whose higher place would otherwise reinstate itself and undo the rewind
-/// silently. The same set-and-check tells a runner that has lost its leadership that it
-/// has, which is the only signal it gets.
+/// where the row is still the one this poll read, compared by the transaction that wrote
+/// it rather than by the place it holds. Comparing the place would not do, and
+/// monotonicity would do even less:
 ///
-/// Deleting the row is the other half of that control surface, so a place the poll *saw*
-/// is written only where a row is still there to compare with. Otherwise the insert would
-/// find no conflict and recreate what the operator removed. What decides that is whether
-/// the poll saw a row, not what number was in it: a stream at place 0 and a stream with no
-/// place are the same number and different things.
+/// - the write to refuse is *lower* than the one this poll carries — an operator rewinding
+///   a stream to force a redelivery (ADR-0012) against a poll that is mid-batch, whose
+///   higher place would otherwise reinstate itself and undo the rewind silently;
+/// - and it may hold the very value this poll read, when the operator rewinds to just
+///   before the event being delivered right now. A compared place cannot see that one at
+///   all (funkode-io/replay#234); a compared row version can, because PostgreSQL bumps
+///   `xmin` on every write whether or not the value changes, and whether or not the writer
+///   knew it had to.
+///
+/// The same set-and-check tells a runner that has lost its leadership that it has, which
+/// is the only signal it gets.
+///
+/// Deleting the row is the other half of that control surface, and what protects it is
+/// that a place the poll read is only ever *updated*: an update matches nothing where the
+/// row has gone. What decides which half a stream is in is whether the poll saw a *row*,
+/// which a place of 0 does not tell you — a stream at the beginning and a stream with no
+/// row are the same number and different things (funkode-io/replay#231), and only the
+/// second may be created here. An upsert would not do, even guarded on the row existing,
+/// because the guard reads the snapshot the statement opened on: against a delete that
+/// had not committed when the statement started, the guard sees the row, the insert waits
+/// on the primary key, and once the delete commits there is nothing left to conflict
+/// with, so the operator's delete is undone by an insert (funkode-io/replay#236 review).
+/// A place the poll found no row for is only ever inserted, and loses to whoever created
+/// one in the meantime.
 async fn checkpoint_places(
     pool: &Pool<Postgres>,
     name: &str,
     places: &[(String, i64)],
-    observed: &HashMap<String, i64>,
-) -> Result<HashSet<String>, replay::Error> {
+    observed: &HashMap<String, Place>,
+) -> Result<HashMap<String, i64>, replay::Error> {
     if places.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
 
     let streams: Vec<String> = places.iter().map(|(stream, _)| stream.clone()).collect();
     let seqs: Vec<i64> = places.iter().map(|(_, seq)| *seq).collect();
-    let from: Vec<i64> = places
+    // A row the poll saw carries the version it saw; a stream it found no row for carries
+    // nothing, which is what puts it in the half of the statement that may create one. A
+    // place of 0 does not tell you which — a stream at the beginning and a stream with no
+    // row are both 0 (funkode-io/replay#231).
+    let from: Vec<Option<i64>> = places
         .iter()
-        .map(|(stream, _)| observed.get(stream).copied().unwrap_or_default())
-        .collect();
-    // Whether the poll saw a *row*, which a place of 0 does not tell you: a stream at the
-    // beginning and a stream with no row are both 0, and only one of them may be created
-    // here. An operator's rewind to 0 is a row, and deleting it mid-poll must not be
-    // undone by this insert finding nothing to conflict with (funkode-io/replay#231).
-    let held: Vec<bool> = places
-        .iter()
-        .map(|(stream, _)| observed.contains_key(stream))
+        .map(|(stream, _)| observed.get(stream).and_then(|place| place.written_by))
         .collect();
 
     let kept = sqlx::query(
-        "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
-         SELECT $1, stream_id, stream_seq \
-           FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::bool[]) \
-              AS incoming(stream_id, stream_seq, observed, held) \
-          WHERE NOT incoming.held \
-             OR EXISTS (SELECT 1 FROM policy_stream_cursors kept \
-                         WHERE kept.policy = $1 AND kept.stream_id = incoming.stream_id) \
-         ON CONFLICT (policy, stream_id) DO UPDATE \
-             SET stream_seq = EXCLUDED.stream_seq, updated_at = now() \
-           WHERE policy_stream_cursors.stream_seq \
-                 = (SELECT observed FROM UNNEST($2::text[], $4::bigint[]) \
-                         AS was(stream_id, observed) \
-                     WHERE was.stream_id = policy_stream_cursors.stream_id) \
-         RETURNING stream_id",
+        "WITH incoming AS ( \
+             SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) \
+                       AS i(stream_id, stream_seq, observed)), \
+         advanced AS ( \
+             UPDATE policy_stream_cursors c \
+                SET stream_seq = i.stream_seq, updated_at = now() \
+               FROM incoming i \
+              WHERE c.policy = $1 AND c.stream_id = i.stream_id \
+                AND i.observed IS NOT NULL \
+                AND c.xmin::text::bigint = i.observed \
+          RETURNING c.stream_id, c.xmin::text::bigint AS written_by), \
+         created AS ( \
+             INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+             SELECT $1, i.stream_id, i.stream_seq FROM incoming i \
+              WHERE i.observed IS NULL \
+             ON CONFLICT (policy, stream_id) DO NOTHING \
+          RETURNING stream_id, xmin::text::bigint AS written_by) \
+         SELECT stream_id, written_by FROM advanced \
+          UNION ALL \
+         SELECT stream_id, written_by FROM created",
     )
     .bind(name)
     .bind(&streams)
     .bind(&seqs)
     .bind(&from)
-    .bind(&held)
     .fetch_all(pool)
     .await
     .map_err(crate::db_error)?;
 
-    let kept: HashSet<String> = kept.into_iter().map(|row| row.get("stream_id")).collect();
+    // The version this statement has just left on each row it kept: what the poll must
+    // compare against next time, since its own write moved the row on.
+    let kept: HashMap<String, i64> = kept
+        .into_iter()
+        .map(|row| (row.get("stream_id"), row.get("written_by")))
+        .collect();
 
     // What `PolicyStatus::last_checkpoint_at` is measured from: the Policy processed
     // something, whichever stream it was. A batch whose every write lost its
@@ -5894,7 +5948,7 @@ mod rotation_tests {
 /// on a busy machine.
 #[cfg(test)]
 mod progress_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
@@ -5902,8 +5956,8 @@ mod progress_tests {
     use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 
     use super::{
-        bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, PolicyProgress,
-        StartAt,
+        bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, Place,
+        PolicyProgress, StartAt,
     };
 
     const POLICY: &str = "progress_under_test";
@@ -5985,11 +6039,23 @@ mod progress_tests {
         }
     }
 
-    async fn places(pool: &PgPool, streams: &[&str]) -> HashMap<String, i64> {
+    /// What a poll reads before it delivers anything, and what its checkpoints are
+    /// compared against.
+    async fn observe(pool: &PgPool, streams: &[&str]) -> HashMap<String, Place> {
         let streams: Vec<String> = streams.iter().map(|s| (*s).to_string()).collect();
         places_of(pool, POLICY, &streams)
             .await
             .expect("reading the places must succeed")
+    }
+
+    /// The places, as a test asserts them: where each stream has got to, without the row
+    /// version that only a checkpoint has any use for.
+    async fn places(pool: &PgPool, streams: &[&str]) -> HashMap<String, i64> {
+        observe(pool, streams)
+            .await
+            .into_iter()
+            .map(|(stream, place)| (stream, place.seq))
+            .collect()
     }
 
     /// A Policy that starts at the beginning owes every stream everything: it writes no
@@ -6065,22 +6131,22 @@ mod progress_tests {
         );
     }
 
-    /// Checkpoint one stream, telling the write what the caller last saw there.
-    /// `from` is what the poll *saw*: `None` when it saw no row at all, which is what a
-    /// stream nobody has checkpointed looks like, and what decides whether this write may
-    /// create one.
-    async fn checkpoint(
-        pool: &PgPool,
-        stream: &str,
-        from: Option<i64>,
-        to: i64,
-    ) -> HashSet<String> {
-        let observed = match from {
-            Some(place) => HashMap::from([(stream.to_string(), place)]),
-            None => HashMap::new(),
-        };
+    /// Checkpoint one stream, the way a poll that has just read it would: against what is
+    /// stored right now.
+    async fn checkpoint(pool: &PgPool, stream: &str, to: i64) -> HashMap<String, i64> {
+        let observed = observe(pool, &[stream]).await;
+        checkpoint_from(pool, &observed, stream, to).await
+    }
 
-        checkpoint_places(pool, POLICY, &[(stream.to_string(), to)], &observed)
+    /// Checkpoint one stream against a view the caller took earlier — a poll that has been
+    /// mid-batch for a while, which is where every contested write happens.
+    async fn checkpoint_from(
+        pool: &PgPool,
+        observed: &HashMap<String, Place>,
+        stream: &str,
+        to: i64,
+    ) -> HashMap<String, i64> {
+        checkpoint_places(pool, POLICY, &[(stream.to_string(), to)], observed)
             .await
             .expect("checkpointing must succeed")
     }
@@ -6148,7 +6214,7 @@ mod progress_tests {
             .await
             .expect("loading must succeed");
 
-        checkpoint(&pool, "urn:probe:a", None, 2).await;
+        checkpoint(&pool, "urn:probe:a", 2).await;
 
         assert_eq!(
             streams_behind(&pool, POLICY, "", 10).await.unwrap(),
@@ -6156,7 +6222,7 @@ mod progress_tests {
             "two of three places processed is still behind"
         );
 
-        checkpoint(&pool, "urn:probe:a", Some(2), 3).await;
+        checkpoint(&pool, "urn:probe:a", 3).await;
 
         assert!(
             streams_behind(&pool, POLICY, "", 10)
@@ -6178,8 +6244,11 @@ mod progress_tests {
             .await
             .expect("loading must succeed");
 
-        checkpoint(&pool, "urn:probe:a", None, 4).await;
-        let kept = checkpoint(&pool, "urn:probe:a", None, 2).await;
+        // A poll that read the stream before anything was written there.
+        let stale = observe(&pool, &["urn:probe:a"]).await;
+
+        checkpoint(&pool, "urn:probe:a", 4).await;
+        let kept = checkpoint_from(&pool, &stale, "urn:probe:a", 2).await;
 
         assert!(
             kept.is_empty(),
@@ -6203,10 +6272,10 @@ mod progress_tests {
         PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        checkpoint(&pool, "urn:probe:a", None, 10).await;
+        checkpoint(&pool, "urn:probe:a", 10).await;
 
         // The poll is mid-batch: it read the place as 10 and has since delivered to 15.
-        let observed = HashMap::from([("urn:probe:a".to_string(), 10)]);
+        let observed = observe(&pool, &["urn:probe:a"]).await;
 
         sqlx::query(
             "UPDATE policy_stream_cursors SET stream_seq = 3 \
@@ -6218,15 +6287,55 @@ mod progress_tests {
         .await
         .expect("the operator's move must succeed");
 
-        let kept = checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 15)], &observed)
-            .await
-            .expect("checkpointing must succeed");
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
 
         assert!(kept.is_empty(), "the poll is told its view went stale");
         assert_eq!(
             places(&pool, &["urn:probe:a"]).await,
             HashMap::from([("urn:probe:a".to_string(), 3)]),
             "and the operator's rewind stands"
+        );
+    }
+
+    /// The rewind an operator is most likely to make is the one a compared *place* cannot
+    /// see: back to just before the event being delivered right now, which is exactly the
+    /// place the poll started from (funkode-io/replay#234).
+    ///
+    /// "Nobody has written this since I read it" and "somebody wrote it and it holds the
+    /// value I read" are the same value and different facts. The write that has to be
+    /// refused here is the one that *agrees* with what the poll observed.
+    #[tokio::test]
+    async fn an_operator_rewinding_to_the_place_a_poll_started_from_is_not_overwritten_postgres_test(
+    ) {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 10).await;
+
+        // The poll is mid-batch: it read the place as 10 and has since delivered to 15.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
+        // The operator asks for event 11 to be delivered again — a rewind to 10, which is
+        // where this poll found the place.
+        sqlx::query(
+            "UPDATE policy_stream_cursors SET stream_seq = 10 \
+             WHERE policy = $1 AND stream_id = $2",
+        )
+        .bind(POLICY)
+        .bind("urn:probe:a")
+        .execute(&pool)
+        .await
+        .expect("the operator's move must succeed");
+
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert_eq!(
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 10)]),
+            "and the redelivery the operator asked for still happens"
         );
     }
 
@@ -6241,7 +6350,10 @@ mod progress_tests {
         PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        checkpoint(&pool, "urn:probe:a", None, 10).await;
+        checkpoint(&pool, "urn:probe:a", 10).await;
+
+        // The poll is mid-batch, holding the place it read before the delete.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
 
         sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
             .bind(POLICY)
@@ -6250,7 +6362,63 @@ mod progress_tests {
             .await
             .expect("the operator's delete must succeed");
 
-        let kept = checkpoint(&pool, "urn:probe:a", Some(10), 15).await;
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and the stream is still at the beginning, where the delete left it"
+        );
+    }
+
+    /// The same delete, still open when the checkpoint starts — which is the interleaving
+    /// the committed one cannot reach (funkode-io/replay#236 review).
+    ///
+    /// A checkpoint that guarded an upsert on the row existing would read that guard from
+    /// the snapshot it opened on, where the row is still there, and then wait on the
+    /// primary key: by the time it goes in, the delete has committed and there is nothing
+    /// to conflict with, so the operator's delete is undone by an insert. The window is
+    /// forced rather than raced for — the checkpoint is made while the delete is open, and
+    /// the delete commits while the checkpoint waits.
+    #[tokio::test]
+    async fn an_operator_deleting_a_place_during_a_checkpoint_is_not_overwritten_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 10).await;
+
+        // The poll is mid-batch, holding the place it read before the delete.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
+        let mut deleting = pool.begin().await.expect("beginning must succeed");
+        let operator: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *deleting)
+            .await
+            .expect("the deleting backend must identify itself");
+        sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
+            .bind(POLICY)
+            .bind("urn:probe:a")
+            .execute(&mut *deleting)
+            .await
+            .expect("the operator's delete must succeed");
+
+        let checkpointing = tokio::spawn({
+            let pool = pool.clone();
+            let observed = observed.clone();
+            async move {
+                checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 15)], &observed)
+                    .await
+            }
+        });
+        await_blocked_by(&pool, operator).await;
+        deleting.commit().await.expect("committing must succeed");
+
+        let kept = checkpointing
+            .await
+            .expect("the checkpoint must finish")
+            .expect("checkpointing must succeed");
 
         assert!(kept.is_empty(), "the poll is told its view went stale");
         assert!(
@@ -6283,6 +6451,10 @@ mod progress_tests {
         .await
         .expect("the operator's rewind must succeed");
 
+        // The poll that was mid-batch when both happened: it saw the row at 0, which is a
+        // row, and not the absence of one that the same number would mean.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
         sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
             .bind(POLICY)
             .bind("urn:probe:a")
@@ -6290,8 +6462,7 @@ mod progress_tests {
             .await
             .expect("the operator's delete must succeed");
 
-        // The poll that was mid-batch when both happened: it saw the row at 0.
-        let kept = checkpoint(&pool, "urn:probe:a", Some(0), 15).await;
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
 
         assert!(kept.is_empty(), "the poll is told its view went stale");
         assert!(
@@ -6310,7 +6481,7 @@ mod progress_tests {
         PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        checkpoint(&pool, "urn:probe:a", None, 5).await;
+        checkpoint(&pool, "urn:probe:a", 5).await;
 
         sqlx::query(
             "UPDATE policy_stream_cursors SET stream_seq = $1 \
@@ -6451,6 +6622,30 @@ mod progress_tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "nothing ever blocked on the lock on {relation}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait until something is queued behind whatever `holder` is holding.
+    async fn await_blocked_by(pool: &PgPool, holder: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(holder)
+            .fetch_one(pool)
+            .await
+            .expect("reading who is blocked must succeed");
+
+            if blocked > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing ever blocked on what backend {holder} holds"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

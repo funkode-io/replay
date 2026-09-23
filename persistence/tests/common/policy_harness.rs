@@ -736,11 +736,10 @@ impl PolicyDaemonHarness {
     /// a place (ADR-0012) does the same deliberately, and is the half of it a
     /// test can perform.
     ///
-    /// Waits for the place to reach `event` before moving it, because that same
-    /// window is what a test races otherwise: a rewind written while the worker
-    /// still has the event in flight loses to the checkpoint that follows it —
-    /// the compare-and-set sees the place it expects and advances — and the
-    /// event is never delivered again.
+    /// Waits for the place to reach `event` before moving it, so that what follows is a
+    /// *re*delivery of something already reacted to once. The rewind needs no window of
+    /// its own: a poll that checkpoints over it is refused, because the place it reads
+    /// back is no longer the row it started from (funkode-io/replay#234).
     pub async fn redeliver(&self, event: &AppendedEvent) {
         let place = sqlx::query_scalar::<_, i64>("SELECT stream_seq FROM events WHERE id = $1")
             .bind(event.event_id)
@@ -862,6 +861,46 @@ impl PolicyDaemonHarness {
             .await
             .expect("the cursor row must exist before it can be held");
         HeldCursorRow(tx)
+    }
+
+    /// Hold the row lock on this policy's place in `stream_id` until the returned guard
+    /// lets go — an operator part-way through a rewind, and a place no poll can record
+    /// progress in meanwhile.
+    ///
+    /// A checkpoint is the one moment in a poll where the operator's rewind and the
+    /// poll's own progress are both live, and it is over in microseconds. Standing in it
+    /// with a lock is what makes a test of that window a test rather than a race
+    /// (funkode-io/replay#234).
+    pub async fn hold_place_row(&self, stream_id: &str) -> HeldPlaceRow {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .expect("holding the place row must be possible");
+        sqlx::query(
+            "SELECT stream_seq FROM policy_stream_cursors \
+              WHERE policy = $1 AND stream_id = $2 FOR UPDATE",
+        )
+        .bind(&self.policy_name)
+        .bind(stream_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("the place must exist before it can be held");
+
+        // Read on the held connection, so what it identifies is the transaction doing the
+        // holding rather than any backend of the pool.
+        let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the holding backend must identify itself");
+
+        HeldPlaceRow {
+            tx,
+            holder,
+            pool: self.pool.clone(),
+            policy: self.policy_name.clone(),
+            stream_id: stream_id.to_string(),
+        }
     }
 
     /// Take the heartbeat columns away: the schema of a consumer who has not
@@ -1306,6 +1345,71 @@ impl HeldCursorRow {
     /// Let the row go, without having changed it.
     pub async fn release(self) {
         let _ = self.0.rollback().await;
+    }
+}
+
+/// An operator's open transaction on one place, and the window it holds open.
+///
+/// Dropping it rolls back, so a test that panics releases the row with its runtime.
+pub struct HeldPlaceRow {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    /// The backend the transaction is on, so "somebody is waiting" can be narrowed to
+    /// "somebody is waiting for *this*".
+    holder: i32,
+    pool: PgPool,
+    policy: String,
+    stream_id: String,
+}
+
+impl HeldPlaceRow {
+    /// Wait until a poll is queued behind this lock: it has delivered, and is trying to
+    /// record what it delivered.
+    ///
+    /// A lock wait is not one of ADR-0014's observations and nothing asserts on it — it
+    /// sequences the test, which still asserts on what the policy dispatched.
+    pub async fn await_a_checkpoint_waiting(&self) {
+        let deadline = Instant::now() + OBSERVE_TIMEOUT;
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(self.holder)
+            .fetch_one(&self.pool)
+            .await
+            .expect("reading who is blocked must succeed");
+
+            if waiting > 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {OBSERVE_TIMEOUT:?} waiting for a checkpoint to queue \
+                 behind the held place of {}",
+                self.stream_id
+            );
+            tokio::time::sleep(OBSERVE_RECHECK).await;
+        }
+    }
+
+    /// Rewind the place to `stream_seq` and let the waiting checkpoint through — the
+    /// operator's move (ADR-0012), landing inside a poll's window.
+    ///
+    /// `stream_seq` and nothing else: an operator is not obliged to touch `updated_at`,
+    /// so a fix that needed them to would not be one.
+    pub async fn rewind_to(mut self, stream_seq: i64) {
+        sqlx::query(
+            "UPDATE policy_stream_cursors SET stream_seq = $1 \
+              WHERE policy = $2 AND stream_id = $3",
+        )
+        .bind(stream_seq)
+        .bind(&self.policy)
+        .bind(&self.stream_id)
+        .execute(&mut *self.tx)
+        .await
+        .expect("the operator's rewind must succeed");
+
+        self.tx.commit().await.expect("committing must succeed");
     }
 }
 
