@@ -1,10 +1,14 @@
 //! Policy status read model.
 //!
-//! [`PolicyStatusStore`] reads operational tables that the runner already
-//! writes (`policy_cursors`, `events`, and `policy_dead_letters`) and returns
-//! one [`PolicyStatus`] per known policy — a lightweight health/lag signal for
-//! monitoring, including whether a policy is parked in front of a
-//! `global_position` that does not exist.
+//! [`PolicyStatusStore`] reads operational tables that the runner already writes
+//! (`policy_cursors`, `policy_stream_cursors`, `streams` and `policy_dead_letters`) and
+//! returns one [`PolicyStatus`] per known policy — a lightweight health and lag signal
+//! for monitoring.
+//!
+//! The lag it reports is a count of events, arrived at by subtracting each stream's place
+//! from its head (funkode-io/replay#196). The number it replaces was a subtraction of
+//! `global_position`s, which counted the positions of every stream the Policy does not
+//! read, plus any a failed write had burned.
 //!
 //! This is **not** a Projection: it reads operational tables, not the event
 //! log, and does not use the [`crate::Query`] / [`crate::InlineProjection`]
@@ -28,13 +32,15 @@ use sqlx::{Pool, Postgres};
 ///
 /// | Condition  | When                                                        |
 /// |------------|-------------------------------------------------------------|
-/// | `Blocked`  | the position after the cursor is absent, a later one exists |
 /// | `Degraded` | `dead_letter_count > 0`                                     |
 /// | `Working`  | `dead_letter_count == 0`, `lag > 0`                         |
 /// | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`                        |
 ///
 /// A policy that is *both* behind and has dead letters resolves to `Degraded`.
-/// An empty tail is not a hole: a drained policy is `CaughtUp`.
+///
+/// There is no `Blocked`: a Policy reads each stream over a sequence that has no holes,
+/// so there is no position it can be parked in front of
+/// ([ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyCondition {
     /// No dead letters and no lag: fully healthy and up to date.
@@ -43,10 +49,6 @@ pub enum PolicyCondition {
     Working,
     /// At least one dead-letter row exists; needs operator attention.
     Degraded,
-    /// The cursor sits in front of a `global_position` that does not exist
-    /// while a later one does, so the feed yields nothing. An append in flight
-    /// looks the same and clears on a later poll; a burned position does not.
-    Blocked,
 }
 
 impl PolicyCondition {
@@ -56,17 +58,13 @@ impl PolicyCondition {
             PolicyCondition::CaughtUp => "CaughtUp",
             PolicyCondition::Working => "Working",
             PolicyCondition::Degraded => "Degraded",
-            PolicyCondition::Blocked => "Blocked",
         }
     }
 
-    /// Derive the condition from the raw `lag`, `dead_letter_count` and
-    /// `missing_position` fields, highest precedence first: a hole, then dead
-    /// letters, then lag.
-    pub fn from_fields(lag: i64, dead_letter_count: i64, missing_position: Option<i64>) -> Self {
-        if missing_position.is_some() {
-            PolicyCondition::Blocked
-        } else if dead_letter_count > 0 {
+    /// Derive the condition from the raw `lag` and `dead_letter_count` fields, highest
+    /// precedence first: dead letters, then lag.
+    pub fn from_fields(lag: i64, dead_letter_count: i64) -> Self {
+        if dead_letter_count > 0 {
             PolicyCondition::Degraded
         } else if lag > 0 {
             PolicyCondition::Working
@@ -89,22 +87,23 @@ impl fmt::Display for PolicyCondition {
 pub struct PolicyStatus {
     /// Stable name of the policy (the cursor key).
     pub name: String,
-    /// Last processed `global_position`.
-    pub position: i64,
-    /// Current global head (`MAX(global_position)` on the events table).
-    pub head: i64,
-    /// Positions the policy has yet to process (`head - position`).
+    /// Events written and not yet passed, summed over every stream this Policy is behind
+    /// on.
     ///
-    /// Counts positions, not events: a burned or deleted position inflates it.
+    /// An exact count, including the events its filter will skip and the snapshot rows
+    /// compaction writes: those are passed rather than delivered, and until they are
+    /// passed they are work.
     pub lag: i64,
-    /// The lowest `global_position` greater than `position` that exists, or
-    /// `None` when nothing past the cursor is in the log.
-    pub next_position: Option<i64>,
-    /// `Some(position + 1)` when that position does not exist while a later one
-    /// does — the hole the feed stops at. A multi-position hole reports its
-    /// first position.
-    pub missing_position: Option<i64>,
-    /// When the cursor was last advanced (staleness signal).
+    /// How many streams that lag is spread across. One stream a million events behind and
+    /// a million streams one event behind are the same `lag` and very different problems.
+    pub streams_behind: i64,
+    /// How far this Policy's search of the log has swept. Not progress — progress is per
+    /// stream — and not a control surface: a running worker reads this once when it takes
+    /// leadership and keeps it in memory, writing it only forwards, so an operator's reset
+    /// takes effect when that worker next starts. Places are the surface that is read
+    /// fresh every poll ([ADR-0012](../../docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)).
+    pub discovered_through: i64,
+    /// When the policy last advanced in any stream (staleness signal).
     pub last_checkpoint_at: DateTime<Utc>,
     /// Number of parked commands recorded for this policy: one row per command
     /// per reaction, not per delivery of the triggering event.
@@ -119,20 +118,10 @@ pub struct PolicyStatus {
     /// one (funkode-io/replay#220), and a reaction failing on every delivery
     /// must not read like one that failed once and stopped.
     pub last_dead_letter_at: Option<DateTime<Utc>>,
-    /// Derived condition: [`PolicyCondition::Blocked`] when
-    /// `missing_position` is set, otherwise [`PolicyCondition::Degraded`] when
-    /// `dead_letter_count > 0`, otherwise [`PolicyCondition::Working`] when
-    /// `lag > 0`, otherwise [`PolicyCondition::CaughtUp`].
+    /// Derived condition: [`PolicyCondition::Degraded`] when `dead_letter_count > 0`,
+    /// otherwise [`PolicyCondition::Working`] when `lag > 0`, otherwise
+    /// [`PolicyCondition::CaughtUp`].
     pub condition: PolicyCondition,
-}
-
-/// The hole a cursor sits in front of, if any: set only when the position right
-/// after `position` is absent *and* some later position exists.
-fn missing_position(position: i64, next_position: Option<i64>) -> Option<i64> {
-    match next_position {
-        Some(next) if next > position + 1 => Some(position + 1),
-        _ => None,
-    }
 }
 
 // ── PolicyStatusStore ─────────────────────────────────────────────────────────
@@ -156,36 +145,38 @@ impl PolicyStatusStore {
     /// `policy_cursors` row.  A registered-but-never-run policy (no row)
     /// does not appear.
     ///
-    /// The result is produced by a **single** SQL read that joins
-    /// `policy_cursors`, `MAX(global_position)` on `events`, a per-policy
-    /// `MIN(global_position) > cursor` probe, and a per-policy `LATERAL`
-    /// aggregate over `policy_dead_letters`.  The dead-letter lateral is
-    /// filtered by `pc.name` and reads `last_parked_at`, which
-    /// `idx_dead_letters_policy_created_parked` carries as a payload column, so
-    /// it stays an index-only scan; the `MIN`/`MAX` on `events` are probes on
-    /// `idx_events_global_position_unique`.
-    /// The event log is never scanned.
+    /// The result is produced by a **single** SQL read: a per-policy `LATERAL` over
+    /// `streams` against that policy's places, and a per-policy `LATERAL` aggregate over
+    /// `policy_dead_letters`. The dead-letter lateral is filtered by `pc.name` and reads
+    /// `last_parked_at`, which `idx_dead_letters_policy_created_parked` carries as a
+    /// payload column, so it stays an index-only scan (funkode-io/replay#227).
+    ///
+    /// The event log is never scanned, but the frontier lateral reads one row per stream
+    /// per policy, because no index can answer a comparison between two tables' columns
+    /// (ADR-0026). That is affordable for a status endpoint scraped every few seconds and
+    /// would not be on every poll, which is why the runner does not use it that way.
     pub async fn list(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
         let rows = sqlx::query(
             r#"
             SELECT
                 pc.name,
-                pc.position,
-                h.head,
-                nx.next_position,
+                pc.discovered_through,
                 pc.updated_at,
+                COALESCE(f.lag, 0) AS lag,
+                COALESCE(f.streams_behind, 0) AS streams_behind,
                 COALESCE(dl.dead_letter_count, 0) AS dead_letter_count,
                 dl.last_dead_letter_at
             FROM policy_cursors pc
-            CROSS JOIN (
-                SELECT COALESCE(MAX(global_position), 0) AS head
-                FROM events
-            ) h
             LEFT JOIN LATERAL (
-                SELECT MIN(global_position) AS next_position
-                FROM events
-                WHERE global_position > pc.position
-            ) nx ON TRUE
+                SELECT
+                    -- `SUM` of a bigint is numeric in PostgreSQL; the count fits.
+                    SUM(s.stream_seq - COALESCE(c.stream_seq, 0))::bigint AS lag,
+                    COUNT(*)                                      AS streams_behind
+                FROM streams s
+                LEFT JOIN policy_stream_cursors c
+                       ON c.policy = pc.name AND c.stream_id = s.id
+                WHERE s.stream_seq > COALESCE(c.stream_seq, 0)
+            ) f ON TRUE
             LEFT JOIN LATERAL (
                 SELECT
                     COUNT(*)             AS dead_letter_count,
@@ -205,23 +196,20 @@ impl PolicyStatusStore {
             .map(|r: sqlx::postgres::PgRow| {
                 use sqlx::Row as _;
                 let name: String = r.get("name");
-                let position: i64 = r.get("position");
-                let head: i64 = r.get("head");
-                let next_position: Option<i64> = r.get("next_position");
+                let discovered_through: i64 = r.get("discovered_through");
                 let updated_at: DateTime<Utc> = r.get("updated_at");
                 let dead_letter_count: i64 = r.get("dead_letter_count");
                 let last_dead_letter_at: Option<DateTime<Utc>> = r.get("last_dead_letter_at");
-                let lag = head - position;
-                let missing_position = missing_position(position, next_position);
-                let condition =
-                    PolicyCondition::from_fields(lag, dead_letter_count, missing_position);
+                // `SUM` over no rows is NULL, which the query has already collapsed: a
+                // Policy behind on nothing is behind by nothing.
+                let lag: i64 = r.get("lag");
+                let streams_behind: i64 = r.get("streams_behind");
+                let condition = PolicyCondition::from_fields(lag, dead_letter_count);
                 PolicyStatus {
                     name,
-                    position,
-                    head,
                     lag,
-                    next_position,
-                    missing_position,
+                    streams_behind,
+                    discovered_through,
                     last_checkpoint_at: updated_at,
                     dead_letter_count,
                     last_dead_letter_at,
@@ -249,123 +237,67 @@ mod tests {
     fn policy_status_condition_derived_from_fields() {
         let now = Utc::now();
 
-        // lag == 0, no dead letters: caught up
-        let lag0 = PolicyStatus {
+        let caught_up = PolicyStatus {
             name: "test_policy".to_string(),
-            position: 10,
-            head: 10,
             lag: 0,
-            next_position: None,
-            missing_position: None,
+            streams_behind: 0,
+            discovered_through: 10,
             last_checkpoint_at: now,
             dead_letter_count: 0,
             last_dead_letter_at: None,
-            condition: PolicyCondition::from_fields(0, 0, None),
+            condition: PolicyCondition::from_fields(0, 0),
         };
-        assert_eq!(lag0.condition, PolicyCondition::CaughtUp);
-        assert_eq!(lag0.lag, 0);
-        assert_eq!(lag0.condition.as_str(), "CaughtUp");
-        assert_eq!(lag0.condition.to_string(), "CaughtUp");
+        assert_eq!(caught_up.condition, PolicyCondition::CaughtUp);
+        assert_eq!(caught_up.condition.as_str(), "CaughtUp");
 
-        // lag > 0, no dead letters: working
-        let lag5 = PolicyStatus {
+        let working = PolicyStatus {
             name: "slow_policy".to_string(),
-            position: 5,
-            head: 10,
             lag: 5,
-            next_position: Some(6),
-            missing_position: None,
+            streams_behind: 2,
+            discovered_through: 10,
             last_checkpoint_at: now,
             dead_letter_count: 0,
             last_dead_letter_at: None,
-            condition: PolicyCondition::from_fields(5, 0, None),
+            condition: PolicyCondition::from_fields(5, 0),
         };
-        assert_eq!(lag5.condition, PolicyCondition::Working);
-        assert_eq!(lag5.lag, 5);
-        assert_eq!(lag5.condition.as_str(), "Working");
-        assert_eq!(lag5.condition.to_string(), "Working");
+        assert_eq!(working.condition, PolicyCondition::Working);
+        assert_eq!(
+            (working.lag, working.streams_behind),
+            (5, 2),
+            "five events owed, spread over two streams"
+        );
 
-        // dead letters present: degraded, even when also behind
         let degraded = PolicyStatus {
             name: "failing_policy".to_string(),
-            position: 7,
-            head: 10,
             lag: 3,
-            next_position: Some(8),
-            missing_position: None,
+            streams_behind: 1,
+            discovered_through: 10,
             last_checkpoint_at: now,
             dead_letter_count: 2,
             last_dead_letter_at: Some(now),
-            condition: PolicyCondition::from_fields(3, 2, None),
+            condition: PolicyCondition::from_fields(3, 2),
         };
         assert_eq!(degraded.condition, PolicyCondition::Degraded);
         assert_eq!(degraded.dead_letter_count, 2);
-        assert_eq!(degraded.condition.as_str(), "Degraded");
-        assert_eq!(degraded.condition.to_string(), "Degraded");
-
-        // in front of a hole: blocked, ahead of both of the above
-        let blocked = PolicyStatus {
-            name: "blocked_policy".to_string(),
-            position: 7,
-            head: 10,
-            lag: 3,
-            next_position: Some(9),
-            missing_position: Some(8),
-            last_checkpoint_at: now,
-            dead_letter_count: 2,
-            last_dead_letter_at: Some(now),
-            condition: PolicyCondition::from_fields(3, 2, Some(8)),
-        };
-        assert_eq!(blocked.condition, PolicyCondition::Blocked);
-        assert_eq!(blocked.missing_position, Some(8));
-        assert_eq!(blocked.next_position, Some(9));
-        assert_eq!(blocked.condition.as_str(), "Blocked");
-        assert_eq!(blocked.condition.to_string(), "Blocked");
     }
 
     /// Exhaustive precedence table for [`PolicyCondition::from_fields`].
     #[test]
     fn policy_condition_precedence() {
         assert_eq!(
-            PolicyCondition::from_fields(0, 0, None),
+            PolicyCondition::from_fields(0, 0),
             PolicyCondition::CaughtUp
         );
+        assert_eq!(PolicyCondition::from_fields(5, 0), PolicyCondition::Working);
         assert_eq!(
-            PolicyCondition::from_fields(5, 0, None),
-            PolicyCondition::Working
-        );
-        assert_eq!(
-            PolicyCondition::from_fields(0, 3, None),
+            PolicyCondition::from_fields(0, 3),
             PolicyCondition::Degraded
         );
         // Dead letters win even when the policy is also behind.
         assert_eq!(
-            PolicyCondition::from_fields(10, 2, None),
+            PolicyCondition::from_fields(10, 2),
             PolicyCondition::Degraded
         );
-        // A hole in front of the cursor outranks everything.
-        assert_eq!(
-            PolicyCondition::from_fields(5, 0, Some(7)),
-            PolicyCondition::Blocked
-        );
-        assert_eq!(
-            PolicyCondition::from_fields(5, 4, Some(7)),
-            PolicyCondition::Blocked
-        );
-    }
-
-    /// The missing position is derived, not stored: it exists only when the
-    /// position immediately after the cursor is absent *and* a later one exists.
-    #[test]
-    fn missing_position_is_the_hole_in_front_of_the_cursor() {
-        // Next event is the very next position: no hole.
-        assert_eq!(missing_position(5, Some(6)), None);
-        // Next event is further out: the hole is position 6.
-        assert_eq!(missing_position(5, Some(9)), Some(6));
-        // Nothing past the cursor at all: caught up, not blocked.
-        assert_eq!(missing_position(5, None), None);
-        // A cursor at 0 with the log starting at 1 is the bootstrap case.
-        assert_eq!(missing_position(0, Some(1)), None);
     }
 
     /// Directly verify the `PolicyCondition` string representations.
@@ -374,10 +306,8 @@ mod tests {
         assert_eq!(PolicyCondition::CaughtUp.as_str(), "CaughtUp");
         assert_eq!(PolicyCondition::Working.as_str(), "Working");
         assert_eq!(PolicyCondition::Degraded.as_str(), "Degraded");
-        assert_eq!(PolicyCondition::Blocked.as_str(), "Blocked");
         assert_eq!(format!("{}", PolicyCondition::CaughtUp), "CaughtUp");
         assert_eq!(format!("{}", PolicyCondition::Working), "Working");
         assert_eq!(format!("{}", PolicyCondition::Degraded), "Degraded");
-        assert_eq!(format!("{}", PolicyCondition::Blocked), "Blocked");
     }
 }

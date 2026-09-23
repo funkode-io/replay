@@ -97,12 +97,6 @@ pub(crate) enum Poll {
     /// The feed ended: nothing to read, and nothing in the way of reading more.
     /// The only observation that closes a burst.
     Exhausted,
-    /// Nothing advanced, and the feed did not end — it stops at a hole, or the
-    /// cursor was moved under the poll. No edge either way: a
-    /// [Blocked policy](https://github.com/funkode-io/replay/blob/main/CONTEXT.md#blocked-policy)
-    /// has not caught up, and its own record says so
-    /// ([`crate::policy_blocked`]).
-    Stalled,
 }
 
 impl Narration {
@@ -124,7 +118,6 @@ impl Narration {
     /// it advanced over — because that happened.
     pub(crate) fn polled(&mut self, poll: Poll) -> Option<Record> {
         match (&mut self.state, poll) {
-            (_, Poll::Stalled) => None,
             (State::CaughtUp, Poll::Exhausted) => None,
             // A window read while a burst is open is that burst carrying on:
             // the bracket is already where it belongs.
@@ -266,64 +259,6 @@ mod tests {
         poll(&mut narration, start, Duration::ZERO, Duration::ZERO, 10);
 
         assert_eq!(narration.polled(Poll::Found { at: start }), None);
-    }
-
-    /// A burst is not closed by a poll that read nothing because something is in
-    /// the way: a Policy parked in front of a hole has not reached the end of its
-    /// feed, and announcing a catch-up would say the opposite of what happened.
-    #[test]
-    fn a_stalled_poll_leaves_the_burst_open() {
-        let mut narration = Narration::new(PROGRESS_EVERY);
-        let start = Instant::now();
-
-        poll(&mut narration, start, Duration::ZERO, Duration::ZERO, 700);
-
-        for minute in 1..10 {
-            assert_eq!(
-                narration.polled(Poll::Stalled),
-                None,
-                "nothing is earned by a poll that advanced nothing and ended nothing, \
-                 at minute {minute} of the block"
-            );
-        }
-
-        assert_eq!(
-            poll(
-                &mut narration,
-                start,
-                Duration::from_secs(600),
-                Duration::ZERO,
-                300
-            ),
-            vec![Record::Progress {
-                events: 1_000,
-                elapsed: Duration::from_secs(600),
-            }],
-            "the hole filled and the same burst carries on — a progress record, \
-             because the spacing has long since elapsed, and never a second bracket"
-        );
-        assert_eq!(
-            poll(
-                &mut narration,
-                start,
-                Duration::from_secs(601),
-                Duration::ZERO,
-                0
-            ),
-            vec![Record::CaughtUp {
-                events: 1_000,
-                elapsed: Duration::from_secs(600),
-            }]
-        );
-    }
-
-    /// A Policy that was already quiet stays quiet in front of a hole: the block
-    /// is reported on the progress axis, by the record that knows how old it is.
-    #[test]
-    fn a_stalled_poll_says_nothing_about_an_idle_policy() {
-        let mut narration = Narration::new(PROGRESS_EVERY);
-
-        assert_eq!(narration.polled(Poll::Stalled), None);
     }
 
     /// One poll can run for minutes — a batch is dispatched event by event, each

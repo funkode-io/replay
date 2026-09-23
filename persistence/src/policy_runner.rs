@@ -11,7 +11,8 @@
 //! later slices that build on this substrate.
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, VecDeque};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -28,13 +29,8 @@ use tokio::task::JoinHandle;
 
 use replay::{Aggregate, Metadata};
 
-use crate::burned_position::{
-    resume_after_burned, sequence_holders, BurnedPositions, Permanence, Resume,
-};
-use crate::commit_stamp::CommitStamp;
 use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
-use crate::policy_blocked::{probe_blocked, resolve_blocked_warn_after, BlockedWatch};
-use crate::policy_feed::{feed_from_window, Feed, Gap, WindowPosition};
+use crate::policy_frontier::{discovered_from_sweep, Discovered};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
 };
@@ -357,7 +353,7 @@ impl PolicyRunnerBuilder {
             replica_id: self.replica_id,
             supervision: self.supervision,
             on_escalation: self.on_escalation,
-            stopped: StoppedPolicies::new(),
+            drained: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -427,48 +423,14 @@ pub struct PolicyRunner {
     supervision: WorkerSupervision,
     /// What the consumer does about a worker this runner has given up on.
     on_escalation: EscalationHook,
-    /// What this process remembers about the Policies that are stopped, shared by
-    /// every drain path so a stop is judged the same way however it is driven.
-    stopped: StoppedPolicies,
-}
-
-/// What a running process remembers about a Policy that is parked in front of a
-/// hole: how long it has been there, and whether any transaction can still fill it.
-///
-/// The two are separate questions with separate answers — one is about elapsed time
-/// and decides when to report, the other is about running transactions and decides
-/// when to move — but they share a subject and a lifetime: the moment a Policy is no
-/// longer parked where it was, both are stale ([`forget`](Self::forget)).
-#[derive(Clone)]
-struct StoppedPolicies {
-    /// Rate gate for the blocked-policy warning.
-    blocked: Arc<BlockedWatch>,
-    /// Candidate transactions for each Policy's hole, as first observed.
-    burned: Arc<BurnedPositions>,
-}
-
-impl StoppedPolicies {
-    fn new() -> Self {
-        Self {
-            blocked: Arc::new(BlockedWatch::new(resolve_blocked_warn_after())),
-            burned: Arc::new(BurnedPositions::new()),
-        }
-    }
-
-    /// Note that `policy` is parked in front of `gap` without judging it: the poll
-    /// that first sees a hole may still have work in front of it, and the hole is no
-    /// younger for that.
-    fn sighted(&self, policy: &str, gap: Gap) {
-        self.blocked
-            .sighted(policy, gap.expected, std::time::Instant::now());
-    }
-
-    /// Forget everything known about where `policy` was stopped: it is no longer
-    /// parked there, so the next hole is a fresh wait and a fresh question.
-    fn forget(&self, policy: &str) {
-        self.blocked.cleared(policy);
-        self.burned.cleared(policy);
-    }
+    /// Where each policy's search had got to at the end of the last [`Self::drain`].
+    ///
+    /// A daemon worker keeps this for its leadership term; a manual drain has no term, so
+    /// the runner keeps it instead. Dropping it between calls would reset the rotation
+    /// that shares a poll between its discovery sources, and a batch too small to divide
+    /// between them would then hand every slot to the same source for ever
+    /// (funkode-io/replay#231 review).
+    drained: tokio::sync::Mutex<HashMap<String, PolicyProgress>>,
 }
 
 /// Handle for background policy tasks spawned by [`PolicyRunner::start_polling`].
@@ -841,10 +803,21 @@ impl PolicyRunner {
 
     /// Manually drain every registered policy once.
     ///
-    /// For each policy: read the gap-free prefix of events past its cursor,
-    /// `react`, execute the returned dispatches through [`Cqrs`], and advance the
-    /// cursor — one event at a time, advancing only after that event's commands
-    /// have committed (at-least-once delivery; reactions must be idempotent).
+    /// For each policy: find the streams it is behind on, read each one's events past the
+    /// place it has reached, `react`, execute the returned dispatches through [`Cqrs`],
+    /// and advance that stream's place — one event at a time, advancing only after that
+    /// event's commands have committed (at-least-once delivery; reactions must be
+    /// idempotent).
+    ///
+    /// **The runner remembers where each policy's search had got to**, so repeated calls
+    /// behave like a daemon's successive polls: the streams one call could not finish are
+    /// looked at by the next, and the turn that shares a poll between the sweep and the
+    /// reconciliation carries on rather than restarting. A fresh runner starts the search
+    /// afresh — from what is stored, never from the beginning.
+    ///
+    /// Unlike a daemon's poll, this one always compares every stream's head with the
+    /// policy's places rather than doing it on a cadence, so a place moved by hand is
+    /// found by the very next call.
     ///
     /// Returns how many dispatches **committed** across all policies — a progress
     /// signal, not an audit. A delivery that fails does not contribute its
@@ -1518,7 +1491,6 @@ impl PolicyRunner {
                 cqrs: self.cqrs.clone(),
                 pool: self.pool.clone(),
                 executors: self.executors.clone(),
-                stopped: self.stopped.clone(),
                 shutdown_rx: shutdown_rx.clone(),
                 leader_rx,
                 wake_tx: wake_tx.clone(),
@@ -1590,19 +1562,31 @@ impl PolicyRunner {
 
     async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
         let name = policy.name().to_string();
-        let mut cursor = PolicyCursor::load(&self.pool, &name, policy.start_at()).await?;
+        // Held across the drain: two manual drains of one policy at once would each work
+        // from the other's stale search state, and the second would undo the first's turn.
+        let mut drained = self.drained.lock().await;
+        let progress = match drained.entry(name.clone()) {
+            Entry::Occupied(kept) => kept.into_mut(),
+            Entry::Vacant(first) => {
+                first.insert(PolicyProgress::load(&self.pool, &name, policy.start_at()).await?)
+            }
+        };
+
+        // A manual drain always pays for the frontier scan, whatever the cadence says. The
+        // cadence bounds what a daemon's tight polling loop spends on a scan it mostly
+        // does not need; a call made by hand is one poll and has to be a whole one — an
+        // operator who moves a place and drains expects that drain to find it.
+        progress.reconcile_now();
+
         let max_depth = resolve_max_depth(policy);
         drain_policy_once(
             &self.cqrs,
             &self.pool,
             &self.executors,
             policy,
-            &mut cursor,
+            progress,
             max_depth,
-            &mut Reporting {
-                stopped: &self.stopped,
-                narration: None,
-            },
+            &mut Reporting { narration: None },
         )
         .await
     }
@@ -1980,7 +1964,6 @@ struct PolicyWorker {
     cqrs: Cqrs<PostgresEventStore>,
     pool: Pool<Postgres>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
-    stopped: StoppedPolicies,
     shutdown_rx: watch::Receiver<bool>,
     leader_rx: watch::Receiver<bool>,
     /// Kept as the sender so each attempt subscribes its own receiver; a
@@ -2006,7 +1989,6 @@ impl PolicyWorker {
             cqrs,
             pool,
             executors,
-            stopped,
             mut shutdown_rx,
             mut leader_rx,
             wake_tx,
@@ -2050,14 +2032,14 @@ impl PolicyWorker {
 
             liveness.leading();
 
-            // Initialize cursor from the stored checkpoint (or bootstrap).
-            let mut cursor = match PolicyCursor::load(&pool, &name, policy.start_at()).await {
-                Ok(cursor) => cursor,
+            // Initialize progress from the stored places (or bootstrap).
+            let mut progress = match PolicyProgress::load(&pool, &name, policy.start_at()).await {
+                Ok(progress) => progress,
                 Err(error) => {
                     tracing::error!(
                         policy = %name,
                         error = %error,
-                        "leader failed to initialize cursor; retrying"
+                        "leader failed to initialize its progress; retrying"
                     );
                     tokio::select! {
                         _ = shutdown_rx.changed() => return Stop::Shutdown,
@@ -2067,16 +2049,14 @@ impl PolicyWorker {
                 }
             };
 
-            // Where this worker picks up, once per election. It is the only
-            // line a process killed from outside leaves: the same
-            // `next_position` on every restart names a poison event
-            // (`SELECT * FROM events WHERE global_position = <next_position>`), a
-            // position that advances means the process is leaking instead.
+            // Where this worker picks up, once per election. A Policy resumes per
+            // stream, so what it announces is where its search resumes; what it has
+            // processed is one row per stream in `policy_stream_cursors`, which is
+            // where an operator looks for a Policy that is not moving.
             tracing::info!(
                 policy = %name,
-                resuming_after = cursor.position(),
-                next_position = cursor.position() + 1,
-                "policy worker is leading; resuming after its last checkpoint"
+                swept_through = progress.swept_through,
+                "policy worker is leading; resuming its search after its last sweep"
             );
 
             // One election, one bracket: a burst this worker does not finish is
@@ -2089,7 +2069,7 @@ impl PolicyWorker {
                     break;
                 }
 
-                // Narrated from inside the drain, as the cursor moves: a batch
+                // Narrated from inside the drain, as the Policy moves: a batch
                 // whose dispatches take minutes is working throughout, and a
                 // record earned only when the poll returns would be paced by the
                 // work rather than by the clock.
@@ -2098,10 +2078,9 @@ impl PolicyWorker {
                     &pool,
                     &executors,
                     policy.as_ref(),
-                    &mut cursor,
+                    &mut progress,
                     max_depth,
                     &mut Reporting {
-                        stopped: &stopped,
                         narration: Some(&mut narration),
                     },
                 )
@@ -3017,8 +2996,6 @@ fn narrate(policy: &str, record: Record) {
 /// [Progress]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#progress
 /// [Narration]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#narration
 struct Reporting<'a> {
-    /// Where a feed that stops is remembered, and how often it is reported.
-    stopped: &'a StoppedPolicies,
     /// The bracket around a burst of work. `None` for [`PolicyRunner::drain`],
     /// which polls once on the caller's command: a manual drain that opened a
     /// burst would leave a bracket nothing ever closes.
@@ -3026,8 +3003,7 @@ struct Reporting<'a> {
 }
 
 impl Reporting<'_> {
-    /// Tell the narration what a read of the feed found, and write whatever
-    /// record it earns.
+    /// Tell the narration what a poll found, and write whatever record it earns.
     fn tell(&mut self, policy: &str, poll: Poll) {
         if let Some(narration) = self.narration.as_deref_mut() {
             if let Some(record) = narration.polled(poll) {
@@ -3042,7 +3018,7 @@ async fn drain_policy_once(
     pool: &Pool<Postgres>,
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     policy: &dyn ErasedPolicy,
-    cursor: &mut PolicyCursor,
+    progress: &mut PolicyProgress,
     max_depth: u32,
     reporting: &mut Reporting<'_>,
 ) -> Result<usize, replay::Error> {
@@ -3058,286 +3034,294 @@ async fn drain_policy_once(
         policy_name: &name,
         dispatch_timeout,
     };
-    let Feed { positions, gap } =
-        read_feed(pool, policy.stream_filter(), cursor.position(), read_batch).await?;
 
-    if positions.is_empty() {
-        // Nothing to process: the policy is idle, or parked in front of a gap
-        // that will never fill. Both are the states an operator corrects by hand
-        // with an UPDATE on `policy_cursors`, and both are the only moments when
-        // a re-read costs nothing, so this is where a *running* leader picks the
-        // correction up — no restart, no leadership change.
-        if cursor.refresh(pool, &name).await? {
-            tracing::info!(
-                policy = %name,
-                position = cursor.position(),
-                "persisted cursor was moved externally; adopting it"
-            );
-            // The gap was read from the position the operator has just replaced:
-            // reporting it would name a stop that no longer exists.
-            reporting.stopped.forget(&name);
-            // Not a catch-up: this poll read nothing and proved nothing about
-            // the feed, which now starts somewhere else entirely.
-            reporting.tell(&name, Poll::Stalled);
-            return Ok(0);
+    // Asked once per poll, not once per stream: it is the Policy's own code, and the
+    // number of times a library calls back into it should not depend on how the log is
+    // laid out.
+    let filter = policy.stream_filter();
+
+    // Three sources: what the last poll could not finish, what the sweep just found, and
+    // — on its own cadence — what the sweep has missed.
+    let carried = std::mem::take(&mut progress.unfinished);
+    let discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
+    let reconciling = progress.reconcile_is_due();
+    let examined = if reconciling {
+        streams_behind(pool, &name, &progress.reconciled_through, read_batch).await?
+    } else {
+        Vec::new()
+    };
+
+    // The poll looks at `read_batch` streams, taken a slot at a time from each source in
+    // turn, starting at a different source each time. Filling from the carried queue
+    // first and letting the others have what is left starves them outright: `read_batch`
+    // continuously-busy streams refill that queue every poll, and a quiet stream the
+    // sweep passed would be nominated by the reconciliation for ever without once being
+    // read. Round-robin bounds every source's share at a third of the batch, and moving
+    // the starting slot keeps that true for a batch too small to divide by three.
+    //
+    // Except on the poll a reconciliation runs, where it leads. Its candidates are the
+    // ones no other source will offer again — the sweep has passed them — and it only
+    // asks once a cadence, so the cost is one poll's turn to the other two. Leaving it to
+    // the turn made the guarantee depend on how the cadence divides into the poll
+    // interval: `share_from` moves per poll and a reconciliation samples it per cadence,
+    // so a cadence of three poll intervals would sample the same phase for ever
+    // (funkode-io/replay#231 review).
+    let page = examined.clone();
+    let Shared { taken, left } = share_the_poll(
+        read_batch,
+        if reconciling {
+            RECONCILED
+        } else {
+            progress.share_from
+        },
+        [carried, discovered.streams, examined],
+    );
+    let [carried_over, _, _] = left;
+    progress.share_from += 1;
+    let streams = taken;
+
+    // The sweep has read this stretch of log whatever the streams in it turn out to owe,
+    // and a stream left unfinished is remembered rather than re-swept for.
+    if discovered.swept_through > progress.swept_through {
+        progress.swept_through = discovered.swept_through;
+        write_sweep(pool, &name, progress.swept_through).await?;
+    }
+
+    if streams.is_empty() {
+        // Nothing was nominated, so the page was empty — a source with anything to offer
+        // always wins a slot. An empty page is the end of a pass, and recording it here
+        // is what wraps the rotation: without it a cursor that has reached the last
+        // stream id queries past the end for ever, and a behind stream sorting before it
+        // is never compared again (funkode-io/replay#231 review).
+        if reconciling {
+            progress.reconciled(&page, 0, read_batch);
+            write_reconciled(pool, &name, &progress.reconciled_through).await?;
         }
 
-        match gap {
-            // Parked in front of a hole, and the cursor is where the read left it.
-            Some(gap) => {
-                trace_gap(&name, gap);
-                // A hole no running transaction can fill is crossed here; anything
-                // else is an append the feed is right to wait for, and waiting is
-                // what gets reported.
-                if !skip_burned_positions(pool, &name, cursor, gap, reporting.stopped).await? {
-                    report_blocked(pool, &name, gap, &reporting.stopped.blocked).await?;
-                }
-                // A Policy stopped in front of a hole has not reached the end of
-                // its feed, whatever this poll read. Reporting it as caught up
-                // would say the opposite of what happened, and the block has a
-                // record of its own.
-                reporting.tell(&name, Poll::Stalled);
-            }
-            // Caught up: a healthy idle policy, and it stays silent unless this
-            // is the poll that closes a burst.
-            None => {
-                reporting.stopped.forget(&name);
-                reporting.tell(&name, Poll::Exhausted);
-            }
-        }
+        reporting.tell(&name, Poll::Exhausted);
         return Ok(0);
     }
+
+    let places = places_of(pool, &name, &streams).await?;
 
     // The window is work, before any of it is done: a first reaction that takes
     // minutes must run inside the bracket rather than before it.
     reporting.tell(&name, Poll::Found { at: started });
 
-    match gap {
-        // A truncated window: the policy advances over the prefix now and parks at
-        // the hole. The hole is as old as this poll even though this poll had work,
-        // so the clock starts here rather than on the first empty poll.
-        //
-        // Whether the hole can ever fill is asked on the *next* poll, once the
-        // prefix has been delivered and the feed comes back empty: the answer costs
-        // a query, and a poll with work in front of it has somewhere better to be.
-        // The delay is one poll, and the positions are no less burned for it.
-        Some(gap) => {
-            trace_gap(&name, gap);
-            reporting.stopped.sighted(&name, gap);
-        }
-        // Advancing with nothing in the way.
-        None => reporting.stopped.forget(&name),
-    }
-
     let mut executed = 0;
     let mut events_since_checkpoint = 0u32;
-    for WindowPosition {
-        commit_txid,
-        global_position,
-        delivered,
-    } in positions
-    {
-        if let Some(raw) = delivered {
-            let depth = event_causation_depth(&raw);
-            if depth >= max_depth {
-                // Circuit breaker: the event's causation chain is too deep.
-                // Skip reactions but keep advancing so the policy is not wedged.
-                let (_, limit_source) = resolve_max_depth_with_source(policy);
-                tracing::warn!(
-                    policy        = %name,
-                    event_id      = %raw.id,
-                    stream_id     = %raw.stream_id,
-                    global_position,
-                    depth,
-                    max_depth,
-                    limit_source,
-                    causation_chain = ?parse_causation_info(&raw),
-                    "causation depth limit reached; skipping reaction to prevent runaway cascade"
-                );
-            } else {
-                // Real event within depth budget: deliver to the policy with
-                // the full resilience policy (BRV advance, retry, dead-letter),
-                // and with a panic in the reaction contained to this event.
-                executed += delivery
-                    .react_to_event(policy, global_position, &raw)
-                    .await?;
+    // One entry per stream advanced since the last flush, so this is bounded by the
+    // number of streams this poll looked at, which `read_batch` bounds in turn.
+    let mut advanced: Vec<(String, i64)> = Vec::new();
+    // The queue the next poll starts from, in two halves: what this poll's budget never
+    // reached, then what it read and may not have finished. A stream written to faster
+    // than it is read goes to the back every time rather than holding the front.
+    let mut unvisited: Vec<String> = Vec::new();
+    let mut unfinished: Vec<String> = Vec::new();
+    // What the poll observed each place to be, which is what its checkpoints are written
+    // against: a place that has moved underneath this poll belongs to an operator or to
+    // another runner, and this one's arithmetic about it is stale.
+    let mut observed = places.clone();
+    // `read_batch_size` is a budget for the drain, not for each stream: spent across the
+    // streams in order, so one poll reads what the knob says however many streams it
+    // looks at. What the budget does not reach is carried, not lost.
+    let mut budget = read_batch;
+    // How far down the candidate list the budget reached. A stream past this was named by
+    // a source and never read, which is the difference the reconciliation's rotation
+    // turns on: a slot is not a read.
+    let mut visited = 0usize;
+
+    for (index, stream_id) in streams.iter().enumerate() {
+        if budget == 0 {
+            unvisited.extend(streams[index..].iter().cloned());
+            break;
+        }
+        visited = index + 1;
+
+        let place = places.get(stream_id).copied().unwrap_or_default().seq;
+        let events = read_stream(pool, filter.clone(), stream_id, place, budget).await?;
+        // A full read means the stream may have more; it is looked at again next poll
+        // rather than drained here, so one busy stream cannot hold up every other. It
+        // goes to the *back* of the queue — ahead of nothing it was ahead of — because a
+        // stream written to faster than it is read would otherwise hold the front of the
+        // queue for good and starve everything behind it.
+        if events.len() as u32 == budget {
+            unfinished.push(stream_id.clone());
+        }
+        budget -= events.len() as u32;
+
+        let mut reached = place;
+        let mut superseded = false;
+        for event in events {
+            if let Some(raw) = event.delivered {
+                let depth = event_causation_depth(&raw);
+                if depth >= max_depth {
+                    // Circuit breaker: the event's causation chain is too deep.
+                    // Skip reactions but keep advancing so the policy is not wedged.
+                    let (_, limit_source) = resolve_max_depth_with_source(policy);
+                    tracing::warn!(
+                        policy        = %name,
+                        event_id      = %raw.id,
+                        stream_id     = %raw.stream_id,
+                        global_position = event.global_position,
+                        stream_seq    = event.stream_seq,
+                        depth,
+                        max_depth,
+                        limit_source,
+                        causation_chain = ?parse_causation_info(&raw),
+                        "causation depth limit reached; skipping reaction to prevent runaway cascade"
+                    );
+                } else {
+                    // Real event within depth budget: deliver to the policy with
+                    // the full resilience policy (BRV advance, retry, dead-letter),
+                    // and with a panic in the reaction contained to this event.
+                    executed += delivery
+                        .react_to_event(policy, event.global_position, &raw)
+                        .await?;
+                }
+            }
+            // Always track in-memory place.
+            reached = event.stream_seq;
+            events_since_checkpoint += 1;
+            // Told as the Policy moves rather than when the poll returns: one poll's
+            // batch is dispatched event by event, each bounded only by the dispatch
+            // timeout and its retries, so a poll can outlast the progress cadence
+            // several times over.
+            reporting.tell(
+                &name,
+                Poll::Advanced {
+                    events: 1,
+                    at: Instant::now(),
+                },
+            );
+            // Write the persistent places every `checkpoint_size` events so that
+            // a crash re-processes at most `checkpoint_size - 1` events rather
+            // than the full drain batch (skip-safety: a place only advances past
+            // events whose reactions are already durably committed).
+            if events_since_checkpoint >= checkpoint_size {
+                let mut flushing = std::mem::take(&mut advanced);
+                flushing.push((stream_id.clone(), reached));
+                let kept = checkpoint_places(pool, &name, &flushing, &observed).await?;
+                for (stream, seq) in &flushing {
+                    if let Some(written_by) = kept.get(stream) {
+                        observed.insert(
+                            stream.clone(),
+                            Place {
+                                seq: *seq,
+                                written_by: Some(*written_by),
+                            },
+                        );
+                    }
+                }
+                events_since_checkpoint = 0;
+                if !kept.contains_key(stream_id) {
+                    superseded = true;
+                    break;
+                }
             }
         }
-        // Always track in-memory position.
-        cursor.advance_to(commit_txid, global_position);
-        events_since_checkpoint += 1;
-        // Told as the cursor moves rather than when the poll returns: one poll's
-        // batch is dispatched event by event, each bounded only by the dispatch
-        // timeout and its retries, so a poll can outlast the progress cadence
-        // several times over.
-        reporting.tell(
-            &name,
-            Poll::Advanced {
-                events: 1,
-                at: Instant::now(),
-            },
-        );
-        // Write the persistent cursor every `checkpoint_size` events so that
-        // a crash re-processes at most `checkpoint_size - 1` events rather
-        // than the full drain batch (skip-safety: the cursor only advances
-        // past events whose reactions are already durably committed).
-        if events_since_checkpoint >= checkpoint_size {
-            if cursor.checkpoint(pool, &name).await? == Checkpoint::Superseded {
-                log_superseded(&name, cursor);
-                return Ok(executed);
-            }
-            events_since_checkpoint = 0;
+
+        // A stream whose place moved under the poll is left where its new owner put it:
+        // nothing is written for it, and it is not carried, because the next poll reads
+        // the place afresh and resumes from there.
+        if superseded {
+            tracing::info!(
+                policy    = %name,
+                stream_id = %stream_id,
+                "policy place moved underneath this poll; abandoning the stream and \
+                 resuming from the place that is stored"
+            );
+            unfinished.retain(|carried| carried != stream_id);
+            continue;
+        }
+
+        if reached > place {
+            advanced.push((stream_id.clone(), reached));
         }
     }
 
-    // Final checkpoint: flush any events processed since the last periodic save.
-    if events_since_checkpoint > 0
-        && cursor.checkpoint(pool, &name).await? == Checkpoint::Superseded
-    {
-        log_superseded(&name, cursor);
+    // Final checkpoint: flush any stream advanced since the last periodic save.
+    checkpoint_places(pool, &name, &advanced, &observed).await?;
+
+    // The rotation advances through what this poll *read*, not through what it admitted:
+    // a candidate the event budget never reached is carried, and stepping the rotation
+    // over it would leave it for a full pass — or for ever, if the front of the page is
+    // always what the budget spends itself on. Contiguous from the front of the page,
+    // because the rotation is one id and cannot describe a hole in the middle.
+    if reconciling {
+        let read: HashSet<&String> = streams[..visited].iter().collect();
+        let read_through = page
+            .iter()
+            .take_while(|stream| read.contains(stream))
+            .count();
+
+        progress.reconciled(&page, read_through, read_batch);
+        write_reconciled(pool, &name, &progress.reconciled_through).await?;
     }
+
+    // What the next poll starts from, oldest claim first: what this one could not fit,
+    // then what it did not reach, then what it read and may not have finished. Capped,
+    // because it is the one collection here that outlives a poll.
+    let mut carrying = carried_over;
+    carrying.extend(unvisited);
+    carrying.extend(unfinished);
+    carrying.truncate(read_batch as usize);
+    progress.unfinished = carrying;
 
     Ok(executed)
 }
 
-/// Trace the stop: the one fact the blocked deployment in funkode-io/replay#164
-/// never had. Cheap enough to emit on every poll, so it needs no rate limit.
-///
-/// `cursor` is where the *feed* stops: the position before the hole, which is where
-/// the poll leaves the cursor when it gets that far. It is a property of the read,
-/// not of what the reactions then managed to do, so it is the same field whether the
-/// window was empty or was truncated after a prefix.
-fn trace_gap(name: &str, gap: Gap) {
-    tracing::debug!(
-        policy = %name,
-        cursor = gap.expected - 1,
-        expected = gap.expected,
-        found = gap.found,
-        "policy feed stops at a gap in global_position"
-    );
+/// Which source the reconciliation is, in the array `drain_policy_once` shares a poll
+/// between. It leads on the poll it runs, so it is the one index that has to be named.
+const RECONCILED: usize = 2;
+
+/// What one poll takes, and what each source still had to offer when it stopped.
+struct Shared<const N: usize> {
+    taken: Vec<String>,
+    /// Per source, in the order given: the candidates that got no slot. Each source's
+    /// caller decides what that means — carried forward, or left for the next pass.
+    left: [Vec<String>; N],
 }
 
-/// Cross a hole no transaction can ever fill, returning whether the Policy moved.
+/// Fill a poll's candidate list from its sources a slot at a time, starting at `from` and
+/// wrapping, skipping streams already taken.
 ///
-/// The feed stops at a missing `global_position` because it cannot tell an append
-/// still committing from a position burned by one that aborted — `nextval` is not
-/// transactional, so an aborted append's positions are gone for good
-/// (funkode-io/replay#164). The two are told apart by who holds the sequence:
-/// only a transaction that has already taken the missing position can write it, and
-/// it holds a lock on the sequence until it ends (see [`crate::burned_position`]).
+/// Takes ownership because each source is consumed as far as it was used: a stream named
+/// twice costs one slot, not two, and the source that named it first keeps its turn. What
+/// is left is handed back rather than dropped, so no caller has to assume its candidates
+/// were read.
 ///
-/// The order of the two queries is the correctness argument and not an accident:
-/// the lock is read first, and only a position still missing *after* that read can
-/// never appear, because Postgres publishes a commit before releasing its locks.
-///
-/// Every burned position in front of the cursor is crossed in one move, so an
-/// aborted batch that burned thousands costs one poll rather than thousands.
-async fn skip_burned_positions(
-    pool: &Pool<Postgres>,
-    name: &str,
-    cursor: &mut PolicyCursor,
-    gap: Gap,
-    stopped: &StoppedPolicies,
-) -> Result<bool, replay::Error> {
-    let Some(holders) = sequence_holders(pool).await? else {
-        // More transactions hold the sequence than this process will track. An
-        // incomplete candidate set can only produce a wrong "permanent", so the
-        // poll declines to judge and looks again next time.
-        return Ok(false);
-    };
-    if stopped.burned.verdict(name, gap.expected, holders) == Permanence::Fillable {
-        return Ok(false);
+/// `from` moves the first turn between polls. With three sources and a batch of two, a
+/// fixed order would give the third source no slot at all — for ever, if the first two
+/// always have something to offer.
+fn share_the_poll<const N: usize>(limit: u32, from: usize, sources: [Vec<String>; N]) -> Shared<N> {
+    let mut sources = sources.map(Vec::into_iter);
+    let mut taken: Vec<String> = Vec::new();
+
+    'filling: while (taken.len() as u32) < limit {
+        let mut offered = false;
+        for turn in 0..N {
+            let source = &mut sources[(from + turn) % N];
+            for stream_id in source.by_ref() {
+                if !taken.contains(&stream_id) {
+                    taken.push(stream_id);
+                    offered = true;
+                    break;
+                }
+            }
+            if (taken.len() as u32) >= limit {
+                break 'filling;
+            }
+        }
+        if !offered {
+            break;
+        }
     }
 
-    let resume = resume_after_burned(pool, name, cursor.position()).await?;
-    let Resume::Skip { next_position } = resume else {
-        // The cursor moved under us, or the hole is gone: either way this verdict
-        // is about a position the Policy is no longer parked in front of.
-        stopped.forget(name);
-        return Ok(false);
-    };
-
-    // The record is written after the checkpoint, not before: a cursor moved by an
-    // operator between the read above and this write loses the compare-and-set, and
-    // this process then crossed nothing. A `warn` saying otherwise would send
-    // whoever reads it looking for a move that never happened.
-    let parked_at = cursor.position();
-    cursor.park_at(next_position - 1);
-    match cursor.checkpoint(pool, name).await? {
-        Checkpoint::Written => tracing::warn!(
-            policy = %name,
-            cursor = parked_at,
-            skipped_from = gap.expected,
-            skipped_to = next_position - 1,
-            skipped = next_position - gap.expected,
-            next_position,
-            "policy feed skipped global_position values that can never appear: no \
-             transaction still holds them, so they were burned by an append that \
-             aborted. Advancing past them (funkode-io/replay#164)"
-        ),
-        Checkpoint::Superseded => log_superseded(name, cursor),
+    Shared {
+        taken,
+        left: sources.map(Iterator::collect),
     }
-    stopped.forget(name);
-
-    Ok(true)
-}
-
-/// Report a Policy parked in front of a hole long enough for the hole to be
-/// permanent rather than an append still landing.
-///
-/// The wait is by design (ADR-0003 skip-safety): a `global_position` is assigned at
-/// `INSERT` and visible at `COMMIT`, so a missing one is normally about to land.
-/// A hole that outlives the transactions that could fill it is crossed by
-/// [`skip_burned_positions`] instead, so what reaches this warning is a wait that is
-/// still legitimate and has lasted longer than an operator wants to be left guessing
-/// about — a long-running append, or a Policy whose cursor an operator has parked in
-/// front of a position that does not exist yet.
-///
-/// [`BlockedWatch`] decides which poll reports; the probe then runs at most once
-/// per interval, to name the head and how long the cursor has been parked.
-async fn report_blocked(
-    pool: &Pool<Postgres>,
-    name: &str,
-    gap: Gap,
-    blocked: &BlockedWatch,
-) -> Result<(), replay::Error> {
-    if !blocked.poll(name, gap.expected, std::time::Instant::now()) {
-        return Ok(());
-    }
-
-    // Confirms the hole is still there and the cursor still in front of it: the read
-    // that found it is a few statements old by now.
-    let Some(parked) = probe_blocked(pool, name, gap.expected - 1, gap.expected).await? else {
-        return Ok(());
-    };
-
-    tracing::warn!(
-        policy = %name,
-        // The feed was empty, so the cursor is parked immediately before the hole.
-        cursor = gap.expected - 1,
-        head = parked.head,
-        missing_position = gap.expected,
-        next_position = gap.found,
-        blocked_for_secs = parked.elapsed.as_secs(),
-        "policy is blocked: its feed stops at a global_position that does not exist \
-         yet. A transaction still holds it, so this is an append that has not \
-         committed, or a cursor parked in front of a position that was never \
-         written. A position no transaction holds is crossed automatically \
-         (funkode-io/replay#170), so do not move the cursor past this one until the \
-         append it is waiting for is known to be gone"
-    );
-
-    Ok(())
-}
-
-/// Report a checkpoint that lost to a cursor moved outside this process. The
-/// batch stops here; the cursor already holds the stored position.
-fn log_superseded(name: &str, cursor: &PolicyCursor) {
-    tracing::info!(
-        policy = %name,
-        position = cursor.position(),
-        "persisted cursor was moved externally mid-batch; abandoning this batch at the stored position"
-    );
 }
 
 /// The runner's machinery for delivering events to **one** policy: the
@@ -4172,8 +4156,8 @@ async fn move_dead_letter_to_archive(
     Ok(result.rows_affected() > 0)
 }
 
-/// Load a single event by its primary key, shaped exactly like [`read_feed`]
-/// so it can be fed back into a policy's erased reaction during retry.
+/// Load a single event by its primary key, shaped exactly like [`read_stream`] delivers
+/// one, so it can be fed back into a policy's erased reaction during retry.
 async fn load_event_by_id(
     pool: &Pool<Postgres>,
     event_id: uuid::Uuid,
@@ -4193,37 +4177,153 @@ async fn load_event_by_id(
     }
 }
 
-/// Read the window of positions past `cursor` the policy may advance over.
+/// Sweep the log past `from` for streams with new events.
 ///
-/// Unfiltered — every `global_position > cursor`, up to `limit` — because contiguity
-/// belongs to the position stream, not to the rows the policy asked for (ADR-0013).
-/// `filter` is evaluated per row as `matches_filter` and decides delivery only; an
-/// excluded row advances the cursor like a compaction snapshot
-/// (`compacted_snapshot = TRUE`, ADR-0004). [`feed_from_window`] then truncates the
-/// window at the first hole, and names the hole it truncated at.
-async fn read_feed(
+/// Two columns and an indexed range scan, bounded by `limit`: this runs on every poll, so
+/// it is the query the design is paid for. It reads no cursors and waits for no position
+/// to fill — a missing `global_position` names no stream, so there is nothing to stop at.
+async fn sweep_for_streams(
+    pool: &Pool<Postgres>,
+    from: i64,
+    limit: u32,
+) -> Result<Discovered, replay::Error> {
+    let rows = sqlx::query(
+        "SELECT global_position, stream_id FROM events WHERE global_position > $1 \
+         ORDER BY global_position ASC LIMIT $2",
+    )
+    .bind(from)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(discovered_from_sweep(
+        from,
+        rows.into_iter()
+            .map(|row| (row.get("global_position"), row.get("stream_id")))
+            .collect(),
+    ))
+}
+
+/// The streams this Policy is behind on, compared head to cursor, taking the batch that
+/// sorts after `after`.
+///
+/// This is the correctness half: it finds what the sweep missed, which is any write that
+/// committed below a position the sweep had already passed. No index answers a comparison
+/// between two tables' columns, so it scans one row per stream and is bounded by `limit`
+/// rather than by an index — which is why it runs on a cadence and the sweep runs on every
+/// poll (ADR-0026).
+///
+/// It resumes after the last id it examined instead of restarting at the lowest, because
+/// `limit` is a batch and not a snapshot: a Policy with `limit` permanently-behind streams
+/// low in the sort order would otherwise return those same ids every time, and a quiet
+/// stream sorting after them — one whose only write the sweep passed, so no future event
+/// will nominate it — would never be examined again. Rotating bounds that at one pass over
+/// the streams: `ceil(streams / limit)` cadences while the Policy is keeping up, and one
+/// stream a cadence at worst, because the poll it runs on gives it the first slot
+/// ([ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) owns the
+/// bound).
+async fn streams_behind(
+    pool: &Pool<Postgres>,
+    name: &str,
+    after: &str,
+    limit: u32,
+) -> Result<Vec<String>, replay::Error> {
+    let rows = sqlx::query(
+        "SELECT s.id FROM streams s \
+         LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
+         WHERE s.id > $2 AND s.stream_seq > COALESCE(c.stream_seq, 0) \
+         ORDER BY s.id LIMIT $3",
+    )
+    .bind(name)
+    .bind(after)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(rows.into_iter().map(|row| row.get("id")).collect())
+}
+
+/// A Policy's place in one stream, as a poll read it.
+///
+/// `written_by` is the transaction that last wrote the row — PostgreSQL's `xmin`, which
+/// every write to the row bumps whoever issues it. It is what a checkpoint compares, so
+/// that "nobody has written this since I read it" is a different fact from "somebody wrote
+/// it and it holds the value I read" (funkode-io/replay#234). `None` means the poll found
+/// no row, which is a stream at the beginning of itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Place {
+    seq: i64,
+    written_by: Option<i64>,
+}
+
+/// Where the Policy has got to in each of `streams`, and the row version it read that
+/// from. A stream with no row is at 0.
+async fn places_of(
+    pool: &Pool<Postgres>,
+    name: &str,
+    streams: &[String],
+) -> Result<HashMap<String, Place>, replay::Error> {
+    // `xid` is 32 bits unsigned and has no `sqlx` decoding of its own, so it is read as
+    // the number it is. Nothing is done with the value but compare it for equality.
+    let rows = sqlx::query(
+        "SELECT stream_id, stream_seq, xmin::text::bigint AS written_by \
+           FROM policy_stream_cursors \
+          WHERE policy = $1 AND stream_id = ANY($2)",
+    )
+    .bind(name)
+    .bind(streams)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("stream_id"),
+                Place {
+                    seq: row.get("stream_seq"),
+                    written_by: Some(row.get("written_by")),
+                },
+            )
+        })
+        .collect())
+}
+
+/// One stream's events past `place`, in the order they were written to it.
+///
+/// No contiguity to check: appends to a stream serialise on its row, so its places arrive
+/// in order and a missing one cannot be an append in flight — it is the operator's doing.
+/// The filter decides delivery only; an excluded row advances the place like a compaction
+/// snapshot does (ADR-0013, ADR-0004).
+async fn read_stream(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
-    cursor: i64,
+    stream_id: &str,
+    place: i64,
     limit: u32,
-) -> Result<Feed<PersistedEvent<Value>>, replay::Error> {
+) -> Result<Vec<StreamEvent>, replay::Error> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-         global_position, commit_txid::text AS commit_txid, compacted_snapshot, COALESCE((",
+         global_position, stream_seq, compacted_snapshot, COALESCE((",
     );
     // As a predicate NULL means no match; read as a value it must be collapsed.
     PostgresEventStore::add_filters(&mut qb, filter);
-    qb.push("), FALSE) AS matches_filter FROM events WHERE global_position > ");
-    qb.push_bind(cursor);
-    qb.push(" ORDER BY global_position ASC LIMIT ");
+    qb.push("), FALSE) AS matches_filter FROM events WHERE stream_id = ");
+    qb.push_bind(stream_id.to_string());
+    qb.push(" AND stream_seq > ");
+    qb.push_bind(place);
+    qb.push(" ORDER BY stream_seq ASC LIMIT ");
     qb.push_bind(limit as i64);
 
     let rows = qb.build().fetch_all(pool).await.map_err(crate::db_error)?;
 
-    let mut window = Vec::with_capacity(rows.len());
+    let mut events = Vec::with_capacity(rows.len());
     for row in rows {
+        let stream_seq: i64 = row.get("stream_seq");
         let global_position: i64 = row.get("global_position");
-        let commit_txid = CommitStamp::from_row(&row, "commit_txid")?;
         let is_snapshot: bool = row.get("compacted_snapshot");
         let matches_filter: bool = row.get("matches_filter");
 
@@ -4234,14 +4334,129 @@ async fn read_feed(
             Some(PersistedEvent::<Value>::try_from(row)?)
         };
 
-        window.push(WindowPosition {
-            commit_txid,
+        events.push(StreamEvent {
+            stream_seq,
             global_position,
             delivered,
         });
     }
 
-    Ok(feed_from_window(cursor, window))
+    Ok(events)
+}
+
+/// One event of one stream, and whether this Policy reacts to it.
+struct StreamEvent {
+    stream_seq: i64,
+    /// Carried for the causation the runner stamps and for what an operator reads in a
+    /// trace: the Policy's order does not use it.
+    global_position: i64,
+    delivered: Option<PersistedEvent<Value>>,
+}
+
+/// Record how far the Policy has got in each stream it advanced, and report back which
+/// of those writes the Policy still owned — and at what row version, so the poll can go
+/// on checkpointing the streams it kept.
+///
+/// One statement for the batch, and a compare-and-set per stream: a place is written only
+/// where the row is still the one this poll read, compared by the transaction that wrote
+/// it rather than by the place it holds. Comparing the place would not do, and
+/// monotonicity would do even less:
+///
+/// - the write to refuse is *lower* than the one this poll carries — an operator rewinding
+///   a stream to force a redelivery (ADR-0012) against a poll that is mid-batch, whose
+///   higher place would otherwise reinstate itself and undo the rewind silently;
+/// - and it may hold the very value this poll read, when the operator rewinds to just
+///   before the event being delivered right now. A compared place cannot see that one at
+///   all (funkode-io/replay#234); a compared row version can, because PostgreSQL bumps
+///   `xmin` on every write whether or not the value changes, and whether or not the writer
+///   knew it had to.
+///
+/// The same set-and-check tells a runner that has lost its leadership that it has, which
+/// is the only signal it gets.
+///
+/// Deleting the row is the other half of that control surface, and what protects it is
+/// that a place the poll read is only ever *updated*: an update matches nothing where the
+/// row has gone. What decides which half a stream is in is whether the poll saw a *row*,
+/// which a place of 0 does not tell you — a stream at the beginning and a stream with no
+/// row are the same number and different things (funkode-io/replay#231), and only the
+/// second may be created here. An upsert would not do, even guarded on the row existing,
+/// because the guard reads the snapshot the statement opened on: against a delete that
+/// had not committed when the statement started, the guard sees the row, the insert waits
+/// on the primary key, and once the delete commits there is nothing left to conflict
+/// with, so the operator's delete is undone by an insert (funkode-io/replay#236 review).
+/// A place the poll found no row for is only ever inserted, and loses to whoever created
+/// one in the meantime.
+async fn checkpoint_places(
+    pool: &Pool<Postgres>,
+    name: &str,
+    places: &[(String, i64)],
+    observed: &HashMap<String, Place>,
+) -> Result<HashMap<String, i64>, replay::Error> {
+    if places.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let streams: Vec<String> = places.iter().map(|(stream, _)| stream.clone()).collect();
+    let seqs: Vec<i64> = places.iter().map(|(_, seq)| *seq).collect();
+    // A row the poll saw carries the version it saw; a stream it found no row for carries
+    // nothing, which is what puts it in the half of the statement that may create one. A
+    // place of 0 does not tell you which — a stream at the beginning and a stream with no
+    // row are both 0 (funkode-io/replay#231).
+    let from: Vec<Option<i64>> = places
+        .iter()
+        .map(|(stream, _)| observed.get(stream).and_then(|place| place.written_by))
+        .collect();
+
+    let kept = sqlx::query(
+        "WITH incoming AS ( \
+             SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) \
+                       AS i(stream_id, stream_seq, observed)), \
+         advanced AS ( \
+             UPDATE policy_stream_cursors c \
+                SET stream_seq = i.stream_seq, updated_at = now() \
+               FROM incoming i \
+              WHERE c.policy = $1 AND c.stream_id = i.stream_id \
+                AND i.observed IS NOT NULL \
+                AND c.xmin::text::bigint = i.observed \
+          RETURNING c.stream_id, c.xmin::text::bigint AS written_by), \
+         created AS ( \
+             INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+             SELECT $1, i.stream_id, i.stream_seq FROM incoming i \
+              WHERE i.observed IS NULL \
+             ON CONFLICT (policy, stream_id) DO NOTHING \
+          RETURNING stream_id, xmin::text::bigint AS written_by) \
+         SELECT stream_id, written_by FROM advanced \
+          UNION ALL \
+         SELECT stream_id, written_by FROM created",
+    )
+    .bind(name)
+    .bind(&streams)
+    .bind(&seqs)
+    .bind(&from)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    // The version this statement has just left on each row it kept: what the poll must
+    // compare against next time, since its own write moved the row on.
+    let kept: HashMap<String, i64> = kept
+        .into_iter()
+        .map(|row| (row.get("stream_id"), row.get("written_by")))
+        .collect();
+
+    // What `PolicyStatus::last_checkpoint_at` is measured from: the Policy processed
+    // something, whichever stream it was. A batch whose every write lost its
+    // compare-and-set processed nothing that stands, so it leaves the stamp alone rather
+    // than reporting an outage as fresh progress.
+    if !kept.is_empty() {
+        sqlx::query("UPDATE policy_cursors SET updated_at = now() WHERE name = $1")
+            .bind(name)
+            .execute(pool)
+            .await
+            .map_err(crate::db_error)?;
+    }
+
+    Ok(kept)
 }
 
 async fn execute_dispatch(
@@ -4279,331 +4494,272 @@ async fn execute_dispatch(
         .await
 }
 
-/// A point in the Policy feed: the transaction a Policy stopped in and the position it
-/// stopped at.
+/// Where a Policy is: a place per stream, and how far discovery has swept the log.
 ///
-/// The pair is what a cursor records (funkode-io/replay#194). Only the position decides
-/// delivery today; the transaction is recorded so the feed can be ordered by writes that
-/// have finished rather than by the numbers those writes took (funkode-io/replay#171).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CursorPoint {
-    commit_txid: CommitStamp,
-    position: i64,
+/// The per-stream places are the progress. The sweep position is a hint that says where
+/// to look next — never what has been delivered — so losing it, resetting it or running
+/// past an uncommitted write costs a search, not an event
+/// ([ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
+///
+/// The places are not held in memory between polls. Each poll loads the places of the
+/// streams it is about to read, which bounds what this struct holds by the poll's own
+/// limit rather than by how many streams the Policy has ever seen — and means an operator
+/// editing `policy_stream_cursors` is adopted on the next poll, with no machinery for it
+/// (ADR-0012).
+struct PolicyProgress {
+    /// The position discovery has swept to, as last written to `policy_cursors`.
+    swept_through: i64,
+    /// Streams this Policy is behind on that the last poll could not finish, so the next
+    /// one looks at them whatever the sweep finds. Bounded by the poll's stream limit.
+    unfinished: Vec<String>,
+    /// Which source takes the first slot of the next poll. Rotating it is what keeps a
+    /// batch too small to divide between the three sources from shutting one out.
+    share_from: usize,
+    /// The stream id the last reconciliation admitted, so the next one resumes after it.
+    /// Persisted, because a runner that restarts often would otherwise rotate from the
+    /// start every time and never reach the end of the sort order.
+    reconciled_through: String,
+    /// When the frontier was last compared with the places. `None` until the first
+    /// reconciliation, so a worker that has just been elected does one straight away —
+    /// which is what makes a crash mid-backlog cost a cadence rather than a deployment.
+    reconciled_at: Option<Instant>,
+    /// How long the sweep is trusted on its own. This is the whole exposure of the
+    /// design: a write that commits below the sweep is delivered within a bounded number
+    /// of these, which
+    /// [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) states
+    /// and this is the unit of.
+    reconcile_every: Duration,
 }
 
-/// A policy's point in the global feed, paired with the value this process
-/// believes is stored in `policy_cursors`.
-///
-/// The stored value is not this process's private state: an operator moves a
-/// stuck policy by updating the row directly (that is how the permanent-gap
-/// incident in funkode-io/replay#164 was recovered). So the in-memory point
-/// is treated as a *lease* on the stored one:
-///
-/// - [`refresh`](Self::refresh) re-reads the row and adopts whatever it finds.
-///   The drain calls it when the feed comes back empty — an idle or wedged
-///   policy — which is where the correction can land for free.
-/// - [`checkpoint`](Self::checkpoint) is a compare-and-set against `persisted`,
-///   so a write derived from a point that predates the operator's update
-///   fails instead of silently reinstating it.
-struct PolicyCursor {
-    /// Last point handed to the policy in this process.
-    point: CursorPoint,
-    /// The value this process last observed in `policy_cursors`.
-    persisted: CursorPoint,
-}
-
-/// Outcome of a [`PolicyCursor::checkpoint`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Checkpoint {
-    /// The stored point now matches the in-memory one.
-    Written,
-    /// Someone else moved the row since this process last read it. The write was
-    /// refused and the cursor has adopted the stored point instead.
-    Superseded,
-}
-
-impl PolicyCursor {
-    /// Where the policy is, for the feed and for the log.
-    fn position(&self) -> i64 {
-        self.point.position
-    }
-
-    /// Move onto the position just read, in the transaction that wrote it.
-    fn advance_to(&mut self, commit_txid: CommitStamp, position: i64) {
-        self.point = CursorPoint {
-            commit_txid,
-            position,
-        };
-    }
-
-    /// Move onto a position no event carries, keeping the transaction half.
-    ///
-    /// A burned position was taken by a write that aborted, so there is no event there
-    /// and no transaction to name: the last write the policy passed is still the one it
-    /// stopped in.
-    fn park_at(&mut self, position: i64) {
-        self.point.position = position;
-    }
-
-    /// Load the stored checkpoint, bootstrapping the row from `start_at` the
-    /// first time a policy runs.
+impl PolicyProgress {
+    /// Load the Policy's sweep position, creating its row the first time it runs.
     async fn load(
         pool: &Pool<Postgres>,
         name: &str,
         start_at: StartAt,
     ) -> Result<Self, replay::Error> {
-        if let Some(stored) = read_point(pool, name).await? {
-            let mut cursor = Self {
-                point: stored,
-                persisted: stored,
-            };
-            // Even a row this policy's last leader wrote goes through `adopt`: a fresh
-            // process cannot tell that row from one an operator has since edited, and
-            // the derivation costs one indexed read per election.
-            cursor.adopt(pool, name, stored).await?;
-            return Ok(cursor);
-        }
-
-        let bootstrap = bootstrap_point(pool, start_at).await?;
-        let mut cursor = Self {
-            point: bootstrap,
-            persisted: bootstrap,
+        let (swept_through, reconciled_through) = match read_sweep(pool, name).await? {
+            Some(progress) => progress,
+            None => bootstrap(pool, name, start_at).await?,
         };
 
-        // `refresh` does the rest: it creates the row if it is still missing and
-        // adopts the stored value, which is a concurrent runner's bootstrap when
-        // that runner won the insert.
-        cursor.refresh(pool, name).await?;
-        Ok(cursor)
+        Ok(Self {
+            swept_through,
+            unfinished: Vec::new(),
+            share_from: 0,
+            reconciled_through,
+            reconciled_at: None,
+            reconcile_every: resolve_reconcile_cadence(),
+        })
     }
 
-    /// Re-read the stored point and adopt it, returning `true` when it moved
-    /// the in-memory one (i.e. something outside this process wrote it).
-    ///
-    /// A deleted row is recreated at the in-memory point: dropping the row is
-    /// not a documented way to rewind a policy, and recreating it keeps the
-    /// policy from silently replaying its whole history. The recreate can lose
-    /// to a concurrent writer, so it re-reads and adopts the winner rather than
-    /// assuming its own value took.
-    async fn refresh(&mut self, pool: &Pool<Postgres>, name: &str) -> Result<bool, replay::Error> {
-        let stored = match read_point(pool, name).await? {
-            Some(stored) => stored,
-            None => {
-                insert_point(pool, name, self.point).await?;
-                read_point(pool, name).await?.ok_or_else(|| {
-                    replay::Error::not_found("policy cursor row vanished immediately after insert")
-                        .with_operation("policy_cursor_refresh")
-                        .with_context("policy", name)
-                })?
-            }
-        };
-
-        // The row is where this process left it: nothing to adopt, and no read of the
-        // log to pay for on an idle poll.
-        if stored == self.persisted && stored == self.point {
-            return Ok(false);
-        }
-
-        let before = self.point;
-        self.adopt(pool, name, stored).await?;
-        Ok(self.point != before)
+    /// Make the next poll pay for the frontier scan whatever the cadence says.
+    fn reconcile_now(&mut self) {
+        self.reconciled_at = None;
     }
 
-    /// Take on a stored point this process did not write, completing its transaction
-    /// half from the log.
-    ///
-    /// The operator's instruction is a position — that is the control surface ADR-0012
-    /// documents, and it stays one column wide. The transaction that belongs with a
-    /// position is the one that wrote the last event at or before it, which is exactly
-    /// what the runner itself stores, so a pair the runner wrote survives this untouched
-    /// and a position written alone is completed rather than refused.
-    ///
-    /// The completion is written back, so the row shows the point the Policy resumes
-    /// from rather than the half-instruction it was given — without disturbing
-    /// `updated_at`, since nothing was processed. Losing that compare-and-set means the
-    /// row moved again; the next poll reads it and adopts that instead.
-    async fn adopt(
-        &mut self,
-        pool: &Pool<Postgres>,
-        name: &str,
-        stored: CursorPoint,
-    ) -> Result<(), replay::Error> {
-        self.persisted = stored;
-        self.point = CursorPoint {
-            commit_txid: commit_txid_at(pool, stored.position).await?,
-            position: stored.position,
-        };
-
-        if self.point != self.persisted
-            && complete_commit_txid(pool, name, self.persisted, self.point.commit_txid).await?
-        {
-            self.persisted = self.point;
-        }
-        Ok(())
+    /// Whether this poll pays for the frontier scan.
+    fn reconcile_is_due(&self) -> bool {
+        self.reconciled_at
+            .is_none_or(|last| last.elapsed() >= self.reconcile_every)
     }
 
-    /// Persist the in-memory point, but only if the stored one is still the
-    /// value this process last saw.
+    /// Record a reconciliation: `page` is the streams it compared, `read` how many of
+    /// them the poll went on to actually read, counted from the front.
     ///
-    /// On [`Checkpoint::Superseded`] the cursor has already adopted the stored
-    /// point, so the caller must stop draining from its own: everything after
-    /// it belongs to the operator's correction, not to this batch.
-    async fn checkpoint(
-        &mut self,
-        pool: &Pool<Postgres>,
-        name: &str,
-    ) -> Result<Checkpoint, replay::Error> {
-        if write_point(pool, name, self.persisted, self.point).await? {
-            self.persisted = self.point;
-            return Ok(Checkpoint::Written);
-        }
+    /// The rotation stops at the last stream that was **read** and never passes one that
+    /// was not, so a page the poll admitted but its event budget never reached is
+    /// compared again next cadence rather than skipped. A page none of which was read
+    /// leaves the rotation where it was. A page read whole and short of the limit — no
+    /// page at all included, which is what the last stream id looks like from the far
+    /// side — is the end of a pass, and the next one starts over: the empty string sorts
+    /// before every id.
+    fn reconciled(&mut self, page: &[String], read: usize, limit: u32) {
+        self.reconciled_at = Some(Instant::now());
 
-        self.refresh(pool, name).await?;
-        Ok(Checkpoint::Superseded)
+        if read == page.len() && (page.len() as u32) < limit {
+            self.reconciled_through = String::new();
+        } else if read > 0 {
+            self.reconciled_through = page[read - 1].clone();
+        }
     }
 }
 
-/// Read a policy's stored point, or `None` when it has no row yet.
-async fn read_point(
+/// Built-in default for [`resolve_reconcile_cadence`].
+///
+/// Five seconds is a latency bound, not a correctness one: it is how long a Policy can
+/// take to notice a write that committed below its sweep. Lower it for a deployment that
+/// cares more about that tail than about scanning one row per stream; raise it for one
+/// with millions of streams and no long transactions.
+const DEFAULT_RECONCILE_CADENCE: Duration = Duration::from_secs(5);
+
+/// Environment variable overriding the built-in cadence, in seconds.
+const RECONCILE_CADENCE_ENV_VAR: &str = "REPLAY_POLICY_RECONCILE_SECS";
+
+/// How often a Policy compares every stream's head with its own place.
+///
+/// Precedence: `REPLAY_POLICY_RECONCILE_SECS` → 5s. `0` and unparseable values fall back
+/// to the default rather than turning every poll into a full scan.
+fn resolve_reconcile_cadence() -> Duration {
+    std::env::var(RECONCILE_CADENCE_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_RECONCILE_CADENCE, Duration::from_secs)
+}
+
+/// Read how far a Policy has swept and where its rotation left off, or `None` when it has
+/// no row yet.
+async fn read_sweep(
     pool: &Pool<Postgres>,
     name: &str,
-) -> Result<Option<CursorPoint>, replay::Error> {
+) -> Result<Option<(i64, String)>, replay::Error> {
     let row = sqlx::query(
-        "SELECT position, commit_txid::text AS commit_txid FROM policy_cursors WHERE name = $1",
+        "SELECT discovered_through, reconciled_through FROM policy_cursors WHERE name = $1",
     )
     .bind(name)
     .fetch_optional(pool)
     .await
     .map_err(crate::db_error)?;
 
-    row.map(|row| {
-        Ok(CursorPoint {
-            commit_txid: CommitStamp::from_row(&row, "commit_txid")?,
-            position: row.get("position"),
-        })
-    })
-    .transpose()
+    Ok(row.map(|row| (row.get("discovered_through"), row.get("reconciled_through"))))
 }
 
-/// Create a policy's cursor row, leaving an existing one untouched.
-async fn insert_point(
+/// Create a Policy's row, and for [`StartAt::Now`] the places that mean "from here".
+///
+/// `Now` is the one case that writes a place per existing stream: every stream is at its
+/// current head, so nothing already written is delivered. It is a single statement and it
+/// happens once in a Policy's life, but it is one row per stream, which is worth knowing
+/// before pointing a new Policy at a database with a million of them.
+///
+/// A stream created *after* this has no row and starts at 0 — correct without a special
+/// case, because everything in it was written after the Policy started.
+///
+/// A write in flight while this runs is not counted, so its events are delivered when it
+/// commits. That is the at-least-once side of the trade: a `Now` Policy may see an event
+/// from just before it started, and never misses one from just after.
+///
+/// The two reads it takes — where the log ends, and where each stream ends — have to be
+/// one snapshot, which is why this runs in a `REPEATABLE READ` transaction. Read
+/// separately, a write committing between them is seeded as processed while sitting above
+/// the position the search starts from: nominated by no sweep, owed by no place, and lost
+/// for good.
+///
+/// The policy's row is claimed *before* anything is seeded, and a runner that loses the
+/// claim seeds nothing. Seeding first would let two runners bootstrapping at once combine
+/// one's sweep position with the other's places: the loser's seed for a stream created
+/// after the winner's snapshot conflicts with nothing, so it stands, and says a stream was
+/// processed through an event above where the winner's search starts
+/// (funkode-io/replay#231 review).
+async fn bootstrap(
     pool: &Pool<Postgres>,
     name: &str,
-    point: CursorPoint,
-) -> Result<(), replay::Error> {
-    sqlx::query(
-        "INSERT INTO policy_cursors (name, position, commit_txid, updated_at) \
-         VALUES ($1, $2, $3::xid8, now()) ON CONFLICT (name) DO NOTHING",
+    start_at: StartAt,
+) -> Result<(i64, String), replay::Error> {
+    let mut tx = pool.begin().await.map_err(crate::db_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
+
+    // The claim, and the snapshot everything below is read in. A concurrent bootstrap
+    // queues here on the primary key and comes back empty-handed.
+    let claimed = sqlx::query(
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
+         VALUES ($1, 0, now()) ON CONFLICT (name) DO NOTHING RETURNING name",
     )
     .bind(name)
-    .bind(point.position)
-    .bind(point.commit_txid.to_string())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(crate::db_error)?;
+
+    if claimed.is_none() {
+        tx.rollback().await.map_err(crate::db_error)?;
+
+        // Both halves come from the row, which is the Policy's and not this process's
+        // opinion of it. The rotation of a row that has just been claimed is empty, so
+        // reading it rather than assuming it changes nothing today — but a value that is
+        // right because of when it is read is one edit from being wrong
+        // (funkode-io/replay#231 review).
+        return Ok(read_sweep(pool, name).await?.unwrap_or_default());
+    }
+
+    let swept_through = match start_at {
+        StartAt::Beginning => 0,
+        StartAt::Now => {
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(global_position) FROM events")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(crate::db_error)?
+                .unwrap_or_default()
+        }
+    };
+
+    if matches!(start_at, StartAt::Now) {
+        sqlx::query(
+            "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+             SELECT $1, s.id, s.stream_seq FROM streams s WHERE s.stream_seq > 0 \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(name)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
+    }
+
+    // The claim went in at 0 so that it could be made before the log was read; nobody has
+    // seen it yet, because it is this transaction's own uncommitted row.
+    sqlx::query("UPDATE policy_cursors SET discovered_through = $2 WHERE name = $1")
+        .bind(name)
+        .bind(swept_through)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
+
+    tx.commit().await.map_err(crate::db_error)?;
+
+    // The rotation starts at the beginning of the stream ids, which is what the row this
+    // transaction just inserted carries.
+    Ok((swept_through, String::new()))
+}
+
+/// Record how far discovery has swept.
+///
+/// Monotonic and unconditional: two runners for one Policy cannot make this wrong, since
+/// the worst a stale value does is sweep a stretch of log again. `updated_at` is left
+/// alone — it records when the Policy last *processed* something, which a search does not.
+async fn write_sweep(
+    pool: &Pool<Postgres>,
+    name: &str,
+    swept_through: i64,
+) -> Result<(), replay::Error> {
+    sqlx::query(
+        "UPDATE policy_cursors SET discovered_through = $2 \
+         WHERE name = $1 AND discovered_through < $2",
+    )
+    .bind(name)
+    .bind(swept_through)
     .execute(pool)
     .await
     .map_err(crate::db_error)?;
     Ok(())
 }
 
-/// The compare-and-set every cursor write goes through: move the row from `from` to
-/// `to`, and report whether it still held `from`.
-///
-/// Both halves are compared, so a write derived from either a stale position or a stale
-/// transaction is refused rather than reinstating it.
-async fn write_point(
+/// Record where the rotation left off, so a restart resumes the pass rather than
+/// restarting it. Unconditional, unlike the sweep: the rotation wraps, so "backwards" is
+/// where it is meant to go once per pass.
+async fn write_reconciled(
     pool: &Pool<Postgres>,
     name: &str,
-    from: CursorPoint,
-    to: CursorPoint,
-) -> Result<bool, replay::Error> {
-    let updated = sqlx::query(
-        "UPDATE policy_cursors SET position = $2, commit_txid = $3::xid8, updated_at = now() \
-         WHERE name = $1 AND position = $4 AND commit_txid = $5::xid8",
-    )
-    .bind(name)
-    .bind(to.position)
-    .bind(to.commit_txid.to_string())
-    .bind(from.position)
-    .bind(from.commit_txid.to_string())
-    .execute(pool)
-    .await
-    .map_err(crate::db_error)?;
-
-    Ok(updated.rows_affected() > 0)
-}
-
-/// Fill in the transaction half of a row whose position stays where it is, under the
-/// same compare-and-set.
-///
-/// `updated_at` is deliberately left alone: it records when the cursor last *advanced*,
-/// and is what a Policy's `blocked_for_secs` ([`crate::policy_blocked`]) and its status's
-/// `last_checkpoint_at` ([`crate::PolicyStatus`]) are measured from. Completing a
-/// transaction half processes nothing, so touching it would erase a running outage.
-async fn complete_commit_txid(
-    pool: &Pool<Postgres>,
-    name: &str,
-    from: CursorPoint,
-    to: CommitStamp,
-) -> Result<bool, replay::Error> {
-    let updated = sqlx::query(
-        "UPDATE policy_cursors SET commit_txid = $2::xid8 \
-         WHERE name = $1 AND position = $3 AND commit_txid = $4::xid8",
-    )
-    .bind(name)
-    .bind(to.to_string())
-    .bind(from.position)
-    .bind(from.commit_txid.to_string())
-    .execute(pool)
-    .await
-    .map_err(crate::db_error)?;
-
-    Ok(updated.rows_affected() > 0)
-}
-
-/// The transaction that belongs with `position`: the one that wrote the last event at or
-/// before it.
-///
-/// [`CommitStamp::SENTINEL`] when there is no such event — a cursor at 0, or a log with
-/// nothing in it yet — which orders before every real transaction, exactly as a cursor
-/// that has processed nothing should. A position past the head takes the head's
-/// transaction: the events between are the ones the policy is being told it has passed.
-async fn commit_txid_at(
-    pool: &Pool<Postgres>,
-    position: i64,
-) -> Result<CommitStamp, replay::Error> {
-    let stamp = sqlx::query_scalar::<_, String>(
-        "SELECT commit_txid::text FROM events WHERE global_position <= $1 \
-         ORDER BY global_position DESC LIMIT 1",
-    )
-    .bind(position)
-    .fetch_optional(pool)
-    .await
-    .map_err(crate::db_error)?;
-
-    stamp.map_or(Ok(CommitStamp::SENTINEL), |stamp| {
-        CommitStamp::parse(stamp.as_str())
-    })
-}
-
-async fn bootstrap_point(
-    pool: &Pool<Postgres>,
-    start_at: StartAt,
-) -> Result<CursorPoint, replay::Error> {
-    let position = match start_at {
-        StartAt::Beginning => 0,
-        StartAt::Now => {
-            let head =
-                sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(global_position) FROM events")
-                    .fetch_one(pool)
-                    .await
-                    .map_err(crate::db_error)?;
-            head.unwrap_or_default()
-        }
-    };
-
-    Ok(CursorPoint {
-        commit_txid: commit_txid_at(pool, position).await?,
-        position,
-    })
+    reconciled_through: &str,
+) -> Result<(), replay::Error> {
+    sqlx::query("UPDATE policy_cursors SET reconciled_through = $2 WHERE name = $1")
+        .bind(name)
+        .bind(reconciled_through)
+        .execute(pool)
+        .await
+        .map_err(crate::db_error)?;
+    Ok(())
 }
 
 /// Typed representation of the `causation` block stamped in event metadata by
@@ -4748,7 +4904,8 @@ fn resolve_checkpoint_batch_size(policy: &dyn ErasedPolicy) -> u32 {
     DEFAULT_CHECKPOINT_BATCH_SIZE
 }
 
-/// Resolve the effective read-batch size (events fetched in a single `read_feed` call).
+/// Resolve the effective read-batch size: the most one poll reads of any one stream, and
+/// the most streams one poll looks at.
 ///
 /// Precedence: per-policy override → `REPLAY_READ_BATCH_SIZE` env var → default 100.
 /// Enforces the invariant `read_batch_size ≥ checkpoint_batch_size`.
@@ -5675,24 +5832,199 @@ mod pinned_session_tests {
     }
 }
 
-/// What a [`PolicyCursor`] records and how it reads a row it did not write
-/// (funkode-io/replay#194).
+/// How one poll's candidate list is shared between the places it can come from.
 ///
-/// These drive the cursor against a real database rather than through a daemon: the
-/// compare-and-set and the derivation are two statements apart, and a test that has to
-/// catch a running worker between them is a test that fails on a busy machine.
+/// Pure, so the cases that matter — a batch too small to divide between the sources, a
+/// source naming what another already named — are one assertion each rather than a
+/// database and a daemon.
 #[cfg(test)]
-mod cursor_tests {
+mod sharing_tests {
+    use super::share_the_poll;
+
+    fn streams(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// One slot and three sources: the turn decides, and over three polls each source
+    /// gets one. Without the turn the same source takes the only slot for ever, which is
+    /// how a quiet stream the sweep passed stays undelivered (funkode-io/replay#231).
+    #[test]
+    fn a_batch_too_small_to_divide_gives_each_source_a_turn() {
+        let taken = |from| {
+            share_the_poll(
+                1,
+                from,
+                [
+                    streams(&["carried"]),
+                    streams(&["swept"]),
+                    streams(&["behind"]),
+                ],
+            )
+            .taken
+        };
+
+        assert_eq!(taken(0), streams(&["carried"]));
+        assert_eq!(taken(1), streams(&["swept"]));
+        assert_eq!(taken(2), streams(&["behind"]));
+        assert_eq!(taken(3), streams(&["carried"]), "the turn wraps");
+    }
+
+    /// Room for everyone: order follows the turn, and nothing is dropped.
+    #[test]
+    fn a_batch_with_room_takes_from_every_source() {
+        let shared = share_the_poll(
+            9,
+            1,
+            [
+                streams(&["carried"]),
+                streams(&["swept"]),
+                streams(&["behind"]),
+            ],
+        );
+
+        assert_eq!(shared.taken, streams(&["swept", "behind", "carried"]));
+        assert!(shared.left.iter().all(Vec::is_empty));
+    }
+
+    /// A stream two sources name costs one slot, and what no slot was found for is handed
+    /// back rather than dropped — the caller decides whether that means "carry it" or
+    /// "leave the rotation where it was".
+    #[test]
+    fn a_stream_named_twice_costs_one_slot_and_the_rest_is_handed_back() {
+        let shared = share_the_poll(
+            2,
+            0,
+            [
+                streams(&["both"]),
+                streams(&["both", "swept-only"]),
+                streams(&["behind-only"]),
+            ],
+        );
+
+        assert_eq!(shared.taken, streams(&["both", "swept-only"]));
+        assert_eq!(
+            shared.left,
+            [streams(&[]), streams(&[]), streams(&["behind-only"]),],
+            "the source that got no slot keeps its candidate"
+        );
+    }
+}
+
+/// Where the reconciliation's rotation stops, which is a decision about a page of stream
+/// ids and nothing else.
+///
+/// Pure, so the cases live here rather than behind a container: what the rotation does
+/// with a page nobody had room for, and with no page at all, is the difference between a
+/// stream examined once a pass and a stream never examined again.
+#[cfg(test)]
+mod rotation_tests {
+    use std::time::Duration;
+
+    use super::PolicyProgress;
+
+    fn at(reconciled_through: &str) -> PolicyProgress {
+        PolicyProgress {
+            swept_through: 0,
+            unfinished: Vec::new(),
+            share_from: 0,
+            reconciled_through: reconciled_through.to_string(),
+            reconciled_at: None,
+            reconcile_every: Duration::from_secs(5),
+        }
+    }
+
+    fn page(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// The end of a pass: no page means nothing sorts after the rotation point, so the
+    /// next one starts over. Without this a rotation that reached the last stream id
+    /// queries past the end for ever, and a stream behind it is never compared again.
+    #[test]
+    fn a_page_with_nothing_in_it_ends_the_pass() {
+        let mut progress = at("urn:probe:z");
+        progress.reconciled(&page(&[]), 0, 100);
+
+        assert_eq!(progress.reconciled_through, "");
+    }
+
+    /// A page shorter than the batch is the last of a pass, for the same reason.
+    #[test]
+    fn a_short_page_taken_whole_ends_the_pass() {
+        let mut progress = at("urn:probe:a");
+        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 2, 100);
+
+        assert_eq!(progress.reconciled_through, "");
+    }
+
+    /// A full page taken whole carries on after it.
+    #[test]
+    fn a_full_page_taken_whole_advances_the_rotation() {
+        let mut progress = at("");
+        progress.reconciled(&page(&["urn:probe:a", "urn:probe:b"]), 2, 2);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:b");
+    }
+
+    /// The case the poll's own limit creates: the page was read, the poll had room for
+    /// some of it, and the rotation stops at the last stream that got a slot. Advancing
+    /// past the rest would step over them unread whenever the front of the page stays
+    /// behind, which is what the rotation exists for.
+    #[test]
+    fn a_page_the_poll_could_not_fit_stops_where_the_room_ran_out() {
+        let mut progress = at("");
+        progress.reconciled(&page(&["urn:probe:a", "urn:probe:b", "urn:probe:c"]), 1, 3);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:a");
+    }
+
+    /// A page the poll admitted but never read is not stepped over either.
+    ///
+    /// The distinction the rotation turns on: winning a candidate slot is not being read,
+    /// because the poll's event budget can be spent before it reaches the stream. A slot
+    /// count is what this used to be given, so a busy stream earlier in the list could
+    /// eat the budget while the rotation moved past a quiet stream nobody looked at
+    /// (funkode-io/replay#231 review).
+    #[test]
+    fn a_page_admitted_but_not_read_is_compared_again() {
+        let mut progress = at("urn:probe:a");
+        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 0, 10);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:a");
+    }
+
+    /// And a page nobody had room for leaves it exactly where it was.
+    #[test]
+    fn a_page_with_no_room_at_all_leaves_the_rotation_alone() {
+        let mut progress = at("urn:probe:a");
+        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 0, 2);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:a");
+    }
+}
+
+/// What a Policy's places are, before a worker is anywhere near them
+/// (funkode-io/replay#195).
+///
+/// These drive the progress machinery against a real database rather than through a
+/// daemon: bootstrapping and checkpointing are statements a test can reason about
+/// directly, and one that has to catch a running worker between them is a test that fails
+/// on a busy machine.
+#[cfg(test)]
+mod progress_tests {
+    use std::collections::HashMap;
+
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
+    use sqlx::PgPool;
     use testcontainers_modules::postgres;
     use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 
-    use crate::commit_stamp::CommitStamp;
+    use super::{
+        bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, Place,
+        PolicyProgress, StartAt,
+    };
 
-    use super::{read_point, Checkpoint, CursorPoint, PolicyCursor, StartAt};
-
-    const POLICY: &str = "cursor_under_test";
+    const POLICY: &str = "progress_under_test";
 
     // The server the suite is verified against. Shared with
     // `tests/common/postgres_image.rs`, which this module cannot import, rather than
@@ -5755,312 +6087,717 @@ mod cursor_tests {
         (pool, container)
     }
 
-    /// Append `count` events through the store's own insert path, one transaction each,
-    /// and report the point each one landed at. No runner is involved: these tests are
-    /// about what a cursor makes of the log, not about how it got there.
-    async fn append_events(pool: &PgPool, count: usize) -> Vec<CursorPoint> {
-        let mut points = Vec::with_capacity(count);
-        for index in 0..count {
+    /// Append `count` events to `stream` through the store's own writer. No runner is
+    /// involved: these tests are about what a Policy makes of the log, not how it got
+    /// there.
+    async fn append_events(pool: &PgPool, stream: &str, count: usize) {
+        for _ in 0..count {
             sqlx::query(
                 "SELECT append_event(gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, \
                  'Appended', $1, 'Probe', NULL)",
             )
-            .bind(format!("urn:probe:{index}"))
+            .bind(stream)
             .execute(pool)
             .await
             .expect("appending must succeed");
-
-            let row = sqlx::query(
-                "SELECT global_position, commit_txid::text AS commit_txid FROM events \
-                 ORDER BY global_position DESC LIMIT 1",
-            )
-            .fetch_one(pool)
-            .await
-            .expect("reading the appended event must succeed");
-
-            points.push(CursorPoint {
-                commit_txid: CommitStamp::from_row(&row, "commit_txid")
-                    .expect("an appended event carries a readable stamp"),
-                position: row.get("global_position"),
-            });
         }
-        points
     }
 
-    /// The row as it stands, which is what a restarted process and an operator both read.
-    async fn stored(pool: &PgPool) -> CursorPoint {
-        read_point(pool, POLICY)
+    /// What a poll reads before it delivers anything, and what its checkpoints are
+    /// compared against.
+    async fn observe(pool: &PgPool, streams: &[&str]) -> HashMap<String, Place> {
+        let streams: Vec<String> = streams.iter().map(|s| (*s).to_string()).collect();
+        places_of(pool, POLICY, &streams)
             .await
-            .expect("reading the cursor must succeed")
-            .expect("the cursor row exists")
+            .expect("reading the places must succeed")
     }
 
-    /// The operator's instruction from ADR-0012, unchanged by this ticket: a position,
-    /// written alone.
-    async fn move_position(pool: &PgPool, position: i64) {
-        sqlx::query("UPDATE policy_cursors SET position = $2, updated_at = now() WHERE name = $1")
-            .bind(POLICY)
-            .bind(position)
-            .execute(pool)
+    /// The places, as a test asserts them: where each stream has got to, without the row
+    /// version that only a checkpoint has any use for.
+    async fn places(pool: &PgPool, streams: &[&str]) -> HashMap<String, i64> {
+        observe(pool, streams)
             .await
-            .expect("the operator's move must succeed");
+            .into_iter()
+            .map(|(stream, place)| (stream, place.seq))
+            .collect()
     }
 
-    /// When the cursor last advanced — the column `blocked_for_secs` and
-    /// `PolicyStatus::last_checkpoint_at` are read from.
-    async fn last_advanced(pool: &PgPool) -> chrono::DateTime<chrono::Utc> {
-        sqlx::query_scalar("SELECT updated_at FROM policy_cursors WHERE name = $1")
-            .bind(POLICY)
-            .fetch_one(pool)
-            .await
-            .expect("reading the cursor's timestamp must succeed")
-    }
-
+    /// A Policy that starts at the beginning owes every stream everything: it writes no
+    /// places, because a stream with no place is at the beginning of itself.
     #[tokio::test]
-    async fn a_checkpoint_records_the_transaction_the_policy_stopped_in_postgres_test() {
+    async fn a_policy_starting_at_the_beginning_is_owed_every_stream_postgres_test() {
         let (pool, _container) = start_postgres().await;
-        let events = append_events(&pool, 2).await;
+        append_events(&pool, "urn:probe:a", 2).await;
+        append_events(&pool, "urn:probe:b", 1).await;
 
-        let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
+        let progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        cursor.advance_to(events[1].commit_txid, events[1].position);
 
+        assert_eq!(progress.swept_through, 0, "it has searched nothing yet");
         assert_eq!(
-            cursor.checkpoint(&pool, POLICY).await.unwrap(),
-            Checkpoint::Written
+            places(&pool, &["urn:probe:a", "urn:probe:b"]).await,
+            HashMap::new(),
+            "no place is stored, and no place means the start of the stream"
         );
         assert_eq!(
-            stored(&pool).await,
-            events[1],
-            "the row records both halves of the point the policy stopped at"
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            "so both streams are behind"
         );
     }
 
-    /// A Policy that has processed nothing sits at the sentinel: it is behind every
-    /// transaction, which is what `StartAt::Beginning` means in the pair order.
+    /// A Policy that starts now is owed nothing: every stream is recorded at its head, so
+    /// the frontier finds nothing behind.
     #[tokio::test]
-    async fn a_policy_that_has_processed_nothing_sits_at_the_sentinel_postgres_test() {
+    async fn a_policy_starting_now_is_owed_nothing_postgres_test() {
         let (pool, _container) = start_postgres().await;
-        append_events(&pool, 1).await;
+        append_events(&pool, "urn:probe:a", 3).await;
 
-        PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
+        let progress = PolicyProgress::load(&pool, POLICY, StartAt::Now)
             .await
             .expect("loading must succeed");
 
         assert_eq!(
-            stored(&pool).await,
-            CursorPoint {
-                commit_txid: CommitStamp::SENTINEL,
-                position: 0,
-            }
-        );
-    }
-
-    /// `StartAt::Now` starts at the head, and the head is a pair.
-    #[tokio::test]
-    async fn a_cursor_bootstrapped_at_the_head_names_the_head_transaction_postgres_test() {
-        let (pool, _container) = start_postgres().await;
-        let events = append_events(&pool, 3).await;
-
-        PolicyCursor::load(&pool, POLICY, StartAt::Now)
-            .await
-            .expect("loading must succeed");
-
-        assert_eq!(stored(&pool).await, events[2]);
-    }
-
-    /// The compare-and-set guards the pair, not half of it: a process whose transaction
-    /// half is stale loses, exactly as one whose position is stale does.
-    #[tokio::test]
-    async fn a_checkpoint_derived_from_a_stale_transaction_is_refused_postgres_test() {
-        let (pool, _container) = start_postgres().await;
-        let events = append_events(&pool, 2).await;
-
-        let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
-            .await
-            .expect("loading must succeed");
-        cursor.advance_to(events[0].commit_txid, events[0].position);
-        cursor.checkpoint(&pool, POLICY).await.unwrap();
-
-        // Someone else moves the row's transaction half only. The position this process
-        // holds is still the stored one, so a guard on the position alone would let the
-        // next checkpoint through.
-        sqlx::query("UPDATE policy_cursors SET commit_txid = $2::xid8 WHERE name = $1")
-            .bind(POLICY)
-            .bind(events[1].commit_txid.to_string())
-            .execute(&pool)
-            .await
-            .expect("the outside write must succeed");
-
-        cursor.advance_to(events[1].commit_txid, events[1].position);
-        assert_eq!(
-            cursor.checkpoint(&pool, POLICY).await.unwrap(),
-            Checkpoint::Superseded,
-            "a write derived from a stale transaction is refused"
+            progress.swept_through, 3,
+            "its search starts at the head of the log"
         );
         assert_eq!(
-            cursor.position(),
-            events[0].position,
-            "the refused cursor is back where the row says it is, not where it wanted to be"
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 3)]),
+            "and the stream is recorded where it already is"
+        );
+        assert!(
+            streams_behind(&pool, POLICY, "", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing written before it started is owed to it"
         );
     }
 
-    /// ADR-0012's control surface stays one column wide: the operator writes a position
-    /// and the runner supplies the transaction that belongs with it — the one that wrote
-    /// the event there, which is what the runner would have stored itself.
+    /// A stream created after a `Now` Policy started has no place, and a missing place is
+    /// the beginning of the stream — which is where that Policy should start in it.
     #[tokio::test]
-    async fn an_operator_may_move_the_position_alone_postgres_test() {
+    async fn a_stream_born_after_a_now_policy_started_is_delivered_whole_postgres_test() {
         let (pool, _container) = start_postgres().await;
-        let events = append_events(&pool, 3).await;
-
-        let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
+        append_events(&pool, "urn:probe:before", 1).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Now)
             .await
             .expect("loading must succeed");
-        cursor.advance_to(events[0].commit_txid, events[0].position);
-        cursor.checkpoint(&pool, POLICY).await.unwrap();
 
-        move_position(&pool, events[2].position).await;
+        append_events(&pool, "urn:probe:after", 2).await;
+
+        assert_eq!(
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            vec!["urn:probe:after".to_string()],
+            "the new stream is behind; the one that predates the Policy is not"
+        );
+    }
+
+    /// Checkpoint one stream, the way a poll that has just read it would: against what is
+    /// stored right now.
+    async fn checkpoint(pool: &PgPool, stream: &str, to: i64) -> HashMap<String, i64> {
+        let observed = observe(pool, &[stream]).await;
+        checkpoint_from(pool, &observed, stream, to).await
+    }
+
+    /// Checkpoint one stream against a view the caller took earlier — a poll that has been
+    /// mid-batch for a while, which is where every contested write happens.
+    async fn checkpoint_from(
+        pool: &PgPool,
+        observed: &HashMap<String, Place>,
+        stream: &str,
+        to: i64,
+    ) -> HashMap<String, i64> {
+        checkpoint_places(pool, POLICY, &[(stream.to_string(), to)], observed)
+            .await
+            .expect("checkpointing must succeed")
+    }
+
+    /// A rotation that has reached the end wraps even on a poll that finds nothing.
+    ///
+    /// The cursor past the last stream id is the state every pass ends in, and the page
+    /// it reads there is empty — which means no candidates, which means the poll returns
+    /// before it does anything. Recording the reconciliation only on the path that reads
+    /// a stream leaves the cursor there for ever, and a behind stream sorting before it
+    /// is never compared again (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn a_pass_that_ends_on_an_empty_poll_still_wraps_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 1).await;
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        // Where a finished pass leaves it, with the stream it is owed sorting before it.
+        progress.reconciled_through = "urn:probe:z".to_string();
+        write_reconciled(&pool, POLICY, &progress.reconciled_through)
+            .await
+            .expect("writing the rotation must succeed");
 
         assert!(
-            cursor.refresh(&pool, POLICY).await.unwrap(),
-            "the running leader adopts a cursor moved underneath it"
+            streams_behind(&pool, POLICY, &progress.reconciled_through, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing sorts after the end, which is the state this is about"
+        );
+
+        progress.reconciled(&[], 0, 10);
+
+        assert_eq!(
+            progress.reconciled_through, "",
+            "an empty page ends the pass, whatever the poll went on to do"
         );
         assert_eq!(
-            cursor.point, events[2],
-            "the adopted point carries the transaction that wrote the event there"
-        );
-        assert_eq!(
-            stored(&pool).await,
-            events[2],
-            "and the row is completed, so it shows the point the policy resumes from"
+            streams_behind(&pool, POLICY, &progress.reconciled_through, 10)
+                .await
+                .unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "and the next pass finds the stream that was behind the cursor"
         );
     }
 
-    /// The same instruction aimed at a position no event carries — the #164 recovery,
-    /// where the operator moves past a burned position. There is no transaction to name
-    /// there, so the cursor takes the last one it has passed.
+    /// The reconciliation rotates, so a stream sorting after a batch that never catches
+    /// up is still examined.
+    ///
+    /// Restarting at the lowest id every cadence is what made this a hole rather than a
+    /// delay: `limit` permanently-behind streams below it would return the same ids for
+    /// ever, and a quiet stream — one whose only write the sweep passed, so no future
+    /// event will nominate it — would never be compared again
+    /// (funkode-io/replay#231 review).
     #[tokio::test]
-    async fn a_position_no_event_carries_takes_the_transaction_before_it_postgres_test() {
+    async fn the_reconciliation_rotates_past_streams_that_stay_behind_postgres_test() {
         let (pool, _container) = start_postgres().await;
-        let events = append_events(&pool, 2).await;
-
-        let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Beginning)
+        for stream in ["urn:probe:a1", "urn:probe:a2", "urn:probe:z"] {
+            append_events(&pool, stream, 1).await;
+        }
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
-        move_position(&pool, events[1].position + 10).await;
-        cursor.refresh(&pool, POLICY).await.unwrap();
 
+        let first = streams_behind(&pool, POLICY, &progress.reconciled_through, 2)
+            .await
+            .unwrap();
         assert_eq!(
-            cursor.point,
-            CursorPoint {
-                commit_txid: events[1].commit_txid,
-                position: events[1].position + 10,
-            }
+            first,
+            vec!["urn:probe:a1".to_string(), "urn:probe:a2".to_string()],
+            "a full batch of the streams that sort first"
+        );
+        progress.reconciled(&first, first.len(), 2);
+        write_reconciled(&pool, POLICY, &progress.reconciled_through)
+            .await
+            .expect("writing the rotation must succeed");
+
+        // A restart resumes the pass rather than starting it again, which is why the
+        // rotation is persisted and not held in memory.
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        assert_eq!(progress.reconciled_through, "urn:probe:a2");
+
+        let second = streams_behind(&pool, POLICY, &progress.reconciled_through, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            vec!["urn:probe:z".to_string()],
+            "the stream the first pass could not reach, with the first two still behind"
+        );
+        progress.reconciled(&second, second.len(), 2);
+        assert_eq!(
+            progress.reconciled_through, "",
+            "a short batch is the end of the pass, and the next one starts over"
         );
     }
 
-    /// Completing a transaction half is bookkeeping, not progress: a Policy that has
-    /// been parked for ten minutes still reads as parked for ten minutes afterwards.
-    ///
-    /// The case is a database upgraded through 0022 whose cursor sits on an event
-    /// appended after 0018: the row takes the sentinel, and the first leader to load it
-    /// derives the real id.
+    /// A place records what has been processed, and the frontier is the difference
+    /// between that and the stream's head.
     #[tokio::test]
-    async fn completing_the_transaction_half_reports_no_progress_postgres_test() {
+    async fn a_checkpointed_place_takes_a_stream_off_the_frontier_postgres_test() {
         let (pool, _container) = start_postgres().await;
-        let events = append_events(&pool, 2).await;
+        append_events(&pool, "urn:probe:a", 3).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        checkpoint(&pool, "urn:probe:a", 2).await;
+
+        assert_eq!(
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "two of three places processed is still behind"
+        );
+
+        checkpoint(&pool, "urn:probe:a", 3).await;
+
+        assert!(
+            streams_behind(&pool, POLICY, "", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "caught up with the last place written"
+        );
+    }
+
+    /// A checkpoint is written only where the place still reads as the value its poll
+    /// started from. Two runners for one Policy is a leadership fault, and the one whose
+    /// view is stale is told so rather than allowed to write over the other.
+    #[tokio::test]
+    async fn a_checkpoint_from_a_stale_view_is_refused_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 5).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        // A poll that read the stream before anything was written there.
+        let stale = observe(&pool, &["urn:probe:a"]).await;
+
+        checkpoint(&pool, "urn:probe:a", 4).await;
+        let kept = checkpoint_from(&pool, &stale, "urn:probe:a", 2).await;
+
+        assert!(
+            kept.is_empty(),
+            "the write loses, and its runner is told it lost"
+        );
+        assert_eq!(
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 4)]),
+            "the stale write is dropped, not applied"
+        );
+    }
+
+    /// The reason the write compares rather than only refusing to go backwards: an
+    /// operator rewinding a stream mid-poll writes a place *below* the one the poll is
+    /// carrying, so a monotonic write would reinstate the higher value and undo the
+    /// rewind without a word (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn an_operator_rewinding_mid_poll_is_not_overwritten_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 10).await;
+
+        // The poll is mid-batch: it read the place as 10 and has since delivered to 15.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
 
         sqlx::query(
-            "INSERT INTO policy_cursors (name, position, updated_at) \
-             VALUES ($1, $2, now() - interval '10 minutes')",
+            "UPDATE policy_stream_cursors SET stream_seq = 3 \
+             WHERE policy = $1 AND stream_id = $2",
         )
         .bind(POLICY)
-        .bind(events[1].position)
+        .bind("urn:probe:a")
         .execute(&pool)
         .await
-        .expect("staging the migrated cursor must succeed");
-        let parked_since = last_advanced(&pool).await;
+        .expect("the operator's move must succeed");
 
-        let mut cursor = PolicyCursor::load(&pool, POLICY, StartAt::Now)
-            .await
-            .expect("loading must succeed");
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
 
+        assert!(kept.is_empty(), "the poll is told its view went stale");
         assert_eq!(
-            stored(&pool).await,
-            events[1],
-            "the load completed the transaction half from the log"
-        );
-        assert_eq!(
-            last_advanced(&pool).await,
-            parked_since,
-            "and reported no progress: nothing was processed"
-        );
-
-        // A checkpoint that does move the policy is progress, and says so.
-        cursor.advance_to(events[1].commit_txid, events[1].position + 1);
-        cursor.checkpoint(&pool, POLICY).await.unwrap();
-        assert!(
-            last_advanced(&pool).await > parked_since,
-            "a cursor that advanced reports when it did"
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 3)]),
+            "and the operator's rewind stands"
         );
     }
 
-    /// A cursor that predates 0022 carries the sentinel and the position it had. It
-    /// resumes exactly there: the sentinel is the transaction every event it has already
-    /// processed was stamped with, because they all predate 0018 too.
+    /// The rewind an operator is most likely to make is the one a compared *place* cannot
+    /// see: back to just before the event being delivered right now, which is exactly the
+    /// place the poll started from (funkode-io/replay#234).
+    ///
+    /// "Nobody has written this since I read it" and "somebody wrote it and it holds the
+    /// value I read" are the same value and different facts. The write that has to be
+    /// refused here is the one that *agrees* with what the poll observed.
     #[tokio::test]
-    async fn a_cursor_written_before_the_stamp_resumes_where_it_was_postgres_test() {
+    async fn an_operator_rewinding_to_the_place_a_poll_started_from_is_not_overwritten_postgres_test(
+    ) {
         let (pool, _container) = start_postgres().await;
-        let events = append_events(&pool, 3).await;
-
-        // The log a deployment upgrades with: events already there when 0018 arrived
-        // carry the sentinel, and the ones appended since carry a real id.
-        sqlx::query("UPDATE events SET commit_txid = '0'::xid8 WHERE global_position <= $1")
-            .bind(events[1].position)
-            .execute(&pool)
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
-            .expect("staging the pre-stamp events must succeed");
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 10).await;
 
-        // The row 0022 leaves behind: a position, and the sentinel.
-        sqlx::query("INSERT INTO policy_cursors (name, position) VALUES ($1, $2)")
+        // The poll is mid-batch: it read the place as 10 and has since delivered to 15.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
+        // The operator asks for event 11 to be delivered again — a rewind to 10, which is
+        // where this poll found the place.
+        sqlx::query(
+            "UPDATE policy_stream_cursors SET stream_seq = 10 \
+             WHERE policy = $1 AND stream_id = $2",
+        )
+        .bind(POLICY)
+        .bind("urn:probe:a")
+        .execute(&pool)
+        .await
+        .expect("the operator's move must succeed");
+
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert_eq!(
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 10)]),
+            "and the redelivery the operator asked for still happens"
+        );
+    }
+
+    /// Deleting a place is the documented way to redeliver a stream from its first event
+    /// (README, "Moving a policy on a running system"), so a poll mid-batch must not
+    /// recreate the row it deleted — which is what an insert with nothing to conflict
+    /// with would do.
+    #[tokio::test]
+    async fn an_operator_deleting_a_place_mid_poll_is_not_overwritten_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 10).await;
+
+        // The poll is mid-batch, holding the place it read before the delete.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
+        sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
             .bind(POLICY)
-            .bind(events[1].position)
+            .bind("urn:probe:a")
             .execute(&pool)
             .await
-            .expect("staging the migrated cursor must succeed");
+            .expect("the operator's delete must succeed");
 
-        let expected = CursorPoint {
-            commit_txid: CommitStamp::SENTINEL,
-            position: events[1].position,
-        };
-        let cursor = PolicyCursor::load(&pool, POLICY, StartAt::Now)
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and the stream is still at the beginning, where the delete left it"
+        );
+    }
+
+    /// The same delete, still open when the checkpoint starts — which is the interleaving
+    /// the committed one cannot reach (funkode-io/replay#236 review).
+    ///
+    /// A checkpoint that guarded an upsert on the row existing would read that guard from
+    /// the snapshot it opened on, where the row is still there, and then wait on the
+    /// primary key: by the time it goes in, the delete has committed and there is nothing
+    /// to conflict with, so the operator's delete is undone by an insert. The window is
+    /// forced rather than raced for — the checkpoint is made while the delete is open, and
+    /// the delete commits while the checkpoint waits.
+    #[tokio::test]
+    async fn an_operator_deleting_a_place_during_a_checkpoint_is_not_overwritten_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 10).await;
+
+        // The poll is mid-batch, holding the place it read before the delete.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
+        let mut deleting = pool.begin().await.expect("beginning must succeed");
+        let operator: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *deleting)
+            .await
+            .expect("the deleting backend must identify itself");
+        sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
+            .bind(POLICY)
+            .bind("urn:probe:a")
+            .execute(&mut *deleting)
+            .await
+            .expect("the operator's delete must succeed");
+
+        let checkpointing = tokio::spawn({
+            let pool = pool.clone();
+            let observed = observed.clone();
+            async move {
+                checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 15)], &observed)
+                    .await
+            }
+        });
+        await_blocked_by(&pool, operator).await;
+        deleting.commit().await.expect("committing must succeed");
+
+        let kept = checkpointing
+            .await
+            .expect("the checkpoint must finish")
+            .expect("checkpointing must succeed");
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and the stream is still at the beginning, where the delete left it"
+        );
+    }
+
+    /// The same, for a row an operator had already rewound to the beginning.
+    ///
+    /// A place of 0 and no place at all are the same number, so a write allowed to create
+    /// a row whenever it saw 0 recreates the one the operator has just deleted. What
+    /// decides is whether the poll saw a *row* (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn an_operator_deleting_a_place_it_had_rewound_to_zero_is_not_overwritten_postgres_test()
+    {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
             .await
             .expect("loading must succeed");
 
+        // Rewound to the beginning by hand, then thought better of it and deleted.
+        sqlx::query(
+            "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) VALUES ($1, $2, 0)",
+        )
+        .bind(POLICY)
+        .bind("urn:probe:a")
+        .execute(&pool)
+        .await
+        .expect("the operator's rewind must succeed");
+
+        // The poll that was mid-batch when both happened: it saw the row at 0, which is a
+        // row, and not the absence of one that the same number would mean.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
+        sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
+            .bind(POLICY)
+            .bind("urn:probe:a")
+            .execute(&pool)
+            .await
+            .expect("the operator's delete must succeed");
+
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and the row the operator deleted stays deleted"
+        );
+    }
+
+    /// ADR-0012, moved to the table that now holds the position: an operator writes a
+    /// place back and the Policy reads it on its next poll, because places are read fresh
+    /// every poll rather than held in memory between them.
+    #[tokio::test]
+    async fn an_operator_can_move_a_place_back_to_force_a_redelivery_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 5).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 5).await;
+
+        sqlx::query(
+            "UPDATE policy_stream_cursors SET stream_seq = $1 \
+             WHERE policy = $2 AND stream_id = $3",
+        )
+        .bind(2_i64)
+        .bind(POLICY)
+        .bind("urn:probe:a")
+        .execute(&pool)
+        .await
+        .expect("the operator's move must succeed");
+
         assert_eq!(
-            cursor.point, expected,
-            "a migrated cursor resumes at its position, behind every real transaction"
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 2)]),
+            "the next poll reads what the operator wrote"
         );
         assert_eq!(
-            stored(&pool).await,
-            expected,
-            "and the row is left alone: there is nothing to complete"
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "and the stream is owed its last three events again"
         );
+    }
+
+    /// A bootstrap that loses the claim on the policy's row seeds no places.
+    ///
+    /// Seeding before claiming let two runners starting at once combine one's sweep
+    /// position with the other's places: a stream created after the winner's snapshot has
+    /// no seed from the winner, so the loser's — which says the stream is processed
+    /// through an event above where the winner's search starts — conflicts with nothing
+    /// and stands, and that event is delivered by nobody (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn a_bootstrap_that_loses_the_claim_seeds_nothing_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 3).await;
+
+        // The winner, at a point that predates the stream below.
+        sqlx::query(
+            "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
+             VALUES ($1, 0, now())",
+        )
+        .bind(POLICY)
+        .execute(&pool)
+        .await
+        .expect("the winning claim must succeed");
+
+        // The winner has a rotation of its own by now, mid-pass.
+        write_reconciled(&pool, POLICY, "urn:probe:m")
+            .await
+            .expect("the winner's rotation must write");
+
+        // `bootstrap` rather than `load`, which would see the row and never get here:
+        // this is the losing half of two runners that both found no row.
+        let progress = bootstrap(&pool, POLICY, StartAt::Now)
+            .await
+            .expect("bootstrapping must succeed");
+
+        assert_eq!(
+            progress,
+            (0, "urn:probe:m".to_string()),
+            "the loser takes both halves from the winner's row, not its own opinion of \
+             either: a rotation reset to the beginning would re-read the streams sorting \
+             first and could starve one sorting last"
+        );
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and writes no places of its own, which would say this stream was processed"
+        );
+        assert_eq!(
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "so the stream is owed, as the winner's own bootstrap decided"
+        );
+    }
+
+    /// The two reads `StartAt::Now` takes are one snapshot, so a write that commits
+    /// between them is owed rather than lost.
+    ///
+    /// The interleaving is forced rather than raced for: locking `policy_stream_cursors`
+    /// holds the bootstrap between its read of the log's end and its read of each
+    /// stream's end, which is the window the bug lived in. Under a snapshot the stream is
+    /// seeded where it was, so the event that committed in the window sits above the
+    /// place *and* above the sweep, and the Policy is owed it. Read separately, the seed
+    /// would include that event while the search started below it: nominated by no sweep,
+    /// owed by no place.
+    #[tokio::test]
+    async fn a_write_committing_during_bootstrap_is_owed_not_lost_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 1).await;
+
+        // Hold the bootstrap at its second read.
+        let mut blocker = pool.begin().await.expect("beginning must succeed");
+        sqlx::query("LOCK TABLE policy_stream_cursors IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .expect("locking must succeed");
+
+        let bootstrapping = tokio::spawn({
+            let pool = pool.clone();
+            async move { PolicyProgress::load(&pool, POLICY, StartAt::Now).await }
+        });
+        await_blocked_on(&pool, "policy_stream_cursors").await;
+
+        // The write the old code lost: a stream that already existed, gaining an event
+        // while the bootstrap is between its two reads.
+        append_events(&pool, "urn:probe:a", 1).await;
+        blocker.commit().await.expect("releasing must succeed");
+
+        let progress = bootstrapping
+            .await
+            .expect("the bootstrap must finish")
+            .expect("loading must succeed");
+
+        assert_eq!(
+            progress.swept_through, 1,
+            "the search starts where the log ended when the snapshot was taken"
+        );
+        assert_eq!(
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 1)]),
+            "and the stream is seeded where it was in that same snapshot"
+        );
+        assert_eq!(
+            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "so the event that committed in the window is owed"
+        );
+    }
+
+    /// Wait until something is queued behind a lock on `relation`.
+    async fn await_blocked_on(pool: &PgPool, relation: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                  WHERE c.relname = $1 AND NOT l.granted",
+            )
+            .bind(relation)
+            .fetch_one(pool)
+            .await
+            .expect("reading pg_locks must succeed");
+
+            if blocked > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing ever blocked on the lock on {relation}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait until something is queued behind whatever `holder` is holding.
+    async fn await_blocked_by(pool: &PgPool, holder: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(holder)
+            .fetch_one(pool)
+            .await
+            .expect("reading who is blocked must succeed");
+
+            if blocked > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing ever blocked on what backend {holder} holds"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The sweep is a hint, so it is written unconditionally forwards and never
+    /// backwards: a stale runner cannot make another one search the log twice.
+    #[tokio::test]
+    async fn the_sweep_position_only_moves_forwards_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 3).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        super::write_sweep(&pool, POLICY, 3).await.unwrap();
+        super::write_sweep(&pool, POLICY, 1).await.unwrap();
+
+        let reloaded = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        assert_eq!(reloaded.swept_through, 3);
     }
 }
 
 /// What a settlement can see while it settles (funkode-io/replay#228).
 ///
 /// Driven against a real database rather than through a daemon, for the reason
-/// [`cursor_tests`] is: a settlement reads its pages several statements apart, and
+/// [`progress_tests`] is: a settlement reads its pages several statements apart, and
 /// a test that has to catch a running retry between two of them is a test that
 /// fails on a busy machine.
 #[cfg(test)]
 mod settlement_tests {
     use sqlx::PgPool;
 
-    use super::cursor_tests::start_postgres;
+    use super::progress_tests::start_postgres;
     use super::{
         begin_settlement, group_digest, load_parked_page, Cqrs, DispatchIdentity, GroupPhase,
         ParkedReaction, PolicyRunner, Replay, ReplayedDispatch, Settlement,

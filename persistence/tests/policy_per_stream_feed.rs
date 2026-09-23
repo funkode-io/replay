@@ -1,0 +1,335 @@
+//! A Policy tracks its position per stream, not over a global order
+//! (funkode-io/replay#195).
+//!
+//! Every test here is a shape that a feed ordered by `global_position` gets wrong, and
+//! that a feed ordered per stream gets right without having to detect anything: a write
+//! held open in one stream, a position burned by a write that failed, a stream that goes
+//! quiet. What they assert is delivery — what the Policy reacted to and in what order —
+//! because that is the only thing a consumer of this library can see.
+
+mod common;
+
+use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
+use replay_persistence::PersistedEvent;
+use replay_persistence::{Dispatch, StartAt};
+
+/// A Policy that echoes every ping, so what it has delivered is readable as the commands
+/// it dispatched. Each echo goes to a stream of its own, named after the tag, so a
+/// reaction never appends to a stream a test is holding a write open on.
+fn echo_back(event: &PersistedEvent<ProbeEvent>) -> Vec<Dispatch> {
+    match &event.data {
+        ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+            ProbeUrn::new(format!("{tag}-echo")).expect("a valid NSS"),
+            ProbeCommand::Echo { tag: tag.clone() },
+        )],
+        ProbeEvent::Echoed { .. } => vec![],
+    }
+}
+
+/// The property the watermark could not give: a write that is slow, or stuck, or simply
+/// large, delays the stream it is writing to and nothing else.
+///
+/// Under a global order this is the wedge of funkode-io/replay#164 — the held write owns
+/// a position below the quiet stream's event, so every Policy stops at it until the write
+/// ends. Per stream there is nothing in the way: the quiet stream's own sequence is
+/// complete.
+#[tokio::test]
+async fn a_write_held_open_in_one_stream_does_not_delay_another_postgres_test() {
+    let harness = PolicyDaemonHarness::start("held_write", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+    })
+    .await;
+
+    // A write that has taken its position and will not end for the rest of the test.
+    let held = harness.hold_a_ping_open("slow-import", "held").await;
+
+    // Appended after it, so it sits above the held position in the log.
+    let after = harness.ping("elsewhere", "after").await;
+    assert!(
+        after.global_position > held.global_position,
+        "the point of the test is an event the held write sits in front of"
+    );
+
+    harness
+        .await_dispatch_caused_by(after.global_position)
+        .await;
+
+    held.abort().await;
+    harness.shutdown().await;
+}
+
+/// The incident (funkode-io/replay#164): a write that failed took a position with it, and
+/// every Policy stopped in front of the number it left behind.
+///
+/// `nextval` is not transactional, so the number is gone for good — nothing will ever
+/// carry it. A Policy that reads no global order never looks at it.
+#[tokio::test]
+async fn a_position_burned_by_a_failed_write_delays_nobody_postgres_test() {
+    let harness = PolicyDaemonHarness::start("burned", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+    })
+    .await;
+
+    // An append that started and failed: the place it took in its stream is handed back,
+    // the position it drew from the sequence is not.
+    harness
+        .hold_a_ping_open("rolled-back", "never")
+        .await
+        .abort()
+        .await;
+
+    let after = harness.ping("carries-on", "after").await;
+    harness
+        .await_dispatch_caused_by(after.global_position)
+        .await;
+
+    harness.shutdown().await;
+}
+
+/// A write in flight is delivered when it commits, and not before: the events either side
+/// of it do not wait for it, and it is not lost for having been overtaken.
+///
+/// The Policy's search sweeps past the held write's position while it is open — that is
+/// the design, and it is what makes the event before this test's held one arrive
+/// immediately. Finding it afterwards is the reconciliation's job, so this test waits for
+/// one cadence of it.
+#[tokio::test]
+async fn an_overtaken_write_is_delivered_when_it_commits_postgres_test() {
+    let harness = PolicyDaemonHarness::start("overtaken", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+    })
+    .await;
+
+    let held = harness.hold_a_ping_open("slow", "held").await;
+
+    // Committed and delivered while the held write is still open, which is what leaves
+    // the search swept past a position it never saw.
+    let overtaking = harness.ping("quick", "overtook").await;
+    harness
+        .await_dispatch_caused_by(overtaking.global_position)
+        .await;
+    assert!(
+        !harness.has_passed(held.global_position).await,
+        "an uncommitted write has been passed by nobody"
+    );
+
+    let position = held.global_position;
+    held.commit().await;
+
+    // Waited for, not asserted: the reaction fires before the checkpoint that records it,
+    // so reading the place the instant a dispatch appears is reading it one write early.
+    harness.await_dispatch_caused_by(position).await;
+    harness.await_passed(position).await;
+
+    harness.shutdown().await;
+}
+
+/// A stream that is written once and then falls silent is still delivered. Nothing about
+/// it is ever written again, so a design that only noticed streams with *new* events
+/// would leave it undelivered for good.
+#[tokio::test]
+async fn a_stream_that_falls_silent_is_still_delivered_postgres_test() {
+    let harness = PolicyDaemonHarness::start("quiet", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+    })
+    .await;
+
+    let only = harness.ping("says-one-thing", "once").await;
+    harness.await_dispatch_caused_by(only.global_position).await;
+
+    // Nothing more is appended anywhere: the Policy's own record of the stream is what
+    // keeps it caught up rather than any further traffic.
+    harness.await_passed(only.global_position).await;
+    assert_eq!(
+        harness.place_in(&only.stream_id).await,
+        Some(1),
+        "the one event it has is the one place it holds"
+    );
+
+    harness.shutdown().await;
+}
+
+/// Every event of a stream is delivered in that stream's order, under concurrent appends
+/// to it and to others — and each exactly once, which at-least-once delivery does not
+/// promise but a quiet run should show.
+#[tokio::test]
+async fn a_streams_events_are_delivered_in_its_own_order_postgres_test() {
+    const STREAMS: usize = 4;
+    const EVENTS: usize = 5;
+
+    let harness = PolicyDaemonHarness::start("ordered", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+    })
+    .await;
+
+    // Joined, not collected and awaited one at a time: every append is in flight at once,
+    // so the positions they take in the log are interleaved in an order nobody chose and
+    // several appends contend for each stream's row. Event-major, so that what a stream
+    // contends with first is the other streams.
+    let tags: Vec<(String, String)> = (0..EVENTS)
+        .flat_map(|event| {
+            (0..STREAMS)
+                .map(move |stream| (format!("ordered-{stream}"), format!("{stream}-{event}")))
+        })
+        .collect();
+    let appended =
+        futures::future::join_all(tags.iter().map(|(stream, tag)| harness.ping(stream, tag))).await;
+
+    // What order the race actually produced, per stream. Not the order the tags are
+    // numbered in: appends contending for one stream's row are granted it in an order
+    // nobody chose, and what the Policy owes is that order, not the test's.
+    let mut written: Vec<(String, Vec<(i64, String)>)> = Vec::new();
+    for ((_, tag), event) in tags.iter().zip(&appended) {
+        match written.iter_mut().find(|(id, _)| id == &event.stream_id) {
+            Some((_, events)) => events.push((event.global_position, tag.clone())),
+            None => written.push((
+                event.stream_id.clone(),
+                vec![(event.global_position, tag.clone())],
+            )),
+        }
+    }
+    for (_, events) in &mut written {
+        events.sort_by_key(|(position, _)| *position);
+    }
+
+    // The Policy also walks the streams its own echoes land in; what this test is about
+    // is the four it was pinged on.
+    harness
+        .observe("every pinged stream to be delivered whole", || async {
+            let places = harness.places().await;
+            (0..STREAMS)
+                .all(|stream| {
+                    places.iter().any(|(id, seq)| {
+                        id == &format!("urn:probe:ordered-{stream}") && *seq == EVENTS as i64
+                    })
+                })
+                .then_some(())
+        })
+        .await;
+
+    // Each echo goes to a stream named after the tag it echoed, so what the Policy was
+    // given is readable from the log in the order it wrote them.
+    let mut delivered: Vec<(String, Vec<String>)> = Vec::new();
+    for dispatch in harness.dispatches().await {
+        let Some(tag) = dispatch
+            .stream_id
+            .strip_prefix("urn:probe:")
+            .and_then(|nss| nss.strip_suffix("-echo"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let (stream, _) = tag.split_once('-').expect("tags are stream-event");
+        match delivered.iter_mut().find(|(seen, _)| seen == stream) {
+            Some((_, tags)) => tags.push(tag),
+            None => delivered.push((stream.to_string(), vec![tag])),
+        }
+    }
+
+    assert_eq!(
+        delivered.len(),
+        STREAMS,
+        "every stream must have been delivered something, or the order assertions below \
+         pass by having nothing to check"
+    );
+
+    for (stream, tags) in delivered {
+        let (_, events) = written
+            .iter()
+            .find(|(id, _)| id == &format!("urn:probe:ordered-{stream}"))
+            .expect("every delivered stream was written by this test");
+        let expected: Vec<String> = events.iter().map(|(_, tag)| tag.clone()).collect();
+
+        assert_eq!(
+            tags, expected,
+            "stream {stream} must be delivered in the order it was written, once each"
+        );
+    }
+
+    harness.shutdown().await;
+}
+
+/// ADR-0012 on the table that now holds the position: an operator moves a place back
+/// against a *running* daemon, and the Policy redelivers from there. No restart, no
+/// leadership change — the property funkode-io/replay#168 asked for, on the new surface.
+#[tokio::test]
+async fn an_operator_moves_a_place_on_a_running_daemon_postgres_test() {
+    let harness = PolicyDaemonHarness::start("operator", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+    })
+    .await;
+
+    let ping = harness.ping("redeliver-me", "again").await;
+    harness.await_dispatch_caused_by(ping.global_position).await;
+    let delivered_once = harness.dispatches().await.len();
+
+    // Waits for the place to be written before moving it, so what the rewind asks for is
+    // a *re*delivery: an event this policy has already reacted to once.
+    harness.redeliver(&ping).await;
+
+    harness
+        .observe("the policy to react to the same event twice", || async {
+            (harness.dispatches().await.len() > delivered_once).then_some(())
+        })
+        .await;
+
+    harness.shutdown().await;
+}
+
+/// The rewind an operator actually makes: back to just before the event that has only
+/// just failed — which is the place the poll delivering it started from
+/// (funkode-io/replay#234).
+///
+/// A checkpoint that compares the place it read cannot see this one at all: "nobody has
+/// written this since I read it" and "the operator wrote it and it says what it said" are
+/// the same value. The rewind is undone and the redelivery never happens.
+///
+/// The interleaving is forced rather than raced for. Holding the row lock on the place
+/// stops the poll at its checkpoint — the one moment where the operator's rewind and the
+/// poll's progress are both live — and the rewind is made from inside that window. Racing
+/// it is how this was found: the test above rewound the instant the reaction fired and
+/// failed about one run in four.
+#[tokio::test]
+async fn a_rewind_to_the_place_a_poll_started_from_survives_its_checkpoint_postgres_test() {
+    let harness = PolicyDaemonHarness::start("rewind_to_start", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+    })
+    .await;
+
+    // The place the next poll will start from: one event delivered, and recorded.
+    let first = harness.ping("rewind-me", "first").await;
+    harness.await_passed(first.global_position).await;
+    let started_from = harness
+        .place_in(&first.stream_id)
+        .await
+        .expect("the stream must have a place once its first event has been passed");
+
+    // In the checkpoint's way before the event it will checkpoint exists.
+    let place = harness.hold_place_row(&first.stream_id).await;
+
+    let failed = harness.ping("rewind-me", "again").await;
+    harness
+        .await_dispatch_caused_by(failed.global_position)
+        .await;
+    place.await_a_checkpoint_waiting().await;
+
+    // "Deliver that one again", made against a poll that is holding it.
+    place.rewind_to(started_from).await;
+
+    harness
+        .observe(
+            "the event the rewind asked for to be delivered again",
+            || async {
+                let delivered = harness
+                    .dispatches()
+                    .await
+                    .into_iter()
+                    .filter(|dispatch| dispatch.caused_by_position == failed.global_position)
+                    .count();
+                (delivered > 1).then_some(())
+            },
+        )
+        .await;
+
+    harness.shutdown().await;
+}

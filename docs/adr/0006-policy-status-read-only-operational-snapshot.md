@@ -1,6 +1,6 @@
 # Policy status is a read-only operational snapshot, not a projection
 
-**Status:** accepted
+**Status:** accepted; its fields were replaced by [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md). The decision below — a read-only operational snapshot, derived from the operational tables, reporting progress and not liveness — stands. What it reports changed with the position it reports on: `lag` is an exact count of events over the streams a Policy is behind on, `streams_behind` says how widely it is spread, and `position`, `head`, `next_position`, `missing_position` and `PolicyCondition::Blocked` are gone with the global order they described (funkode-io/replay#196).
 
 Policies are checkpointed background subscribers (ADR-0003): they store a
 `global_position` cursor, advance at-least-once, and on permanent failure write a
@@ -22,50 +22,54 @@ operational tables the runner already maintains.
 ## Decisions
 
 - **Read the operational tables, never the event log.** A status read is a
-  **single** SQL query over
-  [`policy_cursors`](../../persistence/tests/migrations/0008_policy_cursors.sql)
-  (per-policy stored position + `updated_at`), `MAX(global_position)` on `events`
-  (the global head), `MIN(global_position) > cursor` on `events` (the next
-  position that actually exists), and a per-policy aggregate over
-  [`policy_dead_letters`](../../persistence/tests/migrations/0010_policy_dead_letters.sql)
-  (`COUNT(*)` + `MAX(created_at)`). The event log is never scanned: both `events`
-  reads are `MIN`/`MAX` probes on `idx_events_global_position_unique`, O(log events)
-  each. The dead-letter aggregate still walks one policy's index entries, so
-  status scales with dead letters, not with the log.
+  **single** SQL query. *Amended by
+  [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md): the tables it reads
+  changed with the position it reports on.* It is now `policy_cursors`
+  (`discovered_through` + `updated_at`), a per-policy `LATERAL` over `streams`
+  against that policy's rows in `policy_stream_cursors`, and a per-policy aggregate
+  over
+  [`policy_dead_letters`](../../persistence/tests/migrations/0010_policy_dead_letters.sql).
+  ~~`MAX(global_position)` on `events` and `MIN(global_position) > cursor`~~ are gone
+  with the global order. The event log is still never scanned, but the frontier
+  `LATERAL` reads one row per stream per policy, because no index answers a
+  comparison between two tables' columns — affordable for an endpoint scraped every
+  few seconds, and the reason the runner does not discover work this way.
 
 - **Extend the existing read model; do not fork a parallel one.** Status lives in
   [`PolicyStatusStore`](../../persistence/src/policy_status.rs) and is read via
   `PolicyStatusStore::list()`. The dead-letter dimension *extends* the existing
   `PolicyStatus` / `PolicyCondition` types (adding fields and a variant) rather
   than introducing a second status type or a competing `PolicyRunner` method.
-  One read model, one set of field names (`position` / `head`), one query.
+  One read model, one set of field names, one query.
 
-- **A status is a derived health label plus the raw numbers behind it.**
-  `PolicyStatus` carries `name`, `position`, `head`, `lag` (`head - position`),
-  `next_position`, `missing_position`, `last_checkpoint_at`, `dead_letter_count`,
-  `last_dead_letter_at`, and a derived `condition`. The raw fields are always
-  present so a consumer can render its own view; `condition` is the at-a-glance
-  summary.
+- **A status is a derived health label plus the raw numbers behind it.** The label
+  and the numbers behind it stand; *which* numbers changed with
+  [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md). `PolicyStatus` carries
+  `name`, `lag`, `streams_behind`, `discovered_through`, `last_checkpoint_at`,
+  `dead_letter_count`, `last_dead_letter_at`, and a derived `condition`. ~~`position`,
+  `head`, `next_position`, `missing_position`~~ are gone with the global order
+  (funkode-io/replay#196). `lag` is no longer a subtraction of two positions but an
+  exact count of undelivered **events**, summed over the streams a Policy is behind
+  on, and `streams_behind` says how widely that is spread — one stream a million
+  events behind and a million streams one event behind are the same `lag` and
+  different problems.
 
-- **Report the next position that exists, and the hole in front of the cursor.**
-  `lag` counts positions, so it cannot tell a policy draining a backlog from one
-  parked in front of a `global_position` that will never exist —
+- ~~**Report the next position that exists, and the hole in front of the cursor.**~~
+  *Deleted with funkode-io/replay#197.* It existed because `lag` counted positions and
+  so could not tell a Policy draining a backlog from one parked in front of a
+  `global_position` that would never exist —
   [#164](https://github.com/funkode-io/replay/issues/164), where one burned
-  `BIGSERIAL` value stopped 19 policies for three days and was diagnosed with
-  hand-written SQL. `next_position` is `MIN(global_position) > position`, `None`
-  on an empty tail; `missing_position` is `Some(position + 1)` when
-  `next_position > position + 1`, else `None`. A multi-position hole reports its
-  first position, the one the feed stops at. An empty tail is not a hole: a
-  drained policy is `CaughtUp`.
+  `BIGSERIAL` value stopped 19 policies for three days. A Policy now reads each stream
+  over a sequence with no holes in it, so there is no number to be parked in front of
+  and nothing for the field to report. `lag` counting events rather than positions
+  also makes the distinction it was invented for unnecessary: a burned position is not
+  in the count.
 
-- **`PolicyCondition` precedence: a hole outranks dead letters, dead letters
-  outrank lag.** The condition is derived by
-  `PolicyCondition::from_fields(lag, dead_letter_count, missing_position)` with a
-  strict precedence (highest wins):
+- **`PolicyCondition` precedence: dead letters outrank lag.** *Amended by
+  funkode-io/replay#196, which removed the condition that used to outrank both.*
 
   | Condition  | When                                       |
   |------------|--------------------------------------------|
-  | `Blocked`  | `missing_position.is_some()`               |
   | `Degraded` | `dead_letter_count > 0`                    |
   | `Working`  | `dead_letter_count == 0`, `lag > 0`        |
   | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`       |
@@ -73,10 +77,10 @@ operational tables the runner already maintains.
   A policy that is **both** behind and dead-lettered resolves to `Degraded`, so a
   parked failure is never hidden behind a benign "still catching up" label. Lag is
   expected and self-healing; a dead letter means an event was skipped and needs a
-  human. `Blocked` outranks `Degraded` because it is a throughput statement rather
-  than a failure count: a blocked policy processes nothing, a degraded one is
-  still draining. `condition` has a stable `as_str()` / `Display` form
-  (`"CaughtUp"`, `"Working"`, `"Degraded"`, `"Blocked"`) so JSON/UI consumers can
+  human. ~~`Blocked`~~ has no replacement because it has no cause: a write still in
+  flight leaves a Policy *not behind at all*, since its events are invisible to every
+  reader, including the one computing `lag`. `condition` has a stable `as_str()` /
+  `Display` form (`"CaughtUp"`, `"Working"`, `"Degraded"`) so JSON/UI consumers can
   match on it.
 
 - **Only policies that have run appear.** Status is keyed off `policy_cursors`
@@ -96,14 +100,13 @@ operational tables the runner already maintains.
   and a just-written dead letter appears on the next read. This is correct for a
   monitoring signal and avoids taking any lock on the runner's hot path.
 
-- `Blocked` is an **observation, not a permanence proof**. `global_position` is
-  assigned at INSERT and visible at COMMIT, so an append in flight looks like a
-  hole and clears on a later poll; a burned position never does, and the two are
-  identical from one read. Alert on the condition persisting across polls.
-  Deciding a hole can never fill, and advancing the cursor past it, needs
-  transaction-snapshot evidence on the runner side —
-  [#164](https://github.com/funkode-io/replay/issues/164). This ADR still covers
-  observing only: `Blocked` names the condition, it does not clear it.
+- ~~`Blocked` is an **observation, not a permanence proof**.~~ *Gone with the
+  condition (funkode-io/replay#196).* It was an observation of exactly what this
+  design removed: an append in flight and a burned position were identical from one
+  read of the global order, and telling them apart needed transaction-snapshot
+  evidence on the runner side ([#164](https://github.com/funkode-io/replay/issues/164),
+  and the watermark that tried it in #215). Reading per stream means neither is
+  visible to a reader at all.
 
 - This ADR covers **observing** only. **Controlling** a policy — explicitly
   retrying or discarding a dead letter, or rewinding a cursor — is a separate
@@ -111,8 +114,7 @@ operational tables the runner already maintains.
   mutation surface.
 
 - The condition precedence and the dead-letter / lag interaction are covered by a
-  unit test (the `from_fields` precedence table, and the `missing_position`
-  derivation) and Docker-gated Postgres integration tests (caught-up, behind,
-  multiple policies, never-run-absent, `Degraded` over `Working`, and a burned
-  sequence value proving `Blocked` over `Degraded`), which double as the
-  executable specification of these contracts.
+  unit test (the `from_fields` precedence table) and Docker-gated Postgres
+  integration tests (caught-up, behind, multiple policies, never-run-absent,
+  `Degraded` over `Working`), which double as the executable specification of these
+  contracts.

@@ -291,106 +291,6 @@ impl replay::Aggregate for IdempotentFeeAccount {
     }
 }
 
-/// Position an operator "moves the cursor to" in the mid-batch test below.
-const CURSOR_NUDGE_TARGET: i64 = 10_000;
-
-/// Cursor key shared by the fixture policy and the aggregate that moves it.
-const CURSOR_NUDGE_POLICY: &str = "cursor_nudge_policy";
-
-define_aggregate! {
-    CursorNudgeBox {
-        namespace: "cursor-nudge-box",
-        state: {
-            notes: i64,
-        },
-        commands: {
-            Note { at: i64 },
-        },
-        events: {
-            Noted { at: i64 },
-        }
-    }
-}
-
-impl replay::EventStream for CursorNudgeBox {
-    type Event = CursorNudgeBoxEvent;
-
-    fn stream_type() -> String {
-        "CursorNudgeBox".to_string()
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        match event {
-            CursorNudgeBoxEvent::Noted { .. } => self.notes += 1,
-        }
-    }
-}
-
-/// An aggregate that moves the policy's stored cursor while the policy that
-/// dispatched to it is still mid-batch — the one deterministic way to stage the
-/// race an operator creates by running `UPDATE policy_cursors` against a busy
-/// leader.
-impl replay::Aggregate for CursorNudgeBox {
-    type Command = CursorNudgeBoxCommand;
-    type Error = replay::Error;
-    type Services = sqlx::Pool<sqlx::Postgres>;
-
-    async fn handle(
-        &self,
-        command: Self::Command,
-        services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        match command {
-            CursorNudgeBoxCommand::Note { at } => {
-                sqlx::query(
-                    "UPDATE policy_cursors SET position = $1, updated_at = now() WHERE name = $2",
-                )
-                .bind(CURSOR_NUDGE_TARGET)
-                .bind(CURSOR_NUDGE_POLICY)
-                .execute(services)
-                .await
-                .map_err(|error| replay::Error::internal(error.to_string()))?;
-
-                Ok(vec![CursorNudgeBoxEvent::Noted { at }])
-            }
-        }
-    }
-}
-
-struct CursorNudgePolicy {
-    target: CursorNudgeBoxUrn,
-}
-
-impl replay_persistence::Policy for CursorNudgePolicy {
-    type Event = BankAccountEvent;
-
-    fn name(&self) -> &str {
-        CURSOR_NUDGE_POLICY
-    }
-
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    /// Checkpoint after every event, so the first reaction is followed
-    /// immediately by the cursor write whose outcome the test is about.
-    fn checkpoint_batch_size(&self) -> Option<u32> {
-        Some(1)
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
-        match &event.data {
-            BankAccountEvent::Deposited { .. } => {
-                vec![replay_persistence::Dispatch::to::<CursorNudgeBox>(
-                    self.target.clone(),
-                    CursorNudgeBoxCommand::Note { at: event.version },
-                )]
-            }
-            _ => Vec::new(),
-        }
-    }
-}
-
 struct BankAccountStatement {
     bank_account: BankAccountUrn,
     from: chrono::NaiveDate,
@@ -2688,26 +2588,15 @@ async fn withdraw_fee_policy_drain_postgres_test() {
         "withdraw_fee_policy"
     );
 
-    // The cursor advanced past the triggering event (global_position 1).
-    let cursor: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-        .bind("withdraw_fee_policy")
-        .fetch_one(&pg_pool)
-        .await
-        .expect("cursor row must exist after drain");
-    assert_eq!(cursor, 1);
+    // The policy passed the triggering event (global_position 1).
+    assert!(common::places::passed(&pg_pool, "withdraw_fee_policy", 1).await);
 
-    // A second drain re-scans only the new `Withdrawn` event, which the policy
-    // ignores, so no further commands are issued and the cursor moves to 2.
+    // A second drain re-reads only the new `Withdrawn` event, which the policy
+    // ignores, so no further commands are issued and it passes that one too.
     let executed_again = runner.drain().await.expect("second drain must succeed");
     assert_eq!(executed_again, 0);
 
-    let cursor_after: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind("withdraw_fee_policy")
-            .fetch_one(&pg_pool)
-            .await
-            .expect("cursor row must exist after second drain");
-    assert_eq!(cursor_after, 2);
+    assert!(common::places::passed(&pg_pool, "withdraw_fee_policy", 2).await);
 }
 
 /// A `stream_filter` narrower than `all()` must still receive every event it asked
@@ -2792,13 +2681,8 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
         .unwrap();
     assert_eq!(fees.balance, 90.0, "two fees of 5.0 must have been charged");
 
-    // The cursor walked over the non-matching events too.
-    let cursor: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-        .bind("watched_account_fee_policy")
-        .fetch_one(&pg_pool)
-        .await
-        .expect("cursor row must exist after drain");
-    assert_eq!(cursor, 5);
+    // The policy walked over the non-matching events too.
+    assert!(common::places::passed(&pg_pool, "watched_account_fee_policy", 5).await);
 
     // The fee events the reactions appended (6 and 7) are on an excluded stream: the
     // second drain fires nothing and still walks past them, so the policy is not
@@ -2811,13 +2695,7 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
 
     assert_eq!(runner.drain().await.expect("second drain must succeed"), 0);
 
-    let cursor_after: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind("watched_account_fee_policy")
-            .fetch_one(&pg_pool)
-            .await
-            .expect("cursor row must exist after second drain");
-    assert_eq!(cursor_after, head);
+    assert!(common::places::passed(&pg_pool, "watched_account_fee_policy", head).await);
 }
 
 /// The feed reads the filter as a value, and a value can be NULL — `aggregate_version
@@ -2869,12 +2747,10 @@ async fn policy_filter_that_is_null_per_row_skips_and_advances_postgres_test() {
         "no live event matches the filter"
     );
 
-    let cursor: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-        .bind("archived_only_policy")
-        .fetch_one(&pg_pool)
-        .await
-        .expect("cursor row must exist after drain");
-    assert_eq!(cursor, 2, "the cursor walks past every position it read");
+    assert!(
+        common::places::passed(&pg_pool, "archived_only_policy", 2).await,
+        "the policy walks past every event it read"
+    );
 }
 
 #[tokio::test]
@@ -3181,226 +3057,6 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
     daemon.shutdown().await;
 }
 
-/// Issue #168: an operator must be able to move a stuck cursor on a *running*
-/// leader. Recreates the #164 incident — a hole in `global_position` that the feed
-/// parks in front of — and then applies the recovery that needed every replica
-/// scaled to zero: a plain `UPDATE policy_cursors`. The daemon keeps running and
-/// leading throughout.
-///
-/// The hole is held open by a transaction that never commits, because that is the
-/// kind the runner is right to wait at: a position no transaction holds is crossed
-/// on its own since #170, and would never reach the operator.
-#[tokio::test]
-async fn policy_daemon_adopts_an_external_cursor_move_while_running_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
-    let pg_pool = connect_to_postgres(host, port).await;
-
-    sqlx::migrate!("./tests/migrations")
-        .run(&pg_pool)
-        .await
-        .expect("Failed to run migrations");
-
-    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
-    let cqrs = replay_persistence::Cqrs::new(store);
-    let account = BankAccountUrn::new("cursor-move-1").unwrap();
-
-    let runner = std::sync::Arc::new(
-        replay_persistence::PolicyRunner::builder(cqrs.clone())
-            .register_services::<BankAccount>(())
-            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
-            .build(),
-    );
-    let daemon = runner
-        .clone()
-        .start_polling(std::time::Duration::from_millis(50));
-
-    let deposit = |day: u32| {
-        let cqrs = cqrs.clone();
-        let account = account.clone();
-        async move {
-            cqrs.execute::<BankAccount>(
-                &account,
-                replay::Metadata::default(),
-                BankAccountCommand::Deposit {
-                    effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
-                    amount: 100.0,
-                },
-                &(),
-                None,
-            )
-            .await
-            .unwrap();
-        }
-    };
-
-    let balance = || {
-        let cqrs = cqrs.clone();
-        let account = account.clone();
-        async move {
-            cqrs.fetch_aggregate::<BankAccount>(&account)
-                .await
-                .unwrap()
-                .balance
-        }
-    };
-
-    // Wait until the daemon has charged the fee for the first deposit: 100 - 5.
-    deposit(1).await;
-    let mut settled = false;
-    for _ in 0..100 {
-        if (balance().await - 95.0).abs() < f64::EPSILON {
-            settled = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(settled, "expected the daemon to charge the first fee");
-
-    // Take a global position and keep it: to every other session this is an append
-    // in flight, so the feed must wait at the hole it leaves.
-    let mut holder = pg_pool.begin().await.unwrap();
-    let burned: i64 = sqlx::query_scalar("SELECT nextval('events_global_position_seq')")
-        .fetch_one(&mut *holder)
-        .await
-        .unwrap();
-
-    // The next deposit lands behind the hole, so the policy is now wedged: the
-    // fee for it never fires, however long we wait.
-    deposit(2).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(
-        (balance().await - 195.0).abs() < f64::EPSILON,
-        "expected the policy to be wedged in front of the gap"
-    );
-
-    // The operator's recovery, against the live deployment.
-    let moved = sqlx::query(
-        "UPDATE policy_cursors SET position = $1, updated_at = now() \
-         WHERE name = $2 AND position < $1",
-    )
-    .bind(burned)
-    .bind("withdraw_fee_policy_start_at_beginning")
-    .execute(&pg_pool)
-    .await
-    .unwrap();
-    assert_eq!(moved.rows_affected(), 1, "operator update must hit one row");
-
-    // Honoured by the running leader: the stranded deposit is charged.
-    let mut recovered = false;
-    for _ in 0..100 {
-        if (balance().await - 190.0).abs() < f64::EPSILON {
-            recovered = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(
-        recovered,
-        "expected the running daemon to honour the corrected cursor without a restart"
-    );
-
-    // And the correction is never rolled back by the stale in-memory value, which
-    // is `burned - 1`: the property is that the stored position never falls behind
-    // the operator's write, not that the drain has already checkpointed past it
-    // (that is a race with the poll, and the balance above already proves it drains).
-    for _ in 0..10 {
-        let stored: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind("withdraw_fee_policy_start_at_beginning")
-            .fetch_one(&pg_pool)
-            .await
-            .unwrap();
-        assert!(
-            stored >= burned,
-            "stored cursor {stored} fell back behind the operator's correction {burned}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    holder.rollback().await.unwrap();
-    daemon.shutdown().await;
-}
-
-/// Issue #168, second criterion: the in-memory cursor must never write a stale
-/// position over a newer persisted one. Stages the race deterministically — the
-/// policy's first reaction moves the stored cursor far ahead while the drain is
-/// still mid-batch — and asserts the runner yields to the stored value instead
-/// of checkpointing its own.
-#[tokio::test]
-async fn policy_checkpoint_yields_to_a_concurrent_cursor_move_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
-    let pg_pool = connect_to_postgres(host, port).await;
-
-    sqlx::migrate!("./tests/migrations")
-        .run(&pg_pool)
-        .await
-        .expect("Failed to run migrations");
-
-    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
-    let cqrs = replay_persistence::Cqrs::new(store);
-    let account = BankAccountUrn::new("cursor-nudge-1").unwrap();
-
-    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
-        .register_services::<CursorNudgeBox>(pg_pool.clone())
-        .register_policy(CursorNudgePolicy {
-            target: CursorNudgeBoxUrn::new("cursor-nudge-box-1").unwrap(),
-        })
-        .build();
-
-    for day in 1..=3 {
-        cqrs.execute::<BankAccount>(
-            &account,
-            replay::Metadata::default(),
-            BankAccountCommand::Deposit {
-                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
-                amount: 100.0,
-            },
-            &(),
-            None,
-        )
-        .await
-        .unwrap();
-    }
-
-    // The first reaction moves the stored cursor; the drain must stop there
-    // rather than checkpoint the position it was holding.
-    assert_eq!(
-        runner.drain().await.unwrap(),
-        1,
-        "drain must abandon the batch as soon as the stored cursor moves under it"
-    );
-
-    let stored: i64 = sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-        .bind(CURSOR_NUDGE_POLICY)
-        .fetch_one(&pg_pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        stored, CURSOR_NUDGE_TARGET,
-        "the runner's in-memory position overwrote the newer persisted one"
-    );
-
-    // The next drain resumes from the moved cursor: nothing is left behind it,
-    // and the correction still stands.
-    assert_eq!(runner.drain().await.unwrap(), 0);
-    let stored_after: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind(CURSOR_NUDGE_POLICY)
-            .fetch_one(&pg_pool)
-            .await
-            .unwrap();
-    assert_eq!(stored_after, CURSOR_NUDGE_TARGET);
-}
-
 #[tokio::test]
 async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test() {
     let container = postgres_container().start().await.unwrap();
@@ -3493,12 +3149,8 @@ async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test(
         source_event_id.to_string()
     );
 
-    // Simulate redelivery by rewinding cursor below the source event.
-    sqlx::query("UPDATE policy_cursors SET position = 1 WHERE name = $1")
-        .bind("charge_fee_with_causation_policy")
-        .execute(&pg_pool)
-        .await
-        .expect("cursor rewind update must succeed");
+    // Simulate redelivery by moving the policy back before the source event.
+    common::places::rewind_to_before(&pg_pool, "charge_fee_with_causation_policy", 2).await;
 
     // Second delivery issues the same causation id, and the aggregate absorbs
     // it as a no-op.
@@ -3612,12 +3264,7 @@ async fn policy_duplicate_delivery_example_recipe_postgres_test() {
     .await
     .expect("deposit event must exist in the global feed");
 
-    sqlx::query("UPDATE policy_cursors SET position = $1 WHERE name = $2")
-        .bind(deposit_gp - 1)
-        .bind(DEPOSIT_FEE_POLICY_NAME)
-        .execute(&pg_pool)
-        .await
-        .expect("cursor rewind must succeed");
+    common::places::rewind_to_before(&pg_pool, DEPOSIT_FEE_POLICY_NAME, deposit_gp).await;
 
     // Second delivery: causation guard in PolicyFeeLedger absorbs the duplicate.
     let n: usize = runner.drain().await.unwrap();
@@ -3758,17 +3405,10 @@ async fn policy_lagging_behind_compaction_skips_synthetic_snapshot_postgres_test
         "policy must react to both real Deposited events and skip the synthetic snapshot"
     );
 
-    // The cursor must have advanced past the synthetic (gp=3) and reached gp=4.
-    let final_cursor: i64 = sqlx::query_scalar(
-        "SELECT position FROM policy_cursors WHERE name = 'withdraw_fee_policy_start_at_beginning'",
-    )
-    .fetch_one(&pg_pool)
-    .await
-    .expect("cursor must exist after drain");
-
-    assert_eq!(
-        final_cursor, 4,
-        "cursor must have advanced past the synthetic snapshot to the final real event"
+    // The policy passed the synthetic snapshot (gp=3) and the real event after it.
+    assert!(
+        common::places::passed(&pg_pool, "withdraw_fee_policy_start_at_beginning", 4).await,
+        "the policy must have passed the synthetic snapshot to the final real event"
     );
 }
 
@@ -4410,17 +4050,10 @@ async fn policy_permanent_failure_is_dead_lettered_and_advances_postgres_test() 
         "one dead-letter row per failing dispatch"
     );
 
-    // Cursor must have advanced past both events (policy is not wedged).
-    let cursor: i64 = sqlx::query_scalar(
-        "SELECT position FROM policy_cursors WHERE name = 'poison_dispatch_policy'",
-    )
-    .fetch_one(&pg_pool)
-    .await
-    .expect("cursor must exist after drain");
-
-    assert_eq!(
-        cursor, 2,
-        "cursor must have advanced past both dead-lettered events"
+    // The policy passed both events: a parked reaction does not wedge it.
+    assert!(
+        common::places::passed(&pg_pool, "poison_dispatch_policy", 2).await,
+        "the policy must have passed both dead-lettered events"
     );
 }
 
@@ -4492,15 +4125,11 @@ async fn policy_business_rule_violation_advances_without_dead_letter_postgres_te
         "BRV must not produce a dead-letter record"
     );
 
-    // Cursor advances: the policy is not wedged by the rejection.
-    let cursor: i64 = sqlx::query_scalar(
-        "SELECT position FROM policy_cursors WHERE name = 'insufficient_funds_policy'",
-    )
-    .fetch_one(&pg_pool)
-    .await
-    .expect("cursor must exist after drain");
-
-    assert_eq!(cursor, 1, "cursor must have advanced past the BRV event");
+    // The policy advances: it is not wedged by the rejection.
+    assert!(
+        common::places::passed(&pg_pool, "insufficient_funds_policy", 1).await,
+        "the policy must have passed the BRV event"
+    );
 }
 
 // ── Dead-letter retry: retry_dead_letter primitive (issue #126) ───────────────
@@ -4728,11 +4357,7 @@ async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
         "a parked dead letter must read as Degraded"
     );
 
-    let cursor_before: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'retry_fee_policy'")
-            .fetch_one(&pg_pool)
-            .await
-            .unwrap();
+    let places_before = common::places::all(&pg_pool, "retry_fee_policy").await;
 
     // Retry runner: registers the missing aggregate so the reproduced dispatch
     // can apply.  The polling daemon is intentionally never started.
@@ -4780,15 +4405,10 @@ async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
         "after a successful retry the policy must no longer be Degraded"
     );
 
-    // Cursor untouched.
-    let cursor_after: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'retry_fee_policy'")
-            .fetch_one(&pg_pool)
-            .await
-            .unwrap();
     assert_eq!(
-        cursor_before, cursor_after,
-        "retry must not move the cursor"
+        places_before,
+        common::places::all(&pg_pool, "retry_fee_policy").await,
+        "retry must not move the policy"
     );
 
     // No advisory lock taken: retry needs no leadership.
@@ -5035,11 +4655,7 @@ async fn discard_dead_letter_deletes_row_without_side_effects_postgres_test() {
         .fetch_one(&pg_pool)
         .await
         .unwrap();
-    let cursor_before: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'retry_fee_policy'")
-            .fetch_one(&pg_pool)
-            .await
-            .unwrap();
+    let places_before = common::places::all(&pg_pool, "retry_fee_policy").await;
 
     // Discard runner: it does not even register the target aggregate's
     // services, because discard never executes a command.
@@ -5090,15 +4706,10 @@ async fn discard_dead_letter_deletes_row_without_side_effects_postgres_test() {
         "after discard the policy must no longer be Degraded"
     );
 
-    // Cursor untouched.
-    let cursor_after: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'retry_fee_policy'")
-            .fetch_one(&pg_pool)
-            .await
-            .unwrap();
     assert_eq!(
-        cursor_before, cursor_after,
-        "discard must not move the cursor"
+        places_before,
+        common::places::all(&pg_pool, "retry_fee_policy").await,
+        "discard must not move the policy"
     );
 
     // No advisory lock taken: discard needs no leadership.
@@ -5468,6 +5079,223 @@ impl replay_persistence::Policy for SmallBatchPolicy {
     }
 }
 
+/// `read_batch_size` is a budget for the whole drain, not one per stream.
+///
+/// Three streams of two events each with `read_batch_size = 2`: a drain spends its budget
+/// on the first stream it looks at, and the streams it did not reach are carried to the
+/// next poll rather than read as well. Without the shared budget one drain reads
+/// `batch × streams` events, which is not what the knob says and not what a shutdown or a
+/// leadership change can wait for (funkode-io/replay#231 review).
+///
+/// It also pins the rotation: the stream a drain could not finish goes to the back of the
+/// queue, so each drain moves a *different* stream and none of them is starved by the
+/// first one being busy.
+#[tokio::test]
+async fn policy_read_batch_is_one_budget_across_streams_postgres_test() {
+    let container = postgres_container().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    let accounts: Vec<BankAccountUrn> = (1..=3)
+        .map(|n| BankAccountUrn::new(format!("budget-{n}")).unwrap())
+        .collect();
+    for account in &accounts {
+        for _ in 0..2 {
+            cqrs.execute::<BankAccount>(
+                account,
+                meta.clone(),
+                BankAccountCommand::Deposit {
+                    effective_on: date,
+                    amount: 10.0,
+                },
+                &(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(SmallBatchPolicy { batch: 2 })
+        .build();
+
+    let mut delivered = Vec::new();
+    for _ in 0..3 {
+        runner.drain().await.expect("drain must succeed");
+        delivered.push(
+            common::places::all(&pg_pool, "small_batch_policy")
+                .await
+                .iter()
+                .map(|(_, seq)| *seq)
+                .sum::<i64>(),
+        );
+    }
+
+    assert_eq!(
+        delivered,
+        vec![2, 4, 6],
+        "two events per drain, however many streams are owed"
+    );
+}
+
+/// The reconciliation leads the poll it runs on, so a quiet stream the sweep has passed
+/// is read even when a busy stream is competing for the same slot.
+///
+/// With `read_batch_size = 1` there is one slot, and the sweep always has something to
+/// offer: whoever gets the slot by turn gets it every time. Leaving that to the turn made
+/// the guarantee depend on how the cadence divides into the poll interval, which is not a
+/// thing anybody configures deliberately (funkode-io/replay#231 review).
+#[tokio::test]
+async fn policy_reconciliation_leads_the_poll_it_runs_on_postgres_test() {
+    let container = postgres_container().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let meta = replay::Metadata::default();
+
+    // Named so the quiet one sorts first: the reconciliation reads a page of
+    // `read_batch_size` streams by id, and with a page of one the test would otherwise be
+    // about which name sorts first rather than about which source leads.
+    let quiet = BankAccountUrn::new("a-quiet").unwrap();
+    let busy = BankAccountUrn::new("z-busy").unwrap();
+    for account in [&quiet, &busy, &busy] {
+        cqrs.execute::<BankAccount>(
+            account,
+            meta.clone(),
+            BankAccountCommand::Deposit {
+                effective_on: date,
+                amount: 10.0,
+            },
+            &(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // The state this exists for: the sweep has passed the quiet stream's only event, so
+    // no future event will nominate it and only the reconciliation can.
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) VALUES ($1, 1, now())",
+    )
+    .bind("small_batch_policy")
+    .execute(&pg_pool)
+    .await
+    .expect("the cursor row must insert");
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(SmallBatchPolicy { batch: 1 })
+        .build();
+
+    runner.drain().await.expect("drain must succeed");
+
+    assert_eq!(
+        common::places::all(&pg_pool, "small_batch_policy").await,
+        vec![(quiet.to_urn().to_string(), 1)],
+        "the one slot went to the stream only the reconciliation could nominate"
+    );
+}
+
+/// A rotation that has reached the end of the stream ids wraps, even across a poll that
+/// finds nothing to do.
+///
+/// The poll that ends a pass is an empty one by construction — the page past the last id
+/// is empty, so no source nominates anything and the poll returns early. A rotation
+/// recorded only on the path that reads a stream stays at the end for ever, and a stream
+/// sorting before it is never compared again (funkode-io/replay#231 review).
+#[tokio::test]
+async fn policy_reconciliation_wraps_across_an_empty_poll_postgres_test() {
+    let container = postgres_container().start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+
+    let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let account = BankAccountUrn::new("behind-the-cursor").unwrap();
+
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            amount: 10.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // A policy whose sweep has passed the only event, with its rotation where a finished
+    // pass leaves it: past every stream id, and past the one stream it is owed.
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, discovered_through, reconciled_through, updated_at)          VALUES ($1, 1, 'zzz', now())",
+    )
+    .bind("small_batch_policy")
+    .execute(&pg_pool)
+    .await
+    .expect("the cursor row must insert");
+
+    let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
+        .register_services::<BankAccount>(())
+        .register_policy(SmallBatchPolicy { batch: 2 })
+        .build();
+
+    // The first drain finds nothing — that is the poll that has to wrap the rotation.
+    runner.drain().await.expect("drain must succeed");
+    assert!(
+        common::places::all(&pg_pool, "small_batch_policy")
+            .await
+            .is_empty(),
+        "nothing sorts after the cursor, so the first poll reads nothing"
+    );
+
+    runner.drain().await.expect("drain must succeed");
+    assert_eq!(
+        common::places::all(&pg_pool, "small_batch_policy").await,
+        vec![(account.to_urn().to_string(), 1)],
+        "and the pass that started over finds the stream that was behind the cursor"
+    );
+}
+
 /// Policy with explicit batch sizes for checkpoint testing.
 struct CheckpointBatchPolicy {
     read_batch: u32,
@@ -5545,35 +5373,23 @@ async fn policy_read_batch_limits_events_per_drain_postgres_test() {
         .register_policy(SmallBatchPolicy { batch: 2 })
         .build();
 
-    // First drain: processes events at positions 1 and 2.
-    runner.drain().await.expect("drain 1 must succeed");
-    let cursor_1: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'small_batch_policy'")
-            .fetch_one(&pg_pool)
-            .await
-            .expect("cursor must exist after drain 1");
+    // One stream, so its places run 1..5 alongside the positions.
+    let stream = account.to_urn().to_string();
+    let mut reached = Vec::new();
+    for _ in 0..3 {
+        runner.drain().await.expect("drain must succeed");
+        reached.push(common::places::all(&pg_pool, "small_batch_policy").await);
+    }
+
     assert_eq!(
-        cursor_1, 2,
-        "first drain (batch=2) must stop at global_position 2"
+        reached,
+        vec![
+            vec![(stream.clone(), 2)],
+            vec![(stream.clone(), 4)],
+            vec![(stream, 5)],
+        ],
+        "each drain (batch=2) stops two events further into the stream"
     );
-
-    // Second drain: events 3 and 4.
-    runner.drain().await.expect("drain 2 must succeed");
-    let cursor_2: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'small_batch_policy'")
-            .fetch_one(&pg_pool)
-            .await
-            .expect("cursor must exist after drain 2");
-    assert_eq!(cursor_2, 4, "second drain must stop at global_position 4");
-
-    // Third drain: event 5.
-    runner.drain().await.expect("drain 3 must succeed");
-    let cursor_3: i64 =
-        sqlx::query_scalar("SELECT position FROM policy_cursors WHERE name = 'small_batch_policy'")
-            .fetch_one(&pg_pool)
-            .await
-            .expect("cursor must exist after drain 3");
-    assert_eq!(cursor_3, 5, "third drain must reach global_position 5");
 }
 
 /// Crash-recovery / skip-safety: resetting the cursor to an earlier checkpoint
@@ -5632,39 +5448,32 @@ async fn policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test()
         })
         .build();
 
-    // Full drain: cursor written at positions 2 and 4 (two checkpoints).
+    // Full drain: the place is written at 2 and again at 4 (two checkpoints).
     runner.drain().await.expect("initial drain must succeed");
 
-    let cursor_after_drain: i64 = sqlx::query_scalar(
-        "SELECT position FROM policy_cursors WHERE name = 'checkpoint_batch_policy'",
-    )
-    .fetch_one(&pg_pool)
-    .await
-    .expect("cursor must exist");
+    let stream = account.to_urn().to_string();
     assert_eq!(
-        cursor_after_drain, 4,
-        "cursor must be at 4 after full drain"
+        common::places::all(&pg_pool, "checkpoint_batch_policy").await,
+        vec![(stream.clone(), 4)],
+        "the place must be at the stream's fourth event after a full drain"
     );
 
-    // Simulate crash: roll cursor back to the first checkpoint (position 2),
-    // as if the process died after that checkpoint but before the final one.
-    sqlx::query("UPDATE policy_cursors SET position = 2 WHERE name = 'checkpoint_batch_policy'")
-        .execute(&pg_pool)
-        .await
-        .expect("cursor rollback must succeed");
+    // Simulate crash: roll the place back to the first checkpoint, as if the process
+    // died after that checkpoint but before the final one.
+    sqlx::query(
+        "UPDATE policy_stream_cursors SET stream_seq = 2 WHERE policy = 'checkpoint_batch_policy'",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("rolling the place back must succeed");
 
-    // Re-drain from position 2: only events 3 and 4 are reprocessed.
+    // Re-drain: only the stream's third and fourth events are reprocessed.
     runner.drain().await.expect("recovery drain must succeed");
 
-    let cursor_after_recovery: i64 = sqlx::query_scalar(
-        "SELECT position FROM policy_cursors WHERE name = 'checkpoint_batch_policy'",
-    )
-    .fetch_one(&pg_pool)
-    .await
-    .expect("cursor must exist after recovery");
     assert_eq!(
-        cursor_after_recovery, 4,
-        "cursor must be back at 4 after recovery drain"
+        common::places::all(&pg_pool, "checkpoint_batch_policy").await,
+        vec![(stream, 4)],
+        "the place must be back at the fourth event after the recovery drain"
     );
 }
 
@@ -6065,8 +5874,8 @@ async fn import_streaming_aggregate_executes_via_handle_stream_postgres_test() {
 
 /// A caught-up policy has `lag == 0` and condition `CaughtUp`.
 ///
-/// Setup: append one event, insert a cursor row at the same global position as
-/// the head, then assert that `PolicyStatusStore::list()` returns `CaughtUp`.
+/// Setup: append one event, record the Policy at the place that event took, then assert
+/// that `PolicyStatusStore::list()` returns `CaughtUp`.
 #[tokio::test]
 async fn policy_status_caught_up_postgres_test() {
     let container = postgres_container().start().await.unwrap();
@@ -6086,7 +5895,6 @@ async fn policy_status_caught_up_postgres_test() {
     let cqrs = replay_persistence::Cqrs::new(store);
     let account = BankAccountUrn::new("status-caught-up-1").unwrap();
 
-    // Append one event so the global head is non-zero.
     cqrs.execute::<BankAccount>(
         &account,
         replay::Metadata::default(),
@@ -6100,43 +5908,39 @@ async fn policy_status_caught_up_postgres_test() {
     .await
     .unwrap();
 
-    // Read the actual head position so we can place the cursor exactly there.
-    let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(global_position), 0) FROM events")
-        .fetch_one(&pg_pool)
-        .await
-        .expect("head query must succeed");
-
-    // Insert a cursor row at the head — simulates a fully-drained policy.
+    // A drained policy: a row per stream, each at the stream's head.
     sqlx::query(
-        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ('caught_up_policy', $1, now())",
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
+         VALUES ('caught_up_policy', (SELECT MAX(global_position) FROM events), now())",
     )
-    .bind(head)
     .execute(&pg_pool)
     .await
     .expect("cursor insert must succeed");
+    sqlx::query(
+        "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+         SELECT 'caught_up_policy', id, stream_seq FROM streams",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("place inserts must succeed");
 
-    // Read the status.
     let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
     let statuses = status_store.list().await.expect("list must succeed");
 
-    assert_eq!(statuses.len(), 1, "one policy must appear");
+    assert_eq!(statuses.len(), 1, "exactly one policy must be reported");
     let s = &statuses[0];
     assert_eq!(s.name, "caught_up_policy");
-    assert_eq!(s.lag, 0, "cursor is at head, so lag must be 0");
+    assert_eq!(s.lag, 0, "every stream is at its head, so nothing is owed");
+    assert_eq!(s.streams_behind, 0);
     assert_eq!(
         s.condition,
         replay_persistence::PolicyCondition::CaughtUp,
-        "lag == 0 must yield CaughtUp"
+        "no lag and no dead letters is CaughtUp"
     );
-    assert_eq!(s.head, s.position, "head and position must be equal");
-    assert_eq!(s.next_position, None, "nothing exists past the cursor");
-    assert_eq!(s.missing_position, None, "an empty tail is not a hole");
 }
 
-/// A behind policy has `lag > 0` and condition `Working`.
-///
-/// Setup: append one event but do NOT drain, so the cursor stays at 0 while
-/// the head is 1.
+/// A behind policy has `lag > 0` and condition `Working`, and the lag is a count of the
+/// events it has not passed.
 #[tokio::test]
 async fn policy_status_working_behind_postgres_test() {
     let container = postgres_container().start().await.unwrap();
@@ -6154,60 +5958,52 @@ async fn policy_status_working_behind_postgres_test() {
 
     let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
     let cqrs = replay_persistence::Cqrs::new(store);
-    let account = BankAccountUrn::new("status-behind-1").unwrap();
 
-    // Append one event so the global head is non-zero.
-    cqrs.execute::<BankAccount>(
-        &account,
-        replay::Metadata::default(),
-        BankAccountCommand::Deposit {
-            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
-            amount: 50.0,
-        },
-        &(),
-        None,
-    )
-    .await
-    .unwrap();
+    // Two streams, three events: the lag has to be summed across them.
+    for (nss, deposits) in [("status-behind-1", 2), ("status-behind-2", 1)] {
+        let account = BankAccountUrn::new(nss).unwrap();
+        for _ in 0..deposits {
+            cqrs.execute::<BankAccount>(
+                &account,
+                replay::Metadata::default(),
+                BankAccountCommand::Deposit {
+                    effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                    amount: 10.0,
+                },
+                &(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
 
-    // Bootstrap the cursor at position 0 (StartAt::Beginning) without draining.
+    // Bootstrapped and never drained: no places at all.
     sqlx::query(
-        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ('behind_policy', 0, now())",
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
+         VALUES ('behind_policy', 0, now())",
     )
     .execute(&pg_pool)
     .await
     .expect("cursor insert must succeed");
 
-    // Read the status — policy is behind the head.
     let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
     let statuses = status_store.list().await.expect("list must succeed");
 
-    assert_eq!(statuses.len(), 1, "one policy must appear");
+    assert_eq!(statuses.len(), 1);
     let s = &statuses[0];
-    assert_eq!(s.name, "behind_policy");
-    assert!(s.lag > 0, "policy behind the head must have lag > 0");
-    assert_eq!(
-        s.condition,
-        replay_persistence::PolicyCondition::Working,
-        "lag > 0 must yield Working"
-    );
-    assert_eq!(s.lag, s.head - s.position);
-    assert_eq!(
-        s.next_position,
-        Some(s.position + 1),
-        "the feed continues at the very next position"
-    );
-    assert_eq!(s.missing_position, None, "no hole in front of the cursor");
+    assert_eq!(s.lag, 3, "three events written, none passed");
+    assert_eq!(s.streams_behind, 2, "spread over two streams");
+    assert_eq!(s.condition, replay_persistence::PolicyCondition::Working);
 }
 
-/// A policy in front of a `global_position` that does not exist is `Blocked`,
-/// and `Blocked` outranks `Degraded`.
+/// A position burned by a write that failed is not lag, and not a hole: the Policy is
+/// caught up (funkode-io/replay#164).
 ///
-/// Setup reproduces funkode-io/replay#164: append one event, burn a sequence
-/// value (`nextval` is non-transactional, so an aborted append leaves a
-/// permanent hole), then append again two positions past the first.
+/// This is the shape that used to report `Blocked` — a condition the type no longer has,
+/// because a Policy reads each stream over a sequence with no holes in it.
 #[tokio::test]
-async fn policy_status_blocked_on_missing_position_postgres_test() {
+async fn policy_status_ignores_a_burned_position_postgres_test() {
     let container = postgres_container().start().await.unwrap();
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -6223,84 +6019,51 @@ async fn policy_status_blocked_on_missing_position_postgres_test() {
 
     let store = replay_persistence::PostgresEventStore::new(pg_pool.clone());
     let cqrs = replay_persistence::Cqrs::new(store);
-    let account = BankAccountUrn::new("status-blocked-1").unwrap();
+    let account = BankAccountUrn::new("status-burned-1").unwrap();
 
-    let deposit = |amount: f64| {
-        cqrs.execute::<BankAccount>(
-            &account,
-            replay::Metadata::default(),
-            BankAccountCommand::Deposit {
-                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
-                amount,
-            },
-            &(),
-            None,
-        )
-    };
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            amount: 10.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
 
-    deposit(10.0).await.unwrap();
-
-    // The position the policy will sit in front of.
-    let parked_at: i64 = sqlx::query_scalar("SELECT MAX(global_position) FROM events")
-        .fetch_one(&pg_pool)
-        .await
-        .expect("head query must succeed");
-
-    // Burn the next sequence value the way an aborted append does.
+    // What an aborted append leaves behind: `nextval` is not transactional.
     sqlx::query("SELECT nextval('events_global_position_seq')")
         .execute(&pg_pool)
         .await
-        .expect("burning a sequence value must succeed");
+        .expect("burning a position must succeed");
 
-    deposit(20.0).await.unwrap();
-
-    sqlx::query("INSERT INTO policy_cursors (name, position, updated_at) VALUES ('blocked_policy', $1, now())")
-        .bind(parked_at)
-        .execute(&pg_pool)
-        .await
-        .expect("cursor insert must succeed");
+    sqlx::query(
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
+         VALUES ('burned_policy', (SELECT MAX(global_position) FROM events), now())",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("cursor insert must succeed");
+    sqlx::query(
+        "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+         SELECT 'burned_policy', id, stream_seq FROM streams",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("place inserts must succeed");
 
     let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
     let statuses = status_store.list().await.expect("list must succeed");
 
-    assert_eq!(statuses.len(), 1, "one policy must appear");
     let s = &statuses[0];
-    assert_eq!(s.position, parked_at);
-    assert_eq!(
-        s.missing_position,
-        Some(parked_at + 1),
-        "the burned position is the hole"
-    );
-    assert_eq!(
-        s.next_position,
-        Some(parked_at + 2),
-        "the next event that exists is one beyond the hole"
-    );
+    assert_eq!(s.lag, 0, "a number nothing will ever carry is not work");
     assert_eq!(
         s.condition,
-        replay_persistence::PolicyCondition::Blocked,
-        "a policy in front of a missing position must be Blocked"
-    );
-
-    // Blocked outranks Degraded.
-    sqlx::query(
-        "INSERT INTO policy_dead_letters \
-             (policy_name, global_position, event_id, error_kind, error_message) \
-         VALUES ('blocked_policy', $1, $2, 'Permanent', 'boom')",
-    )
-    .bind(parked_at)
-    .bind(uuid::Uuid::new_v4())
-    .execute(&pg_pool)
-    .await
-    .expect("dead-letter insert must succeed");
-
-    let statuses = status_store.list().await.expect("list must succeed");
-    let s = &statuses[0];
-    assert_eq!(s.dead_letter_count, 1);
-    assert_eq!(
-        s.condition,
-        replay_persistence::PolicyCondition::Blocked,
-        "Blocked must take precedence over Degraded"
+        replay_persistence::PolicyCondition::CaughtUp,
+        "the Policy has everything that exists"
     );
 }
 
@@ -6343,15 +6106,23 @@ async fn policy_status_multiple_policies_postgres_test() {
         .unwrap();
     }
 
-    // Insert two cursor rows: one caught-up (position 2) and one behind (position 1).
+    // Two policies: one that has passed both events, one that has passed the first.
     sqlx::query(
-        "INSERT INTO policy_cursors (name, position, updated_at) VALUES
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) VALUES
              ('alpha_policy', 2, now()),
-             ('beta_policy',  1, now())",
+             ('beta_policy',  2, now())",
     )
     .execute(&pg_pool)
     .await
     .expect("cursor inserts must succeed");
+    sqlx::query(
+        "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+         SELECT 'alpha_policy', id, stream_seq FROM streams \
+         UNION ALL SELECT 'beta_policy', id, stream_seq - 1 FROM streams",
+    )
+    .execute(&pg_pool)
+    .await
+    .expect("place inserts must succeed");
 
     let status_store = replay_persistence::PolicyStatusStore::new(pg_pool.clone());
     let statuses = status_store.list().await.expect("list must succeed");
@@ -6441,7 +6212,8 @@ async fn policy_status_degraded_with_dead_letters_postgres_test() {
 
     // Cursor behind the head (lag > 0) so we can prove Degraded beats Working.
     sqlx::query(
-        "INSERT INTO policy_cursors (name, position, updated_at) VALUES ('degraded_policy', 1, now())",
+        "INSERT INTO policy_cursors (name, discovered_through, updated_at) \
+         VALUES ('degraded_policy', 1, now())",
     )
     .execute(&pg_pool)
     .await

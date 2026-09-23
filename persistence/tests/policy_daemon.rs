@@ -40,11 +40,7 @@ async fn a_registered_policy_reacts_to_an_appended_event_postgres_test() {
     assert_eq!(dispatched.caused_by_event_id, ping.event_id);
     assert_eq!(dispatched.stream_id, "urn:probe:hello-echo");
 
-    let cursor = harness.await_cursor_at_least(ping.global_position).await;
-    assert!(
-        cursor >= ping.global_position,
-        "cursor {cursor} must have advanced past the event it reacted to"
-    );
+    harness.await_passed(ping.global_position).await;
     assert!(
         harness.dead_letters().await.is_empty(),
         "a reaction that succeeded must park nothing"

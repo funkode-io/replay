@@ -1,6 +1,6 @@
 # A Policy crosses a `global_position` no transaction can fill
 
-**Status:** accepted
+**Status:** superseded by [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md). A Policy no longer reads the log by position, so there is no burned number in front of it to cross and no `pg_locks` probe to tell one kind of hole from another. The implementation this ADR describes was deleted with funkode-io/replay#197.
 
 **Amends** [ADR-0003](0003-policies-as-checkpointed-background-subscribers.md)'s
 *Global cursor* decision: "advance only across a contiguous, gap-free prefix (with a

@@ -33,11 +33,47 @@ struct Reviewed {
 const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
-        function: "read_feed",
+        function: "sweep_for_streams",
         justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
-                        (default 100). Bounded by the tunable, not by the feed — nor by \
-                        the policy's stream filter, which now selects what is delivered \
-                        from the window rather than what is read (ADR-0013).",
+                        (default 100). Two columns per row, and the rows are reduced to \
+                        the streams they name before anything else reads them.",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "streams_behind",
+        justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
+                        (default 100). Bounded by the tunable rather than by the number \
+                        of streams behind, which is why a Policy far behind catches up \
+                        over several cadences instead of in one allocation; the batch \
+                        resumes after the last id it examined, so the bound costs a \
+                        rotation rather than leaving a stream unexamined (ADR-0026).",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "places_of",
+        justification: "One row per stream named in the poll's candidate list, which \
+                        `drain_policy_once` truncates to read_batch_size whatever the \
+                        sweep, the reconciliation and the last poll's leftovers offer.",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "read_stream",
+        justification: "SQL carries LIMIT $limit, what is left of the poll's event \
+                        budget: the policy's resolved read_batch_size (default 100), \
+                        spent across the streams the poll looks at rather than per \
+                        stream. One stream's events past its place, and not bounded by \
+                        the policy's stream filter, which selects what is delivered from \
+                        the batch rather than what is read (ADR-0013).",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "checkpoint_places",
+        justification: "RETURNING one row per place written, and the places written are \
+                        the streams the poll advanced: bounded by the candidate list, \
+                        which `drain_policy_once` truncates to read_batch_size. Read \
+                        back rather than counted because the caller needs to know which \
+                        of the writes lost their compare-and-set, and at what row \
+                        version the ones that won now sit.",
     },
     Reviewed {
         file: "src/policy_runner.rs",
@@ -68,7 +104,8 @@ const REVIEWED: &[Reviewed] = &[
         file: "src/policy_status.rs",
         function: "list",
         justification: "One row per registered policy. Bounded by the code that registers \
-                        them, not by data.",
+                        them, not by data — the per-stream frontier each row carries is \
+                        aggregated in SQL, so it costs a scan and not a row.",
     },
     // ── Known unbounded ──────────────────────────────────────────────────────
     Reviewed {

@@ -86,7 +86,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use testcontainers_modules::postgres;
 use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync};
 use uuid::Uuid;
@@ -214,24 +214,40 @@ impl replay::Aggregate for Probe {
 
 // ── Observations ─────────────────────────────────────────────────────────────
 
+/// An append that has started and not finished, and what it has already taken.
+///
+/// Hold it to keep the write in flight; [`commit`](HeldPing::commit) to land it;
+/// [`abort`](HeldPing::abort) to burn what it took the way a failed append does.
+///
+/// Nothing else may append to the same stream while this is open: the second append
+/// waits on the stream lock this one holds, which is a test waiting for itself.
+pub struct HeldPing {
+    tx: Transaction<'static, Postgres>,
+    pub event_id: Uuid,
+    pub global_position: i64,
+    pub stream_seq: i64,
+    pub stream_id: String,
+}
+
+impl HeldPing {
+    /// End the write: the event becomes visible to every reader at once.
+    pub async fn commit(self) {
+        self.tx.commit().await.expect("committing must succeed");
+    }
+
+    /// End the write by discarding it: the position it drew is burned, and the place it
+    /// took in its stream is handed back.
+    pub async fn abort(self) {
+        self.tx.rollback().await.expect("rolling back must succeed");
+    }
+}
+
 /// An event appended by a test, identified the way the runner identifies it.
 #[derive(Debug, Clone)]
 pub struct AppendedEvent {
     pub event_id: Uuid,
     pub global_position: i64,
-    /// The transaction that wrote it, as a Policy's cursor records it
-    /// (funkode-io/replay#194). Text, because `xid8` is an unsigned 64-bit counter sqlx
-    /// has no codec for.
-    pub commit_txid: String,
     pub stream_id: String,
-}
-
-/// A Policy's persisted cursor: the transaction it stopped in and the position it
-/// stopped at.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredCursor {
-    pub commit_txid: String,
-    pub position: i64,
 }
 
 /// A command the policy dispatched, observed as the event it wrote.
@@ -535,20 +551,59 @@ impl PolicyDaemonHarness {
             .expect("append must succeed");
 
         let stream_id = id.to_urn().to_string();
-        let row = sqlx::query(
-            "SELECT id, global_position, commit_txid::text AS commit_txid \
-             FROM events WHERE metadata->>($1::text) = $2",
-        )
-        .bind(PING_MARKER_KEY)
-        .bind(marker.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .expect("the appended event must be readable");
+        let row =
+            sqlx::query("SELECT id, global_position FROM events WHERE metadata->>($1::text) = $2")
+                .bind(PING_MARKER_KEY)
+                .bind(marker.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .expect("the appended event must be readable");
 
         AppendedEvent {
             event_id: row.get("id"),
             global_position: row.get("global_position"),
-            commit_txid: row.get("commit_txid"),
+            stream_id,
+        }
+    }
+
+    /// Append a `Pinged` event inside a transaction the test holds open.
+    ///
+    /// The append has genuinely started: it went through `append_event`, so it holds the
+    /// stream's lock, has drawn its `global_position` and has taken its place in its own
+    /// stream. Nothing outside the transaction can see any of that until it ends, which
+    /// is the only window in which a feed's order can be observed at all.
+    pub async fn hold_a_ping_open(&self, stream: &str, tag: &str) -> HeldPing {
+        let id = ProbeUrn::new(stream).expect("stream name must be a valid URN NSS");
+        let stream_id = id.to_urn().to_string();
+        let event = ProbeEvent::Pinged {
+            tag: tag.to_string(),
+        };
+        let event_id = Uuid::new_v4();
+
+        let mut tx = self.pool.begin().await.expect("beginning must succeed");
+        sqlx::query("SELECT id FROM append_event($1, $2, $3, $4, $5, $6, NULL)")
+            .bind(event_id)
+            .bind(serde_json::to_value(&event).expect("a probe event must serialise"))
+            .bind(serde_json::json!({ PING_MARKER_KEY: Uuid::new_v4() }))
+            .bind(replay::Event::event_type(&event))
+            .bind(&stream_id)
+            .bind("Probe")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the append must succeed inside the held transaction");
+
+        // Read back inside the transaction: nobody else can see this row yet.
+        let row = sqlx::query("SELECT global_position, stream_seq FROM events WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the append's own row is visible to itself");
+
+        HeldPing {
+            tx,
+            event_id,
+            global_position: row.get("global_position"),
+            stream_seq: row.get("stream_seq"),
             stream_id,
         }
     }
@@ -588,64 +643,112 @@ impl PolicyDaemonHarness {
             .collect()
     }
 
-    /// The policy's persisted cursor, or `None` before it has one.
-    pub async fn cursor(&self) -> Option<i64> {
-        self.cursor_for(&self.policy_name).await
+    /// Whether the policy has passed the event at `global_position`.
+    ///
+    /// A Policy's progress is a place per stream, so "how far has it got" only has an
+    /// answer relative to an event: has this Policy passed the place that event holds in
+    /// the stream it belongs to. An event that is not in the log at all — a position that
+    /// was burned, or one that has not committed — has not been passed by anyone.
+    pub async fn has_passed(&self, global_position: i64) -> bool {
+        self.has_passed_for(&self.policy_name, global_position)
+            .await
     }
 
     /// The same, for any policy registered through this harness.
-    pub async fn cursor_for(&self, policy: &str) -> Option<i64> {
-        sqlx::query_scalar::<_, i64>("SELECT position FROM policy_cursors WHERE name = $1")
-            .bind(policy)
-            .fetch_optional(&self.pool)
-            .await
-            .expect("cursor observation must be readable")
+    pub async fn has_passed_for(&self, policy: &str, global_position: i64) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM events e \
+                 JOIN policy_stream_cursors c \
+                   ON c.policy = $1 AND c.stream_id = e.stream_id \
+                  AND c.stream_seq >= e.stream_seq \
+                 WHERE e.global_position = $2)",
+        )
+        .bind(policy)
+        .bind(global_position)
+        .fetch_one(&self.pool)
+        .await
+        .expect("progress observation must be readable")
     }
 
-    /// The policy's persisted cursor as the row holds it — both halves.
-    pub async fn stored_cursor(&self) -> Option<StoredCursor> {
+    /// The place this policy has reached in `stream`, or `None` before it has one.
+    pub async fn place_in(&self, stream_id: &str) -> Option<i64> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT stream_seq FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2",
+        )
+        .bind(&self.policy_name)
+        .bind(stream_id)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("place observation must be readable")
+    }
+
+    /// Every place this policy has reached, by stream — what an operator reads off
+    /// `policy_stream_cursors` when a Policy is not moving.
+    pub async fn places(&self) -> Vec<(String, i64)> {
         sqlx::query(
-            "SELECT position, commit_txid::text AS commit_txid \
-             FROM policy_cursors WHERE name = $1",
+            "SELECT stream_id, stream_seq FROM policy_stream_cursors \
+             WHERE policy = $1 ORDER BY stream_id LIMIT $2",
+        )
+        .bind(&self.policy_name)
+        .bind(OBSERVATION_LIMIT)
+        .fetch_all(&self.pool)
+        .await
+        .expect("place observations must be readable")
+        .into_iter()
+        .map(|row| (row.get("stream_id"), row.get("stream_seq")))
+        .collect()
+    }
+
+    /// How far this policy's search of the log has swept — a hint, not progress.
+    pub async fn swept_through(&self) -> Option<i64> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT discovered_through FROM policy_cursors WHERE name = $1",
         )
         .bind(&self.policy_name)
         .fetch_optional(&self.pool)
         .await
-        .expect("cursor observation must be readable")
-        .map(|row| StoredCursor {
-            commit_txid: row.get("commit_txid"),
-            position: row.get("position"),
-        })
+        .expect("sweep observation must be readable")
     }
 
-    /// The operator's move from ADR-0012, as they make it: a position, written straight
-    /// into the row against a running deployment, with no second column to remember.
-    pub async fn move_cursor_to(&self, position: i64) {
-        sqlx::query("UPDATE policy_cursors SET position = $2, updated_at = now() WHERE name = $1")
-            .bind(&self.policy_name)
-            .bind(position)
-            .execute(&self.pool)
-            .await
-            .expect("the operator's move must succeed");
+    /// The operator's move from ADR-0012, on the table that now holds the position: a
+    /// place in one stream, written straight into the row against a running deployment.
+    pub async fn move_place_to(&self, stream_id: &str, stream_seq: i64) {
+        sqlx::query(
+            "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+             VALUES ($1, $2, $3) ON CONFLICT (policy, stream_id) \
+             DO UPDATE SET stream_seq = EXCLUDED.stream_seq, updated_at = now()",
+        )
+        .bind(&self.policy_name)
+        .bind(stream_id)
+        .bind(stream_seq)
+        .execute(&self.pool)
+        .await
+        .expect("the operator's move must succeed");
     }
 
     /// Deliver `event` to the policy again, by the move that causes a
-    /// redelivery in production: the cursor rewound to just before it.
+    /// redelivery in production: its stream's place rewound to just before it.
     ///
     /// The honest way to reach the window a park sits in. A dead letter is
-    /// written before the batched cursor checkpoint, so a hard kill in between
+    /// written before the batched checkpoint, so a hard kill in between
     /// redelivers every event since the last checkpoint; an operator rewinding
-    /// the cursor (ADR-0012) does the same deliberately, and is the half of it a
+    /// a place (ADR-0012) does the same deliberately, and is the half of it a
     /// test can perform.
     ///
-    /// Waits for the cursor to reach `event` before moving it, because that same
-    /// window is what a test races otherwise: a rewind written while the worker
-    /// still has the event in flight is erased by the checkpoint that follows
-    /// it — the compare-and-set sees the position it expects and advances — and
-    /// the event is never delivered again.
+    /// Waits for the place to reach `event` before moving it, so that what follows is a
+    /// *re*delivery of something already reacted to once. The rewind needs no window of
+    /// its own: a poll that checkpoints over it is refused, because the place it reads
+    /// back is no longer the row it started from (funkode-io/replay#234).
     pub async fn redeliver(&self, event: &AppendedEvent) {
-        self.await_cursor_at_least(event.global_position).await;
-        self.move_cursor_to(event.global_position - 1).await;
+        let place = sqlx::query_scalar::<_, i64>("SELECT stream_seq FROM events WHERE id = $1")
+            .bind(event.event_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the event must have a place in its stream");
+
+        self.await_passed(event.global_position).await;
+        self.move_place_to(&event.stream_id, place - 1).await;
     }
 
     /// The policy's status as a consumer reads it off [`PolicyStatusStore`] —
@@ -758,6 +861,46 @@ impl PolicyDaemonHarness {
             .await
             .expect("the cursor row must exist before it can be held");
         HeldCursorRow(tx)
+    }
+
+    /// Hold the row lock on this policy's place in `stream_id` until the returned guard
+    /// lets go — an operator part-way through a rewind, and a place no poll can record
+    /// progress in meanwhile.
+    ///
+    /// A checkpoint is the one moment in a poll where the operator's rewind and the
+    /// poll's own progress are both live, and it is over in microseconds. Standing in it
+    /// with a lock is what makes a test of that window a test rather than a race
+    /// (funkode-io/replay#234).
+    pub async fn hold_place_row(&self, stream_id: &str) -> HeldPlaceRow {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .expect("holding the place row must be possible");
+        sqlx::query(
+            "SELECT stream_seq FROM policy_stream_cursors \
+              WHERE policy = $1 AND stream_id = $2 FOR UPDATE",
+        )
+        .bind(&self.policy_name)
+        .bind(stream_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("the place must exist before it can be held");
+
+        // Read on the held connection, so what it identifies is the transaction doing the
+        // holding rather than any backend of the pool.
+        let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the holding backend must identify itself");
+
+        HeldPlaceRow {
+            tx,
+            holder,
+            pool: self.pool.clone(),
+            policy: self.policy_name.clone(),
+            stream_id: stream_id.to_string(),
+        }
     }
 
     /// Take the heartbeat columns away: the schema of a consumer who has not
@@ -1064,10 +1207,10 @@ impl PolicyDaemonHarness {
 
     /// Wait until the policy's persisted cursor has reached `position`, and
     /// return where it actually sits.
-    pub async fn await_cursor_at_least(&self, position: i64) -> i64 {
+    pub async fn await_passed(&self, position: i64) {
         self.observe(
-            &format!("the cursor to reach position {position}"),
-            || async { self.cursor().await.filter(|stored| *stored >= position) },
+            &format!("the policy to pass the event at position {position}"),
+            || async { self.has_passed(position).await.then_some(()) },
         )
         .await
     }
@@ -1111,9 +1254,9 @@ impl PolicyDaemonHarness {
                 // gets its own budget rather than the exhausted one.
                 let diagnosis = tokio::time::timeout(OBSERVE_TIMEOUT, async {
                     format!(
-                        "  policy:     {}\n  cursor:     {:?}\n  dispatched: {:#?}\n  parked:     {:#?}",
+                        "  policy:     {}\n  places:     {:?}\n  dispatched: {:#?}\n  parked:     {:#?}",
                         self.policy_name,
-                        self.cursor().await,
+                        self.places().await,
                         self.dispatches().await,
                         self.dead_letters().await,
                     )
@@ -1202,6 +1345,71 @@ impl HeldCursorRow {
     /// Let the row go, without having changed it.
     pub async fn release(self) {
         let _ = self.0.rollback().await;
+    }
+}
+
+/// An operator's open transaction on one place, and the window it holds open.
+///
+/// Dropping it rolls back, so a test that panics releases the row with its runtime.
+pub struct HeldPlaceRow {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    /// The backend the transaction is on, so "somebody is waiting" can be narrowed to
+    /// "somebody is waiting for *this*".
+    holder: i32,
+    pool: PgPool,
+    policy: String,
+    stream_id: String,
+}
+
+impl HeldPlaceRow {
+    /// Wait until a poll is queued behind this lock: it has delivered, and is trying to
+    /// record what it delivered.
+    ///
+    /// A lock wait is not one of ADR-0014's observations and nothing asserts on it — it
+    /// sequences the test, which still asserts on what the policy dispatched.
+    pub async fn await_a_checkpoint_waiting(&self) {
+        let deadline = Instant::now() + OBSERVE_TIMEOUT;
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(self.holder)
+            .fetch_one(&self.pool)
+            .await
+            .expect("reading who is blocked must succeed");
+
+            if waiting > 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {OBSERVE_TIMEOUT:?} waiting for a checkpoint to queue \
+                 behind the held place of {}",
+                self.stream_id
+            );
+            tokio::time::sleep(OBSERVE_RECHECK).await;
+        }
+    }
+
+    /// Rewind the place to `stream_seq` and let the waiting checkpoint through — the
+    /// operator's move (ADR-0012), landing inside a poll's window.
+    ///
+    /// `stream_seq` and nothing else: an operator is not obliged to touch `updated_at`,
+    /// so a fix that needed them to would not be one.
+    pub async fn rewind_to(mut self, stream_seq: i64) {
+        sqlx::query(
+            "UPDATE policy_stream_cursors SET stream_seq = $1 \
+              WHERE policy = $2 AND stream_id = $3",
+        )
+        .bind(stream_seq)
+        .bind(&self.policy)
+        .bind(&self.stream_id)
+        .execute(&mut *self.tx)
+        .await
+        .expect("the operator's rewind must succeed");
+
+        self.tx.commit().await.expect("committing must succeed");
     }
 }
 

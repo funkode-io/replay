@@ -1,6 +1,6 @@
 # The persisted policy cursor is an operator-writable control surface
 
-**Status:** accepted
+**Status:** accepted; the surface moved. Since [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md) a Policy's position is a row per stream in `policy_stream_cursors`, and that is what an operator writes — finer than what this ADR describes, since one stream can be redelivered without rewinding the Policy over the others. The decision below stands unchanged: the stored value is authoritative and a running leader adopts it. The machinery it needed does not, because places are read fresh every poll rather than held in memory between them.
 
 The leader loaded a Policy's cursor once per leadership term and kept it in
 memory for the whole term. `policy_cursors` was therefore a crash-recovery
@@ -17,47 +17,46 @@ the daemon runs, and the in-memory position is a lease on it.
 
 ## Decisions
 
-- **The leader re-reads the stored cursor whenever its feed comes back empty.**
-  An empty feed is exactly the state a wedged or idle Policy sits in — there is
-  nothing to process either because the log has caught up or because the next
-  position can never exist — so it is both the state an operator corrects and the
-  only moment the extra query is free. A busy Policy never re-reads: it pays one
-  query per *idle* poll and nothing per event.
+- ~~**The leader re-reads the stored cursor whenever its feed comes back empty.**~~
+  *Replaced by [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md): a poll
+  reads the places of the streams it is about to look at, every time. There is no
+  in-memory copy to go stale, so there is no trigger to pick for refreshing it, and
+  the "empty feed" heuristic this decision turned on has no equivalent.*
 
-- **Checkpointing is a compare-and-set, not an upsert.** `UPDATE policy_cursors
-  SET position = $new WHERE name = $1 AND position = $expected`, where `$expected`
-  is the value this process last observed. Zero rows affected means someone moved
-  the row underneath us; the runner adopts the stored position and abandons the
-  rest of its batch rather than reinstating a position that predates the
-  correction. This is the same optimistic-concurrency shape `Cqrs::execute` uses
-  on aggregate versions, applied to the cursor.
+- **Checkpointing is a compare-and-set, not an upsert.** Still true, per stream and
+  against the row rather than the number: a place is written only where the row is
+  the one the poll read, which `xmin` says and a value cannot
+  ([ADR-0026](0026-a-policy-tracks-its-position-per-stream.md), funkode-io/replay#234).
+  A poll that loses abandons **that stream** and leaves the place where its new owner
+  put it; the rest of its batch carries on, because one operator moving one stream is
+  no longer a statement about the Policy's whole position.
 
-- **The instruction is a position; the transaction half is derived from it.** The
-  cursor became a pair — `(commit_txid, position)` — when events started carrying
-  the transaction that wrote them (funkode-io/replay#194). An operator still writes
-  the position alone, and the runner completes the pair from the log: the
-  transaction that belongs with a position is the one that wrote the last event at
-  or before it, which is exactly what the runner would have stored itself. It
-  writes the completed pair back, so the row shows the point the Policy resumes
-  from rather than the half-instruction it was given. The compare-and-set covers
-  both halves.
+- ~~**The instruction is a position; the transaction half is derived from it.**~~
+  *Deleted with funkode-io/replay#197: the transaction half existed to make the log's
+  global order total, and a Policy reads no global order. An operator writes a place,
+  which is whole on its own.*
 
-- **The cursor may move in either direction.** Nothing clamps the adopted value
-  to be greater than the in-memory one. Moving forward skips events (the #164
-  recovery); moving backward re-delivers them, which the at-least-once contract
-  and the causation guard already make safe. Clamping to "forward only" would
-  make a rewind livelock — the runner would keep reinstating the higher value it
-  still held.
+- **The place may move in either direction.** Unchanged, and now per stream: moving
+  forward skips that stream's events, moving backward re-delivers them, and the
+  at-least-once contract with the causation guard is what makes the second safe. The
+  write refuses a *stale* value, never a backwards one — clamping to "forward only"
+  would make a rewind livelock.
 
-- **A deleted row is recreated at the in-memory position.** Dropping the row is
-  not a documented way to rewind a Policy, and treating it as one would silently
-  replay history from the `StartAt` bootstrap.
+- **A deleted row is the documented way to redeliver a stream whole.** *Reversed by
+  [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md).* When the position was
+  one number for the whole Policy, dropping the row meant replaying history from the
+  `StartAt` bootstrap, which nobody wants by accident. A place is one stream, absence
+  is its first event, and that is a useful thing to ask for — so the checkpoint
+  refuses to recreate a row it did not read rather than reinstating it.
 
 ## Rejected
 
-- **Re-reading on every drain.** Correct, but it charges a busy Policy a query per
+- ~~**Re-reading on every drain.** Correct, but it charges a busy Policy a query per
   batch to serve an event that happens a few times a year. The empty feed is the
-  cheap, sufficient trigger.
+  cheap, sufficient trigger.~~ *This is what the runner does now, and the objection
+  died with the global cursor: a poll reads the places of the streams it is about to
+  look at, which it needs anyway to know what they are owed. Re-reading costs nothing
+  extra once the read is per stream rather than per Policy.*
 
 - **A monotonic checkpoint (`SET position = GREATEST(current, new)`).** It
   satisfies "never overwrite a newer value with a stale one" only while
@@ -68,20 +67,20 @@ the daemon runs, and the in-memory position is a lease on it.
   against the database, not a handle on the running process. SQL is the surface
   that already exists; this ADR makes it honest rather than replacing it.
 
-- **Honouring a transaction half an operator writes by hand.** It cannot be told
-  apart from the stale one left in the row by a position-only move, and the move is
-  the documented instruction. A pair the runner wrote survives derivation unchanged,
-  so nothing is lost by treating the position as the whole instruction.
+- ~~**Honouring a transaction half an operator writes by hand.**~~ *Moot with the
+  transaction half itself (funkode-io/replay#197).*
 
 ## Consequences
 
 - An operator recovers a stuck Policy with a single `UPDATE` against a running
-  deployment. The change takes effect within one poll interval, with no restart
-  and no leadership change.
-- Anything that writes `policy_cursors` — a migration, a second tool, an
-  overlapping leader mid-failover — is now a participant in the compare-and-set
-  rather than a racer against an in-memory value. The loser re-reads; nobody
-  silently wins.
-- A drain that is superseded mid-batch stops early and returns the reactions it
-  had already executed. The events between the abandoned position and the new one
-  are skipped deliberately: that is what the operator asked for.
+  deployment, with no restart and no leadership change. **When** it takes effect is
+  no longer "one poll interval": a poll reads the places of the streams it is looking
+  at, so the move lands as soon as discovery nominates that stream — immediately for
+  one still being written to, at the next reconciliation for a quiet one
+  ([ADR-0026](0026-a-policy-tracks-its-position-per-stream.md) has the bound).
+- Anything that writes `policy_stream_cursors` — a migration, a second tool, an
+  overlapping leader mid-failover — is a participant in the compare-and-set rather
+  than a racer against an in-memory value. The loser re-reads; nobody silently wins.
+- A poll that is superseded in one stream abandons that stream and returns the
+  reactions it had already executed. The events between the abandoned place and the
+  new one are skipped deliberately: that is what the operator asked for.

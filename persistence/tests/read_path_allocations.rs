@@ -1,7 +1,7 @@
 //! Allocation regression tests for the row → event read seam.
 //!
 //! `PersistedEvent::<D>::try_from(PgRow)` is the single seam every read goes
-//! through (`read_feed`, `fetch_aggregate_at`, `load_event_by_id`, projection
+//! through (`read_stream`, `fetch_aggregate_at`, `load_event_by_id`, projection
 //! replay). It used to clone the decoded `data` document purely to satisfy
 //! `serde_json::from_value`, so every row cost twice its payload. These tests pin
 //! that down: reading a batch must allocate ≈1× the payload, and the diagnostic

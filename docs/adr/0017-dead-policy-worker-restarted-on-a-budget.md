@@ -66,9 +66,12 @@ Each worker now runs under a supervisor that restarts it, bounded by a
   failed dispatch would re-deliver the same event forever, which is the loop the
   dead-letter contract exists to prevent, so no test here asserts it.
 - **An election logs where it resumes from**, at `info`. It is the only trace a
-  process killed from outside leaves: an OOM-killed pod reprinting the same
-  `next_position` is being killed by one event, one whose position advances is
-  leaking.
+  process killed from outside leaves. *Amended by
+  [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md): what it logs is
+  `swept_through`, where discovery resumes, which is not what has been processed. An
+  OOM-killed pod reprinting it says the worker dies before finishing a poll; which
+  event is killing it is read from the places, and the README's runbook has the
+  query.*
 - Nothing is persisted: budget and stopped list are in-process state, so a
   process restart resets both and no schema change is involved.
 - `stopped_workers()` is a poll; what a consumer is *told* about is the escalation

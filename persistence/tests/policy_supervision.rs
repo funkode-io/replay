@@ -160,11 +160,7 @@ async fn a_worker_that_dies_outside_the_reaction_is_restarted_postgres_test() {
     harness
         .await_dispatch_caused_by(after.global_position)
         .await;
-    let cursor = harness.await_cursor_at_least(after.global_position).await;
-    assert!(
-        cursor >= after.global_position,
-        "cursor {cursor} must have passed every event the restarted worker read"
-    );
+    harness.await_passed(after.global_position).await;
 
     assert!(
         harness.dead_letters().await.is_empty(),
@@ -240,15 +236,14 @@ async fn a_worker_that_exhausts_its_budget_escalates_to_the_consumer_postgres_te
         .await_dispatch_caused_by_for(&neighbour, ping.global_position)
         .await;
     assert_eq!(dispatched.event_type, "Echoed");
-    let neighbour_cursor = harness
-        .observe("the neighbour's cursor to pass the ping", || async {
+    harness
+        .observe("the neighbour to pass the ping", || async {
             harness
-                .cursor_for(&neighbour)
+                .has_passed_for(&neighbour, ping.global_position)
                 .await
-                .filter(|stored| *stored >= ping.global_position)
+                .then_some(())
         })
         .await;
-    assert!(neighbour_cursor >= ping.global_position);
 
     assert_eq!(
         harness.escalations().len(),

@@ -107,10 +107,12 @@ much work it does: [Narration](../../CONTEXT.md#narration) is edge-triggered.
 - The catch-up record lags the actual catch-up by up to one poll interval: it is
   written by the first empty poll, which is what proves the feed is exhausted.
   The duration it reports excludes that wait.
-- A Policy that stops in front of a hole never writes a catch-up record for that
-  burst, which is correct and means a bracket can stay open for as long as the
-  block lasts. The progress record keeps arriving once it moves again, and the
-  block itself is reported by `policy_blocked`.
+- ~~A Policy that stops in front of a hole never writes a catch-up record for that
+  burst~~ *— it cannot stop in front of one any more
+  ([ADR-0026](0026-a-policy-tracks-its-position-per-stream.md), funkode-io/replay#197),
+  and `policy_blocked` was deleted with the condition it reported. A bracket now stays
+  open only for as long as there is work, and the progress record is what says so while
+  it lasts.*
 
 ## Rejected
 
