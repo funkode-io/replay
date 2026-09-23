@@ -4015,13 +4015,16 @@ struct StreamEvent {
 ///
 /// Deleting the row is the other half of that control surface, and what protects it is
 /// that a place the poll read is only ever *updated*: an update matches nothing where the
-/// row has gone. An upsert would not do, even guarded on the row existing, because the
-/// guard reads the snapshot the statement opened on: against a delete that had not
-/// committed when the statement started, the guard sees the row, the insert waits on the
-/// primary key, and once the delete commits there is nothing left to conflict with, so
-/// the operator's delete is undone by an insert (funkode-io/replay#236 review). A place
-/// the poll found *no* row for is only ever inserted, and loses to whoever created one in
-/// the meantime.
+/// row has gone. What decides which half a stream is in is whether the poll saw a *row*,
+/// which a place of 0 does not tell you — a stream at the beginning and a stream with no
+/// row are the same number and different things (funkode-io/replay#231), and only the
+/// second may be created here. An upsert would not do, even guarded on the row existing,
+/// because the guard reads the snapshot the statement opened on: against a delete that
+/// had not committed when the statement started, the guard sees the row, the insert waits
+/// on the primary key, and once the delete commits there is nothing left to conflict
+/// with, so the operator's delete is undone by an insert (funkode-io/replay#236 review).
+/// A place the poll found no row for is only ever inserted, and loses to whoever created
+/// one in the meantime.
 async fn checkpoint_places(
     pool: &Pool<Postgres>,
     name: &str,
@@ -4034,6 +4037,10 @@ async fn checkpoint_places(
 
     let streams: Vec<String> = places.iter().map(|(stream, _)| stream.clone()).collect();
     let seqs: Vec<i64> = places.iter().map(|(_, seq)| *seq).collect();
+    // A row the poll saw carries the version it saw; a stream it found no row for carries
+    // nothing, which is what puts it in the half of the statement that may create one. A
+    // place of 0 does not tell you which — a stream at the beginning and a stream with no
+    // row are both 0 (funkode-io/replay#231).
     let from: Vec<Option<i64>> = places
         .iter()
         .map(|(stream, _)| observed.get(stream).and_then(|place| place.written_by))
@@ -4200,9 +4207,10 @@ impl PolicyProgress {
     ///
     /// The rotation stops at the last stream that got a slot and never passes one that
     /// did not, so a page the poll could not fit is read again next cadence rather than
-    /// skipped. A page nobody could take leaves the rotation where it was; a page taken
-    /// whole and short of the limit is the end of a pass, and the next one starts over —
-    /// the empty string sorts before every id.
+    /// skipped. A page nobody could take leaves the rotation where it was. A page taken
+    /// whole and short of the limit — no page at all included, which is what the last
+    /// stream id looks like from the far side — is the end of a pass, and the next one
+    /// starts over: the empty string sorts before every id.
     fn reconciled(&mut self, page: &[String], admitted: usize, limit: u32) {
         self.reconciled_at = Some(Instant::now());
 
@@ -5525,6 +5533,84 @@ mod sharing_tests {
     }
 }
 
+/// Where the reconciliation's rotation stops, which is a decision about a page of stream
+/// ids and nothing else.
+///
+/// Pure, so the cases live here rather than behind a container: what the rotation does
+/// with a page nobody had room for, and with no page at all, is the difference between a
+/// stream examined once a pass and a stream never examined again.
+#[cfg(test)]
+mod rotation_tests {
+    use std::time::Duration;
+
+    use super::PolicyProgress;
+
+    fn at(reconciled_through: &str) -> PolicyProgress {
+        PolicyProgress {
+            swept_through: 0,
+            unfinished: Vec::new(),
+            share_from: 0,
+            reconciled_through: reconciled_through.to_string(),
+            reconciled_at: None,
+            reconcile_every: Duration::from_secs(5),
+        }
+    }
+
+    fn page(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// The end of a pass: no page means nothing sorts after the rotation point, so the
+    /// next one starts over. Without this a rotation that reached the last stream id
+    /// queries past the end for ever, and a stream behind it is never compared again.
+    #[test]
+    fn a_page_with_nothing_in_it_ends_the_pass() {
+        let mut progress = at("urn:probe:z");
+        progress.reconciled(&page(&[]), 0, 100);
+
+        assert_eq!(progress.reconciled_through, "");
+    }
+
+    /// A page shorter than the batch is the last of a pass, for the same reason.
+    #[test]
+    fn a_short_page_taken_whole_ends_the_pass() {
+        let mut progress = at("urn:probe:a");
+        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 2, 100);
+
+        assert_eq!(progress.reconciled_through, "");
+    }
+
+    /// A full page taken whole carries on after it.
+    #[test]
+    fn a_full_page_taken_whole_advances_the_rotation() {
+        let mut progress = at("");
+        progress.reconciled(&page(&["urn:probe:a", "urn:probe:b"]), 2, 2);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:b");
+    }
+
+    /// The case the poll's own limit creates: the page was read, the poll had room for
+    /// some of it, and the rotation stops at the last stream that got a slot. Advancing
+    /// past the rest would step over them unread whenever the front of the page stays
+    /// behind, which is what the rotation exists for.
+    #[test]
+    fn a_page_the_poll_could_not_fit_stops_where_the_room_ran_out() {
+        let mut progress = at("");
+        progress.reconciled(&page(&["urn:probe:a", "urn:probe:b", "urn:probe:c"]), 1, 3);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:a");
+    }
+
+    /// And a page nobody had room for leaves it exactly where it was.
+    #[test]
+    fn a_page_with_no_room_at_all_leaves_the_rotation_alone() {
+        let mut progress = at("urn:probe:a");
+        progress.reconciled(&page(&["urn:probe:b", "urn:probe:c"]), 0, 2);
+
+        assert_eq!(progress.reconciled_through, "urn:probe:a");
+    }
+}
+
 /// What a Policy's places are, before a worker is anywhere near them
 /// (funkode-io/replay#195).
 ///
@@ -5790,39 +5876,6 @@ mod progress_tests {
         );
     }
 
-    /// The rotation never passes a stream the poll had no room for.
-    ///
-    /// Advancing through the whole page is what made the first version of this a hole
-    /// rather than a delay: the poll admits its share of the page, and if the front of
-    /// the page is still behind next pass — which is the case the rotation exists for —
-    /// the same prefix is admitted every time and everything after it is stepped over
-    /// unread (funkode-io/replay#231 review).
-    #[tokio::test]
-    async fn the_rotation_stops_at_the_last_stream_that_got_a_slot_postgres_test() {
-        let (pool, _container) = start_postgres().await;
-        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
-            .await
-            .expect("loading must succeed");
-
-        let page = vec![
-            "urn:probe:a".to_string(),
-            "urn:probe:b".to_string(),
-            "urn:probe:c".to_string(),
-        ];
-
-        progress.reconciled(&page, 1, 3);
-        assert_eq!(
-            progress.reconciled_through, "urn:probe:a",
-            "one slot means one stream, and the next pass resumes at the second"
-        );
-
-        progress.reconciled(&page, 0, 3);
-        assert_eq!(
-            progress.reconciled_through, "urn:probe:a",
-            "a page nobody had room for leaves the rotation where it was"
-        );
-    }
-
     /// A place records what has been processed, and the frontier is the difference
     /// between that and the stream's head.
     #[tokio::test]
@@ -6043,6 +6096,50 @@ mod progress_tests {
         assert!(
             places(&pool, &["urn:probe:a"]).await.is_empty(),
             "and the stream is still at the beginning, where the delete left it"
+        );
+    }
+
+    /// The same, for a row an operator had already rewound to the beginning.
+    ///
+    /// A place of 0 and no place at all are the same number, so a write allowed to create
+    /// a row whenever it saw 0 recreates the one the operator has just deleted. What
+    /// decides is whether the poll saw a *row* (funkode-io/replay#231 review).
+    #[tokio::test]
+    async fn an_operator_deleting_a_place_it_had_rewound_to_zero_is_not_overwritten_postgres_test()
+    {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 20).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        // Rewound to the beginning by hand, then thought better of it and deleted.
+        sqlx::query(
+            "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) VALUES ($1, $2, 0)",
+        )
+        .bind(POLICY)
+        .bind("urn:probe:a")
+        .execute(&pool)
+        .await
+        .expect("the operator's rewind must succeed");
+
+        // The poll that was mid-batch when both happened: it saw the row at 0, which is a
+        // row, and not the absence of one that the same number would mean.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+
+        sqlx::query("DELETE FROM policy_stream_cursors WHERE policy = $1 AND stream_id = $2")
+            .bind(POLICY)
+            .bind("urn:probe:a")
+            .execute(&pool)
+            .await
+            .expect("the operator's delete must succeed");
+
+        let kept = checkpoint_from(&pool, &observed, "urn:probe:a", 15).await;
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "and the row the operator deleted stays deleted"
         );
     }
 
