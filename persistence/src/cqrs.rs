@@ -50,7 +50,7 @@ impl<ES: EventStore> Cqrs<ES> {
         futures::pin_mut!(events);
 
         while let Some(event) = events.try_next().await? {
-            stream.apply(event.data);
+            stream.apply(event.into_data());
         }
 
         Ok(stream)

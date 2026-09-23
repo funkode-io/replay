@@ -17,7 +17,7 @@ use common::policy_harness::{
     DeadLetter, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
 };
 use replay_persistence::{
-    Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder, StartAt, PANIC_ERROR_KIND,
+    Dispatch, ObservedEvent, Policy, PolicyRunnerBuilder, PolicySettings, StartAt, PANIC_ERROR_KIND,
 };
 
 /// Tag whose reaction returns a permanently failing command followed by a
@@ -120,11 +120,7 @@ impl Policy for ParkingPolicy {
         &self.name
     }
 
-    fn start_at(&self) -> StartAt {
-        StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
         let ProbeEvent::Pinged { tag } = &event.data else {
             return vec![];
         };
@@ -168,11 +164,14 @@ fn parking_policy(
 ) -> impl Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static {
     let retries = Arc::new(AtomicUsize::new(0));
     move |builder, policy| {
-        builder.register_policy(ParkingPolicy {
-            name: policy.to_string(),
-            reactions: Arc::clone(&reactions),
-            retries: Arc::clone(&retries),
-        })
+        builder.register_policy(
+            ParkingPolicy {
+                name: policy.to_string(),
+                reactions: Arc::clone(&reactions),
+                retries: Arc::clone(&retries),
+            },
+            PolicySettings::new().starting_at(StartAt::Beginning),
+        )
     }
 }
 

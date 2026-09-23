@@ -11,7 +11,8 @@ use urn::Urn;
 use replay::{prelude::*, Compactable};
 use replay_macros::{define_aggregate, Urn};
 use replay_persistence::{
-    AggregateVersion, CompactionOutcome, EventStore, PersistedEvent, StreamFilter,
+    AggregateVersion, CompactionOutcome, EventStore, ObservedEvent, PersistedEvent, PolicySettings,
+    StreamFilter,
 };
 
 // Re-use the README walkthrough verbatim as the source of truth. The example's
@@ -217,20 +218,20 @@ define_aggregate! {
         namespace: "idempotent-fee-account",
         state: {
             balance: f64,
-            applied_causation_ids: std::collections::HashSet<uuid::Uuid>,
+            applied_charge_keys: std::collections::HashSet<String>,
         },
         commands: {
             Open { balance: f64 },
             ChargeFee {
                 amount: f64,
-                causation_event_id: uuid::Uuid,
+                charge_key: String,
             },
         },
         events: {
             Opened { balance: f64 },
             FeeCharged {
                 amount: f64,
-                causation_event_id: uuid::Uuid,
+                charge_key: String,
             },
         }
     }
@@ -248,12 +249,9 @@ impl replay::EventStream for IdempotentFeeAccount {
             IdempotentFeeAccountEvent::Opened { balance } => {
                 self.balance = balance;
             }
-            IdempotentFeeAccountEvent::FeeCharged {
-                amount,
-                causation_event_id,
-            } => {
+            IdempotentFeeAccountEvent::FeeCharged { amount, charge_key } => {
                 self.balance -= amount;
-                self.applied_causation_ids.insert(causation_event_id);
+                self.applied_charge_keys.insert(charge_key);
             }
         }
     }
@@ -273,22 +271,32 @@ impl replay::Aggregate for IdempotentFeeAccount {
             IdempotentFeeAccountCommand::Open { balance } => {
                 Ok(vec![IdempotentFeeAccountEvent::Opened { balance }])
             }
-            IdempotentFeeAccountCommand::ChargeFee {
-                amount,
-                causation_event_id,
-            } => {
-                // Causation guard recipe: duplicate causation identity is a no-op.
-                if self.applied_causation_ids.contains(&causation_event_id) {
+            IdempotentFeeAccountCommand::ChargeFee { amount, charge_key } => {
+                // Idempotent command shape: a charge already applied under this key is a
+                // no-op. The key is domain data the reacting rule can see — a policy is
+                // not given the triggering event's identity (ADR-0027).
+                if self.applied_charge_keys.contains(&charge_key) {
                     return Ok(Vec::new());
                 }
 
                 Ok(vec![IdempotentFeeAccountEvent::FeeCharged {
                     amount,
-                    causation_event_id,
+                    charge_key,
                 }])
             }
         }
     }
+}
+
+/// The key a fee charge is deduplicated by: the deposit it is charging for, named from
+/// what a rule observes. A re-delivery of the same event yields the same key, which is
+/// what makes the command absorb it (at-least-once delivery, ADR-0003).
+fn charge_key(event: &ObservedEvent<BankAccountEvent>, amount: f64) -> String {
+    format!(
+        "{}@{}#{amount}",
+        event.stream_id,
+        event.created.to_rfc3339()
+    )
 }
 
 struct BankAccountStatement {
@@ -2283,7 +2291,6 @@ struct WithdrawFeePolicyStartAtBeginning {
 }
 
 struct ChargeFeeWithCausationPolicy {
-    source: BankAccountUrn,
     target: IdempotentFeeAccountUrn,
     fee: f64,
 }
@@ -2308,11 +2315,7 @@ impl replay_persistence::Policy for WithdrawFeePolicy {
         "withdraw_fee_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { operation_date, .. } => {
                 let account = BankAccountUrn::try_from(event.stream_id.clone())
@@ -2341,11 +2344,7 @@ impl replay_persistence::Policy for WithdrawFeePolicyStartAtNow {
         "withdraw_fee_policy_start_at_now"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Now
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { operation_date, .. } => {
                 let account = BankAccountUrn::try_from(event.stream_id.clone())
@@ -2370,11 +2369,7 @@ impl replay_persistence::Policy for WithdrawFeePolicyStartAtBeginning {
         "withdraw_fee_policy_start_at_beginning"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { operation_date, .. } => {
                 let account = BankAccountUrn::try_from(event.stream_id.clone())
@@ -2399,22 +2394,14 @@ impl replay_persistence::Policy for ChargeFeeWithCausationPolicy {
         "charge_fee_with_causation_policy"
     }
 
-    fn stream_filter(&self) -> replay_persistence::StreamFilter {
-        replay_persistence::StreamFilter::with_stream_id::<BankAccount>(&self.source)
-    }
-
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Now
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
-            BankAccountEvent::Deposited { .. } => {
+            BankAccountEvent::Deposited { amount, .. } => {
                 vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
                     self.target.clone(),
                     IdempotentFeeAccountCommand::ChargeFee {
                         amount: self.fee,
-                        causation_event_id: event.id,
+                        charge_key: charge_key(event, *amount),
                     },
                 )]
             }
@@ -2430,15 +2417,7 @@ impl replay_persistence::Policy for ArchivedOnlyPolicy {
         "archived_only_policy"
     }
 
-    fn stream_filter(&self) -> replay_persistence::StreamFilter {
-        replay_persistence::StreamFilter::with_aggregate_version(Some(1))
-    }
-
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         panic!("no live event matches aggregate_version = 1, but {event:?} was delivered");
     }
 }
@@ -2483,15 +2462,7 @@ impl replay_persistence::Policy for WatchedAccountFeePolicy {
         "watched_account_fee_policy"
     }
 
-    fn stream_filter(&self) -> replay_persistence::StreamFilter {
-        replay_persistence::StreamFilter::with_stream_id::<BankAccount>(&self.watched)
-    }
-
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         assert_eq!(
             event.stream_id,
             Into::<Urn>::into(self.watched.clone()),
@@ -2499,12 +2470,12 @@ impl replay_persistence::Policy for WatchedAccountFeePolicy {
         );
 
         match &event.data {
-            BankAccountEvent::Deposited { .. } => {
+            BankAccountEvent::Deposited { amount, .. } => {
                 vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
                     self.target.clone(),
                     IdempotentFeeAccountCommand::ChargeFee {
                         amount: self.fee,
-                        causation_event_id: event.id,
+                        charge_key: charge_key(event, *amount),
                     },
                 )]
             }
@@ -2554,7 +2525,10 @@ async fn withdraw_fee_policy_drain_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(WithdrawFeePolicy { fee: 5.0 })
+        .register_policy(
+            WithdrawFeePolicy { fee: 5.0 },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let executed = runner.drain().await.expect("drain must succeed");
@@ -2662,11 +2636,18 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<IdempotentFeeAccount>(())
-        .register_policy(WatchedAccountFeePolicy {
-            watched: watched.clone(),
-            target: target.clone(),
-            fee: 5.0,
-        })
+        .register_policy(
+            WatchedAccountFeePolicy {
+                watched: watched.clone(),
+                target: target.clone(),
+                fee: 5.0,
+            },
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Beginning)
+                .with_stream_filter(replay_persistence::StreamFilter::with_stream_id::<
+                    BankAccount,
+                >(&watched)),
+        )
         .build();
 
     let executed = runner.drain().await.expect("drain must succeed");
@@ -2738,7 +2719,14 @@ async fn policy_filter_that_is_null_per_row_skips_and_advances_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(ArchivedOnlyPolicy)
+        .register_policy(
+            ArchivedOnlyPolicy,
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Beginning)
+                .with_stream_filter(replay_persistence::StreamFilter::with_aggregate_version(
+                    Some(1),
+                )),
+        )
         .build();
 
     assert_eq!(
@@ -2788,7 +2776,10 @@ async fn policy_start_at_now_ignores_prior_history_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(WithdrawFeePolicyStartAtNow { fee: 5.0 })
+        .register_policy(
+            WithdrawFeePolicyStartAtNow { fee: 5.0 },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Now),
+        )
         .build();
 
     // First drain should not backfill pre-existing event.
@@ -2859,7 +2850,10 @@ async fn policy_start_at_beginning_backfills_history_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+        .register_policy(
+            WithdrawFeePolicyStartAtBeginning { fee: 5.0 },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let executed = runner.drain().await.expect("drain must succeed");
@@ -2878,11 +2872,7 @@ async fn policy_code_change_never_rewinds_cursor_postgres_test() {
             "withdraw_fee_policy_no_rewind"
         }
 
-        fn start_at(&self) -> replay_persistence::StartAt {
-            replay_persistence::StartAt::Now
-        }
-
-        fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
             match &event.data {
                 BankAccountEvent::Deposited { operation_date, .. } => {
                     let account = BankAccountUrn::try_from(event.stream_id.clone())
@@ -2907,12 +2897,7 @@ async fn policy_code_change_never_rewinds_cursor_postgres_test() {
             "withdraw_fee_policy_no_rewind"
         }
 
-        // Simulate a code change that attempts to switch bootstrap mode.
-        fn start_at(&self) -> replay_persistence::StartAt {
-            replay_persistence::StartAt::Beginning
-        }
-
-        fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+        fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
             match &event.data {
                 BankAccountEvent::Deposited { operation_date, .. } => {
                     let account = BankAccountUrn::try_from(event.stream_id.clone())
@@ -2963,7 +2948,10 @@ async fn policy_code_change_never_rewinds_cursor_postgres_test() {
 
     let runner_v1 = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(WithdrawFeePolicyNoRewindV1)
+        .register_policy(
+            WithdrawFeePolicyNoRewindV1,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Now),
+        )
         .build();
 
     // First run bootstraps at Now, so no backfill.
@@ -2986,7 +2974,11 @@ async fn policy_code_change_never_rewinds_cursor_postgres_test() {
     // Simulate redeploy/code change with same policy name but different start_at.
     let runner_v2 = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(WithdrawFeePolicyNoRewindV2)
+        .register_policy(
+            // A code change that attempts to switch bootstrap mode.
+            WithdrawFeePolicyNoRewindV2,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     // Must process only the new event; the original pre-registration event
@@ -3016,7 +3008,10 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
     let runner = std::sync::Arc::new(
         replay_persistence::PolicyRunner::builder(cqrs.clone())
             .register_services::<BankAccount>(())
-            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            .register_policy(
+                WithdrawFeePolicyStartAtBeginning { fee: 5.0 },
+                PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+            )
             .build(),
     );
 
@@ -3091,11 +3086,17 @@ async fn policy_duplicate_delivery_is_absorbed_by_causation_guard_postgres_test(
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<IdempotentFeeAccount>(())
-        .register_policy(ChargeFeeWithCausationPolicy {
-            source: source.clone(),
-            target: target.clone(),
-            fee: 5.0,
-        })
+        .register_policy(
+            ChargeFeeWithCausationPolicy {
+                target: target.clone(),
+                fee: 5.0,
+            },
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Now)
+                .with_stream_filter(replay_persistence::StreamFilter::with_stream_id::<
+                    BankAccount,
+                >(&source)),
+        )
         .build();
 
     // Bootstrap StartAt::Now cursor at current head (after target account open,
@@ -3219,7 +3220,7 @@ async fn policy_duplicate_delivery_example_recipe_postgres_test() {
         .register_services::<PolicyFeeLedger>(())
         .register_policy_fn::<global_position::BankAccountEvent, _>(
             DEPOSIT_FEE_POLICY_NAME,
-            replay_persistence::StartAt::Now,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Now),
             global_position::deposit_fee_react,
         )
         .build();
@@ -3392,7 +3393,10 @@ async fn policy_lagging_behind_compaction_skips_synthetic_snapshot_postgres_test
     // `WithdrawFeePolicyStartAtBeginning` starts at gp=0, reacts to Deposited.
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+        .register_policy(
+            WithdrawFeePolicyStartAtBeginning { fee: 5.0 },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let dispatches = runner.drain().await.expect("drain must succeed");
@@ -3424,13 +3428,9 @@ impl replay_persistence::Policy for SingleRunnerPolicy {
         "single_runner_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Now
-    }
-
     /// React to every `Deposited` event by issuing a `Withdraw` of $1.
     /// `Withdrawn` is not a `Deposited`, so the reaction does not feed itself.
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { operation_date, .. } => {
                 let account = BankAccountUrn::try_from(event.stream_id.clone())
@@ -3499,7 +3499,10 @@ async fn policy_single_active_runner_via_advisory_lock_postgres_test() {
     let build_runner = || {
         replay_persistence::PolicyRunner::builder(cqrs.clone())
             .register_services::<BankAccount>(())
-            .register_policy(SingleRunnerPolicy)
+            .register_policy(
+                SingleRunnerPolicy,
+                PolicySettings::new().starting_at(replay_persistence::StartAt::Now),
+            )
             .build()
     };
 
@@ -3619,11 +3622,7 @@ impl replay_persistence::Policy for FootprintPolicy {
         &self.name
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Now
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { operation_date, .. } => {
                 vec![replay_persistence::Dispatch::to::<BankAccount>(
@@ -3720,10 +3719,13 @@ async fn policy_bounded_connection_footprint_many_policies_postgres_test() {
     let mut builder = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(());
     for (i, target) in targets.iter().enumerate() {
-        builder = builder.register_policy(FootprintPolicy {
-            name: format!("footprint_policy_{i}"),
-            target: target.clone(),
-        });
+        builder = builder.register_policy(
+            FootprintPolicy {
+                name: format!("footprint_policy_{i}"),
+                target: target.clone(),
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Now),
+        );
     }
     let daemon = builder.build().start_polling(Duration::from_millis(50));
 
@@ -3781,9 +3783,7 @@ async fn policy_bounded_connection_footprint_many_policies_postgres_test() {
 /// A policy that deliberately creates a loop: every `Deposited` event triggers
 /// another `Deposit` command on the same account. Without the depth limit this
 /// would run forever.
-struct LoopPolicy {
-    max_depth: u32,
-}
+struct LoopPolicy;
 
 impl replay_persistence::Policy for LoopPolicy {
     type Event = BankAccountEvent;
@@ -3792,15 +3792,7 @@ impl replay_persistence::Policy for LoopPolicy {
         "loop_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn max_causation_depth(&self) -> Option<u32> {
-        Some(self.max_depth)
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { operation_date, .. } => {
                 let account = BankAccountUrn::try_from(event.stream_id.clone())
@@ -3864,7 +3856,12 @@ async fn policy_causation_depth_limit_stops_loop_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(LoopPolicy { max_depth: 3 })
+        .register_policy(
+            LoopPolicy,
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Beginning)
+                .with_max_causation_depth(3),
+        )
         .build();
 
     // Drain until the chain stabilises (circuit breaker fires and no more reactions).
@@ -3924,11 +3921,7 @@ impl replay_persistence::Policy for PoisonDispatchPolicy {
         "poison_dispatch_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         if matches!(event.data, BankAccountEvent::Deposited { .. }) {
             // Dispatch to IdempotentFeeAccount — which will NOT be registered in
             // the runner, triggering a permanent InvalidInput error.
@@ -3954,11 +3947,7 @@ impl replay_persistence::Policy for InsufficientFundsPolicy {
         "insufficient_funds_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { operation_date, .. } => {
                 let account = BankAccountUrn::try_from(event.stream_id.clone())
@@ -4027,7 +4016,10 @@ async fn policy_permanent_failure_is_dead_lettered_and_advances_postgres_test() 
     // registered in the runner.  No services are added for it intentionally.
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(PoisonDispatchPolicy)
+        .register_policy(
+            PoisonDispatchPolicy,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     // Drain: both events are processed, both dispatches dead-lettered, 0 commands executed.
@@ -4102,7 +4094,10 @@ async fn policy_business_rule_violation_advances_without_dead_letter_postgres_te
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(InsufficientFundsPolicy)
+        .register_policy(
+            InsufficientFundsPolicy,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     // Drain: the Withdraw is rejected with BusinessRuleViolation; drain does not error.
@@ -4199,18 +4194,14 @@ impl replay_persistence::Policy for RetryFeePolicy {
         "retry_fee_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
-            BankAccountEvent::Deposited { .. } => {
+            BankAccountEvent::Deposited { amount, .. } => {
                 vec![replay_persistence::Dispatch::to::<IdempotentFeeAccount>(
                     self.target.clone(),
                     IdempotentFeeAccountCommand::ChargeFee {
                         amount: self.fee,
-                        causation_event_id: event.id,
+                        charge_key: charge_key(event, *amount),
                     },
                 )]
             }
@@ -4232,11 +4223,7 @@ impl replay_persistence::Policy for AlwaysFailsPolicy {
         "always_fails_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { .. } => {
                 vec![replay_persistence::Dispatch::to::<AlwaysFailsAccount>(
@@ -4300,7 +4287,10 @@ where
     // Manufacturing runner: the policy is registered but the dispatch target's
     // services are NOT, so the dispatch dead-letters.
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
-        .register_policy(policy)
+        .register_policy(
+            policy,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
     runner
         .drain()
@@ -4363,10 +4353,13 @@ async fn retry_dead_letter_resolves_and_deletes_row_postgres_test() {
     // can apply.  The polling daemon is intentionally never started.
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<IdempotentFeeAccount>(())
-        .register_policy(RetryFeePolicy {
-            target: target.clone(),
-            fee: 5.0,
-        })
+        .register_policy(
+            RetryFeePolicy {
+                target: target.clone(),
+                fee: 5.0,
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let outcome = runner
@@ -4439,9 +4432,12 @@ async fn retry_dead_letter_still_failing_updates_row_in_place_postgres_test() {
     // and fails again permanently.
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<AlwaysFailsAccount>(())
-        .register_policy(AlwaysFailsPolicy {
-            target: target.clone(),
-        })
+        .register_policy(
+            AlwaysFailsPolicy {
+                target: target.clone(),
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let outcome = runner
@@ -4493,7 +4489,10 @@ async fn retry_dead_letter_stale_reaction_resolves_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(InsufficientFundsPolicy)
+        .register_policy(
+            InsufficientFundsPolicy,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let outcome = runner
@@ -4534,10 +4533,13 @@ async fn retry_dead_letter_is_idempotent_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<IdempotentFeeAccount>(())
-        .register_policy(RetryFeePolicy {
-            target: target.clone(),
-            fee: 7.0,
-        })
+        .register_policy(
+            RetryFeePolicy {
+                target: target.clone(),
+                fee: 7.0,
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let first = runner
@@ -4588,10 +4590,13 @@ async fn retry_dead_letter_error_contract_postgres_test() {
     // (a) Absent id → defined no-op.
     let runner_full = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<IdempotentFeeAccount>(())
-        .register_policy(RetryFeePolicy {
-            target: target.clone(),
-            fee: 3.0,
-        })
+        .register_policy(
+            RetryFeePolicy {
+                target: target.clone(),
+                fee: 3.0,
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
     let absent = runner_full
         .retry_dead_letter(999_999)
@@ -4611,10 +4616,13 @@ async fn retry_dead_letter_error_contract_postgres_test() {
 
     // (c) Dispatch targets an unregistered aggregate → clear error.
     let runner_no_aggregate = replay_persistence::PolicyRunner::builder(cqrs.clone())
-        .register_policy(RetryFeePolicy {
-            target: target.clone(),
-            fee: 3.0,
-        })
+        .register_policy(
+            RetryFeePolicy {
+                target: target.clone(),
+                fee: 3.0,
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
     let err = runner_no_aggregate
         .retry_dead_letter(id)
@@ -4802,11 +4810,7 @@ impl replay_persistence::Policy for OrderedPickyPolicy {
         "ordered_picky_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { amount, .. } => {
                 vec![replay_persistence::Dispatch::to::<OrderedPickyAccount>(
@@ -4873,7 +4877,10 @@ where
     // Manufacturing runner: the policy is registered but the dispatch target's
     // services are NOT, so each dispatch dead-letters.
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
-        .register_policy(policy)
+        .register_policy(
+            policy,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
     runner
         .drain()
@@ -4905,9 +4912,12 @@ async fn retry_policy_dead_letters_resolves_all_oldest_first_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<OrderedPickyAccount>(())
-        .register_policy(OrderedPickyPolicy {
-            target: target.clone(),
-        })
+        .register_policy(
+            OrderedPickyPolicy {
+                target: target.clone(),
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let summary = runner
@@ -4972,9 +4982,12 @@ async fn retry_policy_dead_letters_mixed_leaves_unresolved_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<OrderedPickyAccount>(())
-        .register_policy(OrderedPickyPolicy {
-            target: target.clone(),
-        })
+        .register_policy(
+            OrderedPickyPolicy {
+                target: target.clone(),
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let summary = runner
@@ -5031,9 +5044,12 @@ async fn retry_policy_dead_letters_empty_is_noop_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<OrderedPickyAccount>(())
-        .register_policy(OrderedPickyPolicy {
-            target: target.clone(),
-        })
+        .register_policy(
+            OrderedPickyPolicy {
+                target: target.clone(),
+            },
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+        )
         .build();
 
     let summary = runner
@@ -5049,9 +5065,7 @@ async fn retry_policy_dead_letters_empty_is_noop_postgres_test() {
 // ── Batching: read-batch size and checkpoint-batch size (issue #85) ───────────
 
 /// Policy with a custom read-batch size for testing.
-struct SmallBatchPolicy {
-    batch: u32,
-}
+struct SmallBatchPolicy;
 
 impl replay_persistence::Policy for SmallBatchPolicy {
     type Event = BankAccountEvent;
@@ -5060,21 +5074,7 @@ impl replay_persistence::Policy for SmallBatchPolicy {
         "small_batch_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn read_batch_size(&self) -> Option<u32> {
-        Some(self.batch)
-    }
-
-    fn checkpoint_batch_size(&self) -> Option<u32> {
-        // Match read_batch so the read_batch ≥ checkpoint_batch invariant
-        // does not silently raise the read batch to the default (100).
-        Some(self.batch)
-    }
-
-    fn react(&self, _: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, _: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         Vec::new() // observe-only; we care about cursor position, not commands
     }
 }
@@ -5132,7 +5132,13 @@ async fn policy_read_batch_is_one_budget_across_streams_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(SmallBatchPolicy { batch: 2 })
+        .register_policy(
+            SmallBatchPolicy,
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Beginning)
+                .with_read_batch_size(2)
+                .with_checkpoint_batch_size(2),
+        )
         .build();
 
     let mut delivered = Vec::new();
@@ -5213,7 +5219,13 @@ async fn policy_reconciliation_leads_the_poll_it_runs_on_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(SmallBatchPolicy { batch: 1 })
+        .register_policy(
+            SmallBatchPolicy,
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Beginning)
+                .with_read_batch_size(1)
+                .with_checkpoint_batch_size(1),
+        )
         .build();
 
     runner.drain().await.expect("drain must succeed");
@@ -5276,7 +5288,13 @@ async fn policy_reconciliation_wraps_across_an_empty_poll_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(SmallBatchPolicy { batch: 2 })
+        .register_policy(
+            SmallBatchPolicy,
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Beginning)
+                .with_read_batch_size(2)
+                .with_checkpoint_batch_size(2),
+        )
         .build();
 
     // The first drain finds nothing — that is the poll that has to wrap the rotation.
@@ -5297,10 +5315,7 @@ async fn policy_reconciliation_wraps_across_an_empty_poll_postgres_test() {
 }
 
 /// Policy with explicit batch sizes for checkpoint testing.
-struct CheckpointBatchPolicy {
-    read_batch: u32,
-    checkpoint_batch: u32,
-}
+struct CheckpointBatchPolicy;
 
 impl replay_persistence::Policy for CheckpointBatchPolicy {
     type Event = BankAccountEvent;
@@ -5309,19 +5324,7 @@ impl replay_persistence::Policy for CheckpointBatchPolicy {
         "checkpoint_batch_policy"
     }
 
-    fn start_at(&self) -> replay_persistence::StartAt {
-        replay_persistence::StartAt::Beginning
-    }
-
-    fn read_batch_size(&self) -> Option<u32> {
-        Some(self.read_batch)
-    }
-
-    fn checkpoint_batch_size(&self) -> Option<u32> {
-        Some(self.checkpoint_batch)
-    }
-
-    fn react(&self, _: &PersistedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
+    fn react(&self, _: &ObservedEvent<Self::Event>) -> Vec<replay_persistence::Dispatch> {
         Vec::new()
     }
 }
@@ -5370,7 +5373,13 @@ async fn policy_read_batch_limits_events_per_drain_postgres_test() {
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(SmallBatchPolicy { batch: 2 })
+        .register_policy(
+            SmallBatchPolicy,
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Beginning)
+                .with_read_batch_size(2)
+                .with_checkpoint_batch_size(2),
+        )
         .build();
 
     // One stream, so its places run 1..5 alongside the positions.
@@ -5442,10 +5451,13 @@ async fn policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test()
 
     let runner = replay_persistence::PolicyRunner::builder(cqrs.clone())
         .register_services::<BankAccount>(())
-        .register_policy(CheckpointBatchPolicy {
-            read_batch: 4,
-            checkpoint_batch: 2,
-        })
+        .register_policy(
+            CheckpointBatchPolicy,
+            PolicySettings::new()
+                .starting_at(replay_persistence::StartAt::Beginning)
+                .with_read_batch_size(4)
+                .with_checkpoint_batch_size(2),
+        )
         .build();
 
     // Full drain: the place is written at 2 and again at 4 (two checkpoints).
@@ -5545,7 +5557,7 @@ async fn global_position_closure_policy_charges_deposit_fee_postgres_test() {
         .register_services::<PolicyFeeLedger>(())
         .register_policy_fn::<BankAccountEvent, _>(
             DEPOSIT_FEE_POLICY_NAME,
-            replay_persistence::StartAt::Beginning,
+            PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
             global_position::deposit_fee_react,
         )
         .build();
@@ -5607,7 +5619,10 @@ async fn policy_notify_wakes_daemon_before_poll_interval_postgres_test() {
     let runner = std::sync::Arc::new(
         replay_persistence::PolicyRunner::builder(cqrs.clone())
             .register_services::<BankAccount>(())
-            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            .register_policy(
+                WithdrawFeePolicyStartAtBeginning { fee: 5.0 },
+                PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+            )
             .build(),
     );
     let daemon = runner
@@ -5673,7 +5688,10 @@ async fn policy_daemon_reacts_without_notify_via_polling_postgres_test() {
     let runner = std::sync::Arc::new(
         replay_persistence::PolicyRunner::builder(cqrs.clone())
             .register_services::<BankAccount>(())
-            .register_policy(WithdrawFeePolicyStartAtBeginning { fee: 5.0 })
+            .register_policy(
+                WithdrawFeePolicyStartAtBeginning { fee: 5.0 },
+                PolicySettings::new().starting_at(replay_persistence::StartAt::Beginning),
+            )
             // Disable NOTIFY: must still react via the polling interval.
             .without_notifications()
             .build(),

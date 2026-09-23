@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
-use replay_persistence::{Dispatch, StartAt, PANIC_ERROR_KIND};
+use replay_persistence::{Dispatch, PolicySettings, StartAt, PANIC_ERROR_KIND};
 use tracing_test::traced_test;
 
 /// Tag whose reaction panics. Any other tag echoes.
@@ -43,8 +43,10 @@ fn panicking_policy(
        + 'static {
     move |builder, policy| {
         let reactions = Arc::clone(&reactions);
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, move |event| {
-            match &event.data {
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            move |event| match &event.data {
                 ProbeEvent::Pinged { tag } if tag == PANICS => {
                     reactions.fetch_add(1, Ordering::SeqCst);
                     panic!("{PANIC_MESSAGE}");
@@ -54,8 +56,8 @@ fn panicking_policy(
                     ProbeCommand::Echo { tag: tag.clone() },
                 )],
                 _ => vec![],
-            }
-        })
+            },
+        )
     }
 }
 
@@ -220,25 +222,26 @@ async fn retrying_a_parked_panic_re_parks_it_rather_than_unwinding_the_retry_pos
 /// before the first await; this one unwinds in the middle of one.
 #[tokio::test]
 async fn a_panic_inside_a_dispatched_command_handler_is_contained_too_postgres_test() {
-    let harness =
-        PolicyDaemonHarness::start("handler_panics", |builder, policy| {
-            builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, |event| {
-                match &event.data {
-                    ProbeEvent::Pinged { tag } if tag == EXPLODES => vec![Dispatch::to::<Probe>(
-                        ProbeUrn::new("detonator").unwrap(),
-                        ProbeCommand::Explode {
-                            reason: HANDLER_PANIC_REASON.to_string(),
-                        },
-                    )],
-                    ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
-                        ProbeUrn::new(format!("{tag}-echo")).unwrap(),
-                        ProbeCommand::Echo { tag: tag.clone() },
-                    )],
-                    _ => vec![],
-                }
-            })
-        })
-        .await;
+    let harness = PolicyDaemonHarness::start("handler_panics", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            |event| match &event.data {
+                ProbeEvent::Pinged { tag } if tag == EXPLODES => vec![Dispatch::to::<Probe>(
+                    ProbeUrn::new("detonator").unwrap(),
+                    ProbeCommand::Explode {
+                        reason: HANDLER_PANIC_REASON.to_string(),
+                    },
+                )],
+                ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+                    ProbeUrn::new(format!("{tag}-echo")).unwrap(),
+                    ProbeCommand::Echo { tag: tag.clone() },
+                )],
+                _ => vec![],
+            },
+        )
+    })
+    .await;
 
     let exploded = harness.ping("subject-1", EXPLODES).await;
 

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::inline_projection::{ErasedInlineProjection, InlineProjection};
 use crate::{CompactionOutcome, EventSink, EventStore, PersistedEvent, StreamFilter};
-use replay::{Compactable, Event, Metadata};
+use replay::{Compactable, Event, Metadata, ObservedEvent};
 
 /// Convenience marker trait for inline projections that run on Postgres.
 ///
@@ -818,25 +818,29 @@ impl EventStore for PostgresEventStore {
             // whole batch. The sink is an infallible observer and cannot abort the txn.
             sink.on_event(&PersistedEvent {
                 id: persisted_id,
-                data: event,
-                stream_id: stream_id.clone(),
                 r#type: event_type.clone(),
                 version,
-                created,
-                metadata: metadata.clone(),
                 aggregate_version: None,
+                observed: ObservedEvent {
+                    data: event,
+                    stream_id: stream_id.clone(),
+                    metadata: metadata.clone(),
+                    created,
+                },
             });
 
             if has_projections {
                 appended.push(PersistedEvent {
                     id: persisted_id,
-                    data: event_data,
-                    stream_id: stream_id.clone(),
                     r#type: event_type,
                     version,
-                    created,
-                    metadata: metadata.clone(),
                     aggregate_version: None,
+                    observed: ObservedEvent {
+                        data: event_data,
+                        stream_id: stream_id.clone(),
+                        metadata: metadata.clone(),
+                        created,
+                    },
                 });
 
                 // Flush on the same transaction, then drop the events. A failure here
@@ -1110,13 +1114,15 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
 
         Ok(PersistedEvent {
             id,
-            data,
-            stream_id,
             r#type,
             version,
-            created,
-            metadata,
             aggregate_version,
+            observed: ObservedEvent {
+                data,
+                stream_id,
+                metadata,
+                created,
+            },
         })
     }
 }

@@ -24,12 +24,12 @@ use common::policy_harness::{
     PRIMARY_REPLICA,
 };
 use replay_persistence::{
-    Dispatch, Liveness, PersistedEvent, Policy, StartAt, StreamFilter, WorkerSupervision,
+    Dispatch, Liveness, ObservedEvent, Policy, PolicySettings, StartAt, WorkerSupervision,
 };
 
 /// The reaction every policy in this file shares: echo a ping into its own
 /// `-echo` stream, so a worker that is working is visible as an event.
-fn echo(event: &PersistedEvent<ProbeEvent>) -> Vec<Dispatch> {
+fn echo(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
     match &event.data {
         ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
             ProbeUrn::new(format!("{tag}-echo")).unwrap(),
@@ -45,7 +45,11 @@ fn echo(event: &PersistedEvent<ProbeEvent>) -> Vec<Dispatch> {
 #[tokio::test]
 async fn one_replica_leads_and_the_other_stands_by_postgres_test() {
     let harness = PolicyDaemonHarness::start("liveness", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo,
+        )
     })
     .await;
 
@@ -114,8 +118,7 @@ async fn one_replica_leads_and_the_other_stands_by_postgres_test() {
 #[tokio::test]
 async fn a_dying_worker_reports_restarting_and_then_stopped_postgres_test() {
     let deaths = Arc::new(AtomicUsize::new(0));
-    // More deaths than the budget allows, so the budget is what stops it.
-    let staged = Arc::new(AtomicUsize::new(usize::MAX));
+    let staged = Arc::new(AtomicUsize::new(0));
 
     let harness = {
         let deaths = Arc::clone(&deaths);
@@ -131,14 +134,21 @@ async fn a_dying_worker_reports_restarting_and_then_stopped_postgres_test() {
                         .initial_backoff(Duration::from_millis(500))
                         .max_backoff(Duration::from_millis(500)),
                 )
-                .register_policy(DiesOutsideTheReaction {
-                    name: policy.to_string(),
-                    deaths_to_stage: Arc::clone(&staged),
-                    deaths: Arc::clone(&deaths),
-                })
+                .register_policy(
+                    DiesOutsideTheReaction {
+                        name: policy.to_string(),
+                        deaths_to_stage: Arc::clone(&staged),
+                        deaths: Arc::clone(&deaths),
+                    },
+                    PolicySettings::new().starting_at(StartAt::Beginning),
+                )
         })
         .await
     };
+
+    // More deaths than the budget allows, so the budget is what stops it. Armed now the
+    // daemon is up, so the deaths counted are the worker's.
+    staged.store(usize::MAX, Ordering::SeqCst);
 
     harness
         .await_liveness(harness.policy_name(), Liveness::Restarting)
@@ -168,7 +178,11 @@ async fn a_dying_worker_reports_restarting_and_then_stopped_postgres_test() {
 #[tokio::test]
 async fn the_leader_beats_on_the_cursor_row_postgres_test() {
     let harness = PolicyDaemonHarness::start("heartbeat", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo,
+        )
     })
     .await;
 
@@ -200,17 +214,21 @@ async fn the_leader_beats_on_the_cursor_row_postgres_test() {
 #[tokio::test]
 async fn the_beat_keeps_arriving_while_a_reaction_hangs_postgres_test() {
     let harness = PolicyDaemonHarness::start("hanging", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, |event| {
-            match &event.data {
-                // Longer than this test needs: the reaction is still running when
-                // every assertion below is made.
-                ProbeEvent::Pinged { .. } => vec![Dispatch::to::<Probe>(
-                    ProbeUrn::new("sleeper").unwrap(),
-                    ProbeCommand::Sleep { millis: 60_000 },
-                )],
-                _ => vec![],
-            }
-        })
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            |event| {
+                match &event.data {
+                    // Longer than this test needs: the reaction is still running when
+                    // every assertion below is made.
+                    ProbeEvent::Pinged { .. } => vec![Dispatch::to::<Probe>(
+                        ProbeUrn::new("sleeper").unwrap(),
+                        ProbeCommand::Sleep { millis: 60_000 },
+                    )],
+                    _ => vec![],
+                }
+            },
+        )
     })
     .await;
 
@@ -266,7 +284,7 @@ async fn the_beat_keeps_arriving_while_a_reaction_hangs_postgres_test() {
 #[tokio::test]
 async fn a_stopped_leader_keeps_beating_and_says_it_is_stopped_postgres_test() {
     let deaths = Arc::new(AtomicUsize::new(0));
-    let staged = Arc::new(AtomicUsize::new(usize::MAX));
+    let staged = Arc::new(AtomicUsize::new(0));
 
     let harness = {
         let deaths = Arc::clone(&deaths);
@@ -279,14 +297,19 @@ async fn a_stopped_leader_keeps_beating_and_says_it_is_stopped_postgres_test() {
                         .initial_backoff(Duration::from_millis(20))
                         .max_backoff(Duration::from_millis(20)),
                 )
-                .register_policy(DiesOutsideTheReaction {
-                    name: policy.to_string(),
-                    deaths_to_stage: Arc::clone(&staged),
-                    deaths: Arc::clone(&deaths),
-                })
+                .register_policy(
+                    DiesOutsideTheReaction {
+                        name: policy.to_string(),
+                        deaths_to_stage: Arc::clone(&staged),
+                        deaths: Arc::clone(&deaths),
+                    },
+                    PolicySettings::new().starting_at(StartAt::Beginning),
+                )
         })
         .await
     };
+
+    staged.store(usize::MAX, Ordering::SeqCst);
 
     let stopped = harness
         .await_heartbeat("a beat reporting the worker stopped", |beat| {
@@ -308,7 +331,11 @@ async fn a_stopped_leader_keeps_beating_and_says_it_is_stopped_postgres_test() {
 #[tokio::test]
 async fn a_standby_replica_does_not_write_the_beat_postgres_test() {
     let harness = PolicyDaemonHarness::start("standby_beat", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo,
+        )
     })
     .await;
 
@@ -352,7 +379,11 @@ async fn a_standby_replica_does_not_write_the_beat_postgres_test() {
 #[tokio::test]
 async fn a_schema_without_the_heartbeat_columns_changes_nothing_postgres_test() {
     let mut harness = PolicyDaemonHarness::start("no_heartbeat", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo,
+        )
     })
     .await;
 
@@ -400,8 +431,16 @@ async fn a_schema_without_the_heartbeat_columns_changes_nothing_postgres_test() 
 async fn a_row_somebody_else_holds_costs_only_that_policy_a_beat_postgres_test() {
     let harness = PolicyDaemonHarness::start("contended", |builder, policy| {
         builder
-            .register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
-            .register_policy_fn::<ProbeEvent, _>(neighbour_of(policy), StartAt::Beginning, echo)
+            .register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                echo,
+            )
+            .register_policy_fn::<ProbeEvent, _>(
+                neighbour_of(policy),
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                echo,
+            )
     })
     .await;
     let neighbour = neighbour_of(harness.policy_name());
@@ -457,7 +496,11 @@ async fn a_new_leader_reports_no_poll_until_it_makes_one_postgres_test() {
         // Slow enough that a beat lands between taking leadership and finishing
         // the first poll, which is the window under test.
         builder
-            .register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo)
+            .register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                echo,
+            )
             .without_notifications()
     })
     .await;
@@ -496,8 +539,13 @@ fn neighbour_of(policy: &str) -> String {
 }
 
 /// A policy whose worker dies from *outside* the reaction — a panic as it
-/// prepares its read of the feed, the shape of a panic in cursor I/O or the feed
-/// read. The reaction itself is ordinary.
+/// prepares its drain, the shape of a panic in cursor I/O or the feed read. The
+/// reaction itself is ordinary.
+///
+/// `name` is the seam: the worker reads it on every drain, before any event is
+/// delivered. The test arms the fault only once the daemon is up, since `name` is
+/// read once more while the daemon wires its workers together, and a death there
+/// would be a daemon that never started.
 struct DiesOutsideTheReaction {
     name: String,
     /// How many more times the worker should die.
@@ -510,14 +558,6 @@ impl Policy for DiesOutsideTheReaction {
     type Event = ProbeEvent;
 
     fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn start_at(&self) -> StartAt {
-        StartAt::Beginning
-    }
-
-    fn stream_filter(&self) -> StreamFilter {
         let staged = self
             .deaths_to_stage
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -530,10 +570,10 @@ impl Policy for DiesOutsideTheReaction {
             panic!("the worker died preparing its read of the feed");
         }
 
-        StreamFilter::all()
+        &self.name
     }
 
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
         echo(event)
     }
 }

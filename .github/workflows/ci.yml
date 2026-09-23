@@ -28,6 +28,24 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  wasm:
+    name: core builds for wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `es-replay` is the crate consumers put in a browser, and it is the one that
+      # gains dependencies as core vocabulary moves into it (chrono, for
+      # `ObservedEvent::created`). Nothing else in the workspace targets wasm.
+      - name: cargo build --target wasm32-unknown-unknown
+        run: cargo build -p es-replay --target wasm32-unknown-unknown
+
   test:
     name: test + allocation budgets
     runs-on: ubuntu-latest

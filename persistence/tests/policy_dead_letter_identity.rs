@@ -18,8 +18,8 @@ use common::policy_harness::{
     DeadLetter, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
 };
 use replay_persistence::{
-    DeadLetterDiscard, DeadLetterRetry, Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder,
-    StartAt, PANIC_ERROR_KIND, TIMEOUT_ERROR_KIND,
+    DeadLetterDiscard, DeadLetterRetry, Dispatch, ObservedEvent, Policy, PolicyRunnerBuilder,
+    PolicySettings, StartAt, PANIC_ERROR_KIND, TIMEOUT_ERROR_KIND,
 };
 
 /// Tag whose reaction dispatches a command the aggregate refuses permanently.
@@ -80,15 +80,7 @@ impl Policy for FailingPolicy {
         &self.name
     }
 
-    fn start_at(&self) -> StartAt {
-        StartAt::Beginning
-    }
-
-    fn dispatch_timeout(&self) -> Option<Duration> {
-        Some(TIGHT_TIMEOUT)
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
         let ProbeEvent::Pinged { tag } = &event.data else {
             return vec![];
         };
@@ -133,10 +125,15 @@ fn failing_policy(
     reactions: Arc<AtomicUsize>,
 ) -> impl Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static {
     move |builder, policy| {
-        builder.register_policy(FailingPolicy {
-            name: policy.to_string(),
-            reactions: Arc::clone(&reactions),
-        })
+        builder.register_policy(
+            FailingPolicy {
+                name: policy.to_string(),
+                reactions: Arc::clone(&reactions),
+            },
+            PolicySettings::new()
+                .starting_at(StartAt::Beginning)
+                .with_dispatch_timeout(TIGHT_TIMEOUT),
+        )
     }
 }
 

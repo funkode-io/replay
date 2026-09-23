@@ -78,6 +78,9 @@ target; run it when the release touches `es/` or `macros/`.
 
 ## Release notes
 
+A release whose migration is non-trivial carries a draft in `docs/releases/<version>.md`,
+written by the PR that breaks the API; the published page is assembled from it.
+
 Match the house style of the previous release page (`gh release view v<prev> --repo
 funkode-io/replay`): Highlights, Breaking changes, New API, Migration, Changes since
 `<prev>`, and a `**Full diff:**` compare link. Sample code uses this repo's own example

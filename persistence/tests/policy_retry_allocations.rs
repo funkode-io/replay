@@ -19,7 +19,7 @@ use common::postgres_image::{postgres_container, POSTGRES_PORT};
 use common::report::report;
 
 use replay_persistence::{
-    Cqrs, Dispatch, PersistedEvent, PolicyRunner, PostgresEventStore, StartAt,
+    Cqrs, Dispatch, ObservedEvent, PolicyRunner, PolicySettings, PostgresEventStore, StartAt,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
@@ -52,11 +52,7 @@ impl replay_persistence::Policy for QuietPolicy {
         &self.name
     }
 
-    fn start_at(&self) -> StartAt {
-        StartAt::Beginning
-    }
-
-    fn react(&self, _event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+    fn react(&self, _event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
         vec![]
     }
 }
@@ -93,9 +89,12 @@ async fn peak_live_bytes_scale_with_the_page_not_the_reaction_postgres_test() {
 
     let runner = PolicyRunner::builder(cqrs)
         .register_services::<Probe>(())
-        .register_policy(QuietPolicy {
-            name: policy_name.to_string(),
-        })
+        .register_policy(
+            QuietPolicy {
+                name: policy_name.to_string(),
+            },
+            PolicySettings::new().starting_at(StartAt::Beginning),
+        )
         .build();
 
     reset_peak();

@@ -28,7 +28,7 @@ serde_json = { workspace = true }
 urn = { workspace = true }
 uuid = { workspace = true }
 
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 
 thiserror = { workspace = true }
 anyhow = { workspace = true }

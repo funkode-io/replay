@@ -195,32 +195,33 @@ impl Compactable for BankAccount {
     }
 }
 
-// ── Policy idempotency recipe (causation guard) ─────────────────────────────
+// ── Policy idempotency recipe (idempotent command shape) ────────────────────
 
 // This aggregate is a copy-pasteable recipe for policy targets under
 // at-least-once delivery:
-// - command carries `causation_event_id` from the triggering event
-// - state tracks applied causation ids
-// - duplicate causation id => no-op (returns no events)
+// - the command carries a `charge_key` the reacting rule derives from what it
+//   observes — a policy is not given the triggering event's identity (ADR-0027)
+// - state tracks the keys already applied
+// - a repeated key => no-op (returns no events)
 define_aggregate! {
     PolicyFeeLedger {
         namespace: "policy-fee-ledger",
         state: {
             balance: f64,
-            applied_causation_ids: HashSet<uuid::Uuid>,
+            applied_charge_keys: HashSet<String>,
         },
         commands: {
             Credit { amount: f64 },
             ChargeFee {
                 amount: f64,
-                causation_event_id: uuid::Uuid,
+                charge_key: String,
             },
         },
         events: {
             Credited { amount: f64 },
             FeeCharged {
                 amount: f64,
-                causation_event_id: uuid::Uuid,
+                charge_key: String,
             },
         }
     }
@@ -236,11 +237,8 @@ impl EventStream for PolicyFeeLedger {
     fn apply(&mut self, event: Self::Event) {
         match event {
             PolicyFeeLedgerEvent::Credited { amount } => self.balance += amount,
-            PolicyFeeLedgerEvent::FeeCharged {
-                amount,
-                causation_event_id,
-            } => {
-                self.applied_causation_ids.insert(causation_event_id);
+            PolicyFeeLedgerEvent::FeeCharged { amount, charge_key } => {
+                self.applied_charge_keys.insert(charge_key);
                 self.balance -= amount;
             }
         }
@@ -261,19 +259,15 @@ impl Aggregate for PolicyFeeLedger {
             PolicyFeeLedgerCommand::Credit { amount } => {
                 Ok(vec![PolicyFeeLedgerEvent::Credited { amount }])
             }
-            PolicyFeeLedgerCommand::ChargeFee {
-                amount,
-                causation_event_id,
-            } => {
-                if self.applied_causation_ids.contains(&causation_event_id) {
-                    // Duplicate delivery for the same causation identity:
-                    // absorb as no-op.
+            PolicyFeeLedgerCommand::ChargeFee { amount, charge_key } => {
+                if self.applied_charge_keys.contains(&charge_key) {
+                    // A charge already applied under this key: absorb as no-op.
                     return Ok(Vec::new());
                 }
 
                 Ok(vec![PolicyFeeLedgerEvent::FeeCharged {
                     amount,
-                    causation_event_id,
+                    charge_key,
                 }])
             }
         }
@@ -300,14 +294,14 @@ pub const DEPOSIT_FEE_LEDGER_ID: &str = "global-fees";
 /// Pure reaction for the deposit-fee policy.
 ///
 /// Reacts to every [`BankAccountEvent::Deposited`] by charging a 1 % fee to
-/// the shared [`PolicyFeeLedger`].  The `causation_event_id` field in the
-/// command carries the triggering event's identity so the ledger can absorb
-/// duplicate deliveries as no-ops.
+/// the shared [`PolicyFeeLedger`].  The `charge_key` names the deposit being
+/// charged for, out of what the rule observes, so the ledger absorbs a duplicate
+/// delivery as a no-op.
 ///
 /// Exported so the integration test can pass it directly to
 /// [`PolicyRunnerBuilder::register_policy_fn`] and keep the logic in one place.
 pub fn deposit_fee_react(
-    event: &replay_persistence::PersistedEvent<BankAccountEvent>,
+    event: &replay_persistence::ObservedEvent<BankAccountEvent>,
 ) -> Vec<replay_persistence::Dispatch> {
     match &event.data {
         BankAccountEvent::Deposited { amount } => {
@@ -316,7 +310,11 @@ pub fn deposit_fee_react(
                 ledger,
                 PolicyFeeLedgerCommand::ChargeFee {
                     amount: amount * DEPOSIT_FEE_RATE,
-                    causation_event_id: event.id,
+                    charge_key: format!(
+                        "{}@{}#{amount}",
+                        event.stream_id,
+                        event.created.to_rfc3339()
+                    ),
                 },
             )]
         }
@@ -383,22 +381,23 @@ impl Query for GlobalPositionQuery {
     }
 
     fn update(&mut self, event: PersistedEvent<Self::Event>) {
-        match event.data {
+        let stream_id = event.stream_id.clone();
+        match event.into_data() {
             GlobalPositionEvent::UserEvent(UserEvent::Registered { name }) => {
                 self.position.name = name;
             }
             GlobalPositionEvent::BankAccountEvent(BankAccountEvent::AccountOpened { owner }) => {
                 if owner == self.user {
-                    self.owned_accounts.insert(event.stream_id);
+                    self.owned_accounts.insert(stream_id);
                 }
             }
             GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Deposited { amount }) => {
-                if self.owned_accounts.contains(&event.stream_id) {
+                if self.owned_accounts.contains(&stream_id) {
                     self.position.total_balance += amount;
                 }
             }
             GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Withdrawn { amount }) => {
-                if self.owned_accounts.contains(&event.stream_id) {
+                if self.owned_accounts.contains(&stream_id) {
                     self.position.total_balance -= amount;
                 }
             }

@@ -1316,7 +1316,9 @@ use replay_persistence::prelude::*;
 | `PostgresEventStore` | PostgreSQL backend |
 | `InlineProjection` | Trait for inline read-model projections |
 | `PostgresInlineProjection` | Postgres-specific inline projection marker trait |
-| `PersistedEvent` | Wrapper holding an event with its metadata |
+| `ObservedEvent` | What a `Policy` reads: payload, stream, metadata, timestamp |
+| `PersistedEvent` | An `ObservedEvent` plus the identity and position the store gave it |
+| `PolicySettings` | How the runner drives one `Policy`, given at registration |
 | `Query` | Trait for read-model projections |
 | `StreamFilter` | Filter builder for event queries |
 | `AggregateVersion` | Current / archived snapshot version discriminant |
@@ -2057,18 +2059,23 @@ executes against aggregates. No read model is derived; side effects happen throu
 the aggregate write path so causation, idempotency, and optimistic locking are all
 inherited for free.
 
-The `Policy` trait lives in `es-replay-persistence`. The implementor stays pure —
-`react` takes an event and returns commands with no I/O — while the
-[`PolicyRunner`] handles reading each stream, stamping causation metadata, persisting
-cursors, and executing the [`Dispatch`]es.
+The `Policy` trait lives in **`es-replay`**, the core crate: a rule is domain
+vocabulary, so declaring one needs neither `Cqrs` nor a store
+([ADR-0027](docs/adr/0027-the-policy-rule-is-core-vocabulary.md)). It is re-exported
+from `es-replay-persistence` along with [`Dispatch`] and `ObservedEvent`, so the
+runner's own imports stay in one place. The implementor stays pure — `react` takes an
+[`ObservedEvent`] and returns commands with no I/O — while the [`PolicyRunner`] handles
+reading each stream, stamping causation metadata, persisting cursors, and executing the
+[`Dispatch`]es.
 
 ### Implementing `Policy`
 
-The minimal implementation requires only `name` and `react`. All other methods
-have sensible defaults.
+The trait is the rule and nothing else: `name` and `react`. How the runner drives it —
+where it starts, what feed it reads, how it batches, how long a dispatch may run — is a
+[`PolicySettings`] value given at registration.
 
 ```rust,ignore
-use replay_persistence::{Dispatch, PersistedEvent, Policy, StartAt, StreamFilter};
+use replay::{Dispatch, ObservedEvent, Policy};
 
 struct FeePolicy {
     ledger_id: FeeLedgerUrn,
@@ -2081,15 +2088,7 @@ impl Policy for FeePolicy {
         "deposit_fee"
     }
 
-    fn start_at(&self) -> StartAt {
-        StartAt::Beginning // process all history on first run
-    }
-
-    fn stream_filter(&self) -> StreamFilter {
-        StreamFilter::for_stream_type::<BankAccount>()
-    }
-
-    fn react(&self, event: &PersistedEvent<BankAccountEvent>) -> Vec<Dispatch> {
+    fn react(&self, event: &ObservedEvent<BankAccountEvent>) -> Vec<Dispatch> {
         match &event.data {
             BankAccountEvent::Deposited { amount } => vec![
                 Dispatch::to::<FeeLedger>(
@@ -2102,6 +2101,15 @@ impl Policy for FeePolicy {
     }
 }
 ```
+
+An `ObservedEvent` carries the four fields a rule may read — `data`, `stream_id`,
+`metadata` and `created`. The store's identity and position (`id`, `type`, `version`,
+`aggregate_version`) stay on `PersistedEvent`, which embeds the observed half and derefs
+to it, so a read path's `event.data` is unchanged.
+
+A rule is therefore not given the triggering event's id, and cannot mint a causation key
+into the command it emits: duplicate deliveries are absorbed by **idempotent command
+shape**, keyed on domain data the rule can see.
 
 `react` is pure — it returns [`Dispatch`]es with no I/O. The runner automatically
 stamps causation metadata onto every dispatched command before executing it:
@@ -2120,7 +2128,7 @@ stamps causation metadata onto every dispatched command before executing it:
 
 This metadata travels with the resulting events, enabling:
 
-- **Idempotency** — target aggregates can key duplicate detection on `causation.event_id` rather than command-value equality.
+- **Idempotency** — `causation.event_id` identifies the triggering event for an operator reading the resulting events. It is not offered to the target aggregate: `Aggregate::handle` receives no metadata, so a duplicate delivery is absorbed by the command's own shape.
 - **Loop prevention** — the `depth` counter is incremented at each hop; the runner skips reactions once it reaches the configured limit (see [Loop prevention](#loop-prevention)).
 - **Observability** — every policy-driven event is traceable back to the original triggering event by `causation.event_id`.
 
@@ -2136,14 +2144,16 @@ Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount })
 For simple, single-aggregate reactions you can skip the struct and `impl Policy`
 entirely with `register_policy_fn`. The closure runs through the exact same runner
 machinery — causation stamping, failure handling, batching, advisory lock — as a
-full `Policy` impl.
+full `Policy` impl, and takes the same [`PolicySettings`].
 
 ```rust,ignore
 let runner = PolicyRunner::builder(cqrs)
     .register_services::<FeeLedger>(fee_services)
     .register_policy_fn::<BankAccountEvent, _>(
         "deposit_fee",
-        StartAt::Beginning,
+        PolicySettings::new()
+            .starting_at(StartAt::Beginning)
+            .with_stream_filter(StreamFilter::for_stream_type::<BankAccount>()),
         |event| match &event.data {
             BankAccountEvent::Deposited { amount } => vec![
                 Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount: amount * 0.01 })
@@ -2161,12 +2171,17 @@ let runner = PolicyRunner::builder(cqrs)
 
 ```rust,ignore
 use std::time::Duration;
-use replay_persistence::{PolicyRunner, StartAt};
+use replay_persistence::{PolicyRunner, PolicySettings, StartAt, StreamFilter};
 
 let runner = PolicyRunner::builder(cqrs)
     .register_services::<BankAccount>(())          // enable Dispatch::to::<BankAccount>
     .register_services::<FeeLedger>(fee_services)
-    .register_policy(FeePolicy { ledger_id })
+    .register_policy(
+        FeePolicy { ledger_id },
+        PolicySettings::new()
+            .starting_at(StartAt::Beginning)       // process all history on first run
+            .with_stream_filter(StreamFilter::for_stream_type::<BankAccount>()),
+    )
     .build();
 
 let daemon = runner.start_polling(Duration::from_secs(30));
@@ -2213,7 +2228,7 @@ go to the front of the next poll's queue, and a stream it could not finish goes 
 back, so a stream written to faster than it can be read never holds up the rest.
 
 Each policy has a **stable name** that keys both tables. On first registration it is
-bootstrapped according to `start_at()`:
+bootstrapped according to the registration's `starting_at`:
 
 | `StartAt` | Behaviour |
 |-----------|-----------|
@@ -2223,8 +2238,8 @@ bootstrapped according to `start_at()`:
 Places are written to Postgres **at least every `checkpoint_batch_size` events** and
 unconditionally at the end of every drain pass. A crash after a command is executed but
 before the place is saved will re-deliver the triggering event. Correctness therefore
-depends on **idempotent command handling** keyed by causation identity in the target
-aggregate.
+depends on **idempotent command handling** in the target aggregate, keyed on domain data
+the reacting rule can see.
 
 ### Moving a policy on a running system
 
@@ -2289,7 +2304,7 @@ task falls back silently to pure polling. You can also opt-out explicitly:
 
 ```rust,ignore
 let runner = PolicyRunner::builder(cqrs)
-    .register_policy(my_policy)
+    .register_policy(my_policy, PolicySettings::new())
     .without_notifications() // pure polling; no PgListener connection opened
     .build();
 ```
@@ -2316,7 +2331,7 @@ Resolution order (most-specific wins):
 
 | Source | How to set |
 |--------|------------|
-| Per-policy override | `fn max_causation_depth(&self) -> Option<u32> { Some(5) }` |
+| Per-policy setting | `PolicySettings::new().with_max_causation_depth(5)` |
 | Environment variable | `REPLAY_MAX_CAUSATION_DEPTH=5` |
 | Built-in default | `10` |
 
@@ -2324,10 +2339,10 @@ Resolution order (most-specific wins):
 
 Two batch sizes control throughput vs checkpoint frequency:
 
-| Setting | `Policy` override | Env var | Default |
-|---------|-------------------|---------|---------|
-| Events read per drain | `read_batch_size() -> Option<u32>` | `REPLAY_READ_BATCH_SIZE` | `100` |
-| Events between cursor saves | `checkpoint_batch_size() -> Option<u32>` | `REPLAY_CHECKPOINT_BATCH_SIZE` | `100` |
+| Setting | `PolicySettings` | Env var | Default |
+|---------|------------------|---------|---------|
+| Events read per drain | `with_read_batch_size(u32)` | `REPLAY_READ_BATCH_SIZE` | `100` |
+| Events between cursor saves | `with_checkpoint_batch_size(u32)` | `REPLAY_CHECKPOINT_BATCH_SIZE` | `100` |
 
 The runner enforces `read_batch_size ≥ checkpoint_batch_size`.
 
@@ -2342,9 +2357,9 @@ raise `read_batch_size` if that latency matters.
 Every dispatch is awaited for a bounded time, so a command that never returns
 cannot hold a worker for the life of the process:
 
-| Setting | `Policy` override | Env var | Default |
-|---------|-------------------|---------|---------|
-| Time one dispatch may run | `dispatch_timeout() -> Option<Duration>` | `REPLAY_DISPATCH_TIMEOUT_MS` | `30s` |
+| Setting | `PolicySettings` | Env var | Default |
+|---------|------------------|---------|---------|
+| Time one dispatch may run | `with_dispatch_timeout(Duration)` | `REPLAY_DISPATCH_TIMEOUT_MS` | `30s` |
 
 Exceeding it is a **retryable** failure: the dispatch is abandoned, retried under
 the same back-off as an `Unavailable` error, and parked with
@@ -2438,7 +2453,7 @@ use std::time::Duration;
 use replay_persistence::{PolicyRunner, WorkerSupervision};
 
 let runner = PolicyRunner::builder(cqrs)
-    .register_policy(my_policy)
+    .register_policy(my_policy, PolicySettings::new())
     .with_worker_supervision(
         WorkerSupervision::default()   // 5 restarts a minute, 100 ms → 30 s
             .max_restarts(10)          // 0 disables restarting entirely
@@ -2464,7 +2479,7 @@ naming the Policy and why it is down. The default hook **exits the process**
 use replay_persistence::{EscalationReason, PolicyRunner};
 
 let runner = PolicyRunner::builder(cqrs)
-    .register_policy(my_policy)
+    .register_policy(my_policy, PolicySettings::new())
     .on_escalation(|escalation| {
         // `escalation.policy` is down; `escalation.reason` says whether it spent
         // its restart budget or lost the lock manager that elects it.
@@ -2869,7 +2884,7 @@ keeps time while a worker is held inside a reaction.
 
 ```rust,ignore
 let runner = PolicyRunner::builder(cqrs)
-    .register_policy(my_policy)
+    .register_policy(my_policy, PolicySettings::new())
     .with_heartbeat(Duration::from_secs(5))  // default: HEARTBEAT_CADENCE
     .replica_id(std::env::var("POD_NAME")?)  // default: HOSTNAME; `led_by` in the row
     .build();
