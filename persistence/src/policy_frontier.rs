@@ -710,6 +710,41 @@ mod liveness_simulation {
         read_this_cadence: bool,
     }
 
+    /// The states the schedules actually reached, counted as they run.
+    ///
+    /// Knobs on the generated configuration are not these states and cannot stand in for
+    /// them: every stream being quiet does not mean a poll ever had no candidates, because
+    /// the carried queue can keep one supplied for ever. What the property is worth
+    /// depends on the states it was decided over, so they are observed rather than
+    /// assumed.
+    #[derive(Default)]
+    struct Coverage {
+        /// Polls with no candidates at all — the state a finished pass ends on, and the
+        /// only one that wraps the rotation.
+        empty_polls: u32,
+        /// Wraps taken on one of those polls: the rotation was past the last stream id
+        /// and nothing was read.
+        wraps_on_an_empty_poll: u32,
+        /// Polls whose event budget ran out before their candidate list did, which is
+        /// where a slot stops meaning a read.
+        budgets_spent_early: u32,
+        /// Reconciliations whose page was filled to the batch, so more streams were
+        /// behind than one page holds.
+        pages_at_the_batch: u32,
+        /// Polls no reconciliation ran on, which only exist when a cadence spans several.
+        polls_between_cadences: u32,
+    }
+
+    impl Coverage {
+        fn add(&mut self, other: &Coverage) {
+            self.empty_polls += other.empty_polls;
+            self.wraps_on_an_empty_poll += other.wraps_on_an_empty_poll;
+            self.budgets_spent_early += other.budgets_spent_early;
+            self.pages_at_the_batch += other.pages_at_the_batch;
+            self.polls_between_cadences += other.polls_between_cadences;
+        }
+    }
+
     /// A schedule: the knobs a seed decides, and the state the polls run against.
     struct Schedule {
         seed: u64,
@@ -728,6 +763,7 @@ mod liveness_simulation {
         /// One line per poll, printed when the bound is missed. Bounded by the run, which
         /// is `CADENCES * polls_per_cadence` long.
         transcript: Vec<String>,
+        seen: Coverage,
     }
 
     impl Schedule {
@@ -757,6 +793,7 @@ mod liveness_simulation {
                 carried: Vec::new(),
                 share_from: 0,
                 transcript: Vec::new(),
+                seen: Coverage::default(),
             };
 
             // A Policy whose work is *only* what the sweep passed. Every other source is
@@ -849,6 +886,7 @@ mod liveness_simulation {
                 Vec::new()
             };
             let page = examined.join(",");
+            let page_len = examined.len();
 
             let mut plan = PollPlan::plan(Nominations {
                 carried: carried.clone(),
@@ -859,6 +897,18 @@ mod liveness_simulation {
                 share_from: self.share_from,
             });
             self.share_from += 1;
+
+            let candidates = plan.streams().len();
+            if candidates == 0 {
+                self.seen.empty_polls += 1;
+            }
+            if reconciling {
+                if page_len == self.read_batch as usize {
+                    self.seen.pages_at_the_batch += 1;
+                }
+            } else {
+                self.seen.polls_between_cadences += 1;
+            }
 
             let mut read: Vec<String> = Vec::new();
             while let Some(turn) = plan.turn() {
@@ -872,11 +922,18 @@ mod liveness_simulation {
                 plan.read(events as u32);
             }
 
+            if read.len() < candidates {
+                self.seen.budgets_spent_early += 1;
+            }
+
             let was = self.rotation.clone();
             let settled = plan.settle();
             self.carried = settled.carried.clone();
             if settled.reconciled {
                 if let Some(through) = settled.rotation {
+                    if through.is_empty() && !was.is_empty() && read.is_empty() {
+                        self.seen.wraps_on_an_empty_poll += 1;
+                    }
                     self.rotation = through;
                 }
             }
@@ -972,7 +1029,8 @@ mod liveness_simulation {
             ))
         }
 
-        fn run(mut self) -> Result<(), String> {
+        /// Run the schedule, and hand back what it reached on the way.
+        fn run(mut self) -> Result<Coverage, String> {
             let mut rng = Lcg(self.seed ^ 0x5eed);
 
             for _ in 0..CADENCES {
@@ -983,7 +1041,7 @@ mod liveness_simulation {
                 self.account()?;
             }
 
-            Ok(())
+            Ok(self.seen)
         }
     }
 
@@ -999,63 +1057,50 @@ mod liveness_simulation {
         }
     }
 
-    /// The schedules are worth what they exercise, so this fails if they stop exercising
-    /// it. Each of these is a state one of the five defects needed to show itself, and a
-    /// seed range that no longer reaches it would leave the property passing over states
-    /// nobody meant to drop.
+    /// The schedules are worth the states they reach, so this fails if they stop reaching
+    /// them. Each of these is a state one of the five defects needed to show itself; a
+    /// seed range or a scheduler change that no longer produces it would leave the
+    /// property passing over a world nobody meant to narrow.
+    ///
+    /// Counted as the schedules run rather than read off the knobs they were generated
+    /// from: "every stream is quiet" is not "a poll had no candidates", because the
+    /// carried queue outlives the sweep that filled it.
     #[test]
     fn the_schedules_reach_the_states_the_property_is_about() {
-        let schedules: Vec<Schedule> = (1..=64).map(Schedule::from_seed).collect();
+        let mut seen = Coverage::default();
+        for seed in 1..=64 {
+            let reached = Schedule::from_seed(seed)
+                .run()
+                .expect("the property holds; this test is about what it was decided over");
+            seen.add(&reached);
+        }
 
-        let saturated = schedules
-            .iter()
-            .filter(|schedule| {
-                schedule
-                    .streams
-                    .iter()
-                    .any(|stream| stream.busy && stream.burst >= u64::from(schedule.read_batch))
-                    && schedule.streams.iter().any(|stream| stream.quiet)
-            })
-            .count();
         assert!(
-            saturated >= 16,
-            "only {saturated} of 64 seeds put a quiet stream behind one that can spend \
-             the whole budget on its own"
+            seen.empty_polls > 0,
+            "no poll in any schedule had an empty candidate list, which is the state a \
+             finished pass ends on"
         );
-
         assert!(
-            schedules
-                .iter()
-                .any(|schedule| schedule.streams.iter().all(|stream| stream.quiet)),
-            "no seed leaves every source but the reconciliation empty, which is the only \
-             way a poll has no candidates at all — and the only state that wraps the \
-             rotation"
+            seen.wraps_on_an_empty_poll > 0,
+            "no schedule wrapped the rotation on a poll that read nothing: the rotation \
+             reached the last stream id and every source was empty, which is the one \
+             state the poll's early return used to step over"
         );
-
         assert!(
-            schedules
-                .iter()
-                .any(|schedule| !schedule.rotation.is_empty()),
-            "no seed starts with the rotation past the last stream id, which is where \
-             every finished pass leaves it"
+            seen.budgets_spent_early > 0,
+            "no poll ran out of event budget before its candidate list ran out, so the \
+             rotation was never asked to tell a slot from a read"
         );
-
         assert!(
-            schedules
-                .iter()
-                .any(|schedule| schedule.polls_per_cadence > 1),
-            "no seed runs a cadence over several polls, so the phase a rotating turn \
-             could sample the same way for ever is never reached"
+            seen.pages_at_the_batch > 0,
+            "no reconciliation filled its page, so a Policy behind on more streams than \
+             one page holds was never simulated"
         );
-
         assert!(
-            schedules.iter().any(|schedule| schedule
-                .streams
-                .iter()
-                .filter(|stream| stream.head > stream.place)
-                .count()
-                > schedule.read_batch as usize),
-            "no seed starts behind on more streams than one page holds"
+            seen.polls_between_cadences > 0,
+            "every poll ran a reconciliation, so a cadence spanning several polls \
+             — the phase a rotating turn could sample the same way for ever — was never \
+             reached"
         );
     }
 }
