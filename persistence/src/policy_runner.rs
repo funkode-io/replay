@@ -3065,22 +3065,26 @@ async fn drain_policy_once(
     });
     progress.share_from += 1;
 
-    // The sweep has read this stretch of log whatever the streams in it turn out to owe,
-    // and a stream left unfinished is remembered rather than re-swept for.
-    if discovered.swept_through > progress.swept_through {
-        progress.swept_through = discovered.swept_through;
-        write_sweep(pool, &name, progress.swept_through).await?;
-    }
+    // Everything from here to the settle is I/O against what the plan decided, and every
+    // way out of it — including a failed statement — goes through the settle below.
+    let drained: Result<usize, replay::Error> = async {
+        // The sweep has read this stretch of log whatever the streams in it turn out to
+        // owe, and a stream left unfinished is remembered rather than re-swept for.
+        if discovered.swept_through > progress.swept_through {
+            progress.swept_through = discovered.swept_through;
+            write_sweep(pool, &name, progress.swept_through).await?;
+        }
 
-    let executed = if plan.streams().is_empty() {
-        // Nothing was nominated, so the page was empty — a source with anything to offer
-        // always wins a slot. The poll is settled below all the same, which is what wraps
-        // the rotation: an empty page is the end of a pass, and a cursor that has reached
-        // the last stream id queries past the end for ever until something records that
-        // (funkode-io/replay#231 review).
-        reporting.tell(&name, Poll::Exhausted);
-        0
-    } else {
+        if plan.streams().is_empty() {
+            // Nothing was nominated, so the page was empty — a source with anything to
+            // offer always wins a slot. The poll is settled all the same, which is what
+            // wraps the rotation: an empty page is the end of a pass, and a cursor that
+            // has reached the last stream id queries past the end for ever until
+            // something records that (funkode-io/replay#231 review).
+            reporting.tell(&name, Poll::Exhausted);
+            return Ok(0);
+        }
+
         let places = places_of(pool, &name, plan.streams()).await?;
 
         // The window is work, before any of it is done: a first reaction that takes
@@ -3199,16 +3203,28 @@ async fn drain_policy_once(
         // Final checkpoint: flush any stream advanced since the last periodic save.
         checkpoint_places(pool, &name, &advanced, &observed).await?;
 
-        executed
-    };
+        Ok(executed)
+    }
+    .await;
 
     // What the poll decided, recorded: the queue the next one starts from, and — on the
-    // polls a reconciliation ran on — where its rotation got to. One call site, on every
-    // path, because the path this was missing from was the one that reads nothing, which
-    // is exactly the one a finished pass ends on (funkode-io/replay#231 review).
-    if progress.settled(plan.settle()) {
-        write_reconciled(pool, &name, &progress.reconciled_through).await?;
-    }
+    // polls a reconciliation ran on — where its rotation got to. One call site, taken on
+    // every path, because the path this was missing from was the one that reads nothing,
+    // which is exactly the one a finished pass ends on (funkode-io/replay#231 review).
+    //
+    // A poll that failed settles too. Nothing here claims more than the poll did — the
+    // rotation moved only through streams it read — and dropping the decision on the way
+    // out would lose the carried queue this poll took ownership of, sending the streams
+    // that were waiting for it back to whatever the sweep happens to nominate next.
+    let rotation = if progress.settled(plan.settle()) {
+        write_reconciled(pool, &name, &progress.reconciled_through).await
+    } else {
+        Ok(())
+    };
+
+    // The drain's own failure first: the rotation write is a consequence of what it did.
+    let executed = drained?;
+    rotation?;
 
     Ok(executed)
 }

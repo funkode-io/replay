@@ -97,8 +97,15 @@ pub(crate) struct PollPlan {
     /// How far down `streams` the budget reached. A stream past this was named by a source
     /// and never read, which is the difference the rotation turns on: a slot is not a read.
     visited: usize,
-    /// Streams this poll read a full budget's worth from, so they may have more.
+    /// Streams this poll read a full budget's worth from, so they may have more. One
+    /// entry per stream read, so the batch bounds it.
     unfinished: Vec<String>,
+    /// Whether [`Self::settle`] was called. A plan dropped without it is a poll that
+    /// stepped over its own decision — which is the shape of the last defect this design
+    /// is for, and the one the pure function cannot see on its own: the rotation was
+    /// recorded on the paths that read something and not on the path that read nothing,
+    /// which is the only one a finished pass ends on (funkode-io/replay#231 review).
+    settled: bool,
 }
 
 /// The next stream to read, and what is left to read it with.
@@ -160,6 +167,7 @@ impl PollPlan {
             budget: read_batch,
             visited: 0,
             unfinished: Vec::new(),
+            settled: false,
         }
     }
 
@@ -213,30 +221,52 @@ impl PollPlan {
     /// it would leave it for a full pass — or for ever, if the front of the page is always
     /// what the budget spends itself on. Contiguous from the front of the page, because
     /// the rotation is one id and cannot describe a hole in the middle.
-    pub(crate) fn settle(self) -> Settled {
+    ///
+    /// `&mut self` rather than `self` so that a plan that is never settled can be caught
+    /// when it is dropped, whatever path the caller took out of the poll.
+    pub(crate) fn settle(&mut self) -> Settled {
+        self.settled = true;
+
         let read: HashSet<&String> = self.streams[..self.visited].iter().collect();
         let read_through = self
             .page
             .iter()
             .take_while(|stream| read.contains(stream))
             .count();
+        let rotation = self
+            .reconciling
+            .then(|| rotation_after(&self.page, read_through, self.read_batch))
+            .flatten();
 
         // What the next poll starts from, oldest claim first: what this one could not fit,
         // then what it did not reach, then what it read and may not have finished. Capped,
         // because it is the one collection here that outlives a poll.
-        let mut carried = self.carried_over;
+        let mut carried = std::mem::take(&mut self.carried_over);
         carried.extend(self.streams[self.visited..].iter().cloned());
-        carried.extend(self.unfinished);
+        carried.extend(std::mem::take(&mut self.unfinished));
         carried.truncate(self.read_batch as usize);
 
         Settled {
             carried,
             reconciled: self.reconciling,
-            rotation: self
-                .reconciling
-                .then(|| rotation_after(&self.page, read_through, self.read_batch))
-                .flatten(),
+            rotation,
         }
+    }
+}
+
+/// A poll that ends without settling is a bug, and a silent one: its carried queue is
+/// lost and its rotation stays where the last pass left it. The assertion is what keeps
+/// "every path settles" a property of the code rather than of whoever last edited the
+/// call site — a `return` added above the settle fails every test that drains a Policy,
+/// which is the check the pure function cannot make for itself.
+impl Drop for PollPlan {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.settled,
+            "a poll's plan must be settled before it is dropped: {} candidates, {} read",
+            self.streams.len(),
+            self.visited
+        );
     }
 }
 
@@ -443,6 +473,43 @@ mod sharing_tests {
             [streams(&[]), streams(&[]), streams(&["behind-only"]),],
             "the source that got no slot keeps its candidate"
         );
+    }
+}
+
+/// The one thing the decision cannot decide for itself: that its caller asked it.
+///
+/// Compiled out of a release build with the `debug_assert` it tests, so it is asserted
+/// where it is checked (funkode-io/replay#243).
+#[cfg(all(test, debug_assertions))]
+mod settling_tests {
+    use super::{Nominations, PollPlan};
+
+    fn plan() -> PollPlan {
+        PollPlan::plan(Nominations {
+            carried: vec!["urn:probe:a".to_string()],
+            swept: Vec::new(),
+            examined: Vec::new(),
+            reconciling: true,
+            read_batch: 10,
+            share_from: 0,
+        })
+    }
+
+    #[test]
+    fn a_settled_plan_is_dropped_quietly() {
+        let mut plan = plan();
+        let settled = plan.settle();
+
+        assert_eq!(settled.carried, vec!["urn:probe:a".to_string()]);
+    }
+
+    /// A poll that returns without settling loses its carried queue and leaves the
+    /// rotation where the last pass left it, and says nothing. Every test that drains a
+    /// Policy fails on this rather than on the delivery it costs a cadence later.
+    #[test]
+    #[should_panic(expected = "must be settled")]
+    fn a_plan_dropped_without_settling_says_so() {
+        drop(plan());
     }
 }
 
