@@ -1,6 +1,6 @@
 # Every event read is ordered by `global_position`
 
-**Status:** accepted, narrowed by [ADR-0025](0025-a-policy-tracks-its-position-per-stream.md): a Policy's feed is no longer one of the reads this ADR governs. It reads one stream at a time, ordered by that stream's own sequence. Hydration, projections and every other read still order by `global_position`.
+**Status:** accepted, narrowed by [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md): a Policy's feed is no longer one of the reads this ADR governs. It reads one stream at a time, ordered by that stream's own sequence. Hydration, projections and every other read still order by `global_position`.
 
 **Amends** [ADR-0011](0011-inline-projections-flushed-in-bounded-chunks.md)'s keyset
 decision: the rebuild cursor's `(created, version, id)` key, and the index behind it.

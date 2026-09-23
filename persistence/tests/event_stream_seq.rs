@@ -371,8 +371,8 @@ async fn concurrent_appends_to_one_stream_leave_no_hole_postgres_test() {
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
     let ledger = LedgerUrn::new("contended").unwrap();
-    // Create the stream first: racing to create it is a different question (the primary
-    // key decides it), and not this one.
+    // Create the stream first: racing to create it is a different question — who wins the
+    // primary key — and is pinned in `stream_creation_race` (funkode-io/replay#232).
     append(&cqrs, &ledger, LedgerCommand::Add { amount: 1.0 }).await;
 
     let racers: Vec<_> = (0..RACERS)

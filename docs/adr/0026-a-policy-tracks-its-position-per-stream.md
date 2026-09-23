@@ -1,4 +1,4 @@
-# 25. A Policy tracks its position per stream
+# 26. A Policy tracks its position per stream
 
 Date: 2026-09-22
 

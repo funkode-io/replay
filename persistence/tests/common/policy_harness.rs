@@ -944,6 +944,63 @@ impl PolicyDaemonHarness {
         }
     }
 
+    /// Park `count` rows for commands this Policy's registered code cannot
+    /// dispatch, all for one reaction — the tail an upgrade inherits
+    /// (funkode-io/replay#228).
+    ///
+    /// Written straight to the table because that is what they are: rows an
+    /// older version of the reaction parked, which no `react` running here can
+    /// reproduce. `target_bytes` pads the instance URN each row names, so a test
+    /// can measure what holding the whole group at once would cost.
+    pub async fn park_retired_commands(
+        &self,
+        event: &AppendedEvent,
+        count: usize,
+        target_bytes: usize,
+    ) {
+        sqlx::query(
+            "INSERT INTO policy_dead_letters \
+             (policy_name, global_position, event_id, error_kind, error_message, \
+              aggregate_name, target_stream_id, command_name, dispatch_ordinal, \
+              last_parked_at) \
+             SELECT $1, $2, $3, 'Unavailable', 'parked by a version that is gone', \
+                    'Probe', 'urn:probe:' || lpad(n::text, $5, 'x'), \
+                    'RetiredCommand', n, now() \
+             FROM generate_series(1, $4) AS n",
+        )
+        .bind(&self.policy_name)
+        .bind(event.global_position)
+        .bind(event.event_id)
+        .bind(count as i32)
+        .bind(target_bytes as i32)
+        .execute(&self.pool)
+        .await
+        .expect("the retired commands must be parked");
+    }
+
+    /// How many rows this policy has parked, counted in the database rather than
+    /// read into memory — what [`PolicyStatus::dead_letter_count`] reports.
+    pub async fn parked_row_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM policy_dead_letters WHERE policy_name = $1")
+            .bind(&self.policy_name)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the parked rows must be countable")
+    }
+
+    /// How many of this policy's rows have been archived under `reason`.
+    pub async fn archived_row_count(&self, reason: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM discarded_dead_letters \
+             WHERE policy_name = $1 AND reason = $2",
+        )
+        .bind(&self.policy_name)
+        .bind(reason)
+        .fetch_one(&self.pool)
+        .await
+        .expect("the archived rows must be countable")
+    }
+
     /// The policy's dead letters — the reactions it parked — oldest first.
     pub async fn dead_letters(&self) -> Vec<DeadLetter> {
         let rows = sqlx::query(

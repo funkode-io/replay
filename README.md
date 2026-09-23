@@ -2182,7 +2182,7 @@ A policy's position is **one row per stream** in `policy_stream_cursors`, holdin
 place it has reached in that stream. Nothing orders one stream against another: a policy
 reads each stream in that stream's own order, and a write that is slow, stuck or rolled
 back delays the stream it is writing to and no other
-([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
 Which streams to look at is found two ways. Every poll sweeps the log past
 `policy_cursors.discovered_through` for streams with new events — indexed, and bounded by
@@ -2672,17 +2672,23 @@ ones that still fail keep their own error and stay retryable. Every settlement
 bumps the row's `retry_count` and stamps `last_retried_at`, the archived copy
 included.
 
-A settlement only settles the row the replay **read**. A parked command is one
-row, so a delivery of the event arriving while the replay runs refreshes that row
-in place; settling it anyway would archive a failure nobody retried, or overwrite
-it with the staler error the replay produced. The retry carries the row's
-`deliveries`/`last_parked_at` — and the `retry_count` another retry moves — into
-its `WHERE`, and the command it parks *without*
-a row is guarded by the key itself — a row that appeared under it belongs to a
-writer no staler than this replay. Either way the retry reports `Superseded` and
-leaves the row alone — retry again to act on what is parked now
-([ADR-0024](docs/adr/0024-a-parked-command-is-one-row.md)). The bulk summary
-counts such a reaction as still failing, which it is.
+A settlement only settles the group the replay **read**. A parked command is one
+row, so a delivery of the event arriving while the replay runs refreshes a row the
+replay is about to settle; settling it anyway would archive a failure nobody
+retried, or overwrite it with the staler error the replay produced. So a retry
+carries a digest of the reaction's rows — how many there are, their summed
+`deliveries` and `retry_count`, their latest `last_parked_at` — and re-reads it
+with the rows locked before settling any of them: a group that moved settles
+nothing, and the command the retry parks *without* a row is guarded by the key
+itself ([ADR-0025](docs/adr/0025-a-retry-settles-the-group-it-locked.md)). Either
+way the retry reports `Superseded` and leaves the rows alone — retry again to act
+on what is parked now. The bulk summary counts such a reaction as still failing,
+which it is.
+
+The group is read a page at a time, so what a retry holds is a page of rows
+rather than everything one reaction has parked — which, after an upgrade, is the
+old code's commands times the deliveries they saw. Every row of the reaction is
+still settled, from one replay, in one transaction.
 
 The summary counts reactions; `PolicyStatus::dead_letter_count` keeps counting
 **rows** (parked commands), so one broken two-command reaction reads as
@@ -2982,7 +2988,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 inflate it and another policy's traffic does not appear in it. It is computed by scanning
 one row per stream, which is affordable for a status endpoint scraped every few seconds and
 would not be on every poll — which is why the runner does not find its work this way
-([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
 When you need a **stable cut** of the log — the largest position `H` such that every
 position in `1..=H` is present, e.g. to freeze a version at publish time — use
@@ -3022,7 +3028,7 @@ exists. A `CaughtUp` policy whose worker died looks exactly like one that is idl
 
 ### Upgrading a running Policy to per-stream cursors
 
-Migration [0033](persistence/tests/migrations/0033_policy_stream_cursors.sql) carries every
+Migration [0034](persistence/tests/migrations/0034_policy_stream_cursors.sql) carries every
 running policy over at exactly what it has processed: for each stream, the place it had
 reached by the position its cursor stopped at. Nothing is redelivered and nothing is
 skipped.

@@ -66,7 +66,7 @@ hydration reads `1..N`, making `(stream_id, version)` name two different events 
 keep, as it is for [Global position], and unlike a [Cursor move]
 ([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md)). It is
 what a [Policy feed] is read and checkpointed over
-([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 _Avoid_: stream sequence, stream version, offset, per-stream position.
 
 ### Policy feed
@@ -75,7 +75,7 @@ What one [Policy] reads on a poll: for each stream it is behind on, that stream'
 past its [Stream place] in that stream, in the stream's own order, up to its read batch
 size. Nothing orders one stream against another, and nothing waits — a stream's places
 arrive in order, so the feed has no holes to reason about
-([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
 Which streams to read is found two ways: a sweep of the log by [Global position] every
 poll, which is fast and may pass a write that had not committed yet, and a reconciliation
@@ -178,7 +178,7 @@ moves backward. The instruction is a [Stream place] in one stream, so a redelive
 forced for that stream alone. The running leader adopts it on the next poll, because it
 reads its places fresh every poll rather than holding them between polls
 ([ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md),
-[ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)).
+[ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 _Avoid_: reset, seek, rewind (as a name for the act; a rewind is one direction of
 it).
 
@@ -204,7 +204,7 @@ Retired. A Policy used to be able to sit in front of a `global_position` that di
 exist and read nothing for ever (funkode-io/replay#164). It reads each stream over that
 stream's own sequence now, which has no holes, so there is no number it can be parked in
 front of and no `Blocked` condition to report
-([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)). A Policy that is
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). A Policy that is
 not moving is lagging, [Degraded](#policy-status), or not alive — three conditions with
 three different readings.
 _Avoid_: stuck, wedged, hung, stalled.
@@ -238,7 +238,7 @@ _Avoid_: lock timeout (unqualified), statement timeout, deadlock detection.
 A `global_position` taken from the sequence by a transaction that then aborted.
 `nextval` is not transactional, so the value is never returned to the sequence and no
 event can ever carry it. It is a number nothing will ever hold, and since
-[ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md) nothing reads it as
+[ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md) nothing reads it as
 anything else: a [Policy feed] is ordered per stream, and a stream's places are handed
 back by a write that fails rather than burned. A [Stream place] has no equivalent.
 _Avoid_: gap, hole (as a name for the permanent kind), lost position, skipped
@@ -254,7 +254,7 @@ can be compared against a snapshot of transactions that have ended, whereas a
 `global_position` can be a [Burned position]. Events that predate the stamp carry the
 sentinel `0`, which orders before every real id. Nothing in the library reads it: the
 ordering it was carried for was the [Policy feed]'s, and that feed is ordered per stream
-now ([ADR-0025](docs/adr/0025-a-policy-tracks-its-position-per-stream.md)). It stays on
+now ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). It stays on
 the event as an operator's diagnostic — which write wrote this row, and what else that
 write wrote.
 _Avoid_: commit id, transaction number, xmin, sequence.

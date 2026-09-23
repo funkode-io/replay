@@ -46,7 +46,7 @@ const REVIEWED: &[Reviewed] = &[
                         of streams behind, which is why a Policy far behind catches up \
                         over several cadences instead of in one allocation; the batch \
                         resumes after the last id it examined, so the bound costs a \
-                        rotation rather than leaving a stream unexamined (ADR-0025).",
+                        rotation rather than leaving a stream unexamined (ADR-0026).",
     },
     Reviewed {
         file: "src/policy_runner.rs",
@@ -77,17 +77,21 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/policy_runner.rs",
-        function: "load_parked_reaction",
-        justification: "One reaction's rows: one per command it dispatches (the vector \
-                        `react_erased` already materialises), plus the rows parked for \
-                        that event before `idx_dead_letters_parked_command` keyed the \
-                        table (funkode-io/replay#220). That legacy tail is the old \
-                        code's commands times its deliveries, it is fixed at the moment \
-                        the migration runs \u{2014} every later park refreshes a row rather \
-                        than adding one \u{2014} and it is not a number in the code, which is \
-                        why bounding the read over it is tracked by \
-                        funkode-io/replay#228. Not bounded by the table: the rows of one \
-                        reaction, never of a policy's backlog.",
+        function: "load_parked_page",
+        justification: "SQL carries LIMIT RETRY_ROW_PAGE_SIZE (100). One page of a \
+                        reaction's parked rows, settled before the next is read, with \
+                        the whole group locked and verified unchanged for the length of \
+                        the transaction (ADR-0025). Not the group: its rows are one per \
+                        command the current code dispatches, plus the tail an older \
+                        version of the policy parked, which is the old code's commands \
+                        times the deliveries it saw.",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "count_rows_naming",
+        justification: "One row per distinct dispatch the replay ran, GROUP BY over the \
+                        identities it passes in: bounded by the vector `react_erased` \
+                        already materialises, never by the group it counts.",
     },
     Reviewed {
         file: "src/policy_runner.rs",

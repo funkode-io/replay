@@ -28,7 +28,7 @@ effects**. Therefore a **projection version bump ⇒ reset + replay**, but a
   **high-water-mark** reader: advance only across a contiguous, gap-free prefix (with a
   short visibility grace), so a sequence value that is assigned but not yet committed by a
   concurrent append can never be skipped.~~ *Replaced by
-  [ADR-0025](0025-a-policy-tracks-its-position-per-stream.md): a Policy has no cursor over
+  [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md): a Policy has no cursor over
   the whole log. It records a place per stream and reads each stream in that stream's own
   order, so there is no contiguous prefix to advance across and no grace to wait out. The
   premise this decision rested on — that a Policy needs a total order — was wrong: events
