@@ -1,9 +1,7 @@
 //! Two appends racing to create one stream (funkode-io/replay#232).
 //!
-//! `write_event` numbers an event under the stream row's lock, and a row that does not
-//! exist yet cannot be locked. Both racers therefore used to insert it, and the loser
-//! died on `streams_pkey` with a raw database error — a failure a caller cannot tell from
-//! a broken database, on the one append where it is least expected.
+//! Why the loser used to collide and what defers it now:
+//! `migrations/0033_stream_creation_race.sql`.
 //!
 //! The race is staged rather than run: the winner's transaction is held open, so the
 //! loser is *made* to arrive second on every run instead of on most of them. A spawned

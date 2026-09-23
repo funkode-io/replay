@@ -43,9 +43,9 @@ CREATE OR REPLACE FUNCTION write_event(
       -- function's OUT parameter of that name, which plpgsql refuses as ambiguous.
       ON CONFLICT ON CONSTRAINT streams_pkey DO NOTHING;
 
-      -- Either this created the row or a concurrent append did, in which case the insert
-      -- above waited for that transaction to end: the row is there to be locked, and the
-      -- version it carries is the one that append left behind.
+      -- Whoever ends up with the row, the re-read finds one: this insert either created
+      -- it, or waited out the transaction that did and then did nothing. The version it
+      -- carries is that transaction's, which is the number this append must follow.
       SELECT s.version, s.stream_seq INTO stream_version, next_stream_seq
       FROM streams as s
       WHERE s.id = p_stream_id FOR UPDATE;
