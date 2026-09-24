@@ -3034,11 +3034,15 @@ async fn drain_policy_once(
     // next poll starts from. What is left here is the I/O those decisions are about
     // (funkode-io/replay#243).
     //
-    // The carried queue is taken only now, once both queries have come back: taking it
-    // above would hand it to a `?` on either of them, and nothing would have it when the
-    // next poll asks.
+    // The carried queue is copied rather than taken, and `progress` keeps the old one
+    // until the settle below replaces it. Taking it would mean every way out of this
+    // function between here and there loses it — a `?` on either query, and a caller who
+    // drops the future: `PolicyRunner::drain` is public and can be timed out or aborted
+    // half way (funkode-io/replay#246 review). A poll that never settles costs the next
+    // one a re-read of streams this one may already have caught up, which the places
+    // decide when it gets there.
     let mut plan = PollPlan::plan(Nominations {
-        carried: std::mem::take(&mut progress.unfinished),
+        carried: progress.unfinished.clone(),
         swept: discovered.streams,
         examined,
         reconciling,
