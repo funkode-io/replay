@@ -3242,11 +3242,15 @@ async fn drain_policy_once(
     // that read nothing included, which is exactly the one a finished pass ends on
     // (funkode-io/replay#231 review).
     if settled.reconciled {
+        // Written first, and taken in memory only once it is written: a runner whose
+        // rotation had moved past a page the database still has it before would examine
+        // that page again only after a restart.
+        let rotation = settled
+            .rotation
+            .unwrap_or_else(|| progress.reconciled_through.clone());
+        write_reconciled(pool, &name, &rotation).await?;
+        progress.reconciled_through = rotation;
         progress.reconciled_at = Some(Instant::now());
-        if let Some(through) = settled.rotation {
-            progress.reconciled_through = through;
-        }
-        write_reconciled(pool, &name, &progress.reconciled_through).await?;
     }
 
     if exhausted {
