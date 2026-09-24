@@ -89,6 +89,11 @@ pub trait AggregatePolicy: Send + Sync {
     fn name(&self) -> &str;
 
     /// Pure reaction: the instances to command, and the commands to send them.
+    ///
+    /// One reaction to one event, as [`Policy::react`], and the same `Vec`: its length is
+    /// the commands this rule writes, not anything the store read. The blanket impl
+    /// turns it into a `Vec<Dispatch>` of exactly that length, which is the shape
+    /// `Policy::react` has to hand the runner.
     fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<TargetedCommand<Self::Target>>;
 
     /// Metadata to attach to every dispatch of one reaction, as
