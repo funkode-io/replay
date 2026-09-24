@@ -12,14 +12,10 @@
 
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sqlx::{AssertSqlSafe, Executor, PgPool, Row};
-use testcontainers_modules::{
-    postgres,
-    testcontainers::{runners::AsyncRunner, ContainerAsync},
-};
 
-mod common;
+use crate::common;
 use common::migrations::{self, through as migrations_through, MIGRATOR};
-use common::postgres_image::postgres_container;
+use common::postgres_image::{start_postgres_server, PostgresServer};
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -33,8 +29,8 @@ const BEFORE_DEDUPE: i64 = 28;
 const DEDUPE: i64 = 29;
 
 /// An empty database — every test decides for itself how far to migrate it.
-async fn start_postgres() -> (ContainerAsync<postgres::Postgres>, PgPool) {
-    let container = postgres_container().start().await.unwrap();
+async fn start_pool() -> (PostgresServer, PgPool) {
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -192,7 +188,7 @@ async fn invalid_indexes(pool: &PgPool) -> Vec<String> {
 /// operator's script — impossible rather than merely unlikely.
 #[tokio::test]
 async fn a_second_row_for_one_parked_command_is_refused_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let event = uuid::Uuid::new_v4();
@@ -243,7 +239,7 @@ async fn a_second_row_for_one_parked_command_is_refused_postgres_test() {
 /// case that kept duplicating.
 #[tokio::test]
 async fn two_rows_with_a_null_identity_collapse_onto_one_reaction_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let event = uuid::Uuid::new_v4();
@@ -284,7 +280,7 @@ async fn two_rows_with_a_null_identity_collapse_onto_one_reaction_postgres_test(
 /// its transaction began.
 #[tokio::test]
 async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     migrations_through(BEFORE_DEDUPE)
         .run(&pool)
         .await
@@ -448,7 +444,7 @@ async fn the_dedupe_migration_collapses_duplicate_generations_postgres_test() {
 /// code still writes.
 #[tokio::test]
 async fn pre_identity_siblings_are_kept_apart_not_collapsed_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     migrations_through(BEFORE_DEDUPE)
         .run(&pool)
         .await
@@ -522,7 +518,7 @@ async fn pre_identity_siblings_are_kept_apart_not_collapsed_postgres_test() {
 /// negative ordinal no dispatch can have.
 #[tokio::test]
 async fn legacy_siblings_naming_one_command_are_kept_not_collapsed_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     migrations_through(BEFORE_DEDUPE)
         .run(&pool)
         .await
@@ -626,7 +622,7 @@ async fn legacy_siblings_naming_one_command_are_kept_not_collapsed_postgres_test
 /// is what keeps it index-only.
 #[tokio::test]
 async fn the_status_aggregate_reads_only_the_index_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let event = uuid::Uuid::new_v4();
@@ -707,7 +703,7 @@ async fn the_status_aggregate_reads_only_the_index_postgres_test() {
 /// of restarting at -1 and colliding with them.
 #[tokio::test]
 async fn the_dedupe_can_be_run_again_over_rows_parked_after_it_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     migrations_through(BEFORE_DEDUPE)
         .run(&pool)
         .await

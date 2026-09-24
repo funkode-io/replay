@@ -11,13 +11,12 @@
 //! must peak near `FLUSH` payloads, not `EVENTS` of them.
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
 use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
 mod common;
 use common::alloc::{peak_live_bytes, reset_peak, CountingAllocator};
-use common::postgres_image::postgres_container;
+use common::postgres_image::start_postgres_server;
 use common::report::report;
 
 /// Every test binary registers its own global allocator; the counting itself is
@@ -143,11 +142,8 @@ impl InlineProjection for NoOpProjection {
     }
 }
 
-async fn start_postgres() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
-    let container = postgres_container().start().await.unwrap();
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -177,7 +173,7 @@ async fn peak_live_bytes_scale_with_the_flush_size_not_the_append_postgres_test(
     const EVENTS: usize = 400;
     const FLUSH: usize = 20;
 
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let store = replay_persistence::PostgresEventStore::builder(pool.clone())
         .projection_flush_size(FLUSH)

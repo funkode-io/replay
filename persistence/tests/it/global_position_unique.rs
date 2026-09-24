@@ -11,14 +11,10 @@
 //! positions they are, and the feed's read still reaches its rows through an index.
 
 use sqlx::{PgPool, Row};
-use testcontainers_modules::{
-    postgres,
-    testcontainers::{runners::AsyncRunner, ContainerAsync},
-};
 
-mod common;
+use crate::common;
 use common::migrations::{through as migrations_through, MIGRATOR};
-use common::postgres_image::postgres_container;
+use common::postgres_image::{start_postgres_server, PostgresServer};
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -27,8 +23,8 @@ const POSTGRES_PORT: u16 = 5432;
 const BEFORE_UNIQUE: i64 = 13;
 
 /// An empty database — every test decides for itself how far to migrate it.
-async fn start_postgres() -> (ContainerAsync<postgres::Postgres>, PgPool) {
-    let container = postgres_container().start().await.unwrap();
+async fn start_pool() -> (PostgresServer, PgPool) {
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -121,7 +117,7 @@ async fn index_names(pool: &PgPool) -> Vec<String> {
 /// A second event cannot take a position a first one already holds — whatever wrote it.
 #[tokio::test]
 async fn a_duplicate_global_position_is_refused_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let stream_id = "urn:acl:unique-1";
@@ -157,7 +153,7 @@ async fn a_duplicate_global_position_is_refused_postgres_test() {
 /// with no half-built index to clean up.
 #[tokio::test]
 async fn duplicate_positions_stop_the_migration_and_name_themselves_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     migrations_through(BEFORE_UNIQUE)
         .run(&pool)
         .await
@@ -199,7 +195,7 @@ async fn duplicate_positions_stop_the_migration_and_name_themselves_postgres_tes
 /// sequential scan and a sort.
 #[tokio::test]
 async fn the_feed_read_still_scans_an_index_postgres_test() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let indexes = index_names(&pool).await;
