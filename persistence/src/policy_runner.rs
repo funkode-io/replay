@@ -3066,11 +3066,11 @@ async fn drain_policy_once(
         // The sweep has read this stretch of log whatever the streams in it turn out to
         // owe, and a stream left unfinished is remembered rather than re-swept for.
         //
-        // Written before it is taken in memory, for the reason the rotation is: a failed
-        // write would otherwise leave this runner searching above a stretch it has not
-        // recorded, so the streams that stretch nominated — already taken off
-        // `progress.unfinished` by the plan, and not all of them fit in the queue it
-        // hands back — would be nominated again by nothing but the reconciliation.
+        // Written before it is taken in memory, for the reason the rotation is: a write
+        // that fails, or a future dropped waiting on it, must leave this runner searching
+        // from where the database says it got to. Advancing in memory first would step
+        // this runner over a stretch nothing recorded, and the streams that stretch
+        // nominated would be nominated again by nothing but the reconciliation.
         if discovered.swept_through > progress.swept_through {
             write_sweep(pool, &name, discovered.swept_through).await?;
             progress.swept_through = discovered.swept_through;
@@ -3238,9 +3238,9 @@ async fn drain_policy_once(
     };
 
     // The queue the next poll starts from, on every path out of this one — the failing
-    // one included. This poll took the queue off `progress` and nobody else has a copy,
-    // so dropping it here sends the streams that were waiting for it back to whatever the
-    // sweep happens to nominate next.
+    // one included. `progress` has held the copy this poll planned from all along, so
+    // this is the only place the queue changes: what a poll that got somewhere says is
+    // still owed, replacing what it was given.
     progress.unfinished = carrying;
 
     // A poll that stopped on an error has not finished reading, so the cadence is not
