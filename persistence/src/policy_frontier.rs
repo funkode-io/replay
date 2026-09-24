@@ -240,16 +240,18 @@ impl PollPlan {
     pub(crate) fn settle(&mut self) -> Settled {
         self.settled = true;
 
-        let read: HashSet<&String> = self.streams[..self.visited].iter().collect();
-        let read_through = self
-            .page
-            .iter()
-            .take_while(|stream| read.contains(stream))
-            .count();
-        let rotation = self
-            .reconciling
-            .then(|| rotation_after(&self.page, read_through, self.read_batch))
-            .flatten();
+        // Only on the polls a reconciliation ran on: off the cadence there is no page for
+        // the rotation to move through, and the set would be hashed for nothing.
+        let rotation = self.reconciling.then(|| {
+            let read: HashSet<&String> = self.streams[..self.visited].iter().collect();
+            let read_through = self
+                .page
+                .iter()
+                .take_while(|stream| read.contains(stream))
+                .count();
+
+            rotation_after(&self.page, read_through, self.read_batch)
+        });
 
         // What the next poll starts from, oldest claim first: what this one could not fit,
         // then what it did not reach, then what it read and may not have finished. Capped,
@@ -262,7 +264,7 @@ impl PollPlan {
         Settled {
             carried,
             reconciled: self.reconciling,
-            rotation,
+            rotation: rotation.flatten(),
         }
     }
 }
