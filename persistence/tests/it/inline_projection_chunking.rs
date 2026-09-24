@@ -11,14 +11,14 @@
 use std::sync::{Arc, Mutex};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use testcontainers_modules::postgres;
 use urn::Urn;
 
 use replay_macros::define_aggregate;
 use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
-mod common;
-use common::postgres_image::postgres_container;
+use crate::common;
+use common::postgres_image::start_postgres_server;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -65,11 +65,11 @@ impl replay::Aggregate for Ledger {
     }
 }
 
-async fn start_postgres() -> (
+async fn start_pool() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -159,7 +159,7 @@ impl InlineProjection for RecordingProjection {
 /// large the append — and the chunks must reassemble into the original sequence.
 #[tokio::test]
 async fn streamed_append_flushes_inline_projections_in_bounded_chunks_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let log = CallLog::default();
     let store = replay_persistence::PostgresEventStore::builder(pool.clone())
@@ -206,7 +206,7 @@ async fn streamed_append_flushes_inline_projections_in_bounded_chunks_postgres_t
 /// Below the flush size, nothing changes: one append, one call.
 #[tokio::test]
 async fn append_smaller_than_the_chunk_arrives_in_one_call_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let log = CallLog::default();
     let store = replay_persistence::PostgresEventStore::builder(pool.clone())
@@ -303,7 +303,7 @@ impl InlineProjection for FailsPartWayProjection {
 /// the writes of every earlier chunk, along with the events themselves.
 #[tokio::test]
 async fn failure_in_a_later_chunk_rolls_back_earlier_chunks_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let calls = Arc::new(Mutex::new(0usize));
     let store = replay_persistence::PostgresEventStore::builder(pool.clone())
@@ -371,7 +371,7 @@ async fn failure_in_a_later_chunk_rolls_back_earlier_chunks_postgres_test() {
 /// projection sees *is* the buffer's high-water mark.
 #[tokio::test]
 async fn peak_retention_stays_bounded_for_a_large_append_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     const APPEND: usize = 2_000;
     const FLUSH: usize = 64;

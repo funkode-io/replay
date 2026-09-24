@@ -10,14 +10,14 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Executor, PgPool, Row};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use testcontainers_modules::postgres;
 
 use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PostgresEventStore};
 
-mod common;
+use crate::common;
 use common::migrations::{self, through as migrations_through, MIGRATOR};
-use common::postgres_image::postgres_container;
+use common::postgres_image::start_postgres_server;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -107,11 +107,11 @@ impl replay::Compactable for Ledger {
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
-async fn start_postgres() -> (
+async fn start_pool() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -225,7 +225,7 @@ async fn append(cqrs: &Cqrs<PostgresEventStore>, ledger: &LedgerUrn, command: Le
 /// The sequence counts a stream's own events, from 1, and counts each stream separately.
 #[tokio::test]
 async fn an_appended_event_carries_its_place_in_its_own_stream_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
@@ -250,7 +250,7 @@ async fn an_appended_event_carries_its_place_in_its_own_stream_postgres_test() {
 /// from there.
 #[tokio::test]
 async fn compaction_restarts_the_version_and_continues_the_sequence_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
@@ -292,7 +292,7 @@ async fn compaction_restarts_the_version_and_continues_the_sequence_postgres_tes
 /// counter picks up from there.
 #[tokio::test]
 async fn events_written_before_the_migration_are_numbered_in_order_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     migrations_through(BEFORE_SEQUENCE)
         .run(&pool)
         .await
@@ -337,7 +337,7 @@ async fn events_written_before_the_migration_are_numbered_in_order_postgres_test
 /// here instead of silently renumbering a stream.
 #[tokio::test]
 async fn two_events_of_a_stream_cannot_share_a_place_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
@@ -366,7 +366,7 @@ async fn two_events_of_a_stream_cannot_share_a_place_postgres_test() {
 /// "a stream has no holes".
 #[tokio::test]
 async fn concurrent_appends_to_one_stream_leave_no_hole_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
@@ -409,7 +409,7 @@ async fn concurrent_appends_to_one_stream_leave_no_hole_postgres_test() {
 /// `append_event` be the only writer without a trigger standing over the table.
 #[tokio::test]
 async fn an_insert_that_names_no_place_is_rejected_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
@@ -445,7 +445,7 @@ async fn an_insert_that_names_no_place_is_rejected_postgres_test() {
 /// case, and it is the test below.
 #[tokio::test]
 async fn a_command_issued_during_the_migration_waits_and_is_numbered_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     migrations_through(BEFORE_SEQUENCE)
         .run(&pool)
         .await
@@ -490,7 +490,7 @@ async fn a_command_issued_during_the_migration_waits_and_is_numbered_postgres_te
 /// is loud and costs that one command, and the log is left as it was.
 #[tokio::test]
 async fn an_append_already_inside_the_old_function_is_refused_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     migrations_through(BEFORE_SEQUENCE)
         .run(&pool)
         .await

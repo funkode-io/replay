@@ -11,7 +11,7 @@
 //! connection therefore fails the test by starving everything after it, which is
 //! the property the fix is about.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
@@ -21,11 +21,10 @@ use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PostgresEventStore};
 use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Connection, PgConnection, PgPool};
 use testcontainers_modules::postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ContainerAsync;
 
 use common::migrations::MIGRATOR;
-use common::postgres_image::{postgres_container, POSTGRES_PORT};
+use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
 
 /// The bound the tests set. Long enough that a loaded CI box does not report it
 /// before the blocker is even in place, short enough that a test waiting it out
@@ -105,10 +104,7 @@ impl replay::Compactable for Ledger {
 async fn start_postgres_with(
     session_lock_timeout: Option<&'static str>,
 ) -> (PgPool, String, ContainerAsync<postgres::Postgres>) {
-    let container = postgres_container()
-        .start()
-        .await
-        .expect("container starts");
+    let container = start_postgres_server().await;
     let host = container.get_host().await.expect("host").to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -142,7 +138,7 @@ async fn start_postgres_with(
 }
 
 /// The common case: a pool carrying no `lock_timeout` of its own.
-async fn start_postgres() -> (PgPool, String, ContainerAsync<postgres::Postgres>) {
+async fn start_pool() -> (PgPool, String, ContainerAsync<postgres::Postgres>) {
     start_postgres_with(None).await
 }
 
@@ -229,7 +225,7 @@ async fn pool_still_serves(pool: &PgPool) -> bool {
 /// — the connection is back in the pool while the blocker is still holding.
 #[tokio::test]
 async fn an_append_blocked_on_the_stream_row_fails_and_frees_its_connection_postgres_test() {
-    let (pool, url, _container) = start_postgres().await;
+    let (pool, url, _container) = start_pool().await;
     let (urn, stream_id) = seeded_stream(&pool, "blocked-append").await;
     let blocker = Blocker::holding(&url, &stream_id).await;
 
@@ -279,7 +275,7 @@ async fn an_append_blocked_on_the_stream_row_fails_and_frees_its_connection_post
 /// The same row, the same bound, the other transaction that takes it.
 #[tokio::test]
 async fn a_compaction_blocked_on_the_stream_row_fails_and_frees_its_connection_postgres_test() {
-    let (pool, url, _container) = start_postgres().await;
+    let (pool, url, _container) = start_pool().await;
     let (urn, stream_id) = seeded_stream(&pool, "blocked-compaction").await;
     let blocker = Blocker::holding(&url, &stream_id).await;
 
@@ -313,7 +309,7 @@ async fn a_compaction_blocked_on_the_stream_row_fails_and_frees_its_connection_p
 /// not carry one store's `lock_timeout` into whatever uses it next.
 #[tokio::test]
 async fn a_bounded_append_leaves_no_lock_timeout_behind_postgres_test() {
-    let (pool, _url, _container) = start_postgres().await;
+    let (pool, _url, _container) = start_pool().await;
     let (urn, _stream_id) = seeded_stream(&pool, "no-residue").await;
 
     let cqrs = Cqrs::new(store(&pool, LOCK_WAIT).await);
@@ -340,7 +336,7 @@ async fn a_bounded_append_leaves_no_lock_timeout_behind_postgres_test() {
 /// without a retry.
 #[tokio::test]
 async fn a_contended_projection_write_is_retryable_postgres_test() {
-    let (pool, url, _container) = start_postgres().await;
+    let (pool, url, _container) = start_pool().await;
     sqlx::query("CREATE TABLE balances (stream_id TEXT PRIMARY KEY, amount DOUBLE PRECISION)")
         .execute(&pool)
         .await
@@ -408,7 +404,7 @@ async fn a_contended_projection_write_is_retryable_postgres_test() {
 /// bound one. It is clamped to the ceiling instead.
 #[tokio::test]
 async fn a_wait_longer_than_postgres_accepts_still_appends_postgres_test() {
-    let (pool, _url, _container) = start_postgres().await;
+    let (pool, _url, _container) = start_pool().await;
     let (urn, _stream_id) = seeded_stream(&pool, "absurd-wait").await;
 
     let cqrs = Cqrs::new(store(&pool, Duration::from_secs(60 * 60 * 24 * 365)).await);

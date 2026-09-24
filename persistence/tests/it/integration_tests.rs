@@ -4,7 +4,7 @@ use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use testcontainers_modules::postgres;
 use tokio_test::assert_err;
 use urn::Urn;
 
@@ -19,11 +19,11 @@ use replay_persistence::{
 // `main` is gated `#[cfg(not(test))]`, so including it here pulls in only the
 // domain types, the live `GlobalPositionQuery`, and the inline
 // `GlobalPositionProjection`.
-#[path = "../examples/global_position.rs"]
+#[path = "../../examples/global_position.rs"]
 mod global_position;
 
-mod common;
-use common::postgres_image::postgres_container;
+use crate::common;
+use common::postgres_image::start_postgres_server;
 use common::wait::wait_for_count;
 
 const POSTGRES_PORT: u16 = 5432;
@@ -373,12 +373,7 @@ impl replay_persistence::Query for BankAccountStatement {
 
 #[tokio::test]
 async fn bank_account_postgres_test() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .init();
-
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -506,7 +501,7 @@ async fn bank_account_postgres_test() {
 /// in-memory store), and the conflicting append must not persist.
 #[tokio::test]
 async fn bank_account_store_events_concurrency_conflict_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -573,7 +568,7 @@ async fn bank_account_store_events_concurrency_conflict_postgres_test() {
 /// stream version that incremented on each append, so the second event always conflicted.
 #[tokio::test]
 async fn bank_account_multi_event_append_with_expected_version_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -643,7 +638,7 @@ async fn bank_account_multi_event_append_with_expected_version_postgres_test() {
 
 #[tokio::test]
 async fn bank_account_store_events_stream_sink_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -717,7 +712,7 @@ async fn bank_account_store_events_stream_sink_postgres_test() {
 
 #[tokio::test]
 async fn bank_account_store_events_stream_producer_error_rolls_back_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -780,7 +775,7 @@ async fn bank_account_store_events_stream_producer_error_rolls_back_postgres_tes
 /// materialised in memory. This is the motivating "bulk import" shape for `store_events_stream`.
 #[tokio::test]
 async fn bulk_payments_csv_streams_end_to_end_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -925,7 +920,7 @@ async fn connect_to_postgres(host: String, port: u16) -> PgPool {
 ///  - The archived Version(1) must still contain all 6 original events.
 #[tokio::test]
 async fn bank_account_compaction_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1092,7 +1087,7 @@ async fn bank_account_compaction_postgres_test() {
 ///    the guarded no-op created no archive.
 #[tokio::test]
 async fn needs_compaction_watermark_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1235,7 +1230,7 @@ async fn needs_compaction_watermark_postgres_test() {
 /// watermark 1, not the stale 4, so it correctly reports `true`.
 #[tokio::test]
 async fn needs_compaction_survives_version_coincidence_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1370,7 +1365,7 @@ async fn needs_compaction_survives_version_coincidence_postgres_test() {
 /// stream is skipped thereafter — while a stream with real work still folds to `Compacted`.
 #[tokio::test]
 async fn already_compacted_skips_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1463,7 +1458,7 @@ async fn already_compacted_skips_postgres_test() {
 /// recorded in the `projections` registry.
 #[tokio::test]
 async fn bank_account_inline_projection_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1641,7 +1636,7 @@ impl replay_persistence::InlineProjection for FailingProjection {
 /// verifies neither event rows nor projection-side writes persist.
 #[tokio::test]
 async fn bank_account_inline_projection_failure_rolls_back_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1780,7 +1775,7 @@ impl replay_persistence::InlineProjection for RebuildBalanceProjection {
 /// it by replaying history, recording the new version.
 #[tokio::test]
 async fn bank_account_inline_projection_version_drift_rebuild_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1865,7 +1860,7 @@ async fn bank_account_inline_projection_version_drift_rebuild_postgres_test() {
 /// rolled-back or older deploy must not run against a view built by newer code.
 #[tokio::test]
 async fn bank_account_inline_projection_stored_newer_than_code_errors_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1912,7 +1907,7 @@ async fn bank_account_inline_projection_stored_newer_than_code_errors_postgres_t
 /// effects. A sentinel seeded into the view survives the rebuild.
 #[tokio::test]
 async fn bank_account_inline_projection_same_version_is_noop_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -1988,7 +1983,7 @@ async fn bank_account_inline_projection_same_version_is_noop_postgres_test() {
 /// replays the existing backlog so the view catches up — not just future events.
 #[tokio::test]
 async fn bank_account_inline_projection_first_registration_replays_backlog_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -2193,7 +2188,7 @@ async fn global_position_live_query_and_inline_projection_agree_postgres_test() 
         GlobalPositionProjection, GlobalPositionQuery, User, UserCommand, UserUrn,
     };
 
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -2513,7 +2508,7 @@ impl replay_persistence::Policy for WatchedAccountFeePolicy {
 /// and the policy cursor advanced past the triggering event.
 #[tokio::test]
 async fn withdraw_fee_policy_drain_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -2605,7 +2600,7 @@ async fn withdraw_fee_policy_drain_postgres_test() {
 /// front of it, silently (funkode-io/replay#166).
 #[tokio::test]
 async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -2708,7 +2703,7 @@ async fn policy_stream_filter_walks_past_non_matching_events_postgres_test() {
 /// getting it wrong fails the read rather than skipping the row.
 #[tokio::test]
 async fn policy_filter_that_is_null_per_row_skips_and_advances_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -2767,7 +2762,7 @@ async fn policy_filter_that_is_null_per_row_skips_and_advances_postgres_test() {
 
 #[tokio::test]
 async fn policy_start_at_now_ignores_prior_history_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -2830,7 +2825,7 @@ async fn policy_start_at_now_ignores_prior_history_postgres_test() {
 
 #[tokio::test]
 async fn policy_start_at_beginning_backfills_history_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -2939,7 +2934,7 @@ async fn policy_code_change_never_rewinds_cursor_postgres_test() {
         }
     }
 
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3012,7 +3007,7 @@ async fn policy_code_change_never_rewinds_cursor_postgres_test() {
 
 #[tokio::test]
 async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3078,7 +3073,7 @@ async fn policy_daemon_polls_and_reacts_without_manual_drain_postgres_test() {
 
 #[tokio::test]
 async fn policy_duplicate_delivery_is_absorbed_by_the_charge_key_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3211,7 +3206,7 @@ async fn policy_duplicate_delivery_example_recipe_postgres_test() {
         DEPOSIT_FEE_RATE,
     };
 
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3337,7 +3332,7 @@ async fn policy_duplicate_delivery_example_recipe_postgres_test() {
 ///     mis-delivered, or 1, which would indicate the cursor stalled at gp=2).
 #[tokio::test]
 async fn policy_lagging_behind_compaction_skips_synthetic_snapshot_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3492,7 +3487,7 @@ impl replay_persistence::Policy for SingleRunnerPolicy {
 async fn policy_single_active_runner_via_advisory_lock_postgres_test() {
     use std::time::Duration;
 
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3691,7 +3686,7 @@ async fn policy_bounded_connection_footprint_many_policies_postgres_test() {
 
     const POLICY_COUNT: usize = 12;
 
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -3849,7 +3844,7 @@ impl replay_persistence::Policy for LoopPolicy {
 /// Exactly 3 reactions, 4 total Deposited events, cursor at gp=4.
 #[tokio::test]
 async fn policy_causation_depth_limit_stops_loop_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -4004,7 +3999,7 @@ impl replay_persistence::Policy for InsufficientFundsPolicy {
 ///     a second, healthy policy to prove the runner is not wedged.
 #[tokio::test]
 async fn policy_permanent_failure_is_dead_lettered_and_advances_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -4088,7 +4083,7 @@ async fn policy_permanent_failure_is_dead_lettered_and_advances_postgres_test() 
 ///   - Cursor advances.
 #[tokio::test]
 async fn policy_business_rule_violation_advances_without_dead_letter_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -4198,11 +4193,11 @@ impl replay::Aggregate for AlwaysFailsAccount {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        let AlwaysFailsAccountCommand::Touch { .. } = command;
-        Err(
-            replay::Error::invalid_input("always-fails-account rejects every command")
-                .with_operation("Touch"),
-        )
+        let AlwaysFailsAccountCommand::Touch { nonce } = command;
+        Err(replay::Error::invalid_input(format!(
+            "always-fails-account rejects every command (nonce {nonce})"
+        ))
+        .with_operation("Touch"))
     }
 }
 
@@ -4283,7 +4278,7 @@ async fn manufacture_dead_letter<P>(
 where
     P: replay_persistence::Policy + 'static,
 {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -4871,7 +4866,7 @@ async fn manufacture_dead_letters<P>(
 where
     P: replay_persistence::Policy + 'static,
 {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5122,7 +5117,7 @@ impl replay_persistence::Policy for SmallBatchPolicy {
 /// first one being busy.
 #[tokio::test]
 async fn policy_read_batch_is_one_budget_across_streams_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5199,7 +5194,7 @@ async fn policy_read_batch_is_one_budget_across_streams_postgres_test() {
 /// thing anybody configures deliberately (funkode-io/replay#231 review).
 #[tokio::test]
 async fn policy_reconciliation_leads_the_poll_it_runs_on_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5276,7 +5271,7 @@ async fn policy_reconciliation_leads_the_poll_it_runs_on_postgres_test() {
 /// sorting before it is never compared again (funkode-io/replay#231 review).
 #[tokio::test]
 async fn policy_reconciliation_wraps_across_an_empty_poll_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5366,7 +5361,7 @@ impl replay_persistence::Policy for CheckpointBatchPolicy {
 /// Three drain calls are required to exhaust all 5 events.
 #[tokio::test]
 async fn policy_read_batch_limits_events_per_drain_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5445,7 +5440,7 @@ async fn policy_read_batch_limits_events_per_drain_postgres_test() {
 ///   - Cursor ends at 4 again.
 #[tokio::test]
 async fn policy_checkpoint_batch_crash_recovery_reprocesses_tail_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5539,7 +5534,7 @@ async fn global_position_closure_policy_charges_deposit_fee_postgres_test() {
         PolicyFeeLedgerUrn, DEPOSIT_FEE_LEDGER_ID, DEPOSIT_FEE_POLICY_NAME, DEPOSIT_FEE_RATE,
     };
 
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5628,7 +5623,7 @@ async fn global_position_closure_policy_charges_deposit_fee_postgres_test() {
 /// `pg_notify('replay_events', ...)` after committing.
 #[tokio::test]
 async fn policy_notify_wakes_daemon_before_poll_interval_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5699,7 +5694,7 @@ async fn policy_notify_wakes_daemon_before_poll_interval_postgres_test() {
 /// reacts correctly.
 #[tokio::test]
 async fn policy_daemon_reacts_without_notify_via_polling_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5876,7 +5871,7 @@ async fn import_streaming_aggregate_executes_via_handle_stream_in_memory_test() 
 /// aggregate reflects every streamed event.
 #[tokio::test]
 async fn import_streaming_aggregate_executes_via_handle_stream_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5927,7 +5922,7 @@ async fn import_streaming_aggregate_executes_via_handle_stream_postgres_test() {
 /// that `PolicyStatusStore::list()` returns `CaughtUp`.
 #[tokio::test]
 async fn policy_status_caught_up_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -5992,7 +5987,7 @@ async fn policy_status_caught_up_postgres_test() {
 /// events it has not passed.
 #[tokio::test]
 async fn policy_status_working_behind_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -6053,7 +6048,7 @@ async fn policy_status_working_behind_postgres_test() {
 /// because a Policy reads each stream over a sequence with no holes in it.
 #[tokio::test]
 async fn policy_status_ignores_a_burned_position_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -6122,7 +6117,7 @@ async fn policy_status_ignores_a_burned_position_postgres_test() {
 /// with correct names, lags, and conditions.
 #[tokio::test]
 async fn policy_status_multiple_policies_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -6194,7 +6189,7 @@ async fn policy_status_multiple_policies_postgres_test() {
 /// A policy that has never run (no `policy_cursors` row) does not appear.
 #[tokio::test]
 async fn policy_status_unregistered_policy_absent_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -6226,7 +6221,7 @@ async fn policy_status_unregistered_policy_absent_postgres_test() {
 /// condition `Degraded` — never `Working`, even though the policy is also behind.
 #[tokio::test]
 async fn policy_status_degraded_with_dead_letters_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -6310,7 +6305,7 @@ async fn policy_status_degraded_with_dead_letters_postgres_test() {
 ///      `MAX(global_position)` is still `3`.
 #[tokio::test]
 async fn contiguous_high_water_mark_postgres_test() {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)

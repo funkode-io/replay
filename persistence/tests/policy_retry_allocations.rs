@@ -15,14 +15,14 @@ mod common;
 
 use common::alloc::{peak_live_bytes, reset_peak, CountingAllocator};
 use common::policy_harness::{Probe, ProbeCommand, ProbeUrn};
-use common::postgres_image::{postgres_container, POSTGRES_PORT};
+use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
 use common::report::report;
 
 use replay_persistence::{
     Cqrs, Dispatch, ObservedEvent, PolicyRunner, PolicySettings, PostgresEventStore, StartAt,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use testcontainers_modules::postgres;
 
 /// Every test binary registers its own global allocator; the counting itself is
 /// shared (`tests/common/alloc.rs`).
@@ -61,7 +61,7 @@ impl replay_persistence::Policy for QuietPolicy {
 /// settlement reads, not with the rows the reaction has parked.
 #[tokio::test]
 async fn peak_live_bytes_scale_with_the_page_not_the_reaction_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let policy_name = "retry_allocations";
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
@@ -172,14 +172,11 @@ async fn park_retired_commands(
 }
 
 /// A database with the crate's schema, and the container that owns it.
-async fn start_postgres() -> (
+async fn start_pool() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres_container()
-        .start()
-        .await
-        .expect("failed to start the postgres container");
+    let container = start_postgres_server().await;
     let host = container
         .get_host()
         .await

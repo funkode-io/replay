@@ -10,14 +10,14 @@
 use std::time::{Duration, Instant};
 
 use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Executor, PgPool, Row};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use testcontainers_modules::postgres;
 
 use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PostgresEventStore};
 
-mod common;
+use crate::common;
 use common::migrations::{self, through as migrations_through, MIGRATOR};
-use common::postgres_image::postgres_container;
+use common::postgres_image::start_postgres_server;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -107,11 +107,11 @@ impl replay::Compactable for Ledger {
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
-async fn start_postgres() -> (
+async fn start_pool() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -176,7 +176,7 @@ async fn append(cqrs: &Cqrs<PostgresEventStore>, ledger: &LedgerUrn, command: Le
 /// One command, one transaction, one id — and a later command a strictly higher one.
 #[tokio::test]
 async fn an_appended_event_carries_the_transaction_that_wrote_it_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
@@ -205,7 +205,7 @@ async fn an_appended_event_carries_the_transaction_that_wrote_it_postgres_test()
 /// They are stamped all the same, by the transaction that compacted.
 #[tokio::test]
 async fn compaction_stamps_the_snapshot_rows_it_writes_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
@@ -246,7 +246,7 @@ async fn compaction_stamps_the_snapshot_rows_it_writes_postgres_test() {
 /// everything written afterwards.
 #[tokio::test]
 async fn events_written_before_the_migration_carry_the_sentinel_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     migrations_through(BEFORE_STAMP)
         .run(&pool)
         .await
@@ -292,7 +292,7 @@ async fn events_written_before_the_migration_carry_the_sentinel_postgres_test() 
 /// table waits, and commits stamped for real rather than with the sentinel.
 #[tokio::test]
 async fn an_append_blocked_by_the_migration_is_stamped_for_real_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     migrations_through(BEFORE_STAMP)
         .run(&pool)
         .await
@@ -332,7 +332,7 @@ async fn an_append_blocked_by_the_migration_is_stamped_for_real_postgres_test() 
 /// Ordering by the stamp then the position is served by the index, not by a sort.
 #[tokio::test]
 async fn ordering_by_transaction_then_position_is_an_index_scan_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));

@@ -4,10 +4,10 @@
 //! `docs/adr/0018-every-event-read-is-ordered-by-global-position.md`.
 
 use sqlx::{PgPool, Row};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use testcontainers_modules::postgres;
 
-mod common;
-use common::postgres_image::postgres_container;
+use crate::common;
+use common::postgres_image::start_postgres_server;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -19,11 +19,11 @@ const EXPLAIN_TIME_TRAVEL_READ: &str = "EXPLAIN (COSTS OFF) \
      SELECT id FROM events WHERE created <= now() - interval '1980 seconds' \
       ORDER BY global_position ASC";
 
-async fn start_postgres() -> (
+async fn start_pool() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -57,7 +57,7 @@ async fn index_names(pool: &PgPool) -> Vec<String> {
 
 #[tokio::test]
 async fn created_is_indexed_on_its_own_after_migration_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let indexes = index_names(&pool).await;
 
@@ -84,7 +84,7 @@ async fn created_is_indexed_on_its_own_after_migration_postgres_test() {
 /// different kind.
 #[tokio::test]
 async fn time_travel_read_scans_the_created_index_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     sqlx::query("INSERT INTO streams (id, type, version) VALUES ('urn:acl:seed', 'Acl', 2000)")
         .execute(&pool)

@@ -13,7 +13,7 @@
 //!
 //! [Policy status]: ../../CONTEXT.md#policy-status
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

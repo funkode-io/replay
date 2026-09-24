@@ -88,10 +88,10 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use testcontainers_modules::postgres;
-use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync};
+use testcontainers_modules::testcontainers::ContainerAsync;
 use uuid::Uuid;
 
-use super::postgres_image::{postgres_container, POSTGRES_PORT};
+use super::postgres_image::{start_postgres_server, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
@@ -406,10 +406,7 @@ impl PolicyDaemonHarness {
     where
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
-        let container = postgres_container()
-            .start()
-            .await
-            .expect("failed to start the postgres container");
+        let container = start_postgres_server().await;
         let host = container
             .get_host()
             .await

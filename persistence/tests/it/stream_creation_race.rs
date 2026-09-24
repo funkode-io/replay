@@ -14,11 +14,11 @@
 use std::time::{Duration, Instant};
 
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use testcontainers_modules::postgres;
 
-mod common;
+use crate::common;
 use common::migrations::MIGRATOR;
-use common::postgres_image::{postgres_container, POSTGRES_PORT};
+use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
 
 /// The stream both racers append to. It does not exist when they start.
 const STREAM_ID: &str = "urn:ledger:contested";
@@ -43,11 +43,11 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// it has to read.
 const SERIALIZATION_FAILURE: &str = "40001";
 
-async fn start_postgres() -> (
+async fn start_pool() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -130,7 +130,7 @@ async fn await_blocked(pool: &PgPool) {
 /// the one the winner already holds.
 #[tokio::test]
 async fn concurrent_first_appends_to_one_new_stream_both_land_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let mut winner = pool.begin().await.expect("beginning the winner");
@@ -172,7 +172,7 @@ async fn concurrent_first_appends_to_one_new_stream_both_land_postgres_test() {
 /// connection.
 #[tokio::test]
 async fn the_wait_for_a_stream_being_created_is_bounded_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let mut winner = pool.begin().await.expect("beginning the winner");
@@ -205,7 +205,7 @@ async fn the_wait_for_a_stream_being_created_is_bounded_postgres_test() {
 /// creation race is a concurrency mismatch — no row — and never a database error.
 #[tokio::test]
 async fn the_loser_that_expected_a_new_stream_conflicts_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let mut winner = pool.begin().await.expect("beginning the winner");
@@ -251,7 +251,7 @@ async fn the_loser_that_expected_a_new_stream_conflicts_postgres_test() {
 /// a retryable failure, not the collision this migration removed.
 #[tokio::test]
 async fn an_append_under_repeatable_read_cannot_serialise_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     MIGRATOR.run(&pool).await.expect("migrations must succeed");
 
     let mut winner = pool.begin().await.expect("beginning the winner");

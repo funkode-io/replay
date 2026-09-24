@@ -21,7 +21,7 @@
 //! consumer's escalation hook was told about it. Escalation is asserted through
 //! the hook and never by letting the default exit the test process.
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

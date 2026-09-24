@@ -7,7 +7,7 @@
 //! quiet. What they assert is delivery — what the Policy reacted to and in what order —
 //! because that is the only thing a consumer of this library can see.
 
-mod common;
+use crate::common;
 
 use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
 use replay_persistence::{Dispatch, ObservedEvent, PolicySettings, StartAt};

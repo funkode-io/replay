@@ -8,7 +8,7 @@
 //! Every observation goes through `tests/common/policy_harness.rs` — a real
 //! daemon, a real database, no inspection of tasks or channels.
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

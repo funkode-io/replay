@@ -14,7 +14,7 @@
 //! Every observation goes through `tests/common/policy_harness.rs` — a real
 //! daemon, a real database, no inspection of tasks or channels (ADR-0014).
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

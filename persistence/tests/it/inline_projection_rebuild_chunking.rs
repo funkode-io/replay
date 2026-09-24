@@ -12,14 +12,14 @@
 use std::sync::{Arc, Mutex};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use testcontainers_modules::postgres;
 use urn::Urn;
 
 use replay_macros::define_aggregate;
 use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
-mod common;
-use common::postgres_image::postgres_container;
+use crate::common;
+use common::postgres_image::start_postgres_server;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -66,11 +66,11 @@ impl replay::Aggregate for Ledger {
     }
 }
 
-async fn start_postgres() -> (
+async fn start_pool() -> (
     PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
 ) {
-    let container = postgres_container().start().await.unwrap();
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -187,7 +187,7 @@ async fn first_registration_replays_history_in_bounded_chunks_postgres_test() {
     const HISTORY: usize = 35;
     const FLUSH: usize = 10;
 
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     seed_history(&pool, "rebuild-chunked-1", HISTORY).await;
 
     let log = CallLog::default();
@@ -225,7 +225,7 @@ async fn version_drift_rebuild_replays_history_in_bounded_chunks_postgres_test()
     const HISTORY: usize = 25;
     const FLUSH: usize = 7;
 
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     seed_history(&pool, "rebuild-chunked-drift-1", HISTORY).await;
 
     // Version 1 registers and replays the backlog; the log of that run is discarded.
@@ -272,7 +272,7 @@ async fn version_drift_rebuild_replays_history_in_bounded_chunks_postgres_test()
 /// A history shorter than the chunk still arrives in a single call, as it always did.
 #[tokio::test]
 async fn history_smaller_than_the_chunk_replays_in_one_call_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     seed_history(&pool, "rebuild-chunked-small-1", 3).await;
 
     let log = CallLog::default();
@@ -296,7 +296,7 @@ async fn history_smaller_than_the_chunk_replays_in_one_call_postgres_test() {
 /// keep them all.
 #[tokio::test]
 async fn replay_keeps_events_that_share_created_and_version_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     // Ten streams, one event each, all with the same `created` and `version` — the
     // shape produced by concurrent single-event appends landing in the same instant.
@@ -406,7 +406,7 @@ async fn replay_does_not_see_events_committed_between_pages_postgres_test() {
     const HISTORY: usize = 20;
     const FLUSH: usize = 5;
 
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     seed_history(&pool, "rebuild-snapshot-1", HISTORY).await;
 
     let log = CallLog::default();
@@ -508,7 +508,7 @@ impl InlineProjection for FailsPartWayProjection {
 /// rolls back the writes of every earlier chunk and leaves no recorded version behind.
 #[tokio::test]
 async fn failure_in_a_later_replay_chunk_rolls_back_the_whole_rebuild_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     let stream_id = seed_history(&pool, "rebuild-chunked-rollback-1", 20).await;
     let stream_id_str = Into::<Urn>::into(stream_id).to_string();
 

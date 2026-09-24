@@ -11,7 +11,9 @@
 #![allow(dead_code)]
 
 use testcontainers_modules::postgres;
-use testcontainers_modules::testcontainers::{ContainerRequest, ImageExt};
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
+use tokio::sync::Semaphore;
 
 include!("../../src/infrastructure/postgres_tag.rs");
 
@@ -21,4 +23,23 @@ pub const POSTGRES_PORT: u16 = 5432;
 /// A container request for the suite's PostgreSQL server.
 pub fn postgres_container() -> ContainerRequest<postgres::Postgres> {
     postgres::Postgres::default().with_tag(POSTGRES_TAG)
+}
+
+/// Bounds how many servers start at once, at the Docker VM's CPU count.
+///
+/// The suite is one binary since #249, so the harness runs one test per host core (10)
+/// and each test starts its own server on a 4-CPU colima VM. Ungated, three tests failed
+/// with `PoolTimedOut` waiting on a server that was up but starved.
+static STARTS: Semaphore = Semaphore::const_new(4);
+
+/// Starts the suite's PostgreSQL server, waiting its turn to do so.
+pub async fn start_postgres_server() -> ContainerAsync<postgres::Postgres> {
+    let _permit = STARTS
+        .acquire()
+        .await
+        .expect("the start gate is never closed");
+    postgres_container()
+        .start()
+        .await
+        .expect("failed to start the postgres container")
 }
