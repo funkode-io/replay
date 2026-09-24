@@ -368,10 +368,11 @@ mod tests {
         }
     }
 
-    /// A payload of the policy's own event type reaches `react`, with the
-    /// envelope (identity, position, metadata) carried across the erasure intact.
+    /// A payload of the policy's own event type reaches `react`, and the dispatch it
+    /// returns carries the stream the event was read from. The store's identity and
+    /// position do not cross the erasure at all — they are not on `ObservedEvent`.
     #[test]
-    fn reacts_to_a_matching_payload_preserving_the_envelope() {
+    fn reacts_to_a_matching_payload_carrying_its_stream_into_the_dispatch() {
         let raw = raw_frozen();
 
         let dispatches = FreezeNotifier.react_erased(&raw);
@@ -383,16 +384,16 @@ mod tests {
         );
         assert_eq!(dispatches[0].target(), TypeId::of::<Account>());
 
-        // The identity a parked dead letter is read by, taken from the id and
-        // the command type before either is erased.
+        // The identity a parked dead letter is read by: the dispatch's own target
+        // stream and command type, taken before either is erased.
         assert_eq!(dispatches[0].target_stream_id(), &raw.stream_id);
         assert_eq!(
             dispatches[0].command_name(),
             std::any::type_name::<<Account as Aggregate>::Command>()
         );
 
-        // The command was built from the deserialized payload and the borrowed
-        // envelope's stream id, so both survived the erasure.
+        // The command was built from the deserialized payload and the stream id the
+        // rule read, so both survived the erasure.
         let (id, command) = dispatches[0]
             .parts::<Account>()
             .expect("dispatch must carry the aggregate's (id, command) pair");

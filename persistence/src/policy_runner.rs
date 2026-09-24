@@ -3014,9 +3014,9 @@ async fn drain_policy_once(
         dispatch_timeout,
     };
 
-    // Asked once per poll, not once per stream: it is the Policy's own code, and the
-    // number of times a library calls back into it should not depend on how the log is
-    // laid out.
+    // A clone of the registration's filter, once per poll rather than once per stream.
+    // It stopped being a call into the Policy when the tunables became `PolicySettings`
+    // (ADR-0027); `name` is now the only consumer code a poll runs outside the reaction.
     let filter = policy.stream_filter();
 
     // Three sources: what the last poll could not finish, what the sweep just found, and
