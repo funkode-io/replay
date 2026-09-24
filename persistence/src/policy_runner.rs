@@ -3217,20 +3217,29 @@ async fn drain_policy_once(
     .await;
 
     let settled = plan.settle();
-    let mut carrying = settled.carried;
 
-    // A poll that failed hands on the places it had moved and not written, too: those
-    // events were delivered, their places are in memory only, and the sweep has passed
-    // the positions that would nominate those streams again. Without this they wait for
-    // the next reconciliation rather than the next poll.
-    if drained.is_err() {
+    // A poll that failed hands on the places it had moved and not written, and hands them
+    // on *first*: those events were delivered, their places are in memory only, and the
+    // sweep has passed the positions that would nominate those streams again. Anything
+    // the cap has to drop should be a stream that costs a re-read, not one that costs a
+    // redelivery.
+    let carrying = if drained.is_err() {
+        let mut recovering: Vec<String> = Vec::new();
         for (stream, _) in advanced {
-            if !carrying.contains(&stream) {
-                carrying.push(stream);
+            if !recovering.contains(&stream) {
+                recovering.push(stream);
             }
         }
-        carrying.truncate(read_batch as usize);
-    }
+        for stream in settled.carried {
+            if !recovering.contains(&stream) {
+                recovering.push(stream);
+            }
+        }
+        recovering.truncate(read_batch as usize);
+        recovering
+    } else {
+        settled.carried
+    };
 
     // The queue the next poll starts from, on every path out of this one — the failing
     // one included. This poll took the queue off `progress` and nobody else has a copy,
