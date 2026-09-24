@@ -34,7 +34,7 @@ pub use policy_runner::{
 };
 pub use policy_status::{PolicyCondition, PolicyStatus, PolicyStatusStore};
 pub use query::Query;
-pub use replay::{Dispatch, ObservedEvent, Policy};
+pub use replay::{AggregatePolicy, Dispatch, ObservedEvent, Policy, TargetedCommand};
 pub use store::{CompactionOutcome, EventSink, EventStore, NoSink};
 
 /// Convenience re-exports of the most commonly used types and traits across

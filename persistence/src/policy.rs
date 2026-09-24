@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use replay::{Dispatch, Event, ObservedEvent, Policy};
+use replay::{Aggregate, AggregatePolicy, Dispatch, Event, Metadata, ObservedEvent, Policy};
 
 use crate::{PersistedEvent, StreamFilter};
 
@@ -232,6 +232,52 @@ where
 
     fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
         (self.react)(event)
+    }
+}
+
+/// The per-reaction metadata a typed closure registration may carry, erased so one
+/// struct serves a registration with the hook and one without.
+type DispatchMetadataFn<E> = Box<dyn Fn(&ObservedEvent<E>) -> Option<Metadata> + Send + Sync>;
+
+/// An [`AggregatePolicy`] backed by a closure, created via
+/// [`PolicyRunnerBuilder::register_aggregate_policy_fn`](crate::PolicyRunnerBuilder::register_aggregate_policy_fn).
+///
+/// The typed twin of [`ClosurePolicy`]: the closure returns `(StreamId, Command)` pairs
+/// for the declared target instead of building [`Dispatch`]es, so it is asserted by
+/// equality. `Policy` arrives through the blanket impl in `es-replay`, which is what
+/// lets [`register_policy`](crate::PolicyRunnerBuilder::register_policy) take one.
+pub(crate) struct AggregateClosurePolicy<E, A, F> {
+    pub(crate) name: String,
+    pub(crate) react: F,
+    pub(crate) dispatch_metadata: Option<DispatchMetadataFn<E>>,
+    // `fn() -> (E, A)`, not `(E, A)`: the phantom must not ask the aggregate or its
+    // event to be `Send`/`Sync` for the policy to be.
+    pub(crate) _phantom: std::marker::PhantomData<fn() -> (E, A)>,
+}
+
+impl<E, A, F> AggregatePolicy for AggregateClosurePolicy<E, A, F>
+where
+    E: Event + 'static,
+    A: Aggregate + 'static,
+    A::StreamId: 'static,
+    A::Command: 'static,
+    F: Fn(&ObservedEvent<E>) -> Vec<(A::StreamId, A::Command)> + Send + Sync + 'static,
+{
+    type Event = E;
+    type Target = A;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<(A::StreamId, A::Command)> {
+        (self.react)(event)
+    }
+
+    fn dispatch_metadata(&self, event: &ObservedEvent<Self::Event>) -> Option<Metadata> {
+        self.dispatch_metadata
+            .as_ref()
+            .and_then(|metadata| metadata(event))
     }
 }
 
@@ -464,5 +510,79 @@ mod tests {
             settings.stream_filter(),
             StreamFilter::for_stream_type::<Account>()
         );
+    }
+
+    /// The typed closure registration's rule: the closure returns pairs, the blanket
+    /// impl addresses them to the declared target, and the metadata hook stamps the
+    /// reaction — all of it reached through the runner's erasure, from raw JSON.
+    #[test]
+    fn a_typed_closure_policy_dispatches_to_its_declared_target() {
+        let policy = AggregateClosurePolicy::<AccountEvent, Account, _> {
+            name: "typed_freeze_notifier".to_string(),
+            react: |event: &ObservedEvent<AccountEvent>| {
+                let AccountEvent::Frozen { reason } = &event.data;
+                vec![(AccountUrn(event.stream_id.clone()), reason.clone())]
+            },
+            dispatch_metadata: Some(Box::new(|event: &ObservedEvent<AccountEvent>| {
+                Some(Metadata::from_json(
+                    json!({ "frozen_stream": event.stream_id.to_string() }),
+                ))
+            })),
+            _phantom: std::marker::PhantomData,
+        };
+        let raw = raw_frozen();
+
+        let dispatches = policy.react_erased(&raw);
+
+        assert_eq!(Policy::name(&policy), "typed_freeze_notifier");
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].target(), TypeId::of::<Account>());
+        assert_eq!(
+            dispatches[0].parts::<Account>(),
+            Some((
+                &AccountUrn(raw.stream_id.clone()),
+                &"fraud-review".to_string()
+            ))
+        );
+        assert_eq!(
+            dispatches[0].metadata(),
+            Some(&Metadata::from_json(
+                json!({ "frozen_stream": raw.stream_id.to_string() })
+            ))
+        );
+    }
+
+    /// Without the hook a typed closure dispatches exactly what an untyped one does.
+    #[test]
+    fn a_typed_closure_policy_without_the_hook_attaches_no_metadata() {
+        let policy = AggregateClosurePolicy::<AccountEvent, Account, _> {
+            name: "bare_freeze_notifier".to_string(),
+            react: |event: &ObservedEvent<AccountEvent>| {
+                let AccountEvent::Frozen { reason } = &event.data;
+                vec![(AccountUrn(event.stream_id.clone()), reason.clone())]
+            },
+            dispatch_metadata: None,
+            _phantom: std::marker::PhantomData,
+        };
+
+        let dispatches = policy.react_erased(&raw_frozen());
+
+        assert!(dispatches[0].metadata().is_none());
+    }
+
+    /// Deserialize-or-skip routing is the blanket impl's, so a typed policy inherits it:
+    /// a payload of another event type produces no reaction and never runs the closure.
+    #[test]
+    fn a_typed_closure_policy_skips_a_non_matching_payload() {
+        let policy = AggregateClosurePolicy::<ShippingEvent, Account, _> {
+            name: "typed_shipping_notifier".to_string(),
+            react: |_: &ObservedEvent<ShippingEvent>| {
+                panic!("react must not be called for a non-matching payload")
+            },
+            dispatch_metadata: None,
+            _phantom: std::marker::PhantomData,
+        };
+
+        assert!(policy.react_erased(&raw_frozen()).is_empty());
     }
 }

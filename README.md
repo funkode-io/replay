@@ -2148,6 +2148,65 @@ Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount, charge_key })
     .with_metadata(Metadata::from([("correlation_id", request_id)]))
 ```
 
+### A policy that targets one aggregate
+
+When every command of a reaction goes to **one** aggregate type, declare that type:
+[`AggregatePolicy`] names it as an associated type and `react` returns
+`(StreamId, Command)` pairs, so a unit test asserts the reaction with `==` — no
+[`Dispatch`], no downcast, no store.
+
+```rust,ignore
+use replay::{AggregatePolicy, Metadata, ObservedEvent};
+
+impl AggregatePolicy for FeePolicy {
+    type Event = BankAccountEvent;
+    type Target = FeeLedger;
+
+    fn name(&self) -> &str {
+        "deposit_fee"
+    }
+
+    fn react(
+        &self,
+        event: &ObservedEvent<BankAccountEvent>,
+    ) -> Vec<(FeeLedgerUrn, FeeLedgerCommand)> {
+        match &event.data {
+            BankAccountEvent::Deposited { amount, reference } => vec![(
+                self.ledger_id.clone(),
+                FeeLedgerCommand::ChargeFee {
+                    amount: amount * FEE_RATE,
+                    charge_key: format!("{}#{reference}", event.stream_id),
+                },
+            )],
+            _ => vec![],
+        }
+    }
+
+    /// The typed twin of `Dispatch::with_metadata`: computed once per reaction and
+    /// attached to every command that reaction issues.
+    fn dispatch_metadata(&self, event: &ObservedEvent<BankAccountEvent>) -> Option<Metadata> {
+        Some(Metadata::from([("source_stream", event.stream_id.to_string())]))
+    }
+}
+
+assert_eq!(
+    FeePolicy { ledger_id: ledger.clone() }.react(&deposit),
+    vec![(ledger, FeeLedgerCommand::ChargeFee { amount: 1.0, charge_key })],
+);
+```
+
+A blanket impl makes it a `Policy`, so `register_policy` and the runner take it
+unchanged. Two consequences worth knowing:
+
+- **A type implements one trait or the other, never both.** A second `impl Policy` for a
+  type that already implements `AggregatePolicy` collides with the blanket impl
+  (`E0119`). A reaction that addresses several aggregate types — a business command plus
+  a dead letter back to the import stream, say — cannot name one target and stays a raw
+  `Policy`.
+- With both traits in scope (`replay::prelude` carries `Policy`), `policy.react(event)`
+  is ambiguous (`E0034`). Import `AggregatePolicy` alone, or write
+  `AggregatePolicy::react(&policy, &event)`.
+
 ### Closure shortcut
 
 For simple, single-aggregate reactions you can skip the struct and `impl Policy`
@@ -2178,6 +2237,34 @@ let runner = PolicyRunner::builder(cqrs)
     )
     .build();
 ```
+
+A closure whose commands all target one aggregate declares it the same way the trait
+does, with `register_aggregate_policy_fn` — the closure hands back pairs instead of
+building dispatches:
+
+```rust,ignore
+let runner = PolicyRunner::builder(cqrs)
+    .register_services::<FeeLedger>(fee_services)
+    .register_aggregate_policy_fn::<BankAccountEvent, FeeLedger, _>(
+        "deposit_fee",
+        PolicySettings::new().starting_at(StartAt::Beginning),
+        |event| match &event.data {
+            BankAccountEvent::Deposited { amount, reference } => vec![(
+                ledger_id.clone(),
+                ChargeFee {
+                    amount: amount * 0.01,
+                    charge_key: format!("{}#{reference}", event.stream_id),
+                },
+            )],
+            _ => vec![],
+        },
+    )
+    .build();
+```
+
+To stamp metadata on the commands of such a reaction, register it with
+`register_aggregate_policy_fn_with_metadata`, which takes the metadata closure before the
+reaction one and runs it once per reaction.
 
 ### Building and starting the runner
 
