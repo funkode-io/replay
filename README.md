@@ -2145,7 +2145,7 @@ You can attach additional metadata to a specific dispatch with [`Dispatch::with_
 
 ```rust,ignore
 Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount, charge_key })
-    .with_metadata(Metadata::from([("correlation_id", request_id)]))
+    .with_metadata(Metadata::new(json!({ "correlation_id": request_id })))
 ```
 
 ### A policy that targets one aggregate
@@ -2185,7 +2185,7 @@ impl AggregatePolicy for FeePolicy {
     /// The typed twin of `Dispatch::with_metadata`: computed once per reaction and
     /// attached to every command that reaction issues.
     fn dispatch_metadata(&self, event: &ObservedEvent<BankAccountEvent>) -> Option<Metadata> {
-        Some(Metadata::from([("source_stream", event.stream_id.to_string())]))
+        Some(Metadata::new(json!({ "source_stream": event.stream_id.to_string() })))
     }
 }
 

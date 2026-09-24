@@ -74,6 +74,8 @@ async fn a_single_target_policy_reacts_and_stamps_its_metadata_postgres_test() {
         dispatched.metadata["causation"]["global_position"],
         serde_json::json!(ping.global_position)
     );
+
+    harness.shutdown().await;
 }
 
 /// The same rule as a closure registration that declares its target: the closure hands
@@ -110,4 +112,6 @@ async fn a_typed_closure_policy_reacts_and_stamps_its_metadata_postgres_test() {
         dispatched.metadata["pinged_stream"],
         serde_json::json!(ping.stream_id)
     );
+
+    harness.shutdown().await;
 }
