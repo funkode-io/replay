@@ -1,5 +1,5 @@
-//! Which streams a Policy looks at this poll, how far the search got, and everything
-//! else the poll decides before it touches the database.
+//! Which streams a Policy looks at this poll, how far the search got, and what the poll
+//! decides between the queries that nominate its streams and the reads that deliver them.
 //!
 //! Discovery is deliberately allowed to be wrong in one direction. It sweeps the log by
 //! `global_position` for streams with new events, and a write that had not committed when
@@ -712,6 +712,9 @@ mod liveness_simulation {
         burst: u64,
         /// Cadences it has been behind without being read. The number under test.
         waited: u32,
+        /// The most streams seen behind at once while it has been waiting, which is the
+        /// numerator of ADR-0026's bound for *this* wait.
+        behind_while_waiting: u32,
         read_this_cadence: bool,
     }
 
@@ -733,8 +736,8 @@ mod liveness_simulation {
         /// Polls whose event budget ran out before their candidate list did, which is
         /// where a slot stops meaning a read.
         budgets_spent_early: u32,
-        /// Reconciliations whose page was filled to the batch, so more streams were
-        /// behind than one page holds.
+        /// Reconciliations whose page was filled to the batch while more streams were
+        /// behind than it held, so the pass took more than one page.
         pages_at_the_batch: u32,
         /// Polls no reconciliation ran on, which only exist when a cadence spans several.
         polls_between_cadences: u32,
@@ -816,6 +819,7 @@ mod liveness_simulation {
                     busy: rng.chance(2),
                     burst: rng.between(1, u64::from(read_batch) + 2),
                     waited: 0,
+                    behind_while_waiting: 0,
                     read_this_cadence: false,
                 });
                 // A backlog to start from, so the first cadences are not all empty.
@@ -908,7 +912,9 @@ mod liveness_simulation {
                 self.seen.empty_polls += 1;
             }
             if reconciling {
-                if page_len == self.read_batch as usize {
+                // A full page is only evidence of a page too small for what is behind if
+                // something was left out of it.
+                if page_len == self.read_batch as usize && self.behind().len() > page_len {
                     self.seen.pages_at_the_batch += 1;
                 }
             } else {
@@ -975,36 +981,44 @@ mod liveness_simulation {
             }
         }
 
-        /// The bound, from [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md):
+        /// Charge a cadence to every stream that was behind and not read during it, and
+        /// compare each against [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md):
         ///
         /// ```text
         /// cadences ≤ ceil(streams behind / streams read per cadence)
         /// ```
         ///
-        /// Derived here at its floor, which is the guarantee the ADR gives: the
-        /// reconciliation leads the poll it runs on, so **one** behind stream is read per
-        /// cadence at worst, and no more than every stream can be behind. Plus the one
-        /// cadence a finished pass spends on an empty page wrapping the rotation.
-        fn bound(&self) -> u32 {
-            self.streams.len() as u32 + 1
-        }
-
-        /// Charge a cadence to every stream that was behind and not read during it.
+        /// Taken at its floor, which is the guarantee the ADR gives rather than its best
+        /// case: the reconciliation leads the poll it runs on, so **one** behind stream is
+        /// read per cadence at worst, and the division is by one. The numerator is the
+        /// most streams seen behind at once *during that stream's wait* — the rotation
+        /// only spends a cadence on a stream that is behind — plus the one cadence a
+        /// finished pass spends wrapping on an empty page.
         fn account(&mut self) -> Result<(), String> {
-            let bound = self.bound();
+            let behind_now = self
+                .streams
+                .iter()
+                .filter(|stream| stream.head > stream.place)
+                .count() as u32;
             let mut starved: Vec<String> = Vec::new();
 
             for stream in &mut self.streams {
                 if stream.read_this_cadence || stream.head == stream.place {
                     stream.waited = 0;
+                    stream.behind_while_waiting = 0;
                 } else {
                     stream.waited += 1;
+                    stream.behind_while_waiting = stream.behind_while_waiting.max(behind_now);
+                    let bound = stream.behind_while_waiting + 1;
                     if stream.waited > bound {
                         starved.push(format!(
-                            "{} (owed {}, unread for {} cadences)",
+                            "{} (owed {}, unread for {} cadences, bound {bound} = at most \
+                             {} behind at once while it waited, read one a cadence, plus \
+                             the cadence a pass ends on)",
                             stream.id,
                             stream.head - stream.place,
-                            stream.waited
+                            stream.waited,
+                            stream.behind_while_waiting,
                         ));
                     }
                 }
@@ -1016,10 +1030,8 @@ mod liveness_simulation {
             }
 
             Err(format!(
-                "a stream the Policy is behind on went unread for more than {bound} \
-                 cadences, which is ADR-0026's bound \
-                 (ceil(streams behind / streams read per cadence), at the floor of one \
-                 read per cadence, plus the cadence a pass ends on):\n  starved: {}\n  \
+                "a stream the Policy is behind on went unread for longer than ADR-0026's \
+                 bound, ceil(streams behind / streams read per cadence):\n  starved: {}\n  \
                  seed: {}\n  streams: {} ({} quiet, {} busy)\n  read_batch: {}\n  \
                  polls per cadence: {}\n  schedule:\n    {}",
                 starved.join("\n           "),
@@ -1097,8 +1109,8 @@ mod liveness_simulation {
         );
         assert!(
             seen.pages_at_the_batch > 0,
-            "no reconciliation filled its page, so a Policy behind on more streams than \
-             one page holds was never simulated"
+            "no reconciliation filled a page while more streams were behind than it \
+             held, so a pass spanning several pages was never simulated"
         );
         assert!(
             seen.polls_between_cadences > 0,
