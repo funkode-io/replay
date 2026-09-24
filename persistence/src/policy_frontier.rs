@@ -97,11 +97,16 @@ pub(crate) struct PollPlan {
     /// How far down `streams` the poll has been handed a stream to read. Ahead of
     /// `visited` for exactly as long as that read is in flight.
     at: usize,
-    /// How far down `streams` the budget reached and the read came back. A stream past
-    /// this was named by a source and never read — because the budget stopped short of it
-    /// or because its read failed — which is the difference the rotation turns on: a slot
-    /// is not a read.
+    /// How far down `streams` the poll got through: read, delivered and done with. A
+    /// stream past this was named by a source and the poll never finished with it —
+    /// because the budget stopped short of it, or because its read or its delivery failed
+    /// — which is the difference the rotation turns on. A slot is not a read, and a read
+    /// is not a delivery.
     visited: usize,
+    /// Whether the read the poll is in the middle of took the whole budget, so the stream
+    /// may have more. Held until the poll is done with the stream: a delivery that fails
+    /// half way carries the stream as unfinished business either way.
+    filled_the_budget: bool,
     /// Streams this poll read a full budget's worth from, so they may have more. One
     /// entry per stream read, so the batch bounds it.
     unfinished: Vec<String>,
@@ -177,6 +182,7 @@ impl PollPlan {
             budget: read_batch,
             at: 0,
             visited: 0,
+            filled_the_budget: false,
             unfinished: Vec::new(),
             settled: false,
         }
@@ -207,24 +213,37 @@ impl PollPlan {
         })
     }
 
-    /// What the stream `turn` was handed out for yielded.
+    /// What the read for `turn` yielded. Spends the budget, and nothing else: the poll
+    /// still has to deliver these events, and the stream is not one it got through until
+    /// it has.
+    pub(crate) fn read(&mut self, _turn: &Turn, events: u32) {
+        self.filled_the_budget = events == self.budget;
+        self.budget -= events;
+    }
+
+    /// The poll is done with the stream `turn` was handed out for: its events were read
+    /// and delivered.
     ///
     /// A full read means the stream may have more; it is looked at again next poll rather
-    /// than drained here, so one busy stream cannot hold up every other.
-    pub(crate) fn read(&mut self, turn: &Turn, events: u32) {
+    /// than drained here, so one busy stream cannot hold up every other. It goes to the
+    /// *back* of the queue — ahead of nothing it was ahead of — because a stream written
+    /// to faster than it is read would otherwise hold the front of the queue for good and
+    /// starve everything behind it.
+    pub(crate) fn delivered(&mut self, turn: &Turn) {
         self.visited = turn.at;
-        if events == self.budget {
+        if std::mem::take(&mut self.filled_the_budget) {
             self.unfinished.push(turn.stream_id.clone());
         }
-        self.budget -= events;
     }
 
     /// The stream `turn` was handed out for belongs to somebody else now.
     ///
     /// A place that moved under the poll is left where its new owner put it, and the
     /// stream is not carried: the next poll reads the place afresh and resumes from there.
+    /// The poll is done with it all the same, so the rotation may pass it.
     pub(crate) fn abandoned(&mut self, turn: &Turn) {
-        self.unfinished.retain(|stream| *stream != turn.stream_id);
+        self.visited = turn.at;
+        self.filled_the_budget = false;
     }
 
     /// What the poll leaves behind.
@@ -529,6 +548,40 @@ mod settling_tests {
     #[should_panic(expected = "must be settled")]
     fn a_plan_dropped_without_settling_says_so() {
         drop(plan());
+    }
+
+    /// A delivery that failed half way leaves the stream where a read that never came
+    /// back does: carried, and not rotated past.
+    ///
+    /// The poll has read its events and put some of them through the Policy, and the
+    /// places for them are still only in memory. Counting it as one the poll got through
+    /// would let the rotation move over a stream that is still behind, and the sweep has
+    /// passed the events that would have nominated it again.
+    #[test]
+    fn a_delivery_that_failed_half_way_is_carried_and_not_rotated_past() {
+        let mut plan = PollPlan::plan(Nominations {
+            carried: Vec::new(),
+            swept: Vec::new(),
+            examined: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            reconciling: true,
+            read_batch: 4,
+            share_from: 0,
+        });
+
+        let turn = plan.turn().expect("the page's first stream leads the poll");
+        plan.read(&turn, 2);
+        // No `delivered`: this is the poll whose reaction, or whose checkpoint, failed.
+        let settled = plan.settle();
+
+        assert_eq!(
+            settled.carried,
+            vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            "the stream it was in the middle of is still owed"
+        );
+        assert_eq!(
+            settled.rotation, None,
+            "and the rotation stays where it was"
+        );
     }
 
     /// The stream a failed read was handed out for is one nobody read.
@@ -933,6 +986,7 @@ mod liveness_simulation {
                 stream.waited = 0;
                 read.push(format!("{}+{events}", turn.stream_id));
                 plan.read(&turn, events as u32);
+                plan.delivered(&turn);
             }
 
             if read.len() < candidates {

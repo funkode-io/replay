@@ -3068,6 +3068,11 @@ async fn drain_policy_once(
     });
     progress.share_from += 1;
 
+    // The places this poll has moved and not yet written. One entry per stream advanced
+    // since the last flush, so the batch bounds it. Declared out here because a poll that
+    // fails still has to say what it was holding: these places are in memory only.
+    let mut advanced: Vec<(String, i64)> = Vec::new();
+
     // Everything from here to the settle is I/O against what the plan decided, and every
     // way out of it — including a failed statement — goes through the settle below.
     let drained: Result<usize, replay::Error> = async {
@@ -3096,9 +3101,6 @@ async fn drain_policy_once(
 
         let mut executed = 0;
         let mut events_since_checkpoint = 0u32;
-        // One entry per stream advanced since the last flush, so this is bounded by the
-        // number of streams this poll looked at, which `read_batch` bounds in turn.
-        let mut advanced: Vec<(String, i64)> = Vec::new();
         // What the poll observed each place to be, which is what its checkpoints are
         // written against: a place that has moved underneath this poll belongs to an
         // operator or to another runner, and this one's arithmetic about it is stale.
@@ -3198,6 +3200,7 @@ async fn drain_policy_once(
                 continue;
             }
 
+            plan.delivered(&turn);
             if reached > place {
                 advanced.push((turn.stream_id, reached));
             }
@@ -3211,12 +3214,26 @@ async fn drain_policy_once(
     .await;
 
     let settled = plan.settle();
+    let mut carrying = settled.carried;
+
+    // A poll that failed hands on the places it had moved and not written, too: those
+    // events were delivered, their places are in memory only, and the sweep has passed
+    // the positions that would nominate those streams again. Without this they wait for
+    // the next reconciliation rather than the next poll.
+    if drained.is_err() {
+        for (stream, _) in advanced {
+            if !carrying.contains(&stream) {
+                carrying.push(stream);
+            }
+        }
+        carrying.truncate(read_batch as usize);
+    }
 
     // The queue the next poll starts from, on every path out of this one — the failing
     // one included. This poll took the queue off `progress` and nobody else has a copy,
     // so dropping it here sends the streams that were waiting for it back to whatever the
     // sweep happens to nominate next.
-    progress.unfinished = settled.carried;
+    progress.unfinished = carrying;
 
     // A poll that stopped on an error has not finished reading, so the cadence is not
     // stamped and the rotation is not moved: the next poll reconciles again, over a page
