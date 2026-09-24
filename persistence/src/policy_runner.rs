@@ -3164,10 +3164,12 @@ async fn drain_policy_once(
                 // than the full drain batch (skip-safety: a place only advances past
                 // events whose reactions are already durably committed).
                 if events_since_checkpoint >= checkpoint_size {
-                    let mut flushing = std::mem::take(&mut advanced);
-                    flushing.push((stream_id.clone(), reached));
-                    let kept = checkpoint_places(pool, &name, &flushing, &observed).await?;
-                    for (stream, seq) in &flushing {
+                    // Flushed out of `advanced` rather than taken from it: a checkpoint
+                    // that fails leaves these places where the poll's failure path can
+                    // find them, which is the only record that they moved at all.
+                    advanced.push((stream_id.clone(), reached));
+                    let kept = checkpoint_places(pool, &name, &advanced, &observed).await?;
+                    for (stream, seq) in &advanced {
                         if let Some(written_by) = kept.get(stream) {
                             observed.insert(
                                 stream.clone(),
@@ -3178,6 +3180,7 @@ async fn drain_policy_once(
                             );
                         }
                     }
+                    advanced.clear();
                     events_since_checkpoint = 0;
                     if !kept.contains_key(stream_id) {
                         superseded = true;
