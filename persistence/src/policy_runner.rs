@@ -3061,9 +3061,15 @@ async fn drain_policy_once(
     let drained: Result<usize, replay::Error> = async {
         // The sweep has read this stretch of log whatever the streams in it turn out to
         // owe, and a stream left unfinished is remembered rather than re-swept for.
+        //
+        // Written before it is taken in memory, for the reason the rotation is: a failed
+        // write would otherwise leave this runner searching above a stretch it has not
+        // recorded, so the streams that stretch nominated — already taken off
+        // `progress.unfinished` by the plan, and not all of them fit in the queue it
+        // hands back — would be nominated again by nothing but the reconciliation.
         if discovered.swept_through > progress.swept_through {
+            write_sweep(pool, &name, discovered.swept_through).await?;
             progress.swept_through = discovered.swept_through;
-            write_sweep(pool, &name, progress.swept_through).await?;
         }
 
         if plan.streams().is_empty() {
