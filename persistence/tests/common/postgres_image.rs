@@ -10,10 +10,12 @@
 //! this module, including the ones that never start a container.
 #![allow(dead_code)]
 
+use std::ops::Deref;
+use std::sync::{Arc, LazyLock};
 use testcontainers_modules::postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 include!("../../src/infrastructure/postgres_tag.rs");
 
@@ -25,21 +27,44 @@ pub fn postgres_container() -> ContainerRequest<postgres::Postgres> {
     postgres::Postgres::default().with_tag(POSTGRES_TAG)
 }
 
-/// Bounds how many servers start at once, at the Docker VM's CPU count.
+/// Bounds how many servers are alive at once, at the Docker VM's CPU count.
 ///
 /// The suite is one binary since #249, so the harness runs one test per host core (10)
-/// and each test starts its own server on a 4-CPU colima VM. Ungated, three tests failed
-/// with `PoolTimedOut` waiting on a server that was up but starved.
-static STARTS: Semaphore = Semaphore::const_new(4);
+/// and each test keeps its own server for the length of the test. Ungated, three tests
+/// failed with `PoolTimedOut` against a server that was up but starved on a 4-CPU colima
+/// VM. A permit is held for the container's whole life, not just its start: a server
+/// already up still costs the CPU the next one needs.
+static SERVERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
+
+/// The suite's PostgreSQL server, and the permit that admitted it.
+///
+/// Derefs to the container, so it reads as one at the call sites; dropping it stops the
+/// server and lets the next test start one.
+pub struct PostgresServer {
+    container: ContainerAsync<postgres::Postgres>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Deref for PostgresServer {
+    type Target = ContainerAsync<postgres::Postgres>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.container
+    }
+}
 
 /// Starts the suite's PostgreSQL server, waiting its turn to do so.
-pub async fn start_postgres_server() -> ContainerAsync<postgres::Postgres> {
-    let _permit = STARTS
-        .acquire()
+pub async fn start_postgres_server() -> PostgresServer {
+    let permit = Arc::clone(&SERVERS)
+        .acquire_owned()
         .await
-        .expect("the start gate is never closed");
-    postgres_container()
+        .expect("the server gate is never closed");
+    let container = postgres_container()
         .start()
         .await
-        .expect("failed to start the postgres container")
+        .expect("failed to start the postgres container");
+    PostgresServer {
+        container,
+        _permit: permit,
+    }
 }

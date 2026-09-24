@@ -11,14 +11,13 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, postgres::PgRow, PgPool};
-use testcontainers_modules::{postgres, testcontainers::ContainerAsync};
 use uuid::Uuid;
 
 use replay_persistence::PersistedEvent;
 
 mod common;
 use common::alloc::{allocated_bytes, CountingAllocator};
-use common::postgres_image::start_postgres_server;
+use common::postgres_image::{start_postgres_server, PostgresServer};
 use common::report::report;
 
 /// Every test binary registers its own global allocator; the counting itself is
@@ -48,7 +47,7 @@ fn fat_event(version: i64) -> Value {
     json!({ "reference": format!("event-{version}"), "blocks": blocks })
 }
 
-async fn start_pool() -> (ContainerAsync<postgres::Postgres>, PgPool) {
+async fn start_pool() -> (PostgresServer, PgPool) {
     let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();

@@ -22,7 +22,6 @@ use replay_persistence::{
     Cqrs, Dispatch, ObservedEvent, PolicyRunner, PolicySettings, PostgresEventStore, StartAt,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use testcontainers_modules::postgres;
 
 /// Every test binary registers its own global allocator; the counting itself is
 /// shared (`tests/common/alloc.rs`).
@@ -172,10 +171,7 @@ async fn park_retired_commands(
 }
 
 /// A database with the crate's schema, and the container that owns it.
-async fn start_pool() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
     let container = start_postgres_server().await;
     let host = container
         .get_host()

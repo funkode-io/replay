@@ -14,7 +14,6 @@
 use std::time::{Duration, Instant};
 
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use testcontainers_modules::postgres;
 
 use crate::common;
 use common::migrations::MIGRATOR;
@@ -43,10 +42,7 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// it has to read.
 const SERIALIZATION_FAILURE: &str = "40001";
 
-async fn start_pool() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container

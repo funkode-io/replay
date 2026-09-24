@@ -11,7 +11,6 @@
 //! `FLUSH` must peak near `FLUSH` payloads, not `EVENTS` of them.
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use testcontainers_modules::postgres;
 
 use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
@@ -142,10 +141,7 @@ impl InlineProjection for NoOpProjection {
     }
 }
 
-async fn start_pool() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container

@@ -4,7 +4,6 @@
 //! `docs/adr/0018-every-event-read-is-ordered-by-global-position.md`.
 
 use sqlx::{PgPool, Row};
-use testcontainers_modules::postgres;
 
 use crate::common;
 use common::postgres_image::start_postgres_server;
@@ -19,10 +18,7 @@ const EXPLAIN_TIME_TRAVEL_READ: &str = "EXPLAIN (COSTS OFF) \
      SELECT id FROM events WHERE created <= now() - interval '1980 seconds' \
       ORDER BY global_position ASC";
 
-async fn start_pool() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container

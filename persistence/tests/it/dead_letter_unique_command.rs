@@ -12,11 +12,10 @@
 
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sqlx::{AssertSqlSafe, Executor, PgPool, Row};
-use testcontainers_modules::{postgres, testcontainers::ContainerAsync};
 
 use crate::common;
 use common::migrations::{self, through as migrations_through, MIGRATOR};
-use common::postgres_image::start_postgres_server;
+use common::postgres_image::{start_postgres_server, PostgresServer};
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -30,7 +29,7 @@ const BEFORE_DEDUPE: i64 = 28;
 const DEDUPE: i64 = 29;
 
 /// An empty database — every test decides for itself how far to migrate it.
-async fn start_pool() -> (ContainerAsync<postgres::Postgres>, PgPool) {
+async fn start_pool() -> (PostgresServer, PgPool) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container

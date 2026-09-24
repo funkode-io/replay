@@ -8,7 +8,6 @@
 
 use futures::TryStreamExt;
 use sqlx::PgPool;
-use testcontainers_modules::postgres;
 use urn::Urn;
 
 use replay_macros::define_aggregate;
@@ -68,10 +67,7 @@ impl replay::Aggregate for Acl {
     }
 }
 
-async fn start_pool() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container

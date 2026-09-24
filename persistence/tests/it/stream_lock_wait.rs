@@ -20,11 +20,9 @@ use replay::ErrorKind;
 use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PostgresEventStore};
 use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Connection, PgConnection, PgPool};
-use testcontainers_modules::postgres;
-use testcontainers_modules::testcontainers::ContainerAsync;
 
 use common::migrations::MIGRATOR;
-use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
+use common::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT};
 
 /// The bound the tests set. Long enough that a loaded CI box does not report it
 /// before the blocker is even in place, short enough that a test waiting it out
@@ -103,7 +101,7 @@ impl replay::Compactable for Ledger {
 /// has to override in both directions.
 async fn start_postgres_with(
     session_lock_timeout: Option<&'static str>,
-) -> (PgPool, String, ContainerAsync<postgres::Postgres>) {
+) -> (PgPool, String, PostgresServer) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.expect("host").to_string();
     let port = container
@@ -138,7 +136,7 @@ async fn start_postgres_with(
 }
 
 /// The common case: a pool carrying no `lock_timeout` of its own.
-async fn start_pool() -> (PgPool, String, ContainerAsync<postgres::Postgres>) {
+async fn start_pool() -> (PgPool, String, PostgresServer) {
     start_postgres_with(None).await
 }
 

@@ -13,7 +13,6 @@
 use std::collections::BTreeMap;
 
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use testcontainers_modules::postgres;
 
 use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PostgresEventStore};
@@ -71,10 +70,7 @@ impl replay::Aggregate for Ledger {
     }
 }
 
-async fn start_pool() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
     let container = start_postgres_server().await;
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)

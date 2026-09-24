@@ -10,7 +10,6 @@
 use std::time::{Duration, Instant};
 
 use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Executor, PgPool, Row};
-use testcontainers_modules::postgres;
 
 use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PostgresEventStore};
@@ -107,10 +106,7 @@ impl replay::Compactable for Ledger {
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
-async fn start_pool() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container

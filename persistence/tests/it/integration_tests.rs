@@ -4,7 +4,6 @@ use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use testcontainers_modules::postgres;
 use tokio_test::assert_err;
 use urn::Urn;
 
@@ -4270,7 +4269,7 @@ async fn manufacture_dead_letter<P>(
     policy: P,
     policy_name: &str,
 ) -> (
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
+    common::postgres_image::PostgresServer,
     PgPool,
     replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
     i64,
@@ -4859,7 +4858,7 @@ async fn manufacture_dead_letters<P>(
     policy: P,
     amounts: &[f64],
 ) -> (
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
+    common::postgres_image::PostgresServer,
     PgPool,
     replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
 )
