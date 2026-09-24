@@ -63,3 +63,10 @@ quote = "1.0.45"
 
 # test dependencies
 wasm-bindgen-test = "0.3.73"
+
+[profile.test]
+# macOS Gatekeeper assesses every freshly linked binary on first exec, and the cost
+# tracks the debug symbol table: 43 MB with full debuginfo scans in 24-77s, 41 MB with
+# line tables in 2.95s. Across 35 test binaries that is 32 min per `cargo test
+# --workspace` run vs 100s. Line tables keep file:line in backtraces (#247).
+debug = "line-tables-only"
