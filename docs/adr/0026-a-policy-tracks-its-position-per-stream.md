@@ -72,8 +72,13 @@ is owed is read from that stream's own sequence, which has no holes.
   is a number.** This ADR owns that number; everything else quoting it links here.
 
   ```text
-  cadences ≤ ceil(streams behind / streams read per cadence)
+  cadences ≤ ceil(streams behind / streams read per cadence) + 1
   ```
+
+  The `+ 1` is the cadence that ends a pass. A rotation standing after the last stream id
+  reads an empty page, so that poll compares nothing and spends itself wrapping the cursor
+  back to the start; a stream sorting before it waits that cadence out
+  (funkode-io/replay#243).
 
   `REPLAY_POLICY_RECONCILE_SECS` (default 5s) is the cadence, and a Policy behind on no
   more streams than it reads in one is inside a single one. What it reads per cadence is
@@ -91,8 +96,9 @@ is owed is read from that stream's own sequence, which has no holes.
 
   The floor is asserted rather than argued: `liveness_simulation` in
   `persistence/src/policy_frontier.rs` replays sixty-four schedules against the poll's own
-  decision and fails if a behind stream goes unread for longer than this bound derived at
-  one read per cadence (funkode-io/replay#243).
+  decision and fails if a behind stream goes unread for longer than this bound, taken at
+  one read per cadence and over the streams seen behind during that stream's own wait
+  (funkode-io/replay#243).
 - **There is no hole to detect, so the machinery that detected holes is gone**:
   `burned_position.rs` and its `pg_locks` probe, `policy_feed.rs` and its gap truncation,
   `policy_blocked.rs` and its rate gate, `PolicyCondition::Blocked`, and the cursor's

@@ -353,6 +353,31 @@ fn share_the_poll<const N: usize>(limit: u32, from: usize, sources: [Vec<String>
     }
 }
 
+/// The queue a poll that failed hands to the next one.
+///
+/// `unwritten` is the places it moved and never wrote — the streams whose progress exists
+/// only in the failing poll's memory, and whose events the sweep has passed — so they go
+/// ahead of what the plan settled: what the cap drops should cost a re-read, not a
+/// redelivery. Each stream once, and capped like the queue a poll that finished hands on.
+pub(crate) fn recovering(
+    unwritten: impl IntoIterator<Item = String>,
+    settled: Vec<String>,
+    cap: u32,
+) -> Vec<String> {
+    let mut carried: Vec<String> = Vec::new();
+
+    for stream in unwritten.into_iter().chain(settled) {
+        if carried.len() as u32 == cap {
+            break;
+        }
+        if !carried.contains(&stream) {
+            carried.push(stream);
+        }
+    }
+
+    carried
+}
+
 /// Where the rotation lands after a reconciliation compared `page` and the poll read
 /// `read` of it, counted from the front. `None` leaves it where it was.
 ///
@@ -518,6 +543,39 @@ mod sharing_tests {
 #[cfg(test)]
 mod settling_tests {
     use super::{Nominations, PollPlan};
+
+    /// What a poll that failed hands on: its own unwritten places first, then what its
+    /// plan settled, each stream once and capped.
+    ///
+    /// The order is the whole point. A place this poll moved and never wrote is a
+    /// redelivery if it is dropped; a candidate it never reached is a re-read
+    /// (funkode-io/replay#246 review).
+    #[test]
+    fn a_failed_poll_hands_on_its_unwritten_places_ahead_of_its_candidates() {
+        let carried = super::recovering(
+            [
+                "urn:probe:advanced".to_string(),
+                "urn:probe:both".to_string(),
+            ],
+            vec![
+                "urn:probe:both".to_string(),
+                "urn:probe:candidate".to_string(),
+                "urn:probe:dropped".to_string(),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            carried,
+            vec![
+                "urn:probe:advanced".to_string(),
+                "urn:probe:both".to_string(),
+                "urn:probe:candidate".to_string(),
+            ],
+            "the unwritten places lead, the repeat costs one slot, and the cap drops the \
+             newest claim"
+        );
+    }
 
     /// A stream does not lose its place in the queue by winning a slot the poll then
     /// failed to use.
@@ -1107,15 +1165,15 @@ mod liveness_simulation {
         /// compare each against [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md):
         ///
         /// ```text
-        /// cadences ≤ ceil(streams behind / streams read per cadence)
+        /// cadences ≤ ceil(streams behind / streams read per cadence) + 1
         /// ```
         ///
         /// Taken at its floor, which is the guarantee the ADR gives rather than its best
         /// case: the reconciliation leads the poll it runs on, so **one** behind stream is
         /// read per cadence at worst, and the division is by one. The numerator is the
         /// most streams seen behind at once *during that stream's wait* — the rotation
-        /// only spends a cadence on a stream that is behind — plus the one cadence a
-        /// finished pass spends wrapping on an empty page.
+        /// only spends a cadence on a stream that is behind. The ADR's `+ 1` is the
+        /// cadence a finished pass spends wrapping on an empty page.
         fn account(&mut self) -> Result<(), String> {
             let behind_now = self
                 .streams
@@ -1153,7 +1211,8 @@ mod liveness_simulation {
 
             Err(format!(
                 "a stream the Policy is behind on went unread for longer than ADR-0026's \
-                 bound, ceil(streams behind / streams read per cadence):\n  starved: {}\n  \
+                 bound, ceil(streams behind / streams read per cadence) + 1:\n  \
+                 starved: {}\n  \
                  seed: {}\n  streams: {} ({} quiet, {} busy)\n  read_batch: {}\n  \
                  polls per cadence: {}\n  schedule:\n    {}",
                 starved.join("\n           "),

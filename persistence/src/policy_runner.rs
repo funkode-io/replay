@@ -30,7 +30,9 @@ use tokio::task::JoinHandle;
 use replay::{Aggregate, Dispatch, Metadata, ObservedEvent, Policy};
 
 use crate::policy::{ClosurePolicy, PolicySettings, RegisteredPolicy, StartAt};
-use crate::policy_frontier::{discovered_from_sweep, Discovered, Nominations, PollPlan};
+use crate::policy_frontier::{
+    discovered_from_sweep, recovering, Discovered, Nominations, PollPlan,
+};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
 };
@@ -3220,19 +3222,11 @@ async fn drain_policy_once(
     // the cap has to drop should be a stream that costs a re-read, not one that costs a
     // redelivery.
     let carrying = if drained.is_err() {
-        let mut recovering: Vec<String> = Vec::new();
-        for (stream, _) in advanced {
-            if !recovering.contains(&stream) {
-                recovering.push(stream);
-            }
-        }
-        for stream in settled.carried {
-            if !recovering.contains(&stream) {
-                recovering.push(stream);
-            }
-        }
-        recovering.truncate(read_batch as usize);
-        recovering
+        recovering(
+            advanced.into_iter().map(|(stream, _)| stream),
+            settled.carried,
+            read_batch,
+        )
     } else {
         settled.carried
     };
