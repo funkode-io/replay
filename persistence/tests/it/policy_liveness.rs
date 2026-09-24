@@ -11,7 +11,7 @@
 //! liveness from cursor movement, which is the false alarm this axis exists to
 //! prevent.
 //!
-//! [Policy status]: ../../CONTEXT.md#policy-status
+//! [Policy status]: ../../../CONTEXT.md#policy-status
 
 use crate::common;
 

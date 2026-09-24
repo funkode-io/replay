@@ -1232,7 +1232,7 @@ async fn two_retries_that_park_the_same_new_failure_leave_one_row_postgres_test(
 /// a delivery moved is left alone and the caller hears
 /// [`DeadLetterRetry::Superseded`] (funkode-io/replay#227).
 ///
-/// [Cursor move]: ../../CONTEXT.md#cursor-move
+/// [Cursor move]: ../../../CONTEXT.md#cursor-move
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delivery_that_reparks_a_row_mid_replay_is_not_settled_by_it_postgres_test() {
     let reaction = Reaction::new();

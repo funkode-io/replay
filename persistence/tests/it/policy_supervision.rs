@@ -6,7 +6,7 @@
 //! raised while the worker prepares its read of the feed, the shape of a panic in
 //! the lock manager, the listener or cursor I/O. A panic *inside* the reaction is
 //! parked as a dead letter and never reaches supervision
-//! ([ADR-0016](../../docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md),
+//! ([ADR-0016](../../../docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md),
 //! `policy_panic.rs`), and a dispatch that merely fails is retried or parked — so
 //! no test here restarts a worker for either.
 //!
