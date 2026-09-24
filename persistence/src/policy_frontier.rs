@@ -272,11 +272,16 @@ impl PollPlan {
             rotation_after(&self.page, read_through, self.read_batch)
         });
 
-        // What the next poll starts from, oldest claim first: what this one could not fit,
-        // then what it did not reach, then what it read and may not have finished. Capped,
-        // because it is the one collection here that outlives a poll.
-        let mut carried = std::mem::take(&mut self.carried_over);
-        carried.extend(self.streams[self.visited..].iter().cloned());
+        // What the next poll starts from. The stream the poll was in the middle of when
+        // it stopped comes first — at most one, handed out and never finished with, its
+        // events part delivered and the sweep already past the positions that would
+        // nominate it again, so the cap must not be what drops it. Then oldest claim
+        // first: what this poll could not fit, what it did not reach, and what it read and
+        // may not have finished. Capped, because it is the one collection here that
+        // outlives a poll.
+        let mut carried: Vec<String> = self.streams[self.visited..self.at].to_vec();
+        carried.extend(std::mem::take(&mut self.carried_over));
+        carried.extend(self.streams[self.at..].iter().cloned());
         carried.extend(std::mem::take(&mut self.unfinished));
         carried.truncate(self.read_batch as usize);
 
@@ -581,6 +586,35 @@ mod settling_tests {
         assert_eq!(
             settled.rotation, None,
             "and the rotation stays where it was"
+        );
+    }
+
+    /// The cap does not get to drop the stream the poll was in the middle of.
+    ///
+    /// One slot, an older leftover that lost it, and a read that failed: capping from the
+    /// front of the queue would drop the in-flight stream and keep the leftover, and the
+    /// sweep has already passed the events that would nominate the in-flight one again
+    /// (funkode-io/replay#246 review).
+    #[test]
+    fn the_stream_a_poll_stopped_in_the_middle_of_survives_the_cap() {
+        let mut plan = PollPlan::plan(Nominations {
+            carried: vec!["urn:probe:old".to_string()],
+            swept: vec!["urn:probe:swept".to_string()],
+            examined: Vec::new(),
+            reconciling: false,
+            read_batch: 1,
+            share_from: 1,
+        });
+
+        let turn = plan.turn().expect("the one slot went to the sweep");
+        assert_eq!(turn.stream_id, "urn:probe:swept");
+        // No `read` and no `delivered`: the poll stopped here.
+        let settled = plan.settle();
+
+        assert_eq!(
+            settled.carried,
+            vec!["urn:probe:swept".to_string()],
+            "the stream the poll was in the middle of keeps the one slot the cap allows"
         );
     }
 
