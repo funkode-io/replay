@@ -277,13 +277,28 @@ impl PollPlan {
         // events part delivered and the sweep already past the positions that would
         // nominate it again, so the cap must not be what drops it. Then oldest claim
         // first: what this poll could not fit, what it did not reach, and what it read and
-        // may not have finished. Capped, because it is the one collection here that
-        // outlives a poll.
-        let mut carried: Vec<String> = self.streams[self.visited..self.at].to_vec();
-        carried.extend(std::mem::take(&mut self.carried_over));
-        carried.extend(self.streams[self.at..].iter().cloned());
-        carried.extend(std::mem::take(&mut self.unfinished));
-        carried.truncate(self.read_batch as usize);
+        // may not have finished.
+        //
+        // Each stream once, and capped: it is the one collection here that outlives a
+        // poll, and a stream that two of those four name would otherwise spend two of the
+        // slots the cap allows and leave another stream out.
+        let leftovers = std::mem::take(&mut self.carried_over);
+        let unfinished = std::mem::take(&mut self.unfinished);
+        let mut carried: Vec<String> = Vec::new();
+        for stream in self.streams[self.visited..self.at]
+            .iter()
+            .cloned()
+            .chain(leftovers)
+            .chain(self.streams[self.at..].iter().cloned())
+            .chain(unfinished)
+        {
+            if carried.len() as u32 == self.read_batch {
+                break;
+            }
+            if !carried.contains(&stream) {
+                carried.push(stream);
+            }
+        }
 
         Settled {
             carried,
@@ -586,6 +601,37 @@ mod settling_tests {
         assert_eq!(
             settled.rotation, None,
             "and the rotation stays where it was"
+        );
+    }
+
+    /// A stream two of the queue's four parts name spends one slot, not two.
+    ///
+    /// The plan's own contract rather than a state `drain_policy_once` reaches today: the
+    /// turn order consumes the carried source before the cap bites except when the cap is
+    /// one, where the queue is one stream whatever is in it. It is asserted here because
+    /// the cap is the only thing standing between a stream and the next pass, and what it
+    /// drops should never be decided by a repeat (funkode-io/replay#246 review).
+    #[test]
+    fn a_stream_named_twice_takes_one_slot_in_the_carried_queue() {
+        let mut plan = PollPlan::plan(Nominations {
+            carried: vec!["urn:probe:a".to_string(), "urn:probe:z".to_string()],
+            swept: vec!["urn:probe:a".to_string()],
+            examined: vec!["urn:probe:p".to_string()],
+            reconciling: false,
+            read_batch: 2,
+            share_from: 1,
+        });
+
+        let turn = plan.turn().expect("the sweep leads this poll");
+        assert_eq!(turn.stream_id, "urn:probe:a");
+        // The poll stops here, so `a` is in flight *and* still in what the carried source
+        // was not asked for.
+        let settled = plan.settle();
+
+        assert_eq!(
+            settled.carried,
+            vec!["urn:probe:a".to_string(), "urn:probe:z".to_string()],
+            "the repeat costs no slot, so the stream behind it keeps its place"
         );
     }
 
