@@ -9,7 +9,7 @@
 //! these two tests exist to prove the harness itself rather than any library
 //! behaviour: the daemon reacts, and the daemon survives a reaction that fails.
 
-mod common;
+use crate::common;
 
 use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
 use replay_persistence::{Dispatch, PolicySettings, StartAt};

@@ -11,9 +11,9 @@
 //! liveness from cursor movement, which is the false alarm this axis exists to
 //! prevent.
 //!
-//! [Policy status]: ../../CONTEXT.md#policy-status
+//! [Policy status]: ../../../CONTEXT.md#policy-status
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

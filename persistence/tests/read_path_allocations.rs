@@ -11,17 +11,13 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, postgres::PgRow, PgPool};
-use testcontainers_modules::{
-    postgres,
-    testcontainers::{runners::AsyncRunner, ContainerAsync},
-};
 use uuid::Uuid;
 
 use replay_persistence::PersistedEvent;
 
 mod common;
 use common::alloc::{allocated_bytes, CountingAllocator};
-use common::postgres_image::postgres_container;
+use common::postgres_image::{start_postgres_server, PostgresServer};
 use common::report::report;
 
 /// Every test binary registers its own global allocator; the counting itself is
@@ -51,8 +47,8 @@ fn fat_event(version: i64) -> Value {
     json!({ "reference": format!("event-{version}"), "blocks": blocks })
 }
 
-async fn start_postgres() -> (ContainerAsync<postgres::Postgres>, PgPool) {
-    let container = postgres_container().start().await.unwrap();
+async fn start_pool() -> (PostgresServer, PgPool) {
+    let container = start_postgres_server().await;
 
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -117,7 +113,7 @@ async fn fetch_event_rows(pool: &PgPool, stream_id: &str) -> Vec<PgRow> {
 
 #[tokio::test]
 async fn reading_a_batch_of_events_allocates_once_per_payload() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
 
     let stream_id = "urn:fat-event:alloc";
     seed_events(&pool, stream_id, (1..=EVENTS).map(fat_event)).await;
@@ -164,7 +160,7 @@ async fn reading_a_batch_of_events_allocates_once_per_payload() {
 
 #[tokio::test]
 async fn a_row_that_fails_to_deserialize_reports_the_stored_json() {
-    let (_container, pool) = start_postgres().await;
+    let (_container, pool) = start_pool().await;
 
     let stream_id = "urn:fat-event:broken";
     seed_events(

@@ -8,14 +8,13 @@
 
 use futures::TryStreamExt;
 use sqlx::PgPool;
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 use urn::Urn;
 
 use replay_macros::define_aggregate;
 use replay_persistence::{AggregateVersion, CompactionOutcome, EventStore};
 
-mod common;
-use common::postgres_image::postgres_container;
+use crate::common;
+use common::postgres_image::start_postgres_server;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -68,11 +67,8 @@ impl replay::Aggregate for Acl {
     }
 }
 
-async fn start_postgres() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
-    let container = postgres_container().start().await.unwrap();
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
+    let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
@@ -126,7 +122,7 @@ async fn insert_event(
 /// no-op and the member is wrongly re-granted.
 #[tokio::test]
 async fn same_stream_replays_in_append_order_not_created_order_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let stream_id = AclUrn::new("acl-order-1").unwrap();
     let stream_key: String = Into::<Urn>::into(stream_id.clone()).to_string();
@@ -238,7 +234,7 @@ async fn events_in_position_order(
 /// scrambled, which is the #199 failure arriving from the write side.
 #[tokio::test]
 async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let cqrs =
         replay_persistence::Cqrs::new(replay_persistence::PostgresEventStore::new(pool.clone()));
@@ -341,7 +337,7 @@ async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postg
 /// second-appended event and drops the first.
 #[tokio::test]
 async fn created_filter_selects_rows_without_ordering_them_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
 
     let stream_id = AclUrn::new("acl-time-travel-1").unwrap();
     let stream_key: String = Into::<Urn>::into(stream_id.clone()).to_string();

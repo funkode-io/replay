@@ -13,14 +13,13 @@
 use std::collections::BTreeMap;
 
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{Cqrs, PostgresEventStore};
 
-mod common;
+use crate::common;
 use common::migrations::{through as migrations_through, MIGRATOR};
-use common::postgres_image::postgres_container;
+use common::postgres_image::start_postgres_server;
 
 const POSTGRES_PORT: u16 = 5432;
 
@@ -71,14 +70,8 @@ impl replay::Aggregate for Ledger {
     }
 }
 
-async fn start_postgres() -> (
-    PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<postgres::Postgres>,
-) {
-    let container = postgres_container()
-        .start()
-        .await
-        .expect("a postgres container must start");
+async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
+    let container = start_postgres_server().await;
     let port = container
         .get_host_port_ipv4(POSTGRES_PORT)
         .await
@@ -129,7 +122,7 @@ async fn places(pool: &PgPool, policy: &str) -> BTreeMap<String, i64> {
 /// migration does can tell what those places were.
 #[tokio::test]
 async fn a_running_policy_carries_over_to_the_place_each_stream_had_reached_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     migrations_through(BEFORE_PER_STREAM)
         .run(&pool)
         .await
@@ -214,7 +207,7 @@ async fn a_running_policy_carries_over_to_the_place_each_stream_had_reached_post
 /// that Policy was.
 #[tokio::test]
 async fn a_stream_the_cursor_never_reached_is_owed_whole_postgres_test() {
-    let (pool, _container) = start_postgres().await;
+    let (pool, _container) = start_pool().await;
     migrations_through(BEFORE_PER_STREAM)
         .run(&pool)
         .await

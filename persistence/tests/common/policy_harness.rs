@@ -87,11 +87,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use testcontainers_modules::postgres;
-use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync};
 use uuid::Uuid;
 
-use super::postgres_image::{postgres_container, POSTGRES_PORT};
+use super::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
@@ -378,7 +376,7 @@ impl Escalations {
 /// [`shutdown`](Self::shutdown).
 pub struct PolicyDaemonHarness {
     /// Dropping this stops the database; the field is never read.
-    _container: ContainerAsync<postgres::Postgres>,
+    _container: PostgresServer,
     pool: PgPool,
     cqrs: Cqrs<PostgresEventStore>,
     policy_name: String,
@@ -406,10 +404,7 @@ impl PolicyDaemonHarness {
     where
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
-        let container = postgres_container()
-            .start()
-            .await
-            .expect("failed to start the postgres container");
+        let container = start_postgres_server().await;
         let host = container
             .get_host()
             .await
