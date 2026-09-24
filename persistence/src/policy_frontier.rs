@@ -90,8 +90,12 @@ pub(crate) struct PollPlan {
     page: Vec<String>,
     reconciling: bool,
     read_batch: u32,
-    /// What no slot was found for, which the next poll has the oldest claim on.
-    carried_over: Vec<String>,
+    /// The queue this poll started from, whole and in order — not just the part that
+    /// found no slot. A stream keeps its seniority when it wins a slot: if the poll then
+    /// fails before reading it, it is still the oldest claim there is, and the sweep has
+    /// long since passed the events that first nominated it (funkode-io/replay#246
+    /// review).
+    carried: Vec<String>,
     /// What is left of the poll's event budget.
     budget: u32,
     /// How far down `streams` the poll has been handed a stream to read. Ahead of
@@ -150,9 +154,11 @@ impl PollPlan {
             share_from,
         } = nominations;
 
-        // Bounded by the batch, like every other collection here: it is the page the
-        // reconciliation read, which its own `LIMIT` capped.
+        // Bounded by the batch, like every other collection here: the page is what the
+        // reconciliation read, which its own `LIMIT` capped, and the queue is what the
+        // last poll handed on, which this one caps again before it hands it on.
         let page = examined.clone();
+        let queue = carried.clone();
         let Shared { taken, left } = share_the_poll(
             read_batch,
             // Except on the poll a reconciliation runs, where it leads. Its candidates are
@@ -165,14 +171,14 @@ impl PollPlan {
             if reconciling { RECONCILED } else { share_from },
             [carried, swept, examined],
         );
-        let [carried_over, _, _] = left;
+        drop(left);
 
         Self {
             streams: taken,
             page,
             reconciling,
             read_batch,
-            carried_over,
+            carried: queue,
             budget: read_batch,
             at: 0,
             visited: 0,
@@ -261,29 +267,32 @@ impl PollPlan {
             rotation_after(&self.page, read_through, self.read_batch)
         });
 
-        // What the next poll starts from. The stream the poll was in the middle of when
-        // it stopped comes first — at most one, handed out and never finished with, its
-        // events part delivered and the sweep already past the positions that would
-        // nominate it again, so the cap must not be what drops it. Then oldest claim
-        // first: what this poll could not fit, what it did not reach, and what it read and
-        // may not have finished.
+        // What the next poll starts from, oldest claim first.
         //
-        // Each stream once, and capped: it is the one collection here that outlives a
+        // The stream the poll was in the middle of leads: at most one, handed out and
+        // never finished with, its events part delivered and the sweep already past the
+        // positions that would nominate it again, so the cap must not be what drops it.
+        // Then the queue this poll was given, in the order it was given it and minus what
+        // the poll got through — a stream does not lose its place by winning a slot the
+        // poll then failed to use. Then the candidates this poll never reached, and last
+        // what it read and may not have finished.
+        //
+        // Each stream once, and capped: this is the one collection here that outlives a
         // poll, and a stream that two of those four name would otherwise spend two of the
         // slots the cap allows and leave another stream out.
+        let done: HashSet<&String> = self.streams[..self.visited].iter().collect();
         let mut carried: Vec<String> = Vec::new();
         for stream in self.streams[self.visited..self.at]
             .iter()
-            .cloned()
-            .chain(self.carried_over)
-            .chain(self.streams[self.at..].iter().cloned())
-            .chain(self.unfinished)
+            .chain(self.carried.iter().filter(|stream| !done.contains(stream)))
+            .chain(self.streams[self.at..].iter())
+            .chain(self.unfinished.iter())
         {
             if carried.len() as u32 == self.read_batch {
                 break;
             }
-            if !carried.contains(&stream) {
-                carried.push(stream);
+            if !carried.contains(stream) {
+                carried.push(stream.clone());
             }
         }
 
@@ -509,6 +518,77 @@ mod sharing_tests {
 #[cfg(test)]
 mod settling_tests {
     use super::{Nominations, PollPlan};
+
+    /// A stream does not lose its place in the queue by winning a slot the poll then
+    /// failed to use.
+    ///
+    /// The poll that fails before its first read is the one that shows it: everything it
+    /// admitted is still owed, and what the cap has to drop should be the newest claim,
+    /// not the oldest. A carried stream that won a slot has been waiting since some
+    /// earlier poll, and the sweep passed the events that first nominated it
+    /// (funkode-io/replay#246 review).
+    #[test]
+    fn a_carried_stream_that_won_a_slot_keeps_its_seniority() {
+        let plan = PollPlan::plan(Nominations {
+            carried: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            swept: vec!["urn:probe:c".to_string(), "urn:probe:d".to_string()],
+            examined: Vec::new(),
+            reconciling: false,
+            read_batch: 2,
+            share_from: 1,
+        });
+        assert_eq!(
+            plan.streams(),
+            ["urn:probe:c".to_string(), "urn:probe:a".to_string()],
+            "the sweep leads this poll and the queue takes the other slot"
+        );
+
+        // The poll fails before its first read — `places_of`, or the sweep's own write.
+        let settled = plan.settle();
+
+        assert_eq!(
+            settled.carried,
+            vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            "the two the poll was given, in the order it was given them"
+        );
+    }
+
+    /// The same, with the queue interleaved through the candidate list: its order is the
+    /// order it was handed over in, not the order the poll would have read it in.
+    #[test]
+    fn a_queue_the_poll_never_read_comes_back_in_the_order_it_arrived() {
+        let carried = ["urn:probe:c1", "urn:probe:c2", "urn:probe:c3"];
+        let plan = PollPlan::plan(Nominations {
+            carried: carried.iter().map(|s| (*s).to_string()).collect(),
+            swept: ["urn:probe:s1", "urn:probe:s2", "urn:probe:s3"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            examined: Vec::new(),
+            reconciling: false,
+            read_batch: 3,
+            share_from: 1,
+        });
+        assert_eq!(
+            plan.streams(),
+            [
+                "urn:probe:s1".to_string(),
+                "urn:probe:c1".to_string(),
+                "urn:probe:s2".to_string()
+            ],
+        );
+
+        let settled = plan.settle();
+
+        assert_eq!(
+            settled.carried,
+            carried
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<String>>(),
+            "the whole queue, unshuffled, and the newly swept candidates behind it"
+        );
+    }
 
     /// A stream two of the queue's four parts name spends one slot, not two.
     ///
