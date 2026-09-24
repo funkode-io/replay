@@ -22,6 +22,9 @@ serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 
 urn = { workspace = true }
+# No clock, no `std`-only paths: the core crate must keep building for wasm32, and
+# `DateTime<Utc>` is a type-level use here — nothing in this crate reads the time.
+chrono = { workspace = true }
 
 tracing = { workspace = true }
 futures = { workspace = true }
@@ -29,6 +32,7 @@ futures = { workspace = true }
 [dev-dependencies]
 tracing-test = { workspace = true }
 uuid = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }

@@ -22,7 +22,9 @@ pub use filters::StreamFilter;
 pub use infrastructure::{InMemoryEventStore, PostgresEventStore, PostgresInlineProjection};
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
-pub use policy::{Dispatch, Policy, StartAt};
+// The rule itself lives in the core crate (ADR-0027); re-exported here permanently so a
+// consumer of the runner has one import and the runner's docs stay self-contained.
+pub use policy::{PolicySettings, StartAt};
 pub use policy_liveness::{Liveness, WorkerLiveness};
 pub use policy_runner::{
     DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, EscalationReason,
@@ -32,6 +34,7 @@ pub use policy_runner::{
 };
 pub use policy_status::{PolicyCondition, PolicyStatus, PolicyStatusStore};
 pub use query::Query;
+pub use replay::{Dispatch, ObservedEvent, Policy};
 pub use store::{CompactionOutcome, EventSink, EventStore, NoSink};
 
 /// Convenience re-exports of the most commonly used types and traits across
@@ -55,9 +58,10 @@ pub mod prelude {
     pub use super::{
         AggregateVersion, CompactionOutcome, Cqrs, DeadLetterDiscard, DeadLetterRetry,
         DeadLetterRetrySummary, Dispatch, Escalation, EscalationReason, EventSink, EventStore,
-        InMemoryEventStore, InlineProjection, Liveness, NoSink, PersistedEvent, Policy,
-        PolicyCondition, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus,
-        PolicyStatusStore, PostgresEventStore, PostgresInlineProjection, Query, StartAt,
-        StoppedWorker, StreamFilter, WorkerLiveness, WorkerSupervision,
+        InMemoryEventStore, InlineProjection, Liveness, NoSink, ObservedEvent, PersistedEvent,
+        Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon,
+        PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
+        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, WorkerLiveness,
+        WorkerSupervision,
     };
 }

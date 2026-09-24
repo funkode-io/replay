@@ -12,26 +12,27 @@
 mod common;
 
 use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
-use replay_persistence::{Dispatch, StartAt};
+use replay_persistence::{Dispatch, PolicySettings, StartAt};
 
 /// The harness works: a policy registered through it reacts to an appended
 /// event, the reaction's command lands as an event carrying the policy's
 /// causation, and the cursor moves past the event that triggered it.
 #[tokio::test]
 async fn a_registered_policy_reacts_to_an_appended_event_postgres_test() {
-    let harness =
-        PolicyDaemonHarness::start("reacts", |builder, policy| {
-            builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, |event| {
-                match &event.data {
-                    ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
-                        ProbeUrn::new(format!("{tag}-echo")).unwrap(),
-                        ProbeCommand::Echo { tag: tag.clone() },
-                    )],
-                    _ => vec![],
-                }
-            })
-        })
-        .await;
+    let harness = PolicyDaemonHarness::start("reacts", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            |event| match &event.data {
+                ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+                    ProbeUrn::new(format!("{tag}-echo")).unwrap(),
+                    ProbeCommand::Echo { tag: tag.clone() },
+                )],
+                _ => vec![],
+            },
+        )
+    })
+    .await;
 
     let ping = harness.ping("subject-1", "hello").await;
 
@@ -54,25 +55,26 @@ async fn a_registered_policy_reacts_to_an_appended_event_postgres_test() {
 /// daemon carries on — the next ping is still reacted to.
 #[tokio::test]
 async fn a_permanently_failing_reaction_is_parked_and_the_daemon_carries_on_postgres_test() {
-    let harness =
-        PolicyDaemonHarness::start("parks", |builder, policy| {
-            builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, |event| {
-                match &event.data {
-                    ProbeEvent::Pinged { tag } if tag == "poison" => vec![Dispatch::to::<Probe>(
-                        ProbeUrn::new("refuser").unwrap(),
-                        ProbeCommand::Refuse {
-                            reason: "poison".to_string(),
-                        },
-                    )],
-                    ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
-                        ProbeUrn::new(format!("{tag}-echo")).unwrap(),
-                        ProbeCommand::Echo { tag: tag.clone() },
-                    )],
-                    _ => vec![],
-                }
-            })
-        })
-        .await;
+    let harness = PolicyDaemonHarness::start("parks", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            |event| match &event.data {
+                ProbeEvent::Pinged { tag } if tag == "poison" => vec![Dispatch::to::<Probe>(
+                    ProbeUrn::new("refuser").unwrap(),
+                    ProbeCommand::Refuse {
+                        reason: "poison".to_string(),
+                    },
+                )],
+                ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+                    ProbeUrn::new(format!("{tag}-echo")).unwrap(),
+                    ProbeCommand::Echo { tag: tag.clone() },
+                )],
+                _ => vec![],
+            },
+        )
+    })
+    .await;
 
     let poison = harness.ping("subject-1", "poison").await;
 
@@ -105,16 +107,20 @@ async fn a_permanently_failing_reaction_is_parked_and_the_daemon_carries_on_post
 #[tokio::test]
 async fn a_reaction_into_the_same_stream_does_not_confuse_the_trigger_postgres_test() {
     let harness = PolicyDaemonHarness::start("same_stream", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, |event| {
-            match &event.data {
-                // Echo back into the stream the ping arrived on.
-                ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
-                    ProbeUrn::parse(&event.stream_id).unwrap(),
-                    ProbeCommand::Echo { tag: tag.clone() },
-                )],
-                _ => vec![],
-            }
-        })
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            |event| {
+                match &event.data {
+                    // Echo back into the stream the ping arrived on.
+                    ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+                        ProbeUrn::parse(&event.stream_id).unwrap(),
+                        ProbeCommand::Echo { tag: tag.clone() },
+                    )],
+                    _ => vec![],
+                }
+            },
+        )
     })
     .await;
 

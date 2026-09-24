@@ -16,7 +16,8 @@ use common::policy_harness::{
     PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn, OBSERVE_TIMEOUT,
 };
 use replay_persistence::{
-    Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder, StartAt, TIMEOUT_ERROR_KIND,
+    Dispatch, ObservedEvent, Policy, PolicyRunnerBuilder, PolicySettings, StartAt,
+    TIMEOUT_ERROR_KIND,
 };
 use tracing_test::traced_test;
 
@@ -48,7 +49,6 @@ const SLEEP_FOR: Duration = Duration::from_millis(50);
 struct HangingPolicy {
     name: String,
     hang_for: Duration,
-    timeout: Duration,
     reactions: Arc<AtomicUsize>,
 }
 
@@ -59,15 +59,7 @@ impl Policy for HangingPolicy {
         &self.name
     }
 
-    fn start_at(&self) -> StartAt {
-        StartAt::Beginning
-    }
-
-    fn dispatch_timeout(&self) -> Option<Duration> {
-        Some(self.timeout)
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
         match &event.data {
             ProbeEvent::Pinged { tag } if tag == HANGS => {
                 self.reactions.fetch_add(1, Ordering::SeqCst);
@@ -95,12 +87,16 @@ fn hanging_policy(
     reactions: Arc<AtomicUsize>,
 ) -> impl Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static {
     move |builder, policy| {
-        builder.register_policy(HangingPolicy {
-            name: policy.to_string(),
-            hang_for,
-            timeout,
-            reactions: Arc::clone(&reactions),
-        })
+        builder.register_policy(
+            HangingPolicy {
+                name: policy.to_string(),
+                hang_for,
+                reactions: Arc::clone(&reactions),
+            },
+            PolicySettings::new()
+                .starting_at(StartAt::Beginning)
+                .with_dispatch_timeout(timeout),
+        )
     }
 }
 

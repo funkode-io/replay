@@ -104,7 +104,11 @@ define_aggregate! {
             // An account is opened *for* a user: the command only references the
             // owning root by its URN, it never reaches into the User aggregate.
             OpenAccount { owner: UserUrn },
-            Deposit { amount: f64 },
+            // `reference` is the depositor's own identifier for the operation —
+            // what a payment instruction is keyed by upstream. A rule that must
+            // recognise a redelivered deposit has nothing else to key on, so the
+            // event carries it (ADR-0027).
+            Deposit { amount: f64, reference: String },
             Withdraw { amount: f64 },
             CloseMonth { month: chrono::NaiveDate },
         },
@@ -112,7 +116,7 @@ define_aggregate! {
             // Only `AccountOpened` carries the owner; movements stay lean and the
             // read models resolve account -> owner from this event.
             AccountOpened { owner: UserUrn },
-            Deposited { amount: f64 },
+            Deposited { amount: f64, reference: String },
             Withdrawn { amount: f64 },
             MonthlyClosed { month: chrono::NaiveDate, closing_balance: f64 },
         }
@@ -129,7 +133,7 @@ impl EventStream for BankAccount {
     fn apply(&mut self, event: Self::Event) {
         match event {
             BankAccountEvent::AccountOpened { owner } => self.owner = Some(owner),
-            BankAccountEvent::Deposited { amount } => self.balance += amount,
+            BankAccountEvent::Deposited { amount, .. } => self.balance += amount,
             BankAccountEvent::Withdrawn { amount } => self.balance -= amount,
             // A checkpoint replaces the running balance with the closing one, so a
             // compacted stream rehydrates to exactly the same state.
@@ -154,8 +158,8 @@ impl Aggregate for BankAccount {
             BankAccountCommand::OpenAccount { owner } => {
                 Ok(vec![BankAccountEvent::AccountOpened { owner }])
             }
-            BankAccountCommand::Deposit { amount } => {
-                Ok(vec![BankAccountEvent::Deposited { amount }])
+            BankAccountCommand::Deposit { amount, reference } => {
+                Ok(vec![BankAccountEvent::Deposited { amount, reference }])
             }
             BankAccountCommand::Withdraw { amount } => {
                 if self.balance < amount {
@@ -195,32 +199,34 @@ impl Compactable for BankAccount {
     }
 }
 
-// ── Policy idempotency recipe (causation guard) ─────────────────────────────
+// ── Policy idempotency recipe (idempotent command shape) ────────────────────
 
 // This aggregate is a copy-pasteable recipe for policy targets under
 // at-least-once delivery:
-// - command carries `causation_event_id` from the triggering event
-// - state tracks applied causation ids
-// - duplicate causation id => no-op (returns no events)
+// - the command carries a `charge_key` the reacting rule reads off the
+//   triggering event — a policy is not given the event's identity (ADR-0027),
+//   so the operation's own identifier has to be in the payload
+// - state tracks the keys already applied
+// - a repeated key => no-op (returns no events)
 define_aggregate! {
     PolicyFeeLedger {
         namespace: "policy-fee-ledger",
         state: {
             balance: f64,
-            applied_causation_ids: HashSet<uuid::Uuid>,
+            applied_charge_keys: HashSet<String>,
         },
         commands: {
             Credit { amount: f64 },
             ChargeFee {
                 amount: f64,
-                causation_event_id: uuid::Uuid,
+                charge_key: String,
             },
         },
         events: {
             Credited { amount: f64 },
             FeeCharged {
                 amount: f64,
-                causation_event_id: uuid::Uuid,
+                charge_key: String,
             },
         }
     }
@@ -236,11 +242,8 @@ impl EventStream for PolicyFeeLedger {
     fn apply(&mut self, event: Self::Event) {
         match event {
             PolicyFeeLedgerEvent::Credited { amount } => self.balance += amount,
-            PolicyFeeLedgerEvent::FeeCharged {
-                amount,
-                causation_event_id,
-            } => {
-                self.applied_causation_ids.insert(causation_event_id);
+            PolicyFeeLedgerEvent::FeeCharged { amount, charge_key } => {
+                self.applied_charge_keys.insert(charge_key);
                 self.balance -= amount;
             }
         }
@@ -261,19 +264,15 @@ impl Aggregate for PolicyFeeLedger {
             PolicyFeeLedgerCommand::Credit { amount } => {
                 Ok(vec![PolicyFeeLedgerEvent::Credited { amount }])
             }
-            PolicyFeeLedgerCommand::ChargeFee {
-                amount,
-                causation_event_id,
-            } => {
-                if self.applied_causation_ids.contains(&causation_event_id) {
-                    // Duplicate delivery for the same causation identity:
-                    // absorb as no-op.
+            PolicyFeeLedgerCommand::ChargeFee { amount, charge_key } => {
+                if self.applied_charge_keys.contains(&charge_key) {
+                    // A charge already applied under this key: absorb as no-op.
                     return Ok(Vec::new());
                 }
 
                 Ok(vec![PolicyFeeLedgerEvent::FeeCharged {
                     amount,
-                    causation_event_id,
+                    charge_key,
                 }])
             }
         }
@@ -300,23 +299,28 @@ pub const DEPOSIT_FEE_LEDGER_ID: &str = "global-fees";
 /// Pure reaction for the deposit-fee policy.
 ///
 /// Reacts to every [`BankAccountEvent::Deposited`] by charging a 1 % fee to
-/// the shared [`PolicyFeeLedger`].  The `causation_event_id` field in the
-/// command carries the triggering event's identity so the ledger can absorb
-/// duplicate deliveries as no-ops.
+/// the shared [`PolicyFeeLedger`].  The `charge_key` names the deposit being
+/// charged for — the stream it landed on and the reference the deposit carries —
+/// so the ledger absorbs a duplicate delivery as a no-op.
+///
+/// The key comes from the event's payload because nothing in the envelope can
+/// stand in for it: a rule is not given the event's id, and `created` is shared
+/// by every event of one append, so two equal deposits in one transaction would
+/// collide.
 ///
 /// Exported so the integration test can pass it directly to
 /// [`PolicyRunnerBuilder::register_policy_fn`] and keep the logic in one place.
 pub fn deposit_fee_react(
-    event: &replay_persistence::PersistedEvent<BankAccountEvent>,
+    event: &replay_persistence::ObservedEvent<BankAccountEvent>,
 ) -> Vec<replay_persistence::Dispatch> {
     match &event.data {
-        BankAccountEvent::Deposited { amount } => {
+        BankAccountEvent::Deposited { amount, reference } => {
             let ledger = PolicyFeeLedgerUrn::new(DEPOSIT_FEE_LEDGER_ID).unwrap();
             vec![replay_persistence::Dispatch::to::<PolicyFeeLedger>(
                 ledger,
                 PolicyFeeLedgerCommand::ChargeFee {
                     amount: amount * DEPOSIT_FEE_RATE,
-                    causation_event_id: event.id,
+                    charge_key: format!("{}#{reference}", event.stream_id),
                 },
             )]
         }
@@ -383,22 +387,25 @@ impl Query for GlobalPositionQuery {
     }
 
     fn update(&mut self, event: PersistedEvent<Self::Event>) {
-        match event.data {
+        let stream_id = event.stream_id.clone();
+        match event.into_data() {
             GlobalPositionEvent::UserEvent(UserEvent::Registered { name }) => {
                 self.position.name = name;
             }
             GlobalPositionEvent::BankAccountEvent(BankAccountEvent::AccountOpened { owner }) => {
                 if owner == self.user {
-                    self.owned_accounts.insert(event.stream_id);
+                    self.owned_accounts.insert(stream_id);
                 }
             }
-            GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Deposited { amount }) => {
-                if self.owned_accounts.contains(&event.stream_id) {
+            GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Deposited {
+                amount, ..
+            }) => {
+                if self.owned_accounts.contains(&stream_id) {
                     self.position.total_balance += amount;
                 }
             }
             GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Withdrawn { amount }) => {
-                if self.owned_accounts.contains(&event.stream_id) {
+                if self.owned_accounts.contains(&stream_id) {
                     self.position.total_balance -= amount;
                 }
             }
@@ -491,7 +498,10 @@ impl InlineProjection for GlobalPositionProjection {
                     .await
                     .map_err(db_error)?;
                 }
-                GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Deposited { amount }) => {
+                GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Deposited {
+                    amount,
+                    ..
+                }) => {
                     apply_balance_delta(conn, &event.stream_id, *amount).await?;
                 }
                 GlobalPositionEvent::BankAccountEvent(BankAccountEvent::Withdrawn { amount }) => {
@@ -576,7 +586,10 @@ async fn main() -> replay::Result<()> {
     cqrs.execute::<BankAccount>(
         &checking,
         Default::default(),
-        BankAccountCommand::Deposit { amount: 1_000.0 },
+        BankAccountCommand::Deposit {
+            amount: 1_000.0,
+            reference: "salary-2025-01".to_string(),
+        },
         &(),
         None,
     )
@@ -592,7 +605,10 @@ async fn main() -> replay::Result<()> {
     cqrs.execute::<BankAccount>(
         &savings,
         Default::default(),
-        BankAccountCommand::Deposit { amount: 500.0 },
+        BankAccountCommand::Deposit {
+            amount: 500.0,
+            reference: "transfer-2025-01".to_string(),
+        },
         &(),
         None,
     )

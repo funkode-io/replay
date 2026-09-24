@@ -25,8 +25,8 @@ use common::policy_harness::{
     OBSERVE_TIMEOUT,
 };
 use replay_persistence::{
-    DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Dispatch, PersistedEvent, Policy,
-    PolicyRunnerBuilder, StartAt,
+    DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Dispatch, ObservedEvent, Policy,
+    PolicyRunnerBuilder, PolicySettings, StartAt,
 };
 
 /// Tag whose reaction dispatches two commands, each to its own instance.
@@ -209,11 +209,7 @@ impl Policy for TwoCommandPolicy {
         &self.name
     }
 
-    fn start_at(&self) -> StartAt {
-        StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
         let ProbeEvent::Pinged { tag } = &event.data else {
             return vec![];
         };
@@ -309,14 +305,17 @@ impl Reaction {
         let retargeted = Arc::clone(&self.retargeted);
         let gate = Arc::clone(&self.gate);
         move |builder, policy| {
-            builder.register_policy(TwoCommandPolicy {
-                name: policy.to_string(),
-                reactions: Arc::clone(&reactions),
-                first_recovered: Arc::clone(&first_recovered),
-                second_recovered: Arc::clone(&second_recovered),
-                retargeted: Arc::clone(&retargeted),
-                gate: Arc::clone(&gate),
-            })
+            builder.register_policy(
+                TwoCommandPolicy {
+                    name: policy.to_string(),
+                    reactions: Arc::clone(&reactions),
+                    first_recovered: Arc::clone(&first_recovered),
+                    second_recovered: Arc::clone(&second_recovered),
+                    retargeted: Arc::clone(&retargeted),
+                    gate: Arc::clone(&gate),
+                },
+                PolicySettings::new().starting_at(StartAt::Beginning),
+            )
         }
     }
 

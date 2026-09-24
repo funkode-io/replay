@@ -27,9 +27,9 @@ use sqlx::{Pool, Postgres, QueryBuilder, Row};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use replay::{Aggregate, Metadata};
+use replay::{Aggregate, Dispatch, Metadata, ObservedEvent, Policy};
 
-use crate::policy::{Dispatch, ErasedPolicy, Policy, StartAt};
+use crate::policy::{ClosurePolicy, PolicySettings, RegisteredPolicy, StartAt};
 use crate::policy_frontier::{discovered_from_sweep, Discovered, Nominations, PollPlan};
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
@@ -41,16 +41,16 @@ use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 ///
 /// Registered via [`PolicyRunnerBuilder::register_services`], which captures the
 /// concrete aggregate `A` *and* its `Services`. At drain time the runner looks up
-/// the executor by the [`Dispatch`]'s [`TypeId`], hands over the opaque payload,
-/// and the executor downcasts it back to `(A::StreamId, A::Command)` and runs it
-/// through [`Cqrs::execute`].
+/// the executor by the [`Dispatch`]'s [`TypeId`] and hands the dispatch over; the
+/// executor takes the `(A::StreamId, A::Command)` pair back out of it and runs it
+/// through [`Cqrs::execute`]. The pair is moved rather than borrowed, which is why the
+/// whole dispatch crosses this seam.
 trait AggregateExecutor: Send + Sync {
     fn execute<'a>(
         &'a self,
         cqrs: &'a Cqrs<PostgresEventStore>,
-        payload: Box<dyn Any + Send>,
+        dispatch: Dispatch,
         metadata: Metadata,
-        expected_version: Option<i64>,
     ) -> BoxFuture<'a, Result<(), replay::Error>>;
 }
 
@@ -69,17 +69,15 @@ where
     fn execute<'a>(
         &'a self,
         cqrs: &'a Cqrs<PostgresEventStore>,
-        payload: Box<dyn Any + Send>,
+        dispatch: Dispatch,
         metadata: Metadata,
-        expected_version: Option<i64>,
     ) -> BoxFuture<'a, Result<(), replay::Error>> {
         Box::pin(async move {
-            let (id, command) = *payload
-                .downcast::<(A::StreamId, A::Command)>()
-                .map_err(|_| {
-                    replay::Error::internal("policy dispatch payload type mismatch")
-                        .with_operation("policy_execute")
-                })?;
+            let expected_version = dispatch.expected_version();
+            let (id, command) = dispatch.into_parts::<A>().map_err(|_| {
+                replay::Error::internal("policy dispatch payload type mismatch")
+                    .with_operation("policy_execute")
+            })?;
 
             cqrs.execute::<A>(&id, metadata, command, &self.services, expected_version)
                 .await
@@ -135,44 +133,13 @@ pub const PANIC_ERROR_KIND: &str = "Panic";
 /// returned produced no error to take a kind from.
 pub const TIMEOUT_ERROR_KIND: &str = "Timeout";
 
-// ── Closure-based policy adapter ─────────────────────────────────────────────
-
-/// A [`Policy`] backed by a plain closure, created via
-/// [`PolicyRunnerBuilder::register_policy_fn`].
-struct ClosurePolicy<E, F> {
-    name: String,
-    start_at: StartAt,
-    react: F,
-    _phantom: std::marker::PhantomData<E>,
-}
-
-impl<E, F> Policy for ClosurePolicy<E, F>
-where
-    E: replay::Event + 'static,
-    F: Fn(&PersistedEvent<E>) -> Vec<Dispatch> + Send + Sync + 'static,
-{
-    type Event = E;
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn start_at(&self) -> StartAt {
-        self.start_at
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
-        (self.react)(event)
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Builds a [`PolicyRunner`] by registering aggregate services and policies.
 pub struct PolicyRunnerBuilder {
     cqrs: Cqrs<PostgresEventStore>,
     pool: Pool<Postgres>,
-    policies: Vec<Arc<dyn ErasedPolicy>>,
+    policies: Vec<Arc<RegisteredPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
     heartbeat: Option<Duration>,
@@ -198,12 +165,21 @@ impl PolicyRunnerBuilder {
         self
     }
 
-    /// Register a policy. Its `name` becomes the stable cursor key.
-    pub fn register_policy<P>(mut self, policy: P) -> Self
+    /// Register a policy, and the [`PolicySettings`] the runner drives it with. Its
+    /// `name` becomes the stable cursor key.
+    ///
+    /// ```rust,ignore
+    /// builder.register_policy(
+    ///     DepositFee,
+    ///     PolicySettings::new().starting_at(StartAt::Beginning),
+    /// )
+    /// ```
+    pub fn register_policy<P>(mut self, policy: P, settings: PolicySettings) -> Self
     where
         P: Policy + 'static,
     {
-        self.policies.push(Arc::new(policy));
+        self.policies
+            .push(Arc::new(RegisteredPolicy::new(policy, settings)));
         self
     }
 
@@ -312,7 +288,7 @@ impl PolicyRunnerBuilder {
     /// runner_builder
     ///     .register_policy_fn::<BankAccountEvent, _>(
     ///         "deposit_fee",
-    ///         StartAt::Beginning,
+    ///         PolicySettings::new().starting_at(StartAt::Beginning),
     ///         |event| match &event.data {
     ///             BankAccountEvent::Deposited { amount } => vec![
     ///                 Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount: amount * 0.01 })
@@ -327,19 +303,21 @@ impl PolicyRunnerBuilder {
     pub fn register_policy_fn<E, F>(
         self,
         name: impl Into<String>,
-        start_at: StartAt,
+        settings: PolicySettings,
         react: F,
     ) -> Self
     where
         E: replay::Event + 'static,
-        F: Fn(&PersistedEvent<E>) -> Vec<Dispatch> + Send + Sync + 'static,
+        F: Fn(&ObservedEvent<E>) -> Vec<Dispatch> + Send + Sync + 'static,
     {
-        self.register_policy(ClosurePolicy {
-            name: name.into(),
-            start_at,
-            react,
-            _phantom: std::marker::PhantomData,
-        })
+        self.register_policy(
+            ClosurePolicy {
+                name: name.into(),
+                react,
+                _phantom: std::marker::PhantomData,
+            },
+            settings,
+        )
     }
 
     pub fn build(self) -> PolicyRunner {
@@ -412,7 +390,7 @@ pub struct DeadLetterRetrySummary {
 pub struct PolicyRunner {
     cqrs: Cqrs<PostgresEventStore>,
     pool: Pool<Postgres>,
-    policies: Vec<Arc<dyn ErasedPolicy>>,
+    policies: Vec<Arc<RegisteredPolicy>>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
     notifications: bool,
     /// How often the durable heartbeat is written, or `None` when the consumer
@@ -884,9 +862,10 @@ impl PolicyRunner {
     /// the drain's rows are, and the column counts retries made on a row, not
     /// executions of a command.
     ///
-    /// Re-execution safety comes from the causation guard (the command carries
-    /// the triggering event's id) plus the optimistic-concurrency check in
-    /// [`Cqrs::execute`], so retrying an already-applied reaction is a no-op.
+    /// Re-execution safety comes from the target's idempotent command shape (the
+    /// command carries a key the rule reads off the triggering event, ADR-0027) plus
+    /// the optimistic-concurrency check in [`Cqrs::execute`], so retrying an
+    /// already-applied reaction is a no-op.
     ///
     /// Returns the outcome for the row `id` names, and
     /// [`DeadLetterRetry::NotFound`] when no row matches it. Returns a clear
@@ -991,7 +970,7 @@ impl PolicyRunner {
                 pool: &self.pool,
                 executors: &self.executors,
                 policy_name,
-                dispatch_timeout: resolve_dispatch_timeout(policy.as_ref()),
+                dispatch_timeout: resolve_dispatch_timeout(policy.settings()),
             };
             for (ordinal, dispatch) in policy.react_erased(&raw).into_iter().enumerate() {
                 if !self.executors.contains_key(&dispatch.target()) {
@@ -1560,7 +1539,7 @@ impl PolicyRunner {
         }
     }
 
-    async fn drain_policy(&self, policy: &dyn ErasedPolicy) -> Result<usize, replay::Error> {
+    async fn drain_policy(&self, policy: &RegisteredPolicy) -> Result<usize, replay::Error> {
         let name = policy.name().to_string();
         // Held across the drain: two manual drains of one policy at once would each work
         // from the other's stale search state, and the second would undo the first's turn.
@@ -1578,7 +1557,7 @@ impl PolicyRunner {
         // operator who moves a place and drains expects that drain to find it.
         progress.reconcile_now();
 
-        let max_depth = resolve_max_depth(policy);
+        let max_depth = resolve_max_depth(policy.settings());
         drain_policy_once(
             &self.cqrs,
             &self.pool,
@@ -1960,7 +1939,7 @@ async fn run_heartbeat(
 /// makes a restart possible at all.
 #[derive(Clone)]
 struct PolicyWorker {
-    policy: Arc<dyn ErasedPolicy>,
+    policy: Arc<RegisteredPolicy>,
     cqrs: Cqrs<PostgresEventStore>,
     pool: Pool<Postgres>,
     executors: HashMap<TypeId, Arc<dyn AggregateExecutor>>,
@@ -1998,7 +1977,7 @@ impl PolicyWorker {
         } = self;
         let mut wake_rx = wake_tx.as_ref().map(broadcast::Sender::subscribe);
 
-        let max_depth = resolve_max_depth(policy.as_ref());
+        let max_depth = resolve_max_depth(policy.settings());
 
         'lifetime: loop {
             if *shutdown_rx.borrow() {
@@ -3017,16 +2996,16 @@ async fn drain_policy_once(
     cqrs: &Cqrs<PostgresEventStore>,
     pool: &Pool<Postgres>,
     executors: &HashMap<TypeId, Arc<dyn AggregateExecutor>>,
-    policy: &dyn ErasedPolicy,
+    policy: &RegisteredPolicy,
     progress: &mut PolicyProgress,
     max_depth: u32,
     reporting: &mut Reporting<'_>,
 ) -> Result<usize, replay::Error> {
     let started = Instant::now();
     let name = policy.name().to_string();
-    let checkpoint_size = resolve_checkpoint_batch_size(policy);
-    let read_batch = resolve_read_batch_size(policy, checkpoint_size);
-    let dispatch_timeout = resolve_dispatch_timeout(policy);
+    let checkpoint_size = resolve_checkpoint_batch_size(policy.settings());
+    let read_batch = resolve_read_batch_size(policy.settings(), checkpoint_size);
+    let dispatch_timeout = resolve_dispatch_timeout(policy.settings());
     let delivery = Delivery {
         cqrs,
         pool,
@@ -3123,7 +3102,7 @@ async fn drain_policy_once(
                     if depth >= max_depth {
                         // Circuit breaker: the event's causation chain is too deep.
                         // Skip reactions but keep advancing so the policy is not wedged.
-                        let (_, limit_source) = resolve_max_depth_with_source(policy);
+                        let (_, limit_source) = resolve_max_depth_with_source(policy.settings());
                         tracing::warn!(
                             policy        = %name,
                             event_id      = %raw.id,
@@ -3312,7 +3291,7 @@ impl Delivery<'_> {
     /// any — is the reaction's own to keep consistent.
     async fn react_to_event(
         &self,
-        policy: &dyn ErasedPolicy,
+        policy: &RegisteredPolicy,
         global_position: i64,
         raw: &PersistedEvent<Value>,
     ) -> Result<usize, replay::Error> {
@@ -3386,12 +3365,12 @@ impl Delivery<'_> {
     /// an event costs at most one timeout per dispatch per attempt.
     ///
     /// **Re-react safety**: on retry the policy's `react` is called again for the
-    /// same event.  Because `react` is a pure function and the at-least-once +
-    /// causation-guard contract already guarantees idempotency, re-executing an
-    /// earlier dispatch that already succeeded is safe.
+    /// same event.  `react` is pure, and the same event yields the same dispatches —
+    /// including the idempotency key the command carries — so a target that absorbs a
+    /// repeated key sees an earlier successful dispatch as a no-op (ADR-0027).
     async fn execute_event_reactions(
         &self,
-        policy: &dyn ErasedPolicy,
+        policy: &RegisteredPolicy,
         global_position: i64,
         raw: &PersistedEvent<Value>,
         pending: &PendingFailures,
@@ -4419,7 +4398,7 @@ async fn execute_dispatch(
     })?;
 
     let aggregate_name = dispatch.aggregate_name();
-    let dispatch_metadata = dispatch.metadata.clone();
+    let dispatch_metadata = dispatch.metadata().cloned();
 
     let metadata = merge_dispatch_metadata(
         causation_metadata(policy_name, global_position, raw),
@@ -4431,9 +4410,7 @@ async fn execute_dispatch(
             .with_context("aggregate", aggregate_name)
     })?;
 
-    executor
-        .execute(cqrs, dispatch.payload, metadata, dispatch.expected_version)
-        .await
+    executor.execute(cqrs, dispatch, metadata).await
 }
 
 /// Where a Policy is: a place per stream, and how far discovery has swept the log.
@@ -4781,7 +4758,7 @@ const CHECKPOINT_BATCH_SIZE_ENV_VAR: &str = "REPLAY_CHECKPOINT_BATCH_SIZE";
 /// Generous on purpose: it exists to cut loose a reaction that has *stopped*,
 /// not to enforce a latency budget, so it must not park a reaction that is
 /// merely slow. A reaction with a legitimately longer ceiling raises it with
-/// [`Policy::dispatch_timeout`].
+/// [`PolicySettings::with_dispatch_timeout`].
 const DEFAULT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Environment variable that overrides the dispatch-timeout default, in
@@ -4791,16 +4768,16 @@ const DISPATCH_TIMEOUT_ENV_VAR: &str = "REPLAY_DISPATCH_TIMEOUT_MS";
 /// Resolve the effective causation depth limit for a policy.
 ///
 /// Precedence (most-specific wins):
-///   1. Per-policy override via [`Policy::max_causation_depth`]
+///   1. Per-policy override via [`PolicySettings::with_max_causation_depth`]
 ///   2. `REPLAY_MAX_CAUSATION_DEPTH` environment variable
 ///   3. Built-in default (10)
-fn resolve_max_depth(policy: &dyn ErasedPolicy) -> u32 {
-    resolve_max_depth_with_source(policy).0
+fn resolve_max_depth(settings: &PolicySettings) -> u32 {
+    resolve_max_depth_with_source(settings).0
 }
 
 /// Like [`resolve_max_depth`] but also returns the source for diagnostic logging.
-fn resolve_max_depth_with_source(policy: &dyn ErasedPolicy) -> (u32, &'static str) {
-    if let Some(d) = policy.max_causation_depth_erased() {
+fn resolve_max_depth_with_source(settings: &PolicySettings) -> (u32, &'static str) {
+    if let Some(d) = settings.max_causation_depth() {
         return (d, "policy override");
     }
     if let Ok(s) = std::env::var(CAUSATION_DEPTH_ENV_VAR) {
@@ -4814,8 +4791,8 @@ fn resolve_max_depth_with_source(policy: &dyn ErasedPolicy) -> (u32, &'static st
 /// Resolve the effective checkpoint batch size (events between cursor saves).
 ///
 /// Precedence: per-policy override → `REPLAY_CHECKPOINT_BATCH_SIZE` env var → default 100.
-fn resolve_checkpoint_batch_size(policy: &dyn ErasedPolicy) -> u32 {
-    if let Some(n) = policy.checkpoint_batch_size_erased() {
+fn resolve_checkpoint_batch_size(settings: &PolicySettings) -> u32 {
+    if let Some(n) = settings.checkpoint_batch_size() {
         return n.max(1);
     }
     if let Ok(s) = std::env::var(CHECKPOINT_BATCH_SIZE_ENV_VAR) {
@@ -4831,8 +4808,8 @@ fn resolve_checkpoint_batch_size(policy: &dyn ErasedPolicy) -> u32 {
 ///
 /// Precedence: per-policy override → `REPLAY_READ_BATCH_SIZE` env var → default 100.
 /// Enforces the invariant `read_batch_size ≥ checkpoint_batch_size`.
-fn resolve_read_batch_size(policy: &dyn ErasedPolicy, checkpoint_size: u32) -> u32 {
-    let raw = if let Some(n) = policy.read_batch_size_erased() {
+fn resolve_read_batch_size(settings: &PolicySettings, checkpoint_size: u32) -> u32 {
+    let raw = if let Some(n) = settings.read_batch_size() {
         n.max(1)
     } else if let Ok(s) = std::env::var(READ_BATCH_SIZE_ENV_VAR) {
         s.parse::<u32>().unwrap_or(DEFAULT_READ_BATCH_SIZE).max(1)
@@ -4848,9 +4825,9 @@ fn resolve_read_batch_size(policy: &dyn ErasedPolicy, checkpoint_size: u32) -> u
 /// Precedence: per-policy override → `REPLAY_DISPATCH_TIMEOUT_MS` env var →
 /// default 30s. `0` and unparseable values fall back to the default rather than
 /// abandoning every dispatch the moment it starts.
-fn resolve_dispatch_timeout(policy: &dyn ErasedPolicy) -> Duration {
+fn resolve_dispatch_timeout(settings: &PolicySettings) -> Duration {
     dispatch_timeout_or_default(
-        policy.dispatch_timeout_erased(),
+        settings.dispatch_timeout(),
         std::env::var(DISPATCH_TIMEOUT_ENV_VAR).ok(),
     )
 }
