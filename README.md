@@ -2090,10 +2090,16 @@ impl Policy for FeePolicy {
 
     fn react(&self, event: &ObservedEvent<BankAccountEvent>) -> Vec<Dispatch> {
         match &event.data {
-            BankAccountEvent::Deposited { amount } => vec![
+            // `reference` is the deposit's own identifier. The ledger absorbs a
+            // repeated `charge_key` as a no-op, which is what makes a redelivery
+            // harmless — see below.
+            BankAccountEvent::Deposited { amount, reference } => vec![
                 Dispatch::to::<FeeLedger>(
                     self.ledger_id.clone(),
-                    FeeLedgerCommand::ChargeFee { amount: amount * FEE_RATE },
+                    FeeLedgerCommand::ChargeFee {
+                        amount: amount * FEE_RATE,
+                        charge_key: format!("{}#{reference}", event.stream_id),
+                    },
                 )
             ],
             _ => vec![],
@@ -2138,7 +2144,7 @@ This metadata travels with the resulting events, enabling:
 You can attach additional metadata to a specific dispatch with [`Dispatch::with_metadata`]; the runner merges it with the causation block (colliding top-level keys are rejected):
 
 ```rust,ignore
-Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount })
+Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount, charge_key })
     .with_metadata(Metadata::from([("correlation_id", request_id)]))
 ```
 
@@ -2158,8 +2164,14 @@ let runner = PolicyRunner::builder(cqrs)
             .starting_at(StartAt::Beginning)
             .with_stream_filter(StreamFilter::for_stream_type::<BankAccount>()),
         |event| match &event.data {
-            BankAccountEvent::Deposited { amount } => vec![
-                Dispatch::to::<FeeLedger>(ledger_id.clone(), ChargeFee { amount: amount * 0.01 })
+            BankAccountEvent::Deposited { amount, reference } => vec![
+                Dispatch::to::<FeeLedger>(
+                    ledger_id.clone(),
+                    ChargeFee {
+                        amount: amount * 0.01,
+                        charge_key: format!("{}#{reference}", event.stream_id),
+                    },
+                )
             ],
             _ => vec![],
         },
