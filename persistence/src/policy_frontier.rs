@@ -110,12 +110,6 @@ pub(crate) struct PollPlan {
     /// Streams this poll read a full budget's worth from, so they may have more. One
     /// entry per stream read, so the batch bounds it.
     unfinished: Vec<String>,
-    /// Whether [`Self::settle`] was called. A plan dropped without it is a poll that
-    /// stepped over its own decision — which is the shape of the last defect this design
-    /// is for, and the one the pure function cannot see on its own: the rotation was
-    /// recorded on the paths that read something and not on the path that read nothing,
-    /// which is the only one a finished pass ends on (funkode-io/replay#231 review).
-    settled: bool,
 }
 
 /// The next stream to read, and what is left to read it with.
@@ -184,7 +178,6 @@ impl PollPlan {
             visited: 0,
             filled_the_budget: false,
             unfinished: Vec::new(),
-            settled: false,
         }
     }
 
@@ -254,11 +247,7 @@ impl PollPlan {
     /// what the budget spends itself on. Contiguous from the front of the page, because
     /// the rotation is one id and cannot describe a hole in the middle.
     ///
-    /// `&mut self` rather than `self` so that a plan that is never settled can be caught
-    /// when it is dropped, whatever path the caller took out of the poll.
-    pub(crate) fn settle(&mut self) -> Settled {
-        self.settled = true;
-
+    pub(crate) fn settle(self) -> Settled {
         // Only on the polls a reconciliation ran on: off the cadence there is no page for
         // the rotation to move through, and the set would be hashed for nothing.
         let rotation = self.reconciling.then(|| {
@@ -282,15 +271,13 @@ impl PollPlan {
         // Each stream once, and capped: it is the one collection here that outlives a
         // poll, and a stream that two of those four name would otherwise spend two of the
         // slots the cap allows and leave another stream out.
-        let leftovers = std::mem::take(&mut self.carried_over);
-        let unfinished = std::mem::take(&mut self.unfinished);
         let mut carried: Vec<String> = Vec::new();
         for stream in self.streams[self.visited..self.at]
             .iter()
             .cloned()
-            .chain(leftovers)
+            .chain(self.carried_over)
             .chain(self.streams[self.at..].iter().cloned())
-            .chain(unfinished)
+            .chain(self.unfinished)
         {
             if carried.len() as u32 == self.read_batch {
                 break;
@@ -305,26 +292,6 @@ impl PollPlan {
             reconciled: self.reconciling,
             rotation: rotation.flatten(),
         }
-    }
-}
-
-/// A poll that ends without settling is a bug, and a silent one: its carried queue is
-/// lost and its rotation stays where the last pass left it. The assertion is what keeps
-/// "every path settles" a property of the code rather than of whoever last edited the
-/// call site — a `return` added above the settle fails every test that drains a Policy,
-/// which is the check the pure function cannot make for itself.
-impl Drop for PollPlan {
-    fn drop(&mut self) {
-        // Not while another panic is unwinding through the poll: a second one from a
-        // `Drop` aborts the process, which would take the worker supervisor's restart
-        // ([`crate::policy_runner::supervise`]) with it — the containment this assertion
-        // is nowhere near important enough to break.
-        debug_assert!(
-            self.settled || std::thread::panicking(),
-            "a poll's plan must be settled before it is dropped: {} candidates, {} read",
-            self.streams.len(),
-            self.visited
-        );
     }
 }
 
@@ -534,75 +501,14 @@ mod sharing_tests {
     }
 }
 
-/// The one thing the decision cannot decide for itself: that its caller asked it.
+/// What a poll hands to the next one when it stops part way through.
 ///
-/// Compiled out of a release build with the `debug_assert` it tests, so it is asserted
-/// where it is checked (funkode-io/replay#243).
-#[cfg(all(test, debug_assertions))]
+/// The queue that outlives a poll is capped, so what the cap drops is a decision, and the
+/// states it decides between are reached only by a poll that stopped between a turn and
+/// its delivery (funkode-io/replay#246 review).
+#[cfg(test)]
 mod settling_tests {
     use super::{Nominations, PollPlan};
-
-    fn plan() -> PollPlan {
-        PollPlan::plan(Nominations {
-            carried: vec!["urn:probe:a".to_string()],
-            swept: Vec::new(),
-            examined: Vec::new(),
-            reconciling: true,
-            read_batch: 10,
-            share_from: 0,
-        })
-    }
-
-    #[test]
-    fn a_settled_plan_is_dropped_quietly() {
-        let mut plan = plan();
-        let settled = plan.settle();
-
-        assert_eq!(settled.carried, vec!["urn:probe:a".to_string()]);
-    }
-
-    /// A poll that returns without settling loses its carried queue and leaves the
-    /// rotation where the last pass left it, and says nothing. Every test that drains a
-    /// Policy fails on this rather than on the delivery it costs a cadence later.
-    #[test]
-    #[should_panic(expected = "must be settled")]
-    fn a_plan_dropped_without_settling_says_so() {
-        drop(plan());
-    }
-
-    /// A delivery that failed half way leaves the stream where a read that never came
-    /// back does: carried, and not rotated past.
-    ///
-    /// The poll has read its events and put some of them through the Policy, and the
-    /// places for them are still only in memory. Counting it as one the poll got through
-    /// would let the rotation move over a stream that is still behind, and the sweep has
-    /// passed the events that would have nominated it again.
-    #[test]
-    fn a_delivery_that_failed_half_way_is_carried_and_not_rotated_past() {
-        let mut plan = PollPlan::plan(Nominations {
-            carried: Vec::new(),
-            swept: Vec::new(),
-            examined: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
-            reconciling: true,
-            read_batch: 4,
-            share_from: 0,
-        });
-
-        let turn = plan.turn().expect("the page's first stream leads the poll");
-        plan.read(&turn, 2);
-        // No `delivered`: this is the poll whose reaction, or whose checkpoint, failed.
-        let settled = plan.settle();
-
-        assert_eq!(
-            settled.carried,
-            vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
-            "the stream it was in the middle of is still owed"
-        );
-        assert_eq!(
-            settled.rotation, None,
-            "and the rotation stays where it was"
-        );
-    }
 
     /// A stream two of the queue's four parts name spends one slot, not two.
     ///
