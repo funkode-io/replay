@@ -2229,11 +2229,12 @@ Lower it if that tail latency matters more than the scan; raise it if you have m
 streams and no long-running writes.
 
 The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
-left off** and wraps. A policy behind on no more streams than that is inside one cadence;
-beyond it, the pass takes `ceil(streams behind / read_batch_size)` cadences while the
-policy is keeping up, plus the one it spends wrapping at the end of a pass, and longer
-when it is not keeping up — the reconciliation leads the poll it runs on, so it always
-reads at least one stream, and its rotation never steps over a stream it did not read. [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)
+left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
+while the policy is keeping up, plus the one a pass spends wrapping — a rotation standing
+past the last stream id reads an empty page and compares nothing that cadence, which is
+why even a policy behind on a single stream can take two. Longer when it is not keeping
+up: the reconciliation leads the poll it runs on, so it always reads at least one stream,
+and its rotation never steps over a stream it did not read. [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)
 owns the bound.
 
 `read_batch_size` is one budget for a whole poll, spent across the streams that poll looks
@@ -2281,7 +2282,7 @@ because a place is only read for a stream that poll is looking at:
 | The stream you moved | When it is picked up |
 |---|---|
 | is still being written to | the next poll, on the sweep |
-| is quiet and the sweep has passed it | the next reconciliation that reaches it — one `REPLAY_POLICY_RECONCILE_SECS` for a policy behind on no more streams than its read batch, and `ceil(streams behind / read_batch_size) + 1` cadences beyond that ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)) |
+| is quiet and the sweep has passed it | the next reconciliation that reaches it — `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)) |
 
 Places themselves are never held in memory between polls, so no running process carries a
 stale copy of one forward.
@@ -3096,7 +3097,7 @@ None of the three stops a policy, and none of them needs an operator:
 |---------------|----------------------|
 | A write failed after taking a `global_position` | Nothing. The number is burned — `nextval` is not transactional — and a policy that reads no global order never looks at it. The place the write took in its stream *is* handed back, because that counter is a row and rolls back with the transaction. |
 | A write is still running | Its stream waits for it, and only its stream. Every other stream is delivered meanwhile. |
-| A write commits below a policy's sweep | It is delivered by the reconciliation, within `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS` — one for a policy behind on no more streams than its read batch ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). |
+| A write commits below a policy's sweep | It is delivered by the reconciliation, within `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS` — the `+ 1` is the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). |
 
 This is the structural fix for
 [#164](https://github.com/funkode-io/replay/issues/164), where a burned position

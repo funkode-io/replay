@@ -80,13 +80,15 @@ is owed is read from that stream's own sequence, which has no holes.
   back to the start; a stream sorting before it waits that cadence out
   (funkode-io/replay#243).
 
-  `REPLAY_POLICY_RECONCILE_SECS` (default 5s) is the cadence, and a Policy behind on no
-  more streams than it reads in one is inside a single one. What it reads per cadence is
-  between **one** and `read_batch_size`: the reconciliation leads the poll it runs on, so
-  its first candidate is always read, and how many more depends on what the poll's event
-  budget has left after them. A Policy keeping up reads the whole page and compares
-  everything it is behind on in `ceil(streams / read_batch_size)` cadences; one saturated
-  enough to spend its whole budget on the first stream advances one stream per cadence.
+  `REPLAY_POLICY_RECONCILE_SECS` (default 5s) is the cadence. A Policy behind on no more
+  streams than it reads in one compares them in a single cadence — two if its rotation is
+  standing past the last stream id, because that cadence goes on the wrap. What it reads
+  per cadence is between **one** and `read_batch_size`: the reconciliation leads the poll
+  it runs on, so its first candidate is always read, and how many more depends on what the
+  poll's event budget has left after them. A Policy keeping up reads the whole page and
+  compares everything it is behind on in `ceil(streams / read_batch_size)` cadences plus
+  the wrap; one saturated enough to spend its whole budget on the first stream advances
+  one stream per cadence.
 
   The guarantee is the floor, not the ceiling: the rotation moves only through streams
   that were **read**, so a page the budget never reached is compared again rather than
