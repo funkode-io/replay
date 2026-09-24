@@ -3047,6 +3047,10 @@ async fn drain_policy_once(
     });
     progress.share_from += 1;
 
+    // Whether the poll found nothing to read. Narrated once its rotation is written, so
+    // an operator is never told a Policy is caught up by a poll that then failed.
+    let mut exhausted = false;
+
     // The places this poll has moved and not yet written. One entry per stream advanced
     // since the last flush, so the batch bounds it. Declared out here because a poll that
     // fails still has to say what it was holding: these places are in memory only.
@@ -3068,7 +3072,10 @@ async fn drain_policy_once(
             // wraps the rotation: an empty page is the end of a pass, and a cursor that
             // has reached the last stream id queries past the end for ever until
             // something records that (funkode-io/replay#231 review).
-            reporting.tell(&name, Poll::Exhausted);
+            //
+            // Narrated below rather than here: "caught up" is a statement about a poll
+            // that finished, and this one still has its rotation to write.
+            exhausted = true;
             return Ok(0);
         }
 
@@ -3240,6 +3247,10 @@ async fn drain_policy_once(
             progress.reconciled_through = through;
         }
         write_reconciled(pool, &name, &progress.reconciled_through).await?;
+    }
+
+    if exhausted {
+        reporting.tell(&name, Poll::Exhausted);
     }
 
     Ok(executed)
