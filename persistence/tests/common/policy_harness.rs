@@ -265,6 +265,9 @@ pub struct DispatchedCommand {
     pub caused_by_position: i64,
     /// Id of the event the policy reacted to.
     pub caused_by_event_id: Uuid,
+    /// Metadata the command's event was written with: the runner's causation, merged
+    /// with whatever the reaction attached to its dispatch.
+    pub metadata: serde_json::Value,
 }
 
 /// A reaction the runner gave up on and parked — the glossary's
@@ -614,7 +617,7 @@ impl PolicyDaemonHarness {
     /// alone) observes it here.
     pub async fn dispatches_for(&self, policy: &str) -> Vec<DispatchedCommand> {
         let rows = sqlx::query(
-            "SELECT id, global_position, stream_id, type, \
+            "SELECT id, global_position, stream_id, type, metadata, \
                     (metadata->'causation'->>'global_position')::bigint AS caused_by_position, \
                     (metadata->'causation'->>'event_id')::uuid            AS caused_by_event_id \
              FROM events \
@@ -634,6 +637,7 @@ impl PolicyDaemonHarness {
                 event_type: row.get("type"),
                 caused_by_position: row.get("caused_by_position"),
                 caused_by_event_id: row.get("caused_by_event_id"),
+                metadata: row.get("metadata"),
             })
             .collect()
     }

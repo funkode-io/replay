@@ -36,5 +36,6 @@ mod policy_redelivery_parks_once;
 mod policy_retry_unit;
 mod policy_supervision;
 mod policy_timeout;
+mod single_target_policy;
 mod stream_creation_race;
 mod stream_lock_wait;
