@@ -10,13 +10,12 @@
 mod common;
 
 use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
-use replay_persistence::PersistedEvent;
-use replay_persistence::{Dispatch, StartAt};
+use replay_persistence::{Dispatch, ObservedEvent, PolicySettings, StartAt};
 
 /// A Policy that echoes every ping, so what it has delivered is readable as the commands
 /// it dispatched. Each echo goes to a stream of its own, named after the tag, so a
 /// reaction never appends to a stream a test is holding a write open on.
-fn echo_back(event: &PersistedEvent<ProbeEvent>) -> Vec<Dispatch> {
+fn echo_back(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
     match &event.data {
         ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
             ProbeUrn::new(format!("{tag}-echo")).expect("a valid NSS"),
@@ -36,7 +35,11 @@ fn echo_back(event: &PersistedEvent<ProbeEvent>) -> Vec<Dispatch> {
 #[tokio::test]
 async fn a_write_held_open_in_one_stream_does_not_delay_another_postgres_test() {
     let harness = PolicyDaemonHarness::start("held_write", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo_back,
+        )
     })
     .await;
 
@@ -66,7 +69,11 @@ async fn a_write_held_open_in_one_stream_does_not_delay_another_postgres_test() 
 #[tokio::test]
 async fn a_position_burned_by_a_failed_write_delays_nobody_postgres_test() {
     let harness = PolicyDaemonHarness::start("burned", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo_back,
+        )
     })
     .await;
 
@@ -96,7 +103,11 @@ async fn a_position_burned_by_a_failed_write_delays_nobody_postgres_test() {
 #[tokio::test]
 async fn an_overtaken_write_is_delivered_when_it_commits_postgres_test() {
     let harness = PolicyDaemonHarness::start("overtaken", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo_back,
+        )
     })
     .await;
 
@@ -130,7 +141,11 @@ async fn an_overtaken_write_is_delivered_when_it_commits_postgres_test() {
 #[tokio::test]
 async fn a_stream_that_falls_silent_is_still_delivered_postgres_test() {
     let harness = PolicyDaemonHarness::start("quiet", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo_back,
+        )
     })
     .await;
 
@@ -158,7 +173,11 @@ async fn a_streams_events_are_delivered_in_its_own_order_postgres_test() {
     const EVENTS: usize = 5;
 
     let harness = PolicyDaemonHarness::start("ordered", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo_back,
+        )
     })
     .await;
 
@@ -255,7 +274,11 @@ async fn a_streams_events_are_delivered_in_its_own_order_postgres_test() {
 #[tokio::test]
 async fn an_operator_moves_a_place_on_a_running_daemon_postgres_test() {
     let harness = PolicyDaemonHarness::start("operator", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo_back,
+        )
     })
     .await;
 
@@ -292,7 +315,11 @@ async fn an_operator_moves_a_place_on_a_running_daemon_postgres_test() {
 #[tokio::test]
 async fn a_rewind_to_the_place_a_poll_started_from_survives_its_checkpoint_postgres_test() {
     let harness = PolicyDaemonHarness::start("rewind_to_start", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(policy, StartAt::Beginning, echo_back)
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo_back,
+        )
     })
     .await;
 

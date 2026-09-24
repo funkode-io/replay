@@ -40,8 +40,25 @@ Policy is **not** a [Projection] — it derives no read model; its output is a
 command and its effects are side effects on the write side. It runs in the
 background and is eventually consistent. Because a Policy re-executes side
 effects when it processes an event, it cannot be safely rebuilt by replaying
-history the way a versioned [Projection] can. (Planned; not yet implemented.)
+history the way a versioned [Projection] can.
+
+The rule is business vocabulary and lives in `es-replay`: `name`, and a `react` that
+takes an [Observed event] and returns dispatches. How it is driven — feed, start
+position, batches, dispatch timeout, causation depth — is `PolicySettings`, given to the
+[Policy runner] at registration ([ADR-0027](docs/adr/0027-the-policy-rule-is-core-vocabulary.md)).
 _Avoid_: reactor, saga, process manager, automation, trigger, reaction.
+
+### Observed event
+
+An event as a rule sees it: `data`, `stream_id`, `metadata` and `created` — and nothing
+else. What a [Policy]'s `react` is handed, and the half `PersistedEvent` embeds and
+derefs to; the store's identity and position (`id`, `type`, `version`,
+`aggregate_version`) stay on the outer envelope.
+
+The event id is absent on purpose: a Policy cannot mint a [Causation] key into the
+command it emits, so a duplicate delivery is absorbed by the command's own shape, keyed
+on domain data the rule can see.
+_Avoid_: event envelope, event view, policy event.
 
 ### Global position
 
@@ -93,9 +110,9 @@ _Avoid_: subscription, stream, queue, backlog.
 ### Causation
 
 The link from the event that triggered a [Policy] to the command and resulting
-events the Policy raises in response. The triggering event's identity is the
-stable key a target [Aggregate] uses to recognise a reaction it has already
-applied, and the chain of causation is what bounds how deep one event may
+events the Policy raises in response. It is metadata the runner stamps, for an operator
+reading the resulting events; it is not offered to the target [Aggregate], which receives
+no metadata in `handle`. The chain of causation is what bounds how deep one event may
 cascade into further reactions.
 _Avoid_: trigger, cause, origin.
 
@@ -452,6 +469,8 @@ it:
 [Aggregate]: #aggregate
 [Policy]: #policy
 [Policy feed]: #policy-feed
+[Observed event]: #observed-event
+[Causation]: #causation
 [Dead letter]: #dead-letter
 [Dispatch timeout]: #dispatch-timeout
 [Stream lock wait]: #stream-lock-wait

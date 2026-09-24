@@ -1,21 +1,16 @@
-//! Policies: checkpointed background subscribers that *react* to events by
-//! issuing commands.
+//! What the runner needs around a [`Policy`]: how its feed is driven, and the erasure
+//! that lets one runner hold policies over different event types.
 //!
-//! A [`Policy`] is a sibling of [`crate::Query`] / inline projections, not a
-//! kind of projection: it derives no read model. Given an event it returns a
-//! list of [`Dispatch`]es — commands the runner should execute against
-//! aggregates. This module is the **portable contract**: it carries no Postgres
-//! or tokio types, so the same `Policy` / `Dispatch` shapes can drive a future
-//! WASM runner. The server-side execution lives in the runner (native only).
+//! The rule itself — [`Policy`], [`Dispatch`], [`ObservedEvent`] — lives in `es-replay`
+//! so a domain layer can declare one without this crate (ADR-0027). All three are
+//! re-exported here so a consumer of the runner has one import.
 
-use std::any::{Any, TypeId};
-use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use urn::Urn;
 
-use replay::{Aggregate, Event, Metadata};
+use replay::{Dispatch, Event, ObservedEvent, Policy};
 
 use crate::{PersistedEvent, StreamFilter};
 
@@ -30,160 +25,28 @@ pub enum StartAt {
     Beginning,
 }
 
-/// A command a [`Policy`] wants the runner to execute against an aggregate.
+/// How the runner drives one [`Policy`]: everything about the reaction that is not the
+/// rule.
 ///
-/// `Dispatch` is an *erased descriptor*: it remembers which aggregate type the
-/// command targets ([`TypeId`]) and carries the `(StreamId, Command)` pair as an
-/// opaque `Box<dyn Any + Send>` payload. The runner — which registered the
-/// concrete aggregate via `register_services::<A>` — downcasts the payload and
-/// runs it through `Cqrs::execute`. Crucially this struct names no Postgres or
-/// tokio types, so it stays WASM-ready.
-///
-/// It also carries, in the open, the identity a parked [dead letter] is read by:
-/// the target stream's URN and the command's type name. A caller that knows the
-/// target aggregate type recovers the pair itself through [`Dispatch::parts`],
-/// which is what lets a `react` implementation be unit-tested. Runner behaviour
-/// is still asserted through operator-visible observations (ADR-0014), not by
-/// inspecting dispatches in process.
-///
-/// [dead letter]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#dead-letter
-pub struct Dispatch {
-    pub(crate) target: TypeId,
-    pub(crate) aggregate_name: &'static str,
-    pub(crate) target_stream_id: Urn,
-    pub(crate) command_name: &'static str,
-    pub(crate) payload: Box<dyn Any + Send>,
-    pub(crate) expected_version: Option<i64>,
-    pub(crate) metadata: Option<Metadata>,
+/// Supplied at registration rather than declared on the trait, so a closure policy can
+/// set the same knobs a `Policy` impl can. `None` leaves a tunable to the environment
+/// variable and built-in default named on each setter.
+#[derive(Debug, Clone, Default)]
+pub struct PolicySettings {
+    stream_filter: StreamFilter,
+    start_at: StartAt,
+    max_causation_depth: Option<u32>,
+    read_batch_size: Option<u32>,
+    checkpoint_batch_size: Option<u32>,
+    dispatch_timeout: Option<Duration>,
 }
 
-impl Dispatch {
-    /// Builds a dispatch targeting aggregate `A`, identified by `id`, carrying
-    /// `command`.
-    ///
-    /// ```rust,ignore
-    /// Dispatch::to::<BankAccount>(account_id, BankAccountCommand::Freeze)
-    /// ```
-    pub fn to<A>(id: A::StreamId, command: A::Command) -> Self
-    where
-        A: Aggregate + 'static,
-        A::StreamId: 'static,
-        A::Command: 'static,
-    {
-        Dispatch {
-            target: TypeId::of::<A>(),
-            aggregate_name: std::any::type_name::<A>(),
-            // Taken eagerly: a parked dead letter is read by code that does not
-            // know `A` and so cannot call `parts` (funkode-io/replay#210).
-            target_stream_id: id.clone().into(),
-            command_name: std::any::type_name::<A::Command>(),
-            payload: Box::new((id, command)),
-            expected_version: None,
-            metadata: None,
-        }
+impl PolicySettings {
+    /// The defaults: the whole log, from the head, with every tunable left to its
+    /// environment variable or built-in default.
+    pub fn new() -> Self {
+        Self::default()
     }
-
-    /// Attach user-defined metadata to this dispatch.
-    ///
-    /// The runner merges this metadata with causation metadata before executing
-    /// the command. Colliding top-level keys are rejected at runtime.
-    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
-    /// The [`TypeId`] of the aggregate this dispatch targets.
-    pub fn target(&self) -> TypeId {
-        self.target
-    }
-
-    /// The Rust type name of the target aggregate (diagnostics only).
-    pub fn aggregate_name(&self) -> &'static str {
-        self.aggregate_name
-    }
-
-    /// The URN of the aggregate instance this command is addressed to.
-    pub fn target_stream_id(&self) -> &Urn {
-        &self.target_stream_id
-    }
-
-    /// The Rust type name of the command (diagnostics only).
-    ///
-    /// The type, not the variant: `Aggregate::Command` carries no `Debug` or
-    /// `Serialize` bound, and adding one would break every consumer.
-    pub fn command_name(&self) -> &'static str {
-        self.command_name
-    }
-
-    /// Borrows the `(StreamId, Command)` pair this dispatch carries, when it
-    /// targets `A`.
-    ///
-    /// The match is on the target aggregate, not on the payload's shape: a
-    /// dispatch to another aggregate yields `None` even when that aggregate's
-    /// `StreamId` and `Command` types coincide with `A`'s.
-    ///
-    /// ```rust,ignore
-    /// let (id, command) = dispatch.parts::<FeeLedger>().unwrap();
-    /// assert_eq!(command, &FeeLedgerCommand::ChargeFee { amount: 25 });
-    /// ```
-    pub fn parts<A>(&self) -> Option<(&A::StreamId, &A::Command)>
-    where
-        A: Aggregate + 'static,
-        A::StreamId: 'static,
-        A::Command: 'static,
-    {
-        if self.target != TypeId::of::<A>() {
-            return None;
-        }
-        self.payload
-            .downcast_ref::<(A::StreamId, A::Command)>()
-            .map(|(id, command)| (id, command))
-    }
-
-    /// The optimistic-concurrency version the command is to be executed under.
-    pub fn expected_version(&self) -> Option<i64> {
-        self.expected_version
-    }
-
-    /// The user-defined metadata attached by [`Dispatch::with_metadata`], before
-    /// the runner merges causation metadata into it.
-    pub fn metadata(&self) -> Option<&Metadata> {
-        self.metadata.as_ref()
-    }
-}
-
-impl fmt::Debug for Dispatch {
-    /// Prints the identity a dead letter is read by. The payload is omitted for
-    /// the reason given on [`Dispatch::command_name`].
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Dispatch")
-            .field("aggregate", &self.aggregate_name)
-            .field("command", &self.command_name)
-            .field("target_stream_id", &self.target_stream_id.to_string())
-            .field("expected_version", &self.expected_version)
-            .finish_non_exhaustive()
-    }
-}
-
-/// A checkpointed background subscriber that reacts to events with commands.
-///
-/// Delivery is **at-least-once**. A crash after command commit but before cursor
-/// save can re-deliver the same triggering event. Correctness therefore depends
-/// on idempotent command handling in the target aggregate, keyed by causation
-/// identity (the triggering event id), not by command-value equality.
-///
-/// Implementors stay pure and store-agnostic: [`react`](Policy::react) takes
-/// an event and returns the commands to issue, with no I/O. The runner handles
-/// reading the feed, executing the returned [`Dispatch`]es, stamping causation
-/// metadata, and advancing the cursor.
-pub trait Policy: Send + Sync {
-    /// The event type this policy understands. Use `query_events!` to merge
-    /// events from several aggregates into one enum.
-    type Event: Event;
-
-    /// Stable identity used as the cursor key. Changing the Rust type must not
-    /// change this string, or the policy would lose its checkpoint.
-    fn name(&self) -> &str;
 
     /// Narrows the feed to the streams this policy cares about. Defaults to the
     /// whole log.
@@ -191,106 +54,135 @@ pub trait Policy: Send + Sync {
     /// Decides what the policy reacts to, not how far its cursor gets: excluded
     /// positions still advance it (ADR-0013), so a selective filter spends its read
     /// batch on positions rather than on matches.
-    fn stream_filter(&self) -> StreamFilter {
-        StreamFilter::all()
+    pub fn with_stream_filter(mut self, stream_filter: StreamFilter) -> Self {
+        self.stream_filter = stream_filter;
+        self
     }
 
-    /// Cursor bootstrap strategy used only when this policy name is first seen.
+    /// Cursor bootstrap strategy, used only when this policy name is first seen.
     ///
-    /// Defaults to [`StartAt::Now`], the safe mode that avoids retroactively
-    /// firing commands across existing history.
-    fn start_at(&self) -> StartAt {
-        StartAt::Now
+    /// Defaults to [`StartAt::Now`], the safe mode that avoids retroactively firing
+    /// commands across existing history.
+    pub fn starting_at(mut self, start_at: StartAt) -> Self {
+        self.start_at = start_at;
+        self
     }
 
-    /// Maximum causation depth this policy will react to.  The runner skips any
+    /// Maximum causation depth this policy will react to. The runner skips any
     /// event whose `causation.depth` is ≥ this value and logs loudly instead,
     /// acting as a circuit breaker for runaway event → command → event cascades.
     ///
-    /// Resolution order (most-specific-first):
-    ///   1. This per-policy override (when `Some`).
-    ///   2. Environment variable `REPLAY_MAX_CAUSATION_DEPTH`.
-    ///   3. Built-in default (10).
-    ///
-    /// Return `None` to defer to the global env var / built-in default.
-    fn max_causation_depth(&self) -> Option<u32> {
-        None
+    /// Unset: `REPLAY_MAX_CAUSATION_DEPTH`, then the built-in default (10).
+    pub fn with_max_causation_depth(mut self, depth: u32) -> Self {
+        self.max_causation_depth = Some(depth);
+        self
     }
 
     /// Maximum number of events fetched from the feed in a single drain call.
     ///
-    /// Resolution order (most-specific-first):
-    ///   1. This per-policy override (when `Some`).
-    ///   2. Environment variable `REPLAY_READ_BATCH_SIZE`.
-    ///   3. Built-in default (100).
-    ///
-    /// The runner enforces the invariant `read_batch_size ≥ checkpoint_batch_size`.
-    fn read_batch_size(&self) -> Option<u32> {
-        None
+    /// Unset: `REPLAY_READ_BATCH_SIZE`, then the built-in default (100). The runner
+    /// enforces the invariant `read_batch_size ≥ checkpoint_batch_size`.
+    pub fn with_read_batch_size(mut self, size: u32) -> Self {
+        self.read_batch_size = Some(size);
+        self
     }
 
-    /// How many events are processed between cursor persistence calls.  The
-    /// cursor is also written unconditionally at the end of every drain call.
+    /// How many events are processed between cursor persistence calls. The cursor is
+    /// also written unconditionally at the end of every drain call.
     ///
-    /// Resolution order (most-specific-first):
-    ///   1. This per-policy override (when `Some`).
-    ///   2. Environment variable `REPLAY_CHECKPOINT_BATCH_SIZE`.
-    ///   3. Built-in default (100).
-    fn checkpoint_batch_size(&self) -> Option<u32> {
-        None
+    /// Unset: `REPLAY_CHECKPOINT_BATCH_SIZE`, then the built-in default (100).
+    pub fn with_checkpoint_batch_size(mut self, size: u32) -> Self {
+        self.checkpoint_batch_size = Some(size);
+        self
     }
 
-    /// How long the runner awaits one [`Dispatch`] of this policy before it
-    /// abandons it.
+    /// How long the runner awaits one [`Dispatch`] of this policy before it abandons
+    /// it.
     ///
-    /// Resolution order (most-specific-first):
-    ///   1. This per-policy override (when `Some`).
-    ///   2. Environment variable `REPLAY_DISPATCH_TIMEOUT_MS`.
-    ///   3. Built-in default (30s).
+    /// Unset: `REPLAY_DISPATCH_TIMEOUT_MS`, then the built-in default (30s).
     ///
-    /// Exceeding it is a **retryable** failure: the dispatch is retried under
-    /// the back-off an `Unavailable` error gets, then parked as a dead letter
-    /// of kind `Timeout`. Raise it for a reaction that is legitimately slow.
+    /// Exceeding it is a **retryable** failure: the dispatch is retried under the
+    /// back-off an `Unavailable` error gets, then parked as a dead letter of kind
+    /// `Timeout`. Raise it for a reaction that is legitimately slow.
     ///
-    /// It bounds the future the runner awaits: cancellation happens at a
-    /// suspension point, so it cannot interrupt work the reaction moved onto
-    /// another task, nor a command that never yields (see `CONTEXT.md`'s
-    /// non-guarantees).
-    fn dispatch_timeout(&self) -> Option<Duration> {
-        None
+    /// It bounds the future the runner awaits: cancellation happens at a suspension
+    /// point, so it cannot interrupt work the reaction moved onto another task, nor a
+    /// command that never yields (see `CONTEXT.md`'s non-guarantees).
+    pub fn with_dispatch_timeout(mut self, timeout: Duration) -> Self {
+        self.dispatch_timeout = Some(timeout);
+        self
     }
 
-    /// Pure reaction: given an event, return the commands to dispatch.
-    ///
-    /// Invariant: because delivery is at-least-once, target aggregate command
-    /// handlers must absorb duplicate causation ids as no-ops.
-    ///
-    /// A panic here does not stop the Policy: the runner contains it at the
-    /// event being delivered, parks a dead letter recording the panic, and
-    /// carries on with the next event. A panic inside a task this reaction
-    /// **spawns itself** is outside that boundary and is contained by nothing.
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch>;
+    pub fn stream_filter(&self) -> StreamFilter {
+        self.stream_filter.clone()
+    }
+
+    pub fn start_at(&self) -> StartAt {
+        self.start_at
+    }
+
+    pub fn max_causation_depth(&self) -> Option<u32> {
+        self.max_causation_depth
+    }
+
+    pub fn read_batch_size(&self) -> Option<u32> {
+        self.read_batch_size
+    }
+
+    pub fn checkpoint_batch_size(&self) -> Option<u32> {
+        self.checkpoint_batch_size
+    }
+
+    pub fn dispatch_timeout(&self) -> Option<Duration> {
+        self.dispatch_timeout
+    }
+}
+
+/// One registration: the rule, and the settings the runner drives it with.
+///
+/// The runner works in these rather than in `dyn ErasedPolicy`, because every tunable it
+/// resolves now comes from the registration rather than from the trait.
+pub(crate) struct RegisteredPolicy {
+    policy: Arc<dyn ErasedPolicy>,
+    settings: PolicySettings,
+}
+
+impl RegisteredPolicy {
+    pub(crate) fn new<P: Policy + 'static>(policy: P, settings: PolicySettings) -> Self {
+        RegisteredPolicy {
+            policy: Arc::new(policy),
+            settings,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        self.policy.name()
+    }
+
+    pub(crate) fn settings(&self) -> &PolicySettings {
+        &self.settings
+    }
+
+    pub(crate) fn stream_filter(&self) -> StreamFilter {
+        self.settings.stream_filter()
+    }
+
+    pub(crate) fn start_at(&self) -> StartAt {
+        self.settings.start_at()
+    }
+
+    pub(crate) fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {
+        self.policy.react_erased(raw)
+    }
 }
 
 /// Object-safe erasure of [`Policy`], mirroring `ErasedInlineProjection`.
 ///
-/// The runner holds `Box<dyn ErasedPolicy>` and feeds it raw JSON events; the
-/// blanket impl deserializes into the concrete `Policy::Event` and skips events
-/// that don't belong to this policy (deserialize-or-skip routing).
+/// A [`RegisteredPolicy`] holds one of these and feeds it raw JSON events; the blanket
+/// impl deserializes into the concrete `Policy::Event` and skips events that don't
+/// belong to this policy (deserialize-or-skip routing).
 pub(crate) trait ErasedPolicy: Send + Sync {
     fn name(&self) -> &str;
-
-    fn stream_filter(&self) -> StreamFilter;
-
-    fn start_at(&self) -> StartAt;
-
-    fn max_causation_depth_erased(&self) -> Option<u32>;
-
-    fn read_batch_size_erased(&self) -> Option<u32>;
-
-    fn checkpoint_batch_size_erased(&self) -> Option<u32>;
-
-    fn dispatch_timeout_erased(&self) -> Option<Duration>;
 
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch>;
 }
@@ -298,30 +190,6 @@ pub(crate) trait ErasedPolicy: Send + Sync {
 impl<P: Policy> ErasedPolicy for P {
     fn name(&self) -> &str {
         Policy::name(self)
-    }
-
-    fn stream_filter(&self) -> StreamFilter {
-        Policy::stream_filter(self)
-    }
-
-    fn start_at(&self) -> StartAt {
-        Policy::start_at(self)
-    }
-
-    fn max_causation_depth_erased(&self) -> Option<u32> {
-        Policy::max_causation_depth(self)
-    }
-
-    fn read_batch_size_erased(&self) -> Option<u32> {
-        Policy::read_batch_size(self)
-    }
-
-    fn checkpoint_batch_size_erased(&self) -> Option<u32> {
-        Policy::checkpoint_batch_size(self)
-    }
-
-    fn dispatch_timeout_erased(&self) -> Option<Duration> {
-        Policy::dispatch_timeout(self)
     }
 
     fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {
@@ -335,23 +203,49 @@ impl<P: Policy> ErasedPolicy for P {
         // payload along with it.
         match P::Event::deserialize(&raw.data) {
             Ok(event) => {
-                let typed = raw.with_data_from(event);
-                self.react(&typed)
+                let observed: ObservedEvent<P::Event> = raw.observed_with_data(event);
+                self.react(&observed)
             }
             Err(_) => Vec::new(),
         }
     }
 }
 
+/// A [`Policy`] backed by a plain closure, created via
+/// [`PolicyRunnerBuilder::register_policy_fn`](crate::PolicyRunnerBuilder::register_policy_fn).
+pub(crate) struct ClosurePolicy<E, F> {
+    pub(crate) name: String,
+    pub(crate) react: F,
+    pub(crate) _phantom: std::marker::PhantomData<E>,
+}
+
+impl<E, F> Policy for ClosurePolicy<E, F>
+where
+    E: Event + 'static,
+    F: Fn(&ObservedEvent<E>) -> Vec<Dispatch> + Send + Sync + 'static,
+{
+    type Event = E;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
+        (self.react)(event)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::any::TypeId;
+
     use chrono::Utc;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use urn::{Urn, UrnBuilder};
     use uuid::Uuid;
 
-    use replay::{Metadata, WithId};
+    use replay::{Aggregate, Metadata, WithId};
     use replay_macros::Event;
 
     use super::*;
@@ -424,48 +318,6 @@ mod tests {
         }
     }
 
-    /// A second aggregate whose `StreamId` and `Command` types are *identical* to
-    /// `Account`'s, so a payload downcast alone cannot tell the two apart.
-    struct Shipment {
-        id: AccountUrn,
-    }
-
-    impl WithId for Shipment {
-        type StreamId = AccountUrn;
-
-        fn with_id(id: Self::StreamId) -> Self {
-            Shipment { id }
-        }
-
-        fn get_id(&self) -> &Self::StreamId {
-            &self.id
-        }
-    }
-
-    impl replay::EventStream for Shipment {
-        type Event = ShippingEvent;
-
-        fn stream_type() -> String {
-            "Shipment".to_string()
-        }
-
-        fn apply(&mut self, _event: Self::Event) {}
-    }
-
-    impl Aggregate for Shipment {
-        type Command = String;
-        type Error = replay::Error;
-        type Services = ();
-
-        async fn handle(
-            &self,
-            _command: Self::Command,
-            _services: &Self::Services,
-        ) -> Result<Vec<Self::Event>, Self::Error> {
-            Ok(vec![])
-        }
-    }
-
     /// Reacts to every event it is given, echoing the reason it received so the
     /// test can prove the envelope reached `react` intact.
     struct FreezeNotifier;
@@ -477,7 +329,7 @@ mod tests {
             "freeze_notifier"
         }
 
-        fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+        fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
             let AccountEvent::Frozen { reason } = &event.data;
             vec![Dispatch::to::<Account>(
                 AccountUrn(event.stream_id.clone()),
@@ -496,7 +348,7 @@ mod tests {
             "shipping_notifier"
         }
 
-        fn react(&self, _event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+        fn react(&self, _event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
             panic!("react must not be called for a non-matching payload");
         }
     }
@@ -504,20 +356,23 @@ mod tests {
     fn raw_frozen() -> PersistedEvent<serde_json::Value> {
         PersistedEvent {
             id: Uuid::new_v4(),
-            data: json!({ "Frozen": { "reason": "fraud-review" } }),
-            stream_id: UrnBuilder::new("account", "42").build().unwrap(),
             r#type: "Frozen".to_string(),
             version: 7,
-            created: Utc::now(),
-            metadata: Metadata::from_json(json!({ "correlation": "c-1" })),
             aggregate_version: None,
+            observed: ObservedEvent {
+                data: json!({ "Frozen": { "reason": "fraud-review" } }),
+                stream_id: UrnBuilder::new("account", "42").build().unwrap(),
+                metadata: Metadata::from_json(json!({ "correlation": "c-1" })),
+                created: Utc::now(),
+            },
         }
     }
 
-    /// A payload of the policy's own event type reaches `react`, with the
-    /// envelope (identity, position, metadata) carried across the erasure intact.
+    /// A payload of the policy's own event type reaches `react`, and the dispatch it
+    /// returns carries the stream the event was read from. The store's identity and
+    /// position do not cross the erasure at all — they are not on `ObservedEvent`.
     #[test]
-    fn reacts_to_a_matching_payload_preserving_the_envelope() {
+    fn reacts_to_a_matching_payload_carrying_its_stream_into_the_dispatch() {
         let raw = raw_frozen();
 
         let dispatches = FreezeNotifier.react_erased(&raw);
@@ -529,80 +384,21 @@ mod tests {
         );
         assert_eq!(dispatches[0].target(), TypeId::of::<Account>());
 
-        // The identity a parked dead letter is read by, taken from the id and
-        // the command type before either is erased.
+        // The identity a parked dead letter is read by: the dispatch's own target
+        // stream and command type, taken before either is erased.
         assert_eq!(dispatches[0].target_stream_id(), &raw.stream_id);
         assert_eq!(
             dispatches[0].command_name(),
             std::any::type_name::<<Account as Aggregate>::Command>()
         );
 
-        // The command was built from the deserialized payload and the borrowed
-        // envelope's stream id, so both survived the erasure.
+        // The command was built from the deserialized payload and the stream id the
+        // rule read, so both survived the erasure.
         let (id, command) = dispatches[0]
             .parts::<Account>()
             .expect("dispatch must carry the aggregate's (id, command) pair");
         assert_eq!(id.0, raw.stream_id);
         assert_eq!(command, "fraud-review");
-    }
-
-    /// The assertion a policy unit test exists to make: which command, with what
-    /// payload, addressed to which instance.
-    #[test]
-    fn recovers_the_pair_a_dispatch_carries() {
-        let id = AccountUrn(UrnBuilder::new("account", "42").build().unwrap());
-        let dispatch = Dispatch::to::<Account>(id.clone(), "freeze".to_string());
-
-        let (recovered_id, command) = dispatch
-            .parts::<Account>()
-            .expect("the target aggregate's own pair must be recoverable");
-
-        assert_eq!(recovered_id, &id);
-        assert_eq!(command, "freeze");
-        assert_eq!(dispatch.expected_version(), None);
-        assert!(dispatch.metadata().is_none());
-    }
-
-    /// Metadata attached at construction reads back through the accessor.
-    #[test]
-    fn exposes_attached_metadata() {
-        let id = AccountUrn(UrnBuilder::new("account", "42").build().unwrap());
-        let dispatch = Dispatch::to::<Account>(id, "freeze".to_string())
-            .with_metadata(Metadata::from_json(json!({ "correlation": "c-1" })));
-
-        assert_eq!(
-            dispatch.metadata(),
-            Some(&Metadata::from_json(json!({ "correlation": "c-1" })))
-        );
-    }
-
-    /// The match is on the target aggregate, not the payload's shape: `Shipment`
-    /// carries the same `(AccountUrn, String)` pair and still yields `None`.
-    #[test]
-    fn refuses_the_pair_to_a_different_aggregate() {
-        let id = AccountUrn(UrnBuilder::new("account", "42").build().unwrap());
-        let dispatch = Dispatch::to::<Account>(id, "freeze".to_string());
-
-        assert!(dispatch.parts::<Shipment>().is_none());
-    }
-
-    /// `Debug` prints the dead-letter identity and nothing that would need a
-    /// `Debug` bound on `Aggregate::Command`.
-    #[test]
-    fn debug_names_the_aggregate_the_command_and_the_stream() {
-        let id = AccountUrn(UrnBuilder::new("account", "42").build().unwrap());
-        let dispatch = Dispatch::to::<Account>(id, "freeze".to_string());
-
-        let rendered = format!("{dispatch:?}");
-
-        assert!(rendered.contains("Account"), "{rendered}");
-        assert!(rendered.contains("String"), "{rendered}");
-        assert!(rendered.contains("urn:account:42"), "{rendered}");
-        assert!(rendered.contains("expected_version"), "{rendered}");
-        assert!(
-            !rendered.contains("freeze"),
-            "the payload must not be printed: {rendered}"
-        );
     }
 
     /// A payload that isn't this policy's event type is skipped: no reaction, and
@@ -616,6 +412,57 @@ mod tests {
         assert!(
             dispatches.is_empty(),
             "a non-matching payload must produce no reaction"
+        );
+    }
+
+    /// The four fields a rule may read are the four it is handed; the store's identity
+    /// and position stay behind on the persisted envelope.
+    #[test]
+    fn the_erasure_hands_over_the_observed_half_only() {
+        let raw = raw_frozen();
+
+        let observed = raw.observed_with_data(AccountEvent::Frozen {
+            reason: "fraud-review".to_string(),
+        });
+
+        assert_eq!(observed.stream_id, raw.stream_id);
+        assert_eq!(observed.metadata, raw.metadata);
+        assert_eq!(observed.created, raw.created);
+    }
+
+    /// Defaults first: an unconfigured registration resolves every tunable elsewhere.
+    #[test]
+    fn settings_default_to_the_runner_wide_resolution() {
+        let settings = PolicySettings::new();
+
+        assert_eq!(settings.start_at(), StartAt::Now);
+        assert_eq!(settings.max_causation_depth(), None);
+        assert_eq!(settings.read_batch_size(), None);
+        assert_eq!(settings.checkpoint_batch_size(), None);
+        assert_eq!(settings.dispatch_timeout(), None);
+        assert_eq!(settings.stream_filter(), StreamFilter::all());
+    }
+
+    /// Every knob the trait used to carry is reachable from a registration — which is
+    /// what a closure policy could not do at all.
+    #[test]
+    fn settings_carry_every_knob_the_trait_used_to() {
+        let settings = PolicySettings::new()
+            .with_stream_filter(StreamFilter::for_stream_type::<Account>())
+            .starting_at(StartAt::Beginning)
+            .with_max_causation_depth(3)
+            .with_read_batch_size(500)
+            .with_checkpoint_batch_size(50)
+            .with_dispatch_timeout(Duration::from_secs(90));
+
+        assert_eq!(settings.start_at(), StartAt::Beginning);
+        assert_eq!(settings.max_causation_depth(), Some(3));
+        assert_eq!(settings.read_batch_size(), Some(500));
+        assert_eq!(settings.checkpoint_batch_size(), Some(50));
+        assert_eq!(settings.dispatch_timeout(), Some(Duration::from_secs(90)));
+        assert_eq!(
+            settings.stream_filter(),
+            StreamFilter::for_stream_type::<Account>()
         );
     }
 }

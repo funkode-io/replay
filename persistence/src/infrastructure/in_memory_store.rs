@@ -11,7 +11,7 @@ use crate::inline_projection::ErasedInlineProjection;
 use crate::{
     CompactionOutcome, EventSink, EventStore, InlineProjection, PersistedEvent, StreamFilter,
 };
-use replay::{Compactable, Event};
+use replay::{Compactable, Event, ObservedEvent};
 
 /// In-memory event store implementation, only for testing purpose.
 ///
@@ -235,24 +235,28 @@ impl EventStore for InMemoryEventStore {
             // copy staged below is what the store retains for querying and inline projections.
             sink.on_event(&PersistedEvent {
                 id,
-                data: event,
-                stream_id: stream_id.clone(),
                 r#type: r#type.clone(),
                 version,
-                created,
-                metadata: metadata.clone(),
                 aggregate_version: None,
+                observed: ObservedEvent {
+                    data: event,
+                    stream_id: stream_id.clone(),
+                    metadata: metadata.clone(),
+                    created,
+                },
             });
 
             staged.push(PersistedEvent {
                 id,
-                data,
-                stream_id: stream_id.clone(),
                 r#type,
                 version,
-                created,
-                metadata: metadata.clone(),
                 aggregate_version: None,
+                observed: ObservedEvent {
+                    data,
+                    stream_id: stream_id.clone(),
+                    metadata: metadata.clone(),
+                    created,
+                },
             });
         }
 
@@ -307,16 +311,25 @@ impl EventStore for InMemoryEventStore {
                 if !Self::evaluate(&filter, &event, stream_type) {
                     continue;
                 }
-                let data: E = serde_json::from_value(event.data).map_err(crate::deser_error)?;
+                let PersistedEvent {
+                    id,
+                    r#type,
+                    version,
+                    aggregate_version,
+                    observed,
+                } = event;
+                let data: E = serde_json::from_value(observed.data).map_err(crate::deser_error)?;
                 yield Ok(PersistedEvent {
-                    id: event.id,
-                    data,
-                    stream_id: event.stream_id,
-                    r#type: event.r#type,
-                    version: event.version,
-                    created: event.created,
-                    metadata: event.metadata,
-                    aggregate_version: event.aggregate_version,
+                    id,
+                    r#type,
+                    version,
+                    aggregate_version,
+                    observed: ObservedEvent {
+                        data,
+                        stream_id: observed.stream_id,
+                        metadata: observed.metadata,
+                        created: observed.created,
+                    },
                 });
             }
         }
@@ -423,13 +436,15 @@ impl EventStore for InMemoryEventStore {
                     *next_position,
                     PersistedEvent {
                         id: Uuid::new_v4(),
-                        data,
-                        stream_id: stream_id.clone(),
                         r#type: event.event_type(),
                         version: seq,
-                        created: Utc::now(),
-                        metadata: metadata.clone(),
                         aggregate_version: None,
+                        observed: ObservedEvent {
+                            data,
+                            stream_id: stream_id.clone(),
+                            metadata: metadata.clone(),
+                            created: Utc::now(),
+                        },
                     },
                 ));
                 *next_position += 1;
@@ -699,7 +714,7 @@ mod tests {
                 Box::new(StreamFilter::with_stream_id::<SnapshotStream>(id)),
                 Box::new(StreamFilter::WithAggregateVersion(None)),
             ))
-            .map_ok(|e| e.data)
+            .map_ok(|e| e.into_data())
             .try_collect::<Vec<_>>()
             .await
             .unwrap()
@@ -735,7 +750,7 @@ mod tests {
                 Box::new(StreamFilter::with_stream_id::<BankAccountStream>(id)),
                 Box::new(StreamFilter::WithAggregateVersion(None)),
             ))
-            .map_ok(|e| e.data)
+            .map_ok(|e| e.into_data())
             .try_collect::<Vec<_>>()
             .await
             .unwrap()
@@ -1145,7 +1160,7 @@ mod tests {
             .stream_events::<BankAccountEvent>(StreamFilter::with_stream_id::<BankAccountStream>(
                 &stream_id,
             ))
-            .map_ok(|persisted_event| persisted_event.data)
+            .map_ok(|persisted_event| persisted_event.into_data())
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -1350,7 +1365,7 @@ mod tests {
             .stream_events::<BankAccountEvent>(StreamFilter::ForStreamTypes(vec![
                 "Checking".to_string()
             ]))
-            .map_ok(|e| e.data)
+            .map_ok(|e| e.into_data())
             .try_collect()
             .await
             .unwrap();
@@ -1365,7 +1380,7 @@ mod tests {
                 "Checking".to_string(),
                 "Savings".to_string(),
             ]))
-            .map_ok(|e| e.data)
+            .map_ok(|e| e.into_data())
             .try_collect()
             .await
             .unwrap();
@@ -1376,7 +1391,7 @@ mod tests {
             .stream_events::<BankAccountEvent>(StreamFilter::ForStreamTypes(vec![
                 "Unknown".to_string()
             ]))
-            .map_ok(|e| e.data)
+            .map_ok(|e| e.into_data())
             .try_collect()
             .await
             .unwrap();
@@ -1607,7 +1622,7 @@ mod tests {
 
         let amounts: Vec<f64> = store
             .stream_events::<BankAccountEvent>(StreamFilter::All)
-            .map_ok(|e| match e.data {
+            .map_ok(|e| match e.into_data() {
                 BankAccountEvent::Deposited { amount } => amount,
                 BankAccountEvent::Withdrawn { amount } => -amount,
             })

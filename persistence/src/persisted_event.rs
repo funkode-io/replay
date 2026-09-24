@@ -1,23 +1,44 @@
+use std::ops::{Deref, DerefMut};
+
 use chrono::{DateTime, Utc};
 use urn::Urn;
 use uuid::Uuid;
 
-use replay::{Event, Metadata};
+use replay::{Event, Metadata, ObservedEvent};
 
+/// An event as it was stored: what a rule observes ([`ObservedEvent`]) plus the identity
+/// and position the store gave it.
+///
+/// The observed half is reached by [`Deref`], so `event.data`, `event.stream_id`,
+/// `event.metadata` and `event.created` read through unchanged; only struct-literal
+/// construction has to name the embedded field (use [`of`](Self::of) instead).
 #[derive(Debug, Clone)]
 pub struct PersistedEvent<E> {
     pub id: Uuid,
-    pub data: E,
-    pub stream_id: Urn,
     pub r#type: String,
     /// Monotonic position of this event within the aggregate's current stream.
     pub version: i64,
-    pub created: DateTime<Utc>,
-    pub metadata: Metadata,
     /// `None` identifies events belonging to the current (latest) stream.
     /// `Some(n)` identifies events that were archived during the nth compaction.
     /// Matches the `INTEGER` column type in the database.
     pub aggregate_version: Option<i32>,
+    /// The half a [`Policy`](replay::Policy) sees. Read it through the deref, not
+    /// through this name.
+    pub observed: ObservedEvent<E>,
+}
+
+impl<E> Deref for PersistedEvent<E> {
+    type Target = ObservedEvent<E>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.observed
+    }
+}
+
+impl<E> DerefMut for PersistedEvent<E> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.observed
+    }
 }
 
 impl<E: Event> PersistedEvent<E> {
@@ -36,12 +57,9 @@ impl<E: Event> PersistedEvent<E> {
         PersistedEvent {
             id: Uuid::new_v4(),
             r#type: data.event_type(),
-            data,
-            stream_id: stream_id.into(),
             version: 1,
-            created: Utc::now(),
-            metadata: Metadata::default(),
             aggregate_version: None,
+            observed: ObservedEvent::of(stream_id, data).with_created(Utc::now()),
         }
     }
 }
@@ -52,12 +70,15 @@ impl<E> PersistedEvent<E> {
     }
 
     pub fn with_created(self, created: DateTime<Utc>) -> Self {
-        PersistedEvent { created, ..self }
+        PersistedEvent {
+            observed: self.observed.with_created(created),
+            ..self
+        }
     }
 
     pub fn with_metadata(self, metadata: impl Into<Metadata>) -> Self {
         PersistedEvent {
-            metadata: metadata.into(),
+            observed: self.observed.with_metadata(metadata),
             ..self
         }
     }
@@ -70,29 +91,45 @@ impl<E> PersistedEvent<E> {
         }
     }
 
+    /// The payload, taken out of the envelope. The counterpart to reading `event.data`
+    /// through the deref, which cannot move.
+    pub fn into_data(self) -> E {
+        self.observed.data
+    }
+
     pub fn wrap_data_with<Other: From<E>>(self) -> PersistedEvent<Other> {
+        let ObservedEvent {
+            data,
+            stream_id,
+            metadata,
+            created,
+        } = self.observed;
         PersistedEvent {
             id: self.id,
-            data: Other::from(self.data),
-            stream_id: self.stream_id,
             r#type: self.r#type,
             version: self.version,
-            created: self.created,
-            metadata: self.metadata,
             aggregate_version: self.aggregate_version,
+            observed: ObservedEvent {
+                data: Other::from(data),
+                stream_id,
+                metadata,
+                created,
+            },
         }
     }
 
     pub fn with_data<Other: Event>(self, data: Other) -> PersistedEvent<Other> {
         PersistedEvent {
             id: self.id,
-            data,
-            stream_id: self.stream_id,
             r#type: self.r#type,
             version: self.version,
-            created: self.created,
-            metadata: self.metadata,
             aggregate_version: self.aggregate_version,
+            observed: ObservedEvent {
+                data,
+                stream_id: self.observed.stream_id,
+                metadata: self.observed.metadata,
+                created: self.observed.created,
+            },
         }
     }
 
@@ -106,13 +143,23 @@ impl<E> PersistedEvent<E> {
     pub(crate) fn with_data_from<Other: Event>(&self, data: Other) -> PersistedEvent<Other> {
         PersistedEvent {
             id: self.id,
-            data,
-            stream_id: self.stream_id.clone(),
             r#type: self.r#type.clone(),
             version: self.version,
-            created: self.created,
-            metadata: self.metadata.clone(),
             aggregate_version: self.aggregate_version,
+            observed: self.observed_with_data(data),
+        }
+    }
+
+    /// The observed half of a *borrowed* event, re-enveloped with new data.
+    ///
+    /// What the policy erasure hands to `react`: two clones (the URN and the metadata
+    /// handle), and nothing of the stored payload, which stays behind in `self`.
+    pub(crate) fn observed_with_data<Other>(&self, data: Other) -> ObservedEvent<Other> {
+        ObservedEvent {
+            data,
+            stream_id: self.observed.stream_id.clone(),
+            metadata: self.observed.metadata.clone(),
+            created: self.observed.created,
         }
     }
 }
@@ -152,13 +199,15 @@ mod tests {
 
         let literal = PersistedEvent {
             id: built.id,
-            data: BankAccountEvent::Deposited { amount: 123.0 },
-            stream_id: account().into(),
             r#type: "Deposited".to_string(),
             version: 7,
-            created,
-            metadata,
             aggregate_version: Some(2),
+            observed: ObservedEvent {
+                data: BankAccountEvent::Deposited { amount: 123.0 },
+                stream_id: account().into(),
+                metadata,
+                created,
+            },
         };
 
         assert_eq!(built.id, literal.id);
@@ -190,5 +239,19 @@ mod tests {
         assert_eq!(event.aggregate_version, None);
         assert!(event.created >= before && event.created <= Utc::now());
         assert_eq!(event.id.get_version_num(), 4);
+    }
+
+    /// The observed half is what a rule is handed, and it is the same values the
+    /// persisted envelope reads through.
+    #[test]
+    fn the_observed_half_is_the_envelope_a_rule_sees() {
+        let event = PersistedEvent::of(account(), BankAccountEvent::Deposited { amount: 1.0 });
+
+        let observed: &ObservedEvent<BankAccountEvent> = &event;
+
+        assert_eq!(observed.data, event.data);
+        assert_eq!(observed.stream_id, event.stream_id);
+        assert_eq!(observed.created, event.created);
+        assert_eq!(observed.metadata, event.metadata);
     }
 }

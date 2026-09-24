@@ -22,7 +22,7 @@ use common::policy_harness::{
     DeadLetter, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
 };
 use replay_persistence::{
-    Dispatch, PersistedEvent, Policy, PolicyRunnerBuilder, StartAt, PANIC_ERROR_KIND,
+    Dispatch, ObservedEvent, Policy, PolicyRunnerBuilder, PolicySettings, StartAt, PANIC_ERROR_KIND,
 };
 
 /// Tag whose reaction returns one permanently failing command, reporting a
@@ -72,11 +72,7 @@ impl Policy for RedeliveredPolicy {
         &self.name
     }
 
-    fn start_at(&self) -> StartAt {
-        StartAt::Beginning
-    }
-
-    fn react(&self, event: &PersistedEvent<Self::Event>) -> Vec<Dispatch> {
+    fn react(&self, event: &ObservedEvent<Self::Event>) -> Vec<Dispatch> {
         let ProbeEvent::Pinged { tag } = &event.data else {
             return vec![];
         };
@@ -121,11 +117,14 @@ fn redelivered_policy_that(
     panic_always: Arc<AtomicBool>,
 ) -> impl Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static {
     move |builder, policy| {
-        builder.register_policy(RedeliveredPolicy {
-            name: policy.to_string(),
-            deliveries: Arc::clone(&deliveries),
-            panic_always: Arc::clone(&panic_always),
-        })
+        builder.register_policy(
+            RedeliveredPolicy {
+                name: policy.to_string(),
+                deliveries: Arc::clone(&deliveries),
+                panic_always: Arc::clone(&panic_always),
+            },
+            PolicySettings::new().starting_at(StartAt::Beginning),
+        )
     }
 }
 

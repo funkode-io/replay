@@ -23,7 +23,10 @@ uuid = { version = "1.23.2", features = [
   "serde",
 ], default-features = false }
 
-chrono = { version = "0.4", features = ["serde"] }
+# No default features: `es-replay` takes the type without the clock, so it needs no
+# wasm-bindgen shim to build for wasm32. `clock` is enabled by the crates that read the
+# time (persistence).
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
 
 thiserror = "2.0.18"
 anyhow = "1.0.102"
