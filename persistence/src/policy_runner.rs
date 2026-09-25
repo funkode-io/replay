@@ -29,7 +29,9 @@ use tokio::task::JoinHandle;
 
 use replay::{Aggregate, Dispatch, Metadata, ObservedEvent, Policy};
 
-use crate::policy::{ClosurePolicy, PolicySettings, RegisteredPolicy, StartAt};
+use crate::policy::{
+    AggregateClosurePolicy, ClosurePolicy, PolicySettings, RegisteredPolicy, StartAt,
+};
 use crate::policy_frontier::{
     discovered_from_sweep, recovering, Discovered, Nominations, PollPlan,
 };
@@ -169,6 +171,10 @@ impl PolicyRunnerBuilder {
 
     /// Register a policy, and the [`PolicySettings`] the runner drives it with. Its
     /// `name` becomes the stable cursor key.
+    ///
+    /// Takes an [`AggregatePolicy`](replay::AggregatePolicy) too — the blanket impl in
+    /// `es-replay` makes one a `Policy` — so a single-target rule needs no registration
+    /// of its own.
     ///
     /// ```rust,ignore
     /// builder.register_policy(
@@ -316,6 +322,92 @@ impl PolicyRunnerBuilder {
             ClosurePolicy {
                 name: name.into(),
                 react,
+                _phantom: std::marker::PhantomData,
+            },
+            settings,
+        )
+    }
+
+    /// Register a closure policy that names the aggregate it commands, so the closure
+    /// returns `(StreamId, Command)` pairs instead of building [`Dispatch`]es.
+    ///
+    /// The typed twin of [`register_policy_fn`](Self::register_policy_fn), and the one
+    /// to reach for when every command of the reaction goes to one aggregate: a test
+    /// asserts the closure's return value with `==`. A reaction addressing several
+    /// aggregate types stays on `register_policy_fn`.
+    ///
+    /// ```rust,ignore
+    /// runner_builder.register_aggregate_policy_fn::<BankAccountEvent, FeeLedger, _>(
+    ///     "deposit_fee",
+    ///     PolicySettings::new().starting_at(StartAt::Beginning),
+    ///     |event| match &event.data {
+    ///         BankAccountEvent::Deposited { amount } => {
+    ///             vec![(ledger_id.clone(), ChargeFee { amount: amount * 0.01 })]
+    ///         }
+    ///         _ => vec![],
+    ///     },
+    /// )
+    /// ```
+    pub fn register_aggregate_policy_fn<E, A, F>(
+        self,
+        name: impl Into<String>,
+        settings: PolicySettings,
+        react: F,
+    ) -> Self
+    where
+        E: replay::Event + 'static,
+        A: Aggregate + 'static,
+        A::StreamId: 'static,
+        A::Command: 'static,
+        F: Fn(&ObservedEvent<E>) -> Vec<(A::StreamId, A::Command)> + Send + Sync + 'static,
+    {
+        self.register_policy(
+            AggregateClosurePolicy::<E, A, F> {
+                name: name.into(),
+                react,
+                dispatch_metadata: None,
+                _phantom: std::marker::PhantomData,
+            },
+            settings,
+        )
+    }
+
+    /// The same, for a reaction that stamps its own metadata on the commands it issues.
+    ///
+    /// `dispatch_metadata` runs **once per reaction**, before the pairs become
+    /// dispatches, so a correlation id minted there is the same on every command that
+    /// reaction issues; the runner then merges it with causation metadata, rejecting
+    /// colliding top-level keys. It is what
+    /// [`Dispatch::with_metadata`] is to `register_policy_fn`.
+    ///
+    /// ```rust,ignore
+    /// runner_builder.register_aggregate_policy_fn_with_metadata::<BankAccountEvent, FeeLedger, _, _>(
+    ///     "deposit_fee",
+    ///     PolicySettings::new(),
+    ///     |event| Some(Metadata::new(json!({ "source_stream": event.stream_id.to_string() }))),
+    ///     |event| vec![(ledger_id.clone(), ChargeFee { amount: 1.0 })],
+    /// )
+    /// ```
+    pub fn register_aggregate_policy_fn_with_metadata<E, A, M, F>(
+        self,
+        name: impl Into<String>,
+        settings: PolicySettings,
+        dispatch_metadata: M,
+        react: F,
+    ) -> Self
+    where
+        E: replay::Event + 'static,
+        A: Aggregate + 'static,
+        A::StreamId: 'static,
+        A::Command: 'static,
+        M: Fn(&ObservedEvent<E>) -> Option<Metadata> + Send + Sync + 'static,
+        F: Fn(&ObservedEvent<E>) -> Vec<(A::StreamId, A::Command)> + Send + Sync + 'static,
+    {
+        self.register_policy(
+            AggregateClosurePolicy::<E, A, F> {
+                name: name.into(),
+                react,
+                dispatch_metadata: Some(Box::new(dispatch_metadata)),
                 _phantom: std::marker::PhantomData,
             },
             settings,

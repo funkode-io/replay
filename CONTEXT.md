@@ -43,7 +43,10 @@ effects when it processes an event, it cannot be safely rebuilt by replaying
 history the way a versioned [Projection] can.
 
 The rule is business vocabulary and lives in `es-replay`: `name`, and a `react` that
-takes an [Observed event] and returns dispatches. How it is driven — feed, start
+takes an [Observed event] and returns dispatches. A rule whose commands all go to one
+aggregate type declares it instead (`AggregatePolicy`) and returns `(StreamId, Command)`
+pairs; a blanket impl makes it a Policy, so a type implements one trait or the other,
+never both ([ADR-0028](docs/adr/0028-a-single-target-policy-declares-its-target.md)). How it is driven — feed, start
 position, batches, dispatch timeout, causation depth — is `PolicySettings`, given to the
 [Policy runner] at registration ([ADR-0027](docs/adr/0027-the-policy-rule-is-core-vocabulary.md)).
 _Avoid_: reactor, saga, process manager, automation, trigger, reaction.
