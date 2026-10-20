@@ -78,6 +78,28 @@ When a buffer is a deliberate bounded one, say what bounds it, in the code. The
 allocation-budget tests (`*_allocations.rs`) pin specific paths in bytes, but they are a
 point defence: they cannot see a new path, which is why this section exists.
 
+## Events record facts, not state
+
+Consumers model their events on this repository's examples, so the examples, tests
+and docs must model events correctly. An event names an act in the past tense and
+carries that act's data; a status, ownership flag or any other derived value is
+decided in `apply`, never stored in the payload. The rules of thumb, including when
+a value is attested and therefore part of the fact, are in the README section
+*Events record facts, not state*.
+
+When reviewing, treat these as violations of a documented standard, not style
+notes:
+
+- an event or command carrying a status, flag or other value the domain derives;
+- an event named after the state it produces (`Promoted`, `MarkedFinal`) rather
+  than the act that caused it;
+- a correction modelled by re-emitting the original event, or carrying the
+  previous value the stream already holds;
+- a `compacted_events` that writes state into an event instead of emitting the
+  facts that rebuild it.
+
+Once an event is stored it cannot be fixed, which is why this is a rule.
+
 ## Agent skills
 
 The skills themselves are vendored in `.github/skills/` so they travel with the repo
