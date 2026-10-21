@@ -4408,7 +4408,7 @@ async fn lookup_late_writes(
     let counter_moved_backwards = state
         .tail
         .as_ref()
-        .is_some_and(|tail| sweep.xmax < tail.xmax);
+        .is_some_and(|tail| sweep.xmax < tail.seen_xmax);
     if counter_moved_backwards || state.needs_reconciliation {
         state = LateWriteState {
             tail: Some(Tail::at(sweep, swept_through)),
@@ -4458,6 +4458,7 @@ async fn lookup_late_writes(
                                 tail.after = page.after;
                             }
                             tail.swept_through = swept_through;
+                            tail.seen_xmax = sweep.xmax;
                         }
                     }
                 }
@@ -5081,7 +5082,12 @@ impl LateWriteState {
 /// snapshot's `xmax`.
 #[derive(Clone)]
 struct Tail {
+    /// The walk's lower bound: the `xmax` of the sweep it began after.
     xmax: u64,
+    /// The newest `xmax` any sweep has shown it, which a later one may not fall below. An
+    /// unfinished walk keeps its lower bound while the counter moves on, so that bound
+    /// alone would miss a reset to anywhere above it.
+    seen_xmax: u64,
     swept_through: i64,
     after: Option<(u64, i64)>,
 }
@@ -5091,6 +5097,7 @@ impl Tail {
     fn at(sweep: &Sweep, swept_through: i64) -> Self {
         Self {
             xmax: sweep.xmax,
+            seen_xmax: sweep.xmax,
             swept_through,
             after: None,
         }
@@ -6856,6 +6863,7 @@ mod progress_tests {
             &pool,
             &Tail {
                 xmax: txid,
+                seen_xmax: txid,
                 swept_through: position,
                 after: None,
             },
@@ -6884,6 +6892,7 @@ mod progress_tests {
         prior.unseen.insert(8);
         prior.tail = Some(Tail {
             xmax: 10,
+            seen_xmax: 10,
             swept_through: 50,
             after: Some((9, 45)),
         });
@@ -6929,6 +6938,48 @@ mod progress_tests {
         assert!(overflow.state.unseen.is_empty());
         assert!(overflow.state.tail.is_none());
         assert!(overflow.state.needs_reconciliation);
+    }
+
+    /// A counter reset during an unfinished walk is caught against the newest `xmax` the
+    /// walk has seen, not its lower bound: a walk from 10 that has seen 100, then a sweep at
+    /// 90, clears the state and asks for the comparison.
+    #[tokio::test]
+    async fn a_counter_reset_during_an_unfinished_walk_requests_a_comparison_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let prior = LateWriteState {
+            tail: Some(Tail {
+                xmax: 10,
+                seen_xmax: 100,
+                swept_through: 50,
+                after: Some((95, 45)),
+            }),
+            ..LateWriteState::default()
+        };
+
+        let reset = lookup_late_writes(
+            &pool,
+            &prior,
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: 60,
+                },
+                xmax: 90,
+                in_progress: Vec::new(),
+            },
+            60,
+            10,
+        )
+        .await
+        .expect("a reset should not query the old range");
+
+        assert!(reset.force_comparison);
+        assert_eq!(reset.state.tail.as_ref().map(|tail| tail.xmax), Some(90));
+        assert!(reset
+            .state
+            .tail
+            .as_ref()
+            .is_some_and(|tail| tail.after.is_none()));
     }
 
     /// Write one event from `writer`, leaving its transaction as the caller holds it, and
@@ -7077,6 +7128,7 @@ mod progress_tests {
         let mut state = LateWriteState {
             tail: Some(Tail {
                 xmax: first.expect("traffic was written"),
+                seen_xmax: first.expect("traffic was written"),
                 swept_through: through,
                 after: None,
             }),

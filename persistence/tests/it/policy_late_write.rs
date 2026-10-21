@@ -143,7 +143,7 @@ async fn a_write_in_flight_across_a_leader_change_is_delivered_postgres_test() {
 /// find the write.
 #[tokio::test]
 async fn a_poll_that_fails_after_its_sweep_keeps_its_tail_postgres_test() {
-    let harness = PolicyDaemonHarness::start("late_write_failed_poll", |builder, policy| {
+    let mut harness = PolicyDaemonHarness::start("late_write_failed_poll", |builder, policy| {
         builder
             .reconcile_every(SAFETY_NET)
             .register_policy_fn::<ProbeEvent, _>(
@@ -154,11 +154,14 @@ async fn a_poll_that_fails_after_its_sweep_keeps_its_tail_postgres_test() {
     })
     .await;
 
-    // A place moved back is found only by a comparison, so its redelivery proves the
-    // leader's start-up comparison has run: the next is the safety net's, far away.
+    // A place moved back is found only by a comparison. Moved while no leader runs, its
+    // redelivery proves the new leader's start-up comparison has run: the next is the
+    // safety net's, far away.
     let seed = harness.ping("seed", "seed").await;
     harness.await_passed(seed.global_position).await;
+    harness.stop().await;
     harness.move_place_to(&seed.stream_id, 0).await;
+    harness.resume();
     harness.await_passed(seed.global_position).await;
 
     harness.break_places().await;
