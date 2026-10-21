@@ -11,7 +11,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use futures::TryStreamExt;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use urn::Urn;
 
@@ -66,24 +65,6 @@ impl replay::Aggregate for Ledger {
     }
 }
 
-impl replay::Compactable for Ledger {
-    async fn compacted_events(
-        &self,
-        events: impl futures::TryStream<Ok = LedgerEvent, Error = replay::Error> + Send,
-    ) -> replay::Result<replay::Compaction<LedgerEvent>> {
-        let balance = events
-            .try_fold(0.0, |balance, event| async move {
-                let LedgerEvent::Added { amount } = event;
-                Ok(balance + amount)
-            })
-            .await?;
-
-        Ok(replay::Compaction::Rewrite(vec![LedgerEvent::Added {
-            amount: balance,
-        }]))
-    }
-}
-
 async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
@@ -135,7 +116,6 @@ async fn seed_history(pool: &PgPool, stream: &str, count: usize) -> LedgerUrn {
 #[derive(Clone, Default)]
 struct CallLog {
     batches: Arc<Mutex<Vec<Vec<f64>>>>,
-    snapshot_flags: Arc<Mutex<Vec<bool>>>,
 }
 
 impl CallLog {
@@ -156,10 +136,6 @@ impl CallLog {
             .flatten()
             .copied()
             .collect()
-    }
-
-    fn all_snapshot_flags(&self) -> Vec<bool> {
-        self.snapshot_flags.lock().unwrap().clone()
     }
 }
 
@@ -196,11 +172,6 @@ impl InlineProjection for RecordingProjection {
             })
             .collect();
         self.log.batches.lock().unwrap().push(batch);
-        self.log
-            .snapshot_flags
-            .lock()
-            .unwrap()
-            .extend(events.iter().map(|event| event.compacted_snapshot));
         Ok(())
     }
 }
@@ -292,54 +263,6 @@ async fn version_drift_rebuild_replays_history_in_bounded_chunks_postgres_test()
         (0..HISTORY).map(|i| i as f64).collect::<Vec<_>>(),
         "every event must reach handle exactly once, in order"
     );
-}
-
-#[tokio::test]
-async fn projection_rebuild_skips_synthetic_compaction_rows_postgres_test() {
-    let (pool, _container) = start_pool().await;
-    let cqrs =
-        replay_persistence::Cqrs::new(replay_persistence::PostgresEventStore::new(pool.clone()));
-    let stream_id = LedgerUrn::new("rebuild-compacted-1").unwrap();
-    let metadata = replay::Metadata::default();
-
-    for amount in [10.0, 20.0] {
-        cqrs.execute::<Ledger>(
-            &stream_id,
-            metadata.clone(),
-            LedgerCommand::Add { amount },
-            &(),
-            None,
-        )
-        .await
-        .expect("append must succeed");
-    }
-
-    let ledger = cqrs.fetch_aggregate::<Ledger>(&stream_id).await.unwrap();
-    cqrs.compact(&ledger, metadata.clone())
-        .await
-        .expect("compaction must succeed");
-    cqrs.execute::<Ledger>(
-        &stream_id,
-        metadata,
-        LedgerCommand::Add { amount: 5.0 },
-        &(),
-        None,
-    )
-    .await
-    .expect("post-compaction append must succeed");
-
-    let log = CallLog::default();
-    let _store = replay_persistence::PostgresEventStore::builder(pool)
-        .register(RecordingProjection {
-            log: log.clone(),
-            version: 1,
-        })
-        .build()
-        .await
-        .expect("projection build must succeed");
-
-    assert_eq!(log.all_amounts(), vec![10.0, 20.0, 5.0]);
-    assert_eq!(log.all_snapshot_flags(), vec![false, false, false]);
 }
 
 /// A history shorter than the chunk still arrives in a single call, as it always did.

@@ -653,11 +653,10 @@ impl PostgresEventStoreBuilder {
     ) -> Result<(Vec<PersistedEvent<Value>>, Option<ReplayCursor>), replay::Error> {
         let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
             "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-             compacted_snapshot, global_position FROM events \
-             WHERE (compacted_snapshot = FALSE AND (",
+             compacted_snapshot, global_position FROM events WHERE (",
         );
         PostgresEventStore::add_filters(&mut query_builder, filter);
-        query_builder.push("))");
+        query_builder.push(")");
 
         if let Some(ReplayCursor { global_position }) = after {
             query_builder
