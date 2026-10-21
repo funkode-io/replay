@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -883,9 +883,9 @@ impl PolicyRunner {
     ///
     /// **The runner remembers where each policy's search had got to**, so repeated calls
     /// behave like a daemon's successive polls: the streams one call could not finish are
-    /// looked at by the next, and the turn that shares a poll between the sweep and the
-    /// reconciliation carries on rather than restarting. A fresh runner starts the search
-    /// afresh — from what is stored, never from the beginning.
+    /// looked at by the next, commit-stamp candidates are checked after each sweep, and the
+    /// full comparison's rotation carries on rather than restarting. A fresh runner starts
+    /// the search afresh — from what is stored, never from the beginning.
     ///
     /// Unlike a daemon's poll, this one always compares every stream's head with the
     /// policy's places rather than doing it on a cadence, so a place moved by hand is
@@ -2127,9 +2127,9 @@ impl PolicyWorker {
                     }
                 };
 
-            // A new leader compares the frontier with its places within a few polls, at
-            // its own phase, so the Policies of one runner do not all scan at once.
-            progress.spread_first_reconciliation(&name, interval);
+            // In-memory commit-stamp state is lost at an election, so a new leader starts
+            // the safety comparison immediately.
+            progress.reconcile_now();
 
             // Where this worker picks up, once per election. A Policy resumes per
             // stream, so what it announces is where its search resumes; what it has
@@ -3126,14 +3126,30 @@ async fn drain_policy_once(
     let tracked = TrackedStreams::of(&filter);
     progress.track(pool, &name, &tracked).await?;
 
-    // Three sources: what the last poll could not finish, what the sweep just found, and
-    // — on its own cadence — what the sweep has missed.
-    let mut discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
+    // The sweep and its snapshot are one statement: the snapshot says exactly which
+    // transactions its rows could not see.
+    let sweep = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
+    let mut discovered = sweep.discovered.clone();
+    if remember_open_transactions(&mut progress.late_writes, &sweep.in_progress) {
+        progress.reconcile_now();
+    }
     // After the sweep, not in it: the sweep reads its `LIMIT` of positions whatever streams
     // they name, and `swept_through` passes all of them. Filtering in its SQL would make it
     // search ahead for a matching row, examining rows in proportion to the ones it skips —
     // the cost #258 measured, moved rather than removed.
     discovered.streams = tracked.keep_tracked(pool, discovered.streams).await?;
+    let mut late = lookup_late_writes(
+        pool,
+        &progress.late_writes,
+        &sweep,
+        discovered.swept_through,
+        read_batch,
+    )
+    .await?;
+    late.streams = tracked.keep_tracked(pool, late.streams).await?;
+    if late.force_comparison {
+        progress.reconcile_now();
+    }
     let reconciling = progress.reconcile_is_due();
     let examined = if reconciling {
         streams_behind(
@@ -3163,6 +3179,7 @@ async fn drain_policy_once(
     let mut plan = PollPlan::plan(Nominations {
         carried: progress.unfinished.clone(),
         swept: discovered.streams,
+        late: late.streams,
         examined,
         reconciling,
         read_batch,
@@ -3373,6 +3390,8 @@ async fn drain_policy_once(
         progress.reconciled_through = rotation;
         progress.reconciled();
     }
+
+    progress.late_writes = late.state;
 
     if exhausted {
         reporting.tell(&name, Poll::Exhausted);
@@ -4243,23 +4262,308 @@ async fn sweep_for_streams(
     pool: &Pool<Postgres>,
     from: i64,
     limit: u32,
-) -> Result<Discovered, replay::Error> {
+) -> Result<Sweep, replay::Error> {
     let rows = sqlx::query(
-        "SELECT global_position, stream_id FROM events WHERE global_position > $1 \
-         ORDER BY global_position ASC LIMIT $2",
+        "WITH current_snapshot AS MATERIALIZED ( \
+             SELECT pg_current_snapshot() AS snapshot \
+         ), active_ids AS MATERIALIZED ( \
+             SELECT txid::text AS id \
+               FROM current_snapshot, \
+                    LATERAL pg_snapshot_xip(current_snapshot.snapshot) AS active(txid) \
+              LIMIT $3 \
+         ), active AS ( \
+             SELECT COALESCE(array_agg(id), ARRAY[]::text[]) AS ids FROM active_ids \
+         ), swept AS MATERIALIZED ( \
+             SELECT global_position, stream_id FROM events WHERE global_position > $1 \
+              ORDER BY global_position ASC LIMIT $2 \
+         ) \
+         SELECT swept.global_position, swept.stream_id, \
+                pg_snapshot_xmax(current_snapshot.snapshot)::text AS xmax, active.ids \
+           FROM current_snapshot CROSS JOIN active LEFT JOIN swept ON TRUE",
     )
     .bind(from)
+    .bind(limit as i64)
+    .bind((UNSEEN_TRANSACTION_CAP + 1) as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    let first = rows
+        .first()
+        .expect("the snapshot CTE returns one row even when the sweep is empty");
+    let xmax = parse_txid(first.get("xmax"))?;
+    let in_progress: Vec<u64> = first
+        .get::<Vec<String>, _>("ids")
+        .into_iter()
+        .map(parse_txid)
+        .collect::<Result<_, _>>()?;
+    let discovered = discovered_from_sweep(
+        from,
+        rows.into_iter()
+            .filter_map(|row| {
+                Some((
+                    row.get::<Option<i64>, _>("global_position")?,
+                    row.get::<Option<String>, _>("stream_id")?,
+                ))
+            })
+            .collect(),
+    );
+
+    Ok(Sweep {
+        discovered,
+        xmax,
+        in_progress,
+    })
+}
+
+/// Parse an `xid8` rendered as text. SQLx does not decode the PostgreSQL type directly.
+fn parse_txid(value: String) -> Result<u64, replay::Error> {
+    value.parse().map_err(|error| {
+        replay::Error::internal("PostgreSQL returned an invalid transaction id")
+            .with_operation("policy_sweep")
+            .with_context("txid", value)
+            .with_context("cause", error)
+    })
+}
+
+/// Keep the snapshot's open ids even if a later query or delivery in this poll fails.
+fn remember_open_transactions(state: &mut LateWriteState, active: &[u64]) -> bool {
+    let active: BTreeSet<u64> = active.iter().copied().collect();
+    let ended: Vec<u64> = state.unseen.difference(&active).copied().collect();
+    for txid in ended {
+        state.pending.entry(txid).or_insert(None);
+    }
+
+    if active.len() > UNSEEN_TRANSACTION_CAP
+        || active.len().saturating_add(state.pending.len()) > UNSEEN_TRANSACTION_CAP
+    {
+        *state = LateWriteState {
+            needs_full_comparison: true,
+            ..LateWriteState::default()
+        };
+        return true;
+    }
+
+    state.unseen = active;
+    false
+}
+
+/// Find ended transactions the sweep could not see, retaining a bounded keyset cursor for
+/// any page that did not fit in this poll.
+async fn lookup_late_writes(
+    pool: &Pool<Postgres>,
+    prior: &LateWriteState,
+    sweep: &Sweep,
+    swept_through: i64,
+    read_batch: u32,
+) -> Result<LatePoll, replay::Error> {
+    let active: HashSet<u64> = sweep.in_progress.iter().copied().collect();
+    let mut state = prior.clone();
+    let mut streams = Vec::new();
+    let mut rows_read = 0u32;
+    let mut force_comparison = false;
+
+    if remember_open_transactions(&mut state, &sweep.in_progress) {
+        return Ok(LatePoll {
+            streams,
+            state,
+            force_comparison: true,
+        });
+    }
+
+    let counter_moved_backwards = state
+        .tail
+        .as_ref()
+        .is_some_and(|tail| sweep.xmax < tail.xmax);
+    if counter_moved_backwards || state.needs_full_comparison {
+        state = LateWriteState {
+            tail: Some(Tail {
+                xmax: sweep.xmax,
+                swept_through,
+                after: None,
+            }),
+            unseen: active.iter().copied().collect(),
+            needs_full_comparison: active.len() > UNSEEN_TRANSACTION_CAP,
+            ..LateWriteState::default()
+        };
+        force_comparison = true;
+    } else {
+        if let Some(tail) = state.tail.as_mut() {
+            let page = late_tail_page(pool, tail, sweep, read_batch).await?;
+            rows_read += page.rows.len() as u32;
+            for row in page.rows {
+                if !streams.contains(&row.stream_id) {
+                    streams.push(row.stream_id);
+                }
+            }
+            if page.complete {
+                *tail = Tail {
+                    xmax: sweep.xmax,
+                    swept_through,
+                    after: None,
+                };
+            } else {
+                tail.after = page.after;
+            }
+        } else {
+            state.tail = Some(Tail {
+                xmax: sweep.xmax,
+                swept_through,
+                after: None,
+            });
+        }
+
+        let remaining = read_batch.saturating_sub(rows_read);
+        if remaining > 0 {
+            let mut ids: Vec<u64> = state.pending.keys().copied().collect();
+            if let Some(after) = state.unseen_after {
+                let split = ids.partition_point(|txid| *txid <= after);
+                ids.rotate_left(split);
+            }
+            let mut last_seen = None;
+            for txid in ids {
+                last_seen = Some(txid);
+                if active.contains(&txid) {
+                    continue;
+                }
+                let cursor = state.pending.get(&txid).copied().flatten();
+                let page = ended_transaction_page(pool, txid, cursor, remaining).await?;
+                rows_read += page.rows.len() as u32;
+                for row in page.rows {
+                    if !streams.contains(&row.stream_id) {
+                        streams.push(row.stream_id);
+                    }
+                }
+                match page.after {
+                    Some(after) if !page.complete => {
+                        state.pending.insert(txid, Some(after.1));
+                    }
+                    _ => {
+                        state.pending.remove(&txid);
+                    }
+                }
+                if rows_read >= read_batch {
+                    break;
+                }
+            }
+            if let Some(last_seen) = last_seen {
+                state.unseen_after = Some(last_seen);
+            }
+        }
+
+        if state.unseen.len().saturating_add(state.pending.len()) > UNSEEN_TRANSACTION_CAP {
+            state = LateWriteState {
+                needs_full_comparison: true,
+                ..LateWriteState::default()
+            };
+            streams.clear();
+            force_comparison = true;
+        }
+    }
+
+    Ok(LatePoll {
+        streams,
+        state,
+        force_comparison,
+    })
+}
+
+struct LatePage {
+    rows: Vec<LateRow>,
+    after: Option<(u64, i64)>,
+    complete: bool,
+}
+
+struct LateRow {
+    stream_id: String,
+    txid: u64,
+    position: i64,
+}
+
+/// A page of ended ids assigned above the previous snapshot's xmax. Its position bound is
+/// the last sweep that shared that snapshot.
+async fn late_tail_page(
+    pool: &Pool<Postgres>,
+    tail: &Tail,
+    sweep: &Sweep,
+    limit: u32,
+) -> Result<LatePage, replay::Error> {
+    let active: Vec<String> = sweep.in_progress.iter().map(u64::to_string).collect();
+    let rows = sqlx::query(
+        "SELECT stream_id, commit_txid::text AS txid, global_position \
+           FROM events \
+          WHERE commit_txid >= $1::xid8 AND commit_txid < $2::xid8 \
+            AND global_position <= $3 \
+            AND commit_txid::text <> ALL($4::text[]) \
+            AND ($5::text IS NULL OR (commit_txid, global_position) > \
+                 ($5::text::xid8, $6::bigint)) \
+          ORDER BY commit_txid, global_position LIMIT $7",
+    )
+    .bind(tail.xmax.to_string())
+    .bind(sweep.xmax.to_string())
+    .bind(tail.swept_through)
+    .bind(active)
+    .bind(tail.after.map(|(txid, _)| txid.to_string()))
+    .bind(tail.after.map(|(_, position)| position))
     .bind(limit as i64)
     .fetch_all(pool)
     .await
     .map_err(crate::db_error)?;
 
-    Ok(discovered_from_sweep(
-        from,
-        rows.into_iter()
-            .map(|row| (row.get("global_position"), row.get("stream_id")))
-            .collect(),
-    ))
+    let rows: Vec<LateRow> = rows
+        .into_iter()
+        .map(|row| {
+            Ok(LateRow {
+                stream_id: row.get("stream_id"),
+                txid: parse_txid(row.get("txid"))?,
+                position: row.get("global_position"),
+            })
+        })
+        .collect::<Result<_, replay::Error>>()?;
+    let after = rows.last().map(|row| (row.txid, row.position));
+    let complete = rows.len() < limit as usize;
+    Ok(LatePage {
+        rows,
+        after,
+        complete,
+    })
+}
+
+/// A page of one ended transaction's events. The index and LIMIT bound every result.
+async fn ended_transaction_page(
+    pool: &Pool<Postgres>,
+    txid: u64,
+    after: Option<i64>,
+    limit: u32,
+) -> Result<LatePage, replay::Error> {
+    let rows = sqlx::query(
+        "SELECT stream_id, global_position \
+           FROM events \
+          WHERE commit_txid = $1::xid8 \
+            AND ($2::bigint IS NULL OR global_position > $2) \
+          ORDER BY global_position LIMIT $3",
+    )
+    .bind(txid.to_string())
+    .bind(after)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    let rows: Vec<LateRow> = rows
+        .into_iter()
+        .map(|row| LateRow {
+            stream_id: row.get("stream_id"),
+            txid,
+            position: row.get("global_position"),
+        })
+        .collect();
+    let last = rows.last().map(|row| row.position);
+    Ok(LatePage {
+        complete: rows.len() < limit as usize,
+        rows,
+        after: last.map(|position| (txid, position)),
+    })
 }
 
 /// The streams a Policy **tracks** — compares, reads and keeps a place for — which its
@@ -4676,7 +4980,49 @@ struct PolicyProgress {
     /// re-checks its carried queue, only when the filter it asked for has changed
     /// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
     tracked: TrackedStreams,
+    /// Transaction ids and per-transaction position cursors the sweep has not yet looked
+    /// up. Bounded by [`UNSEEN_TRANSACTION_CAP`].
+    late_writes: LateWriteState,
 }
+
+/// The most recent sweep's transaction snapshot and the events still to look up.
+///
+/// This state is deliberately leader-local. Losing it costs a full comparison at the next
+/// leadership start, never a delivery.
+#[derive(Clone, Default)]
+struct LateWriteState {
+    unseen: BTreeSet<u64>,
+    pending: BTreeMap<u64, Option<i64>>,
+    tail: Option<Tail>,
+    unseen_after: Option<u64>,
+    needs_full_comparison: bool,
+}
+
+/// A bounded keyset walk over transaction ids that were at or above the previous
+/// snapshot's `xmax`.
+#[derive(Clone)]
+struct Tail {
+    xmax: u64,
+    swept_through: i64,
+    after: Option<(u64, i64)>,
+}
+
+/// One statement's sweep rows and the transaction snapshot they were read under.
+struct Sweep {
+    discovered: Discovered,
+    xmax: u64,
+    in_progress: Vec<u64>,
+}
+
+/// The late-write candidates and state changes a successfully settled poll may adopt.
+struct LatePoll {
+    streams: Vec<String>,
+    state: LateWriteState,
+    force_comparison: bool,
+}
+
+/// A snapshot's in-progress set is capped in code, including the overflow sentinel.
+const UNSEEN_TRANSACTION_CAP: usize = 4_096;
 
 impl PolicyProgress {
     /// Load the Policy's sweep position, creating its row the first time it runs, and
@@ -4706,6 +5052,7 @@ impl PolicyProgress {
             reconciled_through,
             reconcile: ReconcileSchedule::after_load(resolve_reconcile_cadence()),
             tracked,
+            late_writes: LateWriteState::default(),
         })
     }
 
@@ -4732,13 +5079,6 @@ impl PolicyProgress {
         Ok(())
     }
 
-    /// Move the first comparison after a load to the Policy's phase into the start-up
-    /// window of a runner polling every `poll_interval`.
-    fn spread_first_reconciliation(&mut self, name: &str, poll_interval: Duration) {
-        self.reconcile
-            .spread(name, startup_window(poll_interval), Instant::now());
-    }
-
     /// Make the next poll pay for the frontier scan whatever the cadence says.
     fn reconcile_now(&mut self) {
         self.reconcile.force();
@@ -4757,14 +5097,11 @@ impl PolicyProgress {
 
 /// When a Policy next compares the frontier with its places.
 ///
-/// A loaded Policy is due on its next poll. The daemon then [spreads](Self::spread) a
-/// worker's first comparison after a start or an election to the Policy's
-/// [`reconcile_phase`] into the [`startup_window`], so a new leader reconciles within a
-/// few polls — not within the cadence, which may be minutes: that comparison is how a
-/// failover finds the writes that were in flight
+/// A loaded Policy is due on its next poll. The first full comparison after a start or an
+/// election is immediate because the in-memory commit-stamp state does not survive either
 /// ([ADR-0030](../../docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). Every
-/// later comparison is due one cadence after the one before. A manual drain
-/// [forces](Self::force) one regardless.
+/// later comparison is due one cadence after the one before. A manual drain [forces](Self::force)
+/// one regardless.
 ///
 /// Pure over the `now` it is handed, so the decision is tested without a clock.
 struct ReconcileSchedule {
@@ -4786,13 +5123,6 @@ impl ReconcileSchedule {
             due_at: None,
             every,
         }
-    }
-
-    /// Make the next comparison due at the phase of `name` into `window`, counted from
-    /// `now`. A window wider than the cadence is cut to the cadence: spreading must never
-    /// make a first comparison later than an ordinary one.
-    fn spread(&mut self, name: &str, window: Duration, now: Instant) {
-        self.due_at = Some(now + reconcile_phase(name, window.min(self.every)));
     }
 
     /// Make the next comparison due on the next poll, whatever the phase or cadence.
@@ -4817,14 +5147,14 @@ impl ReconcileSchedule {
 /// take to notice a write that committed below its sweep. Lower it for a deployment that
 /// cares more about that tail than about scanning one row per stream; raise it for one
 /// with millions of streams and no long transactions.
-const DEFAULT_RECONCILE_CADENCE: Duration = Duration::from_secs(5);
+const DEFAULT_RECONCILE_CADENCE: Duration = Duration::from_secs(300);
 
 /// Environment variable overriding the built-in cadence, in seconds.
 const RECONCILE_CADENCE_ENV_VAR: &str = "REPLAY_POLICY_RECONCILE_SECS";
 
 /// How often a Policy compares every stream's head with its own place.
 ///
-/// Precedence: `REPLAY_POLICY_RECONCILE_SECS` → 5s. `0` and unparseable values fall back
+/// Precedence: `REPLAY_POLICY_RECONCILE_SECS` → 300s. `0` and unparseable values fall back
 /// to the default rather than turning every poll into a full scan.
 fn resolve_reconcile_cadence() -> Duration {
     std::env::var(RECONCILE_CADENCE_ENV_VAR)
@@ -4832,54 +5162,6 @@ fn resolve_reconcile_cadence() -> Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map_or(DEFAULT_RECONCILE_CADENCE, Duration::from_secs)
-}
-
-/// Polls a new leader's first reconciliations are spread over.
-///
-/// Three: wide enough that the Policies of one runner do not all scan on the same tick,
-/// narrow enough that a failover finds the writes that were in flight in seconds.
-const STARTUP_SPREAD_POLLS: u32 = 3;
-
-/// The window a new leader's first reconciliations are spread over: a few polls of a
-/// runner polling every `poll_interval`.
-fn startup_window(poll_interval: Duration) -> Duration {
-    poll_interval.saturating_mul(STARTUP_SPREAD_POLLS)
-}
-
-/// How far into its start-up window a Policy's first reconciliation is due: its *phase*,
-/// always within `[0, span)`.
-///
-/// Were the first reconciliation due on the first poll, every Policy would compare the
-/// frontier with its places in the same moment after a start or an election, and — each
-/// next one being a cadence after the last — keep doing so in lockstep
-/// (funkode-io/replay#269). The phase staggers those first reconciliations across the
-/// window instead.
-///
-/// What is guaranteed is the first one only: it is due at load plus the phase, and runs
-/// on the first poll at or after that moment. Later ones are due a cadence after the
-/// previous one *finished* — the time is taken after the scan — and run on a poll tick,
-/// so the phases drift and Policies may draw together again over a long leadership. They
-/// do not all start together, which is the burst this exists to break up.
-///
-/// Derived from the name, not drawn at random: a Policy keeps its phase across polls,
-/// processes and runs, and the hash is FNV-1a written here rather than `DefaultHasher`,
-/// whose output a Rust release is free to change.
-fn reconcile_phase(name: &str, span: Duration) -> Duration {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let hash = name.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    });
-
-    let span = span.as_nanos();
-    if span == 0 {
-        return Duration::ZERO;
-    }
-    let nanos = u128::from(hash) % span;
-    Duration::from_nanos(
-        u64::try_from(nanos).expect("a remainder of a u64 hash is no larger than the hash"),
-    )
 }
 
 /// Read how far a Policy has swept and where its rotation left off, or `None` when it has
@@ -6152,8 +6434,10 @@ mod progress_tests {
     use crate::policy_frontier::rotation_after;
 
     use super::{
-        bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, Place,
-        PolicyProgress, StartAt, TrackedStreams, STREAMS_BEHIND_OF_TYPES,
+        bootstrap, checkpoint_places, late_tail_page, lookup_late_writes, places_of,
+        streams_behind, sweep_for_streams, write_reconciled, Discovered, LateWriteState, Place,
+        PolicyProgress, StartAt, Sweep, Tail, TrackedStreams, STREAMS_BEHIND_OF_TYPES,
+        UNSEEN_TRANSACTION_CAP,
     };
 
     /// Move the rotation the way a poll that compared `page` and read `read` of it would,
@@ -6242,6 +6526,293 @@ mod progress_tests {
             .await
             .expect("appending must succeed");
         }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_rows_and_transaction_snapshot_share_one_statement_snapshot_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut held = pool.begin().await.expect("starting the held writer");
+        let held_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Held', \
+                 'urn:probe:held', 'Probe', NULL, FALSE)",
+        )
+        .bind(held_id)
+        .fetch_one(&mut *held)
+        .await
+        .expect("the held event must be written");
+        let held_position: i64 =
+            sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+                .bind(held_id)
+                .fetch_one(&mut *held)
+                .await
+                .expect("the held event must have its position");
+        let held_txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(held_id)
+                .fetch_one(&mut *held)
+                .await
+                .expect("the held event must have its transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+
+        let overtaking_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Overtaking', \
+                 'urn:probe:overtaking', 'Probe', NULL, FALSE)",
+        )
+        .bind(overtaking_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the overtaking event must commit");
+        let overtaking_position: i64 =
+            sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+                .bind(overtaking_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the overtaking event must have its position");
+
+        let sweep = sweep_for_streams(&pool, 0, 10)
+            .await
+            .expect("the sweep must return its snapshot");
+
+        assert!(sweep.in_progress.contains(&held_txid));
+        assert!(held_position < overtaking_position);
+        assert!(sweep.discovered.swept_through >= overtaking_position);
+        assert!(
+            !sweep
+                .discovered
+                .streams
+                .contains(&"urn:probe:held".to_string()),
+            "the row is invisible in the same snapshot that reports its writer in progress"
+        );
+        assert!(sweep
+            .discovered
+            .streams
+            .contains(&"urn:probe:overtaking".to_string()));
+
+        held.rollback().await.expect("aborting the held writer");
+    }
+
+    #[tokio::test]
+    async fn an_open_transaction_is_retained_and_looked_up_after_it_ends_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut held = pool.begin().await.expect("starting the held writer");
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Held', \
+                 'urn:probe:held-many-polls', 'Probe', NULL, FALSE)",
+        )
+        .bind(event_id)
+        .fetch_one(&mut *held)
+        .await
+        .expect("the held event must be written");
+        let txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(&mut *held)
+                .await
+                .expect("the held event must have a transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+        let position: i64 = sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&mut *held)
+            .await
+            .expect("the held event must have a position");
+        append_events(&pool, "urn:probe:advance-xmax", 1).await;
+        let mut state = LateWriteState::default();
+
+        for _ in 0..4 {
+            let sweep = sweep_for_streams(&pool, position, 10)
+                .await
+                .expect("a poll must read the held transaction snapshot");
+            assert!(
+                sweep.in_progress.contains(&txid),
+                "transaction {txid} is absent from {:?} at xmax {}",
+                sweep.in_progress,
+                sweep.xmax
+            );
+            let late = lookup_late_writes(&pool, &state, &sweep, position, 10)
+                .await
+                .expect("an open transaction must not be looked up");
+            assert!(late.streams.is_empty());
+            assert_eq!(late.state.unseen.len(), 1);
+            assert!(late.state.unseen.contains(&txid));
+            state = late.state;
+        }
+
+        held.commit().await.expect("committing the held writer");
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the next poll must read the ended transaction");
+        let late = lookup_late_writes(&pool, &state, &sweep, position, 10)
+            .await
+            .expect("the ended transaction must be read");
+        assert_eq!(late.streams, vec!["urn:probe:held-many-polls"]);
+        assert!(!late.state.unseen.contains(&txid));
+        assert!(!late.state.pending.contains_key(&txid));
+
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("a following poll must continue normally");
+        let after = lookup_late_writes(&pool, &late.state, &sweep, position, 10)
+            .await
+            .expect("the completed transaction must be forgotten");
+        assert!(after.streams.is_empty());
+        assert!(after.state.unseen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_tail_finds_an_id_at_the_previous_xmax_below_the_sweep_position_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Tail', \
+                 'urn:probe:tail', 'Probe', NULL, FALSE)",
+        )
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the event must commit");
+        let txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the event must have a transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+        let position: i64 = sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the event must have a position");
+
+        let page = late_tail_page(
+            &pool,
+            &Tail {
+                xmax: txid,
+                swept_through: position,
+                after: None,
+            },
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: position,
+                },
+                xmax: txid + 1,
+                in_progress: Vec::new(),
+            },
+            10,
+        )
+        .await
+        .expect("the tail query must succeed");
+
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].stream_id, "urn:probe:tail");
+        assert_eq!(page.rows[0].position, position);
+    }
+
+    #[tokio::test]
+    async fn invalid_late_write_state_is_cleared_and_requests_a_full_comparison_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut prior = LateWriteState::default();
+        prior.unseen.insert(8);
+        prior.tail = Some(Tail {
+            xmax: 10,
+            swept_through: 50,
+            after: Some((9, 45)),
+        });
+        let reset = lookup_late_writes(
+            &pool,
+            &prior,
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: 60,
+                },
+                xmax: 9,
+                in_progress: Vec::new(),
+            },
+            60,
+            10,
+        )
+        .await
+        .expect("a backward counter should not query the old range");
+
+        assert!(reset.force_comparison);
+        assert!(reset.state.unseen.is_empty());
+        assert_eq!(reset.state.tail.as_ref().map(|tail| tail.xmax), Some(9));
+
+        let overflow = lookup_late_writes(
+            &pool,
+            &LateWriteState::default(),
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: 0,
+                },
+                xmax: 20,
+                in_progress: (0..=UNSEEN_TRANSACTION_CAP as u64).collect(),
+            },
+            0,
+            10,
+        )
+        .await
+        .expect("an over-cap snapshot should not query transaction rows");
+
+        assert!(overflow.force_comparison);
+        assert!(overflow.state.unseen.is_empty());
+        assert!(overflow.state.tail.is_none());
+        assert!(overflow.state.needs_full_comparison);
+    }
+
+    #[tokio::test]
+    async fn an_open_foreign_transaction_does_not_delay_ended_lookups_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Ended', \
+             'urn:probe:ended', 'Probe', NULL, FALSE)",
+        )
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the ended event must commit");
+        let ended_txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the event must have a transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+        let foreign_txid = ended_txid + 1;
+        let mut prior = LateWriteState::default();
+        prior.unseen.insert(ended_txid);
+        prior.unseen.insert(foreign_txid);
+
+        let late = lookup_late_writes(
+            &pool,
+            &prior,
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: 0,
+                },
+                xmax: foreign_txid + 1,
+                in_progress: vec![foreign_txid],
+            },
+            0,
+            10,
+        )
+        .await
+        .expect("an unrelated in-progress transaction must not block the ended lookup");
+
+        assert_eq!(late.streams, vec!["urn:probe:ended"]);
+        assert!(late.state.unseen.contains(&foreign_txid));
+        assert!(!late.state.unseen.contains(&ended_txid));
     }
 
     /// What a poll reads before it delivers anything, and what its checkpoints are
@@ -7496,183 +8067,33 @@ mod settlement_tests {
 /// `now`, so no test waits on a clock.
 #[cfg(test)]
 mod reconcile_schedule_tests {
-    use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
-    use super::{reconcile_phase, startup_window, ReconcileSchedule};
+    use super::{ReconcileSchedule, DEFAULT_RECONCILE_CADENCE};
 
-    /// The start-up window of a runner polling every five seconds.
-    const WINDOW: Duration = Duration::from_secs(15);
-    /// A safety-net cadence far wider than the window, as ADR-0030's default is.
-    const CADENCE: Duration = Duration::from_secs(300);
-
-    /// The phase is FNV-1a of the name, reduced to the span. A span wider than any
-    /// 64-bit hash leaves the hash itself, which pins it to the published FNV-1a test
-    /// vectors: a value no compiler release, platform or process can move.
-    #[test]
-    fn the_phase_is_a_stable_hash_of_the_name() {
-        let widest = Duration::from_nanos(u64::MAX);
-
-        assert_eq!(
-            reconcile_phase("a", widest),
-            Duration::from_nanos(0xaf63_dc4c_8601_ec8c)
-        );
-        assert_eq!(
-            reconcile_phase("foobar", widest),
-            Duration::from_nanos(0x8594_4171_f739_67e8)
-        );
-    }
-
-    #[test]
-    fn the_same_name_gets_the_same_phase_every_time() {
-        assert_eq!(
-            reconcile_phase("billing", WINDOW),
-            reconcile_phase("billing", WINDOW)
-        );
-    }
-
-    /// The window is a few polls of the runner's interval.
-    #[test]
-    fn the_startup_window_is_three_polls() {
-        assert_eq!(startup_window(Duration::from_secs(5)), WINDOW);
-        assert_eq!(
-            startup_window(Duration::MAX),
-            Duration::MAX,
-            "saturates rather than overflowing"
-        );
-    }
-
-    /// Several Policies in one runner start together; their first reconciliations are
-    /// spread across the window rather than bunched: eight names, and every quarter of
-    /// the window holds at least one of them.
-    #[test]
-    fn different_names_spread_across_the_window() {
-        let names = [
-            "billing",
-            "shipping",
-            "notifications",
-            "inventory",
-            "loyalty",
-            "fraud_screening",
-            "refunds",
-            "invoicing",
-        ];
-
-        let phases: Vec<Duration> = names
-            .iter()
-            .map(|name| reconcile_phase(name, WINDOW))
-            .collect();
-
-        assert!(
-            phases.iter().all(|phase| *phase < WINDOW),
-            "every phase falls within the window: {phases:?}"
-        );
-        let distinct: HashSet<&Duration> = phases.iter().collect();
-        assert_eq!(
-            distinct.len(),
-            names.len(),
-            "every Policy has its own moment"
-        );
-        let quarters: HashSet<u128> = phases
-            .iter()
-            .map(|phase| phase.as_nanos() * 4 / WINDOW.as_nanos())
-            .collect();
-        assert_eq!(
-            quarters.len(),
-            4,
-            "every quarter of the window has a Policy reconciling in it: {phases:?}"
-        );
-    }
-
-    /// A name whose phase is well inside the window, so "before it" and "at it" are
-    /// both moments a load could see.
-    const NAME: &str = "billing";
-
-    fn phase() -> Duration {
-        let phase = reconcile_phase(NAME, WINDOW);
-        assert!(
-            phase > Duration::from_millis(1),
-            "the name under test has a phase to wait for"
-        );
-        phase
-    }
-
-    /// A Policy just loaded is due on its next poll, until its runner spreads it.
+    /// A newly elected leader begins the comparison immediately, independent of the
+    /// safety-net cadence.
     #[test]
     fn a_loaded_policy_is_due_on_its_next_poll() {
-        let schedule = ReconcileSchedule::after_load(CADENCE);
+        let schedule = ReconcileSchedule::after_load(Duration::from_secs(300));
 
         assert!(schedule.is_due(Instant::now()));
     }
 
-    /// A new leader waits for its phase into the start-up window — not into the
-    /// cadence, which may be minutes: that first comparison is how a failover finds the
-    /// writes that were in flight (ADR-0030).
     #[test]
-    fn a_new_leader_first_reconciles_at_its_phase_within_the_window() {
-        let loaded = Instant::now();
-        let mut schedule = ReconcileSchedule::after_load(CADENCE);
-        schedule.spread(NAME, WINDOW, loaded);
-
-        assert!(!schedule.is_due(loaded), "not on the first poll");
-        assert!(!schedule.is_due(loaded + phase() - Duration::from_nanos(1)));
-        assert!(schedule.is_due(loaded + phase()), "at its phase");
-        assert!(
-            schedule.is_due(loaded + WINDOW),
-            "within the window, whatever the name and however long the cadence"
-        );
+    fn the_default_safety_net_is_five_minutes() {
+        assert_eq!(DEFAULT_RECONCILE_CADENCE, Duration::from_secs(300));
     }
 
-    /// A window wider than the cadence is cut to it: spreading never makes the first
-    /// comparison later than an ordinary one would be.
     #[test]
-    fn a_window_wider_than_the_cadence_is_cut_to_the_cadence() {
-        let short = Duration::from_secs(1);
+    fn a_reconciliation_hands_back_to_the_configured_cadence() {
+        let cadence = Duration::from_secs(300);
         let loaded = Instant::now();
-        let mut schedule = ReconcileSchedule::after_load(short);
-        schedule.spread(NAME, WINDOW, loaded);
-
-        assert!(schedule.is_due(loaded + short));
-    }
-
-    /// A manual drain is one poll and has to be a whole one: the phase does not apply.
-    #[test]
-    fn a_forced_reconciliation_is_due_on_the_first_poll() {
-        let loaded = Instant::now();
-        let mut schedule = ReconcileSchedule::after_load(CADENCE);
-        schedule.spread(NAME, WINDOW, loaded);
-
+        let mut schedule = ReconcileSchedule::after_load(cadence);
         schedule.force();
-
-        assert!(schedule.is_due(loaded));
-    }
-
-    /// The phase places the first reconciliation only; every later one follows the
-    /// cadence from the one before, as it always has.
-    #[test]
-    fn after_the_first_reconciliation_the_cadence_is_unchanged() {
-        let loaded = Instant::now();
-        let mut schedule = ReconcileSchedule::after_load(CADENCE);
-        schedule.spread(NAME, WINDOW, loaded);
-        let first = loaded + phase();
-
-        schedule.reconciled(first);
-
-        assert!(!schedule.is_due(first));
-        assert!(!schedule.is_due(first + CADENCE - Duration::from_nanos(1)));
-        assert!(schedule.is_due(first + CADENCE));
-    }
-
-    /// A forced reconciliation, once done, hands back to the cadence too.
-    #[test]
-    fn a_forced_reconciliation_hands_back_to_the_cadence() {
-        let loaded = Instant::now();
-        let mut schedule = ReconcileSchedule::after_load(CADENCE);
-        schedule.force();
-
         schedule.reconciled(loaded);
 
-        assert!(!schedule.is_due(loaded + CADENCE - Duration::from_nanos(1)));
-        assert!(schedule.is_due(loaded + CADENCE));
+        assert!(!schedule.is_due(loaded + cadence - Duration::from_nanos(1)));
+        assert!(schedule.is_due(loaded + cadence));
     }
 }

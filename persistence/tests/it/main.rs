@@ -28,6 +28,7 @@ mod integration_tests;
 mod policy_cursor_backfill;
 mod policy_daemon;
 mod policy_dead_letter_identity;
+mod policy_late_write;
 mod policy_liveness;
 mod policy_panic;
 mod policy_park_once;

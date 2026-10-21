@@ -112,21 +112,20 @@ pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The reconciliation cadence the daemon under test runs on: what
 /// `REPLAY_POLICY_RECONCILE_SECS` resolves to, by the runner's own rule — a positive
-/// whole number of seconds, else 5s. No test sets it, so this is the default.
+/// whole number of seconds, else 300s. No test sets it, so this is the default.
 pub fn reconcile_cadence() -> Duration {
     std::env::var("REPLAY_POLICY_RECONCILE_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
-        .map_or(Duration::from_secs(5), Duration::from_secs)
+        .map_or(Duration::from_secs(300), Duration::from_secs)
 }
 
 /// How long an observation that only a reconciliation can satisfy may take.
 ///
-/// The next reconciliation is up to one cadence away — a whole one after a load, where
-/// the first is due at the Policy's phase (funkode-io/replay#269) — and a rotation
-/// standing past the stream spends one more wrapping (ADR-0026). Three cadences leave a
-/// third for a slow machine, where [`OBSERVE_TIMEOUT`] would be exactly the two.
+/// The next reconciliation is up to one cadence away, and a rotation standing past the
+/// stream spends one more wrapping (ADR-0026). Three cadences leave a third for a slow
+/// machine, where [`OBSERVE_TIMEOUT`] would be exactly the two.
 pub fn reconciliation_timeout() -> Duration {
     reconcile_cadence() * 3
 }

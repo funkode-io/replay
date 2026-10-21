@@ -56,13 +56,11 @@ columns and no index can answer it. Two paths, with different costs and differen
   scan, two columns, proportional to new events. It nominates streams and reads no cursors.
   It advances `swept_through` to the last position it *read*, deliberately passing
   positions it never saw, which is what stops it waiting for anything.
-- **The reconciliation, on a cadence.** `streams.stream_seq > COALESCE(cursor, 0)` — one
-  row per stream, bounded by the same batch, default every 5 seconds
-  (`REPLAY_POLICY_RECONCILE_SECS`). It finds what the sweep swept past: a write that had
-  not committed when the sweep passed its position. A worker that has just started or
-  been elected first reconciles **within three poll intervals**, at a per-Policy phase
-  (`reconcile_phase`, funkode-io/replay#269, #273); a manual drain reconciles on its
-  first poll.
+- **The reconciliation, as a safety net.** `streams.stream_seq > COALESCE(cursor, 0)` —
+  one row per stream, bounded by the same batch, default every 300 seconds
+  (`REPLAY_POLICY_RECONCILE_SECS`). Late writes are normally found by their commit stamp
+  (ADR-0030). A worker that has just started or been elected begins a full comparison on
+  its first poll; a manual drain compares on its first poll too.
 
 The sweep is allowed to be wrong because it decides nothing. It nominates; what a stream
 is owed is read from that stream's own sequence, which has no holes.
@@ -74,20 +72,20 @@ is owed is read from that stream's own sequence, which has no holes.
   written. This is the property the commit watermark (funkode-io/replay#215, closed) could
   not give: it bought the same correctness by making every Policy wait for the oldest
   in-flight write in the whole instance (funkode-io/replay#214).
-- **A write that commits below the sweep is delivered late, not never — and the lateness
-  is a number.** This ADR owns that number; everything else quoting it links here.
+- **The reconciliation's rotation is bounded.** The normal late-write delivery bound is
+  the next poll after commit (ADR-0030); the formula below applies to recovery through the
+  safety-net comparison.
 
   ```text
   cadences ≤ ceil(streams behind / streams read per cadence) + 1
   ```
 
-  The count starts at the first reconciliation after an election, which comes up to three
-  poll intervals after the election itself (the Policy's phase, above). The `+ 1` is the cadence
-  that ends a pass. A rotation standing after the last stream id reads an empty page, so
-  that poll compares nothing and spends itself wrapping the cursor back to the start; a
-  stream sorting before it waits that cadence out (funkode-io/replay#243).
+  The first safety-net comparison starts on the first poll after an election. The `+ 1` is
+  the cadence that ends a pass. A rotation standing after the last stream id reads an empty
+  page, so that poll compares nothing and spends itself wrapping the cursor back to the
+  start; a stream sorting before it waits that cadence out (funkode-io/replay#243).
 
-  `REPLAY_POLICY_RECONCILE_SECS` (default 5s) is the cadence. A Policy behind on no more
+  `REPLAY_POLICY_RECONCILE_SECS` (default 300s) is the cadence. A Policy behind on no more
   streams than it reads in one compares them in a single cadence — two if its rotation is
   standing past the last stream id, because that cadence goes on the wrap. What it reads
   per cadence is between **one** and `read_batch_size`: the reconciliation leads the poll
