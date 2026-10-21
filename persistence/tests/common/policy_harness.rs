@@ -248,6 +248,18 @@ pub struct AppendedEvent {
     pub stream_id: String,
 }
 
+impl From<&HeldPing> for AppendedEvent {
+    /// The event a held append will be once it commits: its identity is fixed from the
+    /// moment the append drew it.
+    fn from(held: &HeldPing) -> Self {
+        AppendedEvent {
+            event_id: held.event_id,
+            global_position: held.global_position,
+            stream_id: held.stream_id.clone(),
+        }
+    }
+}
+
 /// A command the policy dispatched, observed as the event it wrote.
 ///
 /// The runner stamps every policy-issued command with causation metadata naming
@@ -592,11 +604,7 @@ impl PolicyDaemonHarness {
         let held = self
             .hold_a_ping_of_type_open(stream_type, stream_id, tag)
             .await;
-        let appended = AppendedEvent {
-            event_id: held.event_id,
-            global_position: held.global_position,
-            stream_id: held.stream_id.clone(),
-        };
+        let appended = AppendedEvent::from(&held);
         held.commit().await;
         appended
     }

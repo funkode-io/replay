@@ -40,10 +40,11 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/policy_runner.rs",
-        function: "tracked_among",
-        justification: "One row per stream the sweep nominated, and the sweep nominates at \
-                        most one stream per row it read: bounded by the sweep's LIMIT, the \
-                        policy's resolved read_batch_size (default 100). The rows it \
+        function: "keep_tracked",
+        justification: "One row per stream nominated: by the sweep, which nominates at \
+                        most one stream per row it read, bounded by its LIMIT; or by the \
+                        carried queue, which `PollPlan::plan` caps at the read batch. Either \
+                        way the policy's resolved read_batch_size (default 100). The rows it \
                         examines are the same ids, each one primary-key lookup.",
     },
     Reviewed {

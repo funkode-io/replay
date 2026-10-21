@@ -36,7 +36,8 @@ are the streams whose `streams.type` is in `types`, and every path honours that 
 
 - **The reconciliation** compares only those streams:
   `WHERE s.type = ANY($types) AND s.id > $rotation`, served by an index on
-  `streams (type, id)` (migration 0036, which supersedes 0005's index on `type` alone). Its
+  `streams (type, id)` (migration 0036, which supersedes 0005's index on `type` alone;
+  migration 0037 drops that one once its replacement exists). Its
   cost is proportional to the tracked streams after the rotation, and it reads no row of
   another type. The rotation rules of ADR-0026 are unchanged: it rotates through the
   tracked streams, and moves only through streams the poll read.
@@ -45,12 +46,15 @@ are the streams whose `streams.type` is in `types`, and every path honours that 
   whose type is not tracked — one primary-key lookup per nominated stream, bounded by the
   same `LIMIT`.
 - **A poll** therefore never reads an untracked stream and never writes a place for one.
-  `StartAt::Now` seeds places in tracked streams only.
+  That includes the streams the last poll left unfinished: when the tracked set changes,
+  the carried queue goes through the same lookup as the sweep's nominations. `StartAt::Now`
+  seeds places in tracked streams only.
 - **`PolicyStatusStore::list`** counts `lag` and `streams_behind` over the tracked streams.
   The status store has no Policy to ask, so the runner records the tracked types in
   `policy_cursors.tracked_stream_types` (migration 0035) whenever a worker loads the Policy
   and whenever the filter a poll is given differs from what was recorded. `NULL` is every
-  stream.
+  stream — which is also what a row written before the column existed holds, so a filtered
+  Policy's lag counts every stream until a worker next starts it and records its types.
 
 Only a top-level `ForStreamTypes` narrows what is tracked. `All`, `WithStreamId`,
 `WithMetadata` and every combinator — including an `And` that contains a `ForStreamTypes` —

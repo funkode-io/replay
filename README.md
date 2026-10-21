@@ -2356,7 +2356,11 @@ not just delivers from them
   `policy_stream_cursors` — `StartAt::Now` included;
 - `PolicyStatusStore::list` counts `lag` and `streams_behind` over the tracked streams.
   The runner records the types in `policy_cursors.tracked_stream_types` when a worker
-  starts the policy; `NULL` there means every stream.
+  starts the policy; `NULL` there means every stream. A policy's row from before the
+  upgrade holds `NULL` until a worker starts it under this version, so until then its lag
+  counts every stream of every type, untracked ones included;
+- the index on `streams (type, id)` (migration 0036) replaces the one on `type` alone,
+  which migration 0037 drops once its replacement exists.
 
 Every other filter — `All`, `WithStreamId`, `WithMetadata`, and any combinator, including
 an `And` containing a `ForStreamTypes` — tracks every stream. So declare the stream type as

@@ -63,15 +63,6 @@ impl StreamFilter {
         }
     }
 
-    /// The stream types a Policy under this filter tracks, or `None` when it tracks every
-    /// stream. `Some` only for a top-level [`StreamFilter::ForStreamTypes`].
-    pub(crate) fn tracked_stream_types(&self) -> Option<&[String]> {
-        match self {
-            StreamFilter::ForStreamTypes(types) => Some(types),
-            _ => None,
-        }
-    }
-
     pub fn all() -> StreamFilter {
         StreamFilter::All
     }

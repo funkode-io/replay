@@ -162,7 +162,12 @@ impl PolicyStatusStore {
     /// [`StreamFilter::ForStreamTypes`](crate::StreamFilter::ForStreamTypes) the streams of
     /// those types. A stream it does not track is never behind — counted against every
     /// stream, each one with no place would read as behind for ever
-    /// ([ADR-0030](../../docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+    /// ([ADR-0030](https://github.com/funkode-io/replay/blob/main/docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+    ///
+    /// **Until a runner records it, every stream counts.** The column is `NULL` — every
+    /// stream — on a row written before it existed, so a policy filtered by type reports
+    /// the lag of every stream of every other type from the upgrade until a worker next
+    /// starts it under this version; that worker records the types, and the lag narrows.
     pub async fn list(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
         let rows = sqlx::query(
             r#"
