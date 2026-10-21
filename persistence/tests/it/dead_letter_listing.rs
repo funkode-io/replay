@@ -15,7 +15,8 @@ use futures::{StreamExt, TryStreamExt};
 
 use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
 use replay_persistence::{
-    DeadLetterFilter, Dispatch, ObservedEvent, Policy, PolicyRunnerBuilder, PolicySettings, StartAt,
+    DeadLetter, DeadLetterFilter, Dispatch, ObservedEvent, Policy, PolicyRunnerBuilder,
+    PolicySettings, StartAt,
 };
 
 /// Tag whose reaction dispatches a command the aggregate refuses permanently, to the
@@ -295,25 +296,25 @@ async fn the_listing_resumes_after_a_key_across_chunks_postgres_test() {
     assert_eq!(counted(&harness, mine.clone()).await, BACKLOG as i64);
 
     // A paged UI behind HTTP: the second screen starts after the last id the first one
-    // showed.
+    // showed. Whole rows are collected straight after `take`, as the README shows.
     let screen = 30;
-    let first: Vec<i64> = harness
+    let first: Vec<DeadLetter> = harness
         .status_store()
         .dead_letters(mine.clone())
-        .map_ok(|row| row.id)
         .take(screen)
         .try_collect()
         .await
         .unwrap();
+    let first: Vec<i64> = first.iter().map(|row| row.id).collect();
     assert_eq!(first, all[..screen]);
-    let second: Vec<i64> = harness
+    let second: Vec<DeadLetter> = harness
         .status_store()
         .dead_letters_after(mine.clone(), *first.last().unwrap())
-        .map_ok(|row| row.id)
         .take(screen)
         .try_collect()
         .await
         .unwrap();
+    let second: Vec<i64> = second.iter().map(|row| row.id).collect();
     assert_eq!(second, all[screen..2 * screen]);
 
     // The rest, resumed from inside the second chunk, reaches the end.

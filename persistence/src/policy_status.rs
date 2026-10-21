@@ -30,7 +30,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use futures::{TryStream, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 use serde_json::Value;
 use sqlx::{Pool, Postgres, QueryBuilder};
 use urn::Urn;
@@ -268,7 +268,7 @@ impl PolicyStatusStore {
     pub fn dead_letters(
         &self,
         filter: DeadLetterFilter,
-    ) -> impl TryStream<Ok = DeadLetter, Error = replay::Error> + Send + 'static {
+    ) -> impl Stream<Item = Result<DeadLetter, replay::Error>> + Send + 'static {
         self.dead_letters_after(filter, 0)
     }
 
@@ -281,7 +281,7 @@ impl PolicyStatusStore {
         &self,
         filter: DeadLetterFilter,
         after: i64,
-    ) -> impl TryStream<Ok = DeadLetter, Error = replay::Error> + Send + 'static {
+    ) -> impl Stream<Item = Result<DeadLetter, replay::Error>> + Send + 'static {
         let pool = self.pool.clone();
         async_stream::try_stream! {
             let mut after = after;
