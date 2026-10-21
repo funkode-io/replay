@@ -369,13 +369,15 @@ impl PolicyStatusStore {
 /// let filter = DeadLetterFilter::new()
 ///     .policy("import_readiness")
 ///     .triggered_in(import_id)          // the trigger event's stream
-///     .triggered_by("RecordRejected");  // the trigger event's type
+///     .triggered_by("RecordRejected")   // the trigger event's type
+///     .triggered_with(Metadata::new(json!({ "file_upload_urn": file })));  // one file
 /// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeadLetterFilter {
     policy_name: Option<String>,
     trigger_stream_id: Option<Urn>,
     trigger_event_type: Option<String>,
+    trigger_metadata: Option<replay::Metadata>,
 }
 
 impl DeadLetterFilter {
@@ -404,9 +406,23 @@ impl DeadLetterFilter {
         self
     }
 
+    /// Only rows whose triggering event's metadata contains `metadata` (JSON
+    /// containment, `@>`): the keys and values given, whatever else it carries.
+    ///
+    /// For what a stream does not separate. One stream can hold the events of many
+    /// units of work — a catalog's import stream holds every file imported into it —
+    /// and the unit is named in the events' metadata, so this is how a consumer lists
+    /// the parked commands of one of them.
+    pub fn triggered_with(mut self, metadata: replay::Metadata) -> Self {
+        self.trigger_metadata = Some(metadata);
+        self
+    }
+
     /// Whether a criterion reads the triggering event, so the query must join it.
     fn reads_trigger(&self) -> bool {
-        self.trigger_stream_id.is_some() || self.trigger_event_type.is_some()
+        self.trigger_stream_id.is_some()
+            || self.trigger_event_type.is_some()
+            || self.trigger_metadata.is_some()
     }
 
     /// Append this filter's criteria to a `WHERE` that already holds one predicate.
@@ -423,6 +439,11 @@ impl DeadLetterFilter {
         }
         if let Some(event_type) = &self.trigger_event_type {
             query.push(" AND e.type = ").push_bind(event_type.clone());
+        }
+        if let Some(metadata) = &self.trigger_metadata {
+            query
+                .push(" AND e.metadata @> ")
+                .push_bind(metadata.to_json());
         }
     }
 }
@@ -554,13 +575,15 @@ async fn read_dead_letter_chunk(
     filter: &DeadLetterFilter,
     after: i64,
 ) -> Result<Vec<DeadLetter>, replay::Error> {
+    // Every column of `events` the row conversion to a `PersistedEvent` reads, including
+    // `compacted_snapshot`, which it reads once funkode-io/replay#262 lands.
     let mut query: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT dl.id AS dead_letter_id, dl.policy_name, dl.error_kind, dl.error_message, \
                 dl.created_at, dl.last_parked_at, dl.deliveries, dl.retry_count, \
                 dl.last_retried_at, dl.aggregate_name, dl.target_stream_id, \
                 dl.command_name, dl.dispatch_ordinal, dl.event_id AS trigger_event_id, \
                 e.id, e.data, e.metadata, e.stream_id, e.type, e.version, e.created, \
-                e.aggregate_version \
+                e.aggregate_version, e.compacted_snapshot \
          FROM policy_dead_letters dl \
          LEFT JOIN events e ON e.id = dl.event_id \
          WHERE dl.id > ",

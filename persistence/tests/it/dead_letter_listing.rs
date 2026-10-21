@@ -267,6 +267,54 @@ async fn a_filter_narrows_the_listing_and_its_count_by_policy_trigger_stream_and
     harness.shutdown().await;
 }
 
+/// One stream can hold several units of work — a catalog's import stream holds every
+/// file imported into it — so a stream does not separate them; the unit is named in the
+/// trigger's metadata, and the filter narrows to it, listing and count alike.
+#[tokio::test]
+async fn a_filter_narrows_to_the_triggers_whose_metadata_contains_a_document_postgres_test() {
+    let harness = PolicyDaemonHarness::start("listing-metadata", two_refusing_policies()).await;
+    let policy = harness.policy_name().to_string();
+
+    // Two pings into one stream: two units of work the stream does not tell apart.
+    harness.ping("catalog-1", "refused-file-a").await;
+    harness.ping("catalog-1", "refused-file-b").await;
+    harness.await_dead_letters(2).await;
+
+    let in_catalog = DeadLetterFilter::new()
+        .policy(&policy)
+        .triggered_in(ProbeUrn::new("catalog-1").unwrap());
+    let rows = harness
+        .status_store()
+        .dead_letters_all(in_catalog.clone())
+        .await
+        .expect("the listing must be readable");
+    assert_eq!(rows.len(), 2, "the stream holds both: {rows:#?}");
+
+    // The harness stamps each ping with a marker of its own: the unit of work here.
+    let marker = rows[0]
+        .triggering_event
+        .as_ref()
+        .expect("the trigger is still in the log")
+        .metadata
+        .to_json()["harness_ping"]
+        .clone();
+    let one_unit = in_catalog.triggered_with(replay::Metadata::new(
+        serde_json::json!({ "harness_ping": marker }),
+    ));
+
+    let listed = listed_ids(&harness, one_unit.clone()).await;
+    assert_eq!(listed, vec![rows[0].id], "only the rows of that unit");
+    assert_eq!(counted(&harness, one_unit).await, 1, "and the count agrees");
+
+    let nobody = DeadLetterFilter::new().triggered_with(replay::Metadata::new(
+        serde_json::json!({ "harness_ping": "no-such-marker" }),
+    ));
+    assert!(listed_ids(&harness, nobody.clone()).await.is_empty());
+    assert_eq!(counted(&harness, nobody).await, 0);
+
+    harness.shutdown().await;
+}
+
 /// More parked rows than one chunk of the listing reads: [`DEAD_LETTER_CHUNK`] is 100
 /// in the library, and the walk must cross it twice without the consumer seeing a seam.
 const BACKLOG: usize = 250;

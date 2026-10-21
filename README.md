@@ -2962,13 +2962,16 @@ showed. The count is its own call and loads no rows.
 
 ```rust,ignore
 use futures::{StreamExt, TryStreamExt};
+use replay::Metadata;
 use replay_persistence::{DeadLetter, DeadLetterFilter, PolicyStatusStore};
+use serde_json::json;
 
 let store = PolicyStatusStore::new(pool.clone());
 let filter = DeadLetterFilter::new()
     .policy("import_readiness")
     .triggered_in(import_id)          // the triggering event's stream
-    .triggered_by("RecordRejected");  // the triggering event's type
+    .triggered_by("RecordRejected")   // the triggering event's type
+    .triggered_with(Metadata::new(json!({ "file_upload_urn": file })));  // its metadata contains this
 
 let total = store.dead_letter_count(&filter).await?;
 
@@ -2980,6 +2983,11 @@ let next: Vec<DeadLetter> = store
     .try_collect()
     .await?;
 ```
+
+`triggered_with` is for a unit of work a stream does not separate: one import stream
+can hold every file imported into a catalog, and the file is named in the events'
+metadata, so the errors of one file are the rows whose trigger's metadata contains it
+(JSON containment, `@>`).
 
 Each `DeadLetter` carries the row's `id` (what `retry_dead_letter` and
 `discard_dead_letter` take), `policy_name`, `error_kind` and `error_message`,
