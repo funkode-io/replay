@@ -195,7 +195,7 @@ impl PostgresEventStore {
 
     /// Begin configuring a store with inline projections.
     ///
-    /// Projections are registered on the builder and frozen by [`PostgresEventStoreBuilder::build`],
+    /// Projections are registered on the builder and frozen by the builder's `build`,
     /// which runs their first-time `init` and records their version in the `projections` table.
     pub fn builder(pool: Pool<Postgres>) -> PostgresEventStoreBuilder {
         PostgresEventStoreBuilder {

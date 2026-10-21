@@ -46,7 +46,7 @@ impl<ES: EventStore> Cqrs<ES> {
     ///
     /// - `aggregate_version`: choose which snapshot of the stream to load.  Use
     ///   [`AggregateVersion::Latest`] (the default) to replay the current event stream; use
-    ///   [`AggregateVersion::Version(n)`] to inspect a specific archived compaction version.
+    ///   [`AggregateVersion::Version`]`(n)` to inspect a specific archived compaction version.
     /// - `at_stream_version`: optional inclusive upper bound on the event sequence number
     ///   (events with version ≤ n are included).  Use this for time-travel reads.
     /// - `at_timestamp`: optional inclusive upper bound on the event creation timestamp
@@ -144,7 +144,7 @@ impl<ES: EventStore> Cqrs<ES> {
     ///
     /// Archives the current full history under a new version number, then replaces
     /// the live stream with the minimal set of events returned by
-    /// [`Compactable::compacted_events`].  Returns a [`CompactionOutcome`]:
+    /// [`Compactable::compacted_events`](replay::Compactable::compacted_events).  Returns a [`CompactionOutcome`]:
     /// `Compacted { archive_version }` (starting at `1` for the first compaction), or
     /// `Skipped` when the aggregate reports the stream is already minimal
     /// ([`replay::Compaction::AlreadyCompacted`]) — in which case nothing is written but the

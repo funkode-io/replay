@@ -549,8 +549,8 @@ impl PolicyRunnerDaemon {
     /// [Leader] parked in front of a hole runs and advances nothing either.
     ///
     /// Every registered Policy appears, including one whose worker has not
-    /// reached its first election ([`Liveness::Unknown`]). A Policy another
-    /// replica leads is [`Liveness::StandingBy`] here — a standby is healthy and
+    /// reached its first election ([`Liveness::Unknown`](crate::Liveness::Unknown)). A Policy another
+    /// replica leads is [`Liveness::StandingBy`](crate::Liveness::StandingBy) here — a standby is healthy and
     /// deliberately idle, and reading it as down is the false alarm this
     /// accessor exists to prevent.
     ///
@@ -1339,7 +1339,7 @@ impl PolicyRunner {
     /// `react`, executes **no** command, and therefore produces **no** new
     /// aggregate event. It takes no advisory lock and never touches
     /// `policy_cursors`. Once the row leaves the active table,
-    /// [`PolicyStatusStore::list`] reports the policy leaving `Degraded`
+    /// [`PolicyStatusStore::list`](crate::PolicyStatusStore::list) reports the policy leaving `Degraded`
     /// exactly as it does after a successful retry.
     ///
     /// Returns [`DeadLetterDiscard::NotFound`] when no active row matches `id`
@@ -1377,7 +1377,7 @@ impl PolicyRunner {
     ///
     /// The backlog this drains is the one an outage leaves — one parked reaction
     /// per event the downstream refused — so the enumeration is **paged**:
-    /// [`RETRY_PAGE_SIZE`] reactions are read at a time, settled, and the next
+    /// `RETRY_PAGE_SIZE` (100) reactions are read at a time, settled, and the next
     /// page read from the last `(global_position, event_id)` of the previous
     /// one. Nothing here grows with the size of the backlog. A page settles
     /// before the next is read, so a reaction re-parked by this run is behind
