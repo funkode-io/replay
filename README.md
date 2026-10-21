@@ -2361,6 +2361,12 @@ costs a scan of one row per stream, so it runs on a cadence rather than per poll
 Lower it if that tail latency matters more than the scan; raise it if you have millions of
 streams and no long-running writes.
 
+A policy's first reconciliation after its worker starts or is elected leader runs **within
+one cadence**, at a phase derived from the policy's name, rather than on its first poll —
+so the policies of one runner do not all scan at once (see `reconcile_phase` in
+`persistence/src/policy_runner.rs`). A manual `PolicyRunner::drain` always reconciles on
+the spot.
+
 The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
 left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
 while the policy is keeping up, plus the one a pass spends wrapping — a rotation standing
