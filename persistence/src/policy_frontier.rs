@@ -920,7 +920,7 @@ mod liveness_simulation {
     use super::{examined_through, Nominations, PollPlan};
 
     /// How many cadences each seed is run for. Long enough that a starved stream is
-    /// starved rather than merely waiting: the bound below is at most `STREAMS + 1`.
+    /// starved rather than merely waiting: the bound below is at most `2 × STREAMS`.
     const CADENCES: u32 = 40;
 
     /// A linear congruential generator, so a seed is a schedule and a schedule replays.
@@ -1261,15 +1261,15 @@ mod liveness_simulation {
         /// compare each against [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md):
         ///
         /// ```text
-        /// cadences ≤ ceil(streams behind / streams read per cadence) + 1
+        /// cadences ≤ ceil(streams behind / streams read per cadence) + ceil(streams / window)
         /// ```
         ///
         /// Taken at its floor, which is the guarantee the ADR gives rather than its best
         /// case: the reconciliation leads the poll it runs on, so **one** behind stream is
         /// read per cadence at worst, and the division is by one. The numerator is the
         /// most streams seen behind at once *during that stream's wait* — the rotation
-        /// only spends a cadence on a stream that is behind. The ADR's `+ 1` is the
-        /// cadence a finished pass spends wrapping on an empty page.
+        /// only spends a cadence on a stream that is behind. The second term is the
+        /// windows a pass steps through, the cadence it spends wrapping included.
         fn account(&mut self) -> Result<(), String> {
             let behind_now = self
                 .streams
@@ -1311,7 +1311,7 @@ mod liveness_simulation {
 
             Err(format!(
                 "a stream the Policy is behind on went unread for longer than ADR-0026's \
-                 bound, ceil(streams behind / streams read per cadence) + 1:\n  \
+                 bound, ceil(streams behind / streams read per cadence) + ceil(streams / window):\n  \
                  starved: {}\n  \
                  seed: {}\n  streams: {} ({} quiet, {} busy)\n  read_batch: {}\n  \
                  window: {}\n  polls per cadence: {}\n  schedule:\n    {}",
