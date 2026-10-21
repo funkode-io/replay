@@ -56,7 +56,10 @@ columns and no index can answer it. Two paths, with different costs and differen
 - **The reconciliation, on a cadence.** `streams.stream_seq > COALESCE(cursor, 0)` — one
   row per stream, bounded by the same batch, default every 5 seconds
   (`REPLAY_POLICY_RECONCILE_SECS`). It finds what the sweep swept past: a write that had
-  not committed when the sweep passed its position.
+  not committed when the sweep passed its position. A worker that has just started or
+  been elected reconciles **within one cadence**, at an offset into it derived from the
+  Policy's name, so the Policies sharing a runner's cadence do not all scan at once
+  (funkode-io/replay#269); a manual drain reconciles on its first poll.
 
 The sweep is allowed to be wrong because it decides nothing. It nominates; what a stream
 is owed is read from that stream's own sequence, which has no holes.

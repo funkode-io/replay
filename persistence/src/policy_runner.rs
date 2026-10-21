@@ -3346,7 +3346,7 @@ async fn drain_policy_once(
             .unwrap_or_else(|| progress.reconciled_through.clone());
         write_reconciled(pool, &name, &rotation).await?;
         progress.reconciled_through = rotation;
-        progress.reconciled_at = Some(Instant::now());
+        progress.reconcile.reconciled(Instant::now());
     }
 
     if exhausted {
@@ -4549,16 +4549,8 @@ struct PolicyProgress {
     /// Persisted, because a runner that restarts often would otherwise rotate from the
     /// start every time and never reach the end of the sort order.
     reconciled_through: String,
-    /// When the frontier was last compared with the places. `None` until the first
-    /// reconciliation, so a worker that has just been elected does one straight away —
-    /// which is what makes a crash mid-backlog cost a cadence rather than a deployment.
-    reconciled_at: Option<Instant>,
-    /// How long the sweep is trusted on its own. This is the whole exposure of the
-    /// design: a write that commits below the sweep is delivered within a bounded number
-    /// of these, which
-    /// [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) states
-    /// and this is the unit of.
-    reconcile_every: Duration,
+    /// When the frontier is next compared with the places.
+    reconcile: ReconcileSchedule,
 }
 
 impl PolicyProgress {
@@ -4578,20 +4570,69 @@ impl PolicyProgress {
             unfinished: Vec::new(),
             share_from: 0,
             reconciled_through,
-            reconciled_at: None,
-            reconcile_every: resolve_reconcile_cadence(),
+            reconcile: ReconcileSchedule::after_load(
+                name,
+                resolve_reconcile_cadence(),
+                Instant::now(),
+            ),
         })
     }
 
     /// Make the next poll pay for the frontier scan whatever the cadence says.
     fn reconcile_now(&mut self) {
-        self.reconciled_at = None;
+        self.reconcile.force();
     }
 
     /// Whether this poll pays for the frontier scan.
     fn reconcile_is_due(&self) -> bool {
-        self.reconciled_at
-            .is_none_or(|last| last.elapsed() >= self.reconcile_every)
+        self.reconcile.is_due(Instant::now())
+    }
+}
+
+/// When a Policy next compares the frontier with its places.
+///
+/// The first comparison after a load — a start, or an election — falls at the Policy's
+/// [`reconcile_offset`] into the cadence, so a worker that has just been elected
+/// reconciles within one cadence, and the Policies of one runner do not all reconcile
+/// in the same moment (funkode-io/replay#269). Within one cadence is still what makes a
+/// crash mid-backlog cost a cadence rather than a deployment. Every later comparison is
+/// one cadence after the one before.
+///
+/// Pure over the `now` it is handed, so the decision is tested without a clock.
+struct ReconcileSchedule {
+    /// The moment the next comparison is due. `None` when one is due whatever the
+    /// cadence says: a manual drain has asked for it.
+    due_at: Option<Instant>,
+    /// How long the sweep is trusted on its own. This is the whole exposure of the
+    /// design: a write that commits below the sweep is delivered within a bounded number
+    /// of these, which
+    /// [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) states
+    /// and this is the unit of.
+    every: Duration,
+}
+
+impl ReconcileSchedule {
+    /// The schedule of the Policy `name`, loaded at `now`: first due at its offset.
+    fn after_load(name: &str, every: Duration, now: Instant) -> Self {
+        Self {
+            due_at: Some(now + reconcile_offset(name, every)),
+            every,
+        }
+    }
+
+    /// Make the next comparison due on the next poll, offset or no offset.
+    fn force(&mut self) {
+        self.due_at = None;
+    }
+
+    /// Record a comparison made at `now`: the next one is a cadence later.
+    fn reconciled(&mut self, now: Instant) {
+        self.due_at = Some(now + self.every);
+    }
+
+    /// Whether a poll at `now` pays for the comparison.
+    fn is_due(&self, now: Instant) -> bool {
+        self.due_at.is_none_or(|due_at| now >= due_at)
     }
 }
 
@@ -4616,6 +4657,33 @@ fn resolve_reconcile_cadence() -> Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map_or(DEFAULT_RECONCILE_CADENCE, Duration::from_secs)
+}
+
+/// How far into its first cadence a Policy's first reconciliation falls.
+///
+/// Every Policy in a runner shares one cadence, so a first reconciliation due on the first
+/// poll would have every Policy compare the frontier with its places in the same moment —
+/// at start, after each election, and every cadence after that. Spreading the first one
+/// spreads them all (funkode-io/replay#269).
+///
+/// Derived from the name, not drawn at random: a Policy keeps its moment across polls,
+/// processes and runs, and the hash is FNV-1a written here rather than `DefaultHasher`,
+/// whose output a Rust release is free to change. Always within `[0, every)`.
+fn reconcile_offset(name: &str, every: Duration) -> Duration {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let hash = name.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    });
+
+    let span = every.as_nanos();
+    if span == 0 {
+        return Duration::ZERO;
+    }
+    // Below `span` and below 2^64, so it fits the nanoseconds a `Duration` is built from.
+    let nanos = u128::from(hash) % span;
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 /// Read how far a Policy has swept and where its rotation left off, or `None` when it has
@@ -6908,5 +6976,139 @@ mod settlement_tests {
             3,
             "and the command parked meanwhile is in the table, for the next retry"
         );
+    }
+}
+
+/// When a Policy's reconciliation is due (funkode-io/replay#269): pure over an injected
+/// `now`, so no test waits on a clock.
+#[cfg(test)]
+mod reconcile_schedule_tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    use super::{reconcile_offset, ReconcileSchedule};
+
+    const CADENCE: Duration = Duration::from_secs(5);
+
+    /// The offset is FNV-1a of the name, reduced to the cadence. A cadence wider than any
+    /// 64-bit hash leaves the hash itself, which pins it to the published FNV-1a test
+    /// vectors: a value no compiler release, platform or process can move.
+    #[test]
+    fn the_offset_is_a_stable_hash_of_the_name() {
+        let widest = Duration::from_nanos(u64::MAX);
+
+        assert_eq!(
+            reconcile_offset("a", widest),
+            Duration::from_nanos(0xaf63_dc4c_8601_ec8c)
+        );
+        assert_eq!(
+            reconcile_offset("foobar", widest),
+            Duration::from_nanos(0x8594_4171_f739_67e8)
+        );
+    }
+
+    #[test]
+    fn the_same_name_gets_the_same_offset_every_time() {
+        assert_eq!(
+            reconcile_offset("billing", CADENCE),
+            reconcile_offset("billing", CADENCE)
+        );
+    }
+
+    /// Several Policies in one runner share the cadence; their first reconciliations do
+    /// not share a moment.
+    #[test]
+    fn different_names_spread_across_the_cadence() {
+        let names = [
+            "billing",
+            "shipping",
+            "notifications",
+            "inventory",
+            "loyalty",
+            "fraud_screening",
+        ];
+
+        let offsets: HashSet<Duration> = names
+            .iter()
+            .map(|name| reconcile_offset(name, CADENCE))
+            .collect();
+
+        assert_eq!(
+            offsets.len(),
+            names.len(),
+            "every Policy has its own moment"
+        );
+        assert!(
+            offsets.iter().all(|offset| *offset < CADENCE),
+            "every offset falls within one cadence: {offsets:?}"
+        );
+    }
+
+    /// A name whose offset is well inside the cadence, so "before it" and "at it" are
+    /// both moments a load could see.
+    const NAME: &str = "billing";
+
+    fn offset() -> Duration {
+        let offset = reconcile_offset(NAME, CADENCE);
+        assert!(
+            offset > Duration::from_millis(1),
+            "the name under test has an offset to wait for"
+        );
+        offset
+    }
+
+    /// A freshly loaded Policy — just started, or just elected — waits for its offset
+    /// rather than reconciling on its first poll.
+    #[test]
+    fn a_loaded_policy_first_reconciles_at_its_offset() {
+        let loaded = Instant::now();
+        let schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+
+        assert!(!schedule.is_due(loaded), "not on the first poll");
+        assert!(!schedule.is_due(loaded + offset() - Duration::from_nanos(1)));
+        assert!(schedule.is_due(loaded + offset()), "at its offset");
+        assert!(
+            schedule.is_due(loaded + CADENCE),
+            "within one cadence, whatever the name"
+        );
+    }
+
+    /// A manual drain is one poll and has to be a whole one: the offset does not apply.
+    #[test]
+    fn a_forced_reconciliation_is_due_on_the_first_poll() {
+        let loaded = Instant::now();
+        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+
+        schedule.force();
+
+        assert!(schedule.is_due(loaded));
+    }
+
+    /// The offset places the first reconciliation only; every later one follows the
+    /// cadence from the one before, as it always has.
+    #[test]
+    fn after_the_first_reconciliation_the_cadence_is_unchanged() {
+        let loaded = Instant::now();
+        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+        let first = loaded + offset();
+
+        schedule.reconciled(first);
+
+        assert!(!schedule.is_due(first));
+        assert!(!schedule.is_due(first + CADENCE - Duration::from_nanos(1)));
+        assert!(schedule.is_due(first + CADENCE));
+    }
+
+    /// A forced reconciliation, once done, hands back to the cadence too.
+    #[test]
+    fn a_forced_reconciliation_hands_back_to_the_cadence() {
+        let loaded = Instant::now();
+        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+        schedule.force();
+
+        schedule.reconciled(loaded);
+
+        assert!(!schedule.is_due(loaded + CADENCE - Duration::from_nanos(1)));
+        assert!(schedule.is_due(loaded + CADENCE));
     }
 }
