@@ -1700,6 +1700,179 @@ async fn bank_account_inline_projection_failure_rolls_back_postgres_test() {
 
 // ── Inline projection version drift rebuild (issue #60) ───────────────────────
 
+struct RebuildEventRecorder {
+    batches: std::sync::Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>,
+    version: i32,
+    filter: StreamFilter,
+}
+
+impl replay_persistence::InlineProjection for RebuildEventRecorder {
+    type Exec = sqlx::PgConnection;
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "rebuild_event_recorder"
+    }
+
+    fn version(&self) -> i32 {
+        self.version
+    }
+
+    fn stream_filter(&self) -> StreamFilter {
+        self.filter.clone()
+    }
+
+    async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        Ok(())
+    }
+
+    async fn reset(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        self.batches.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        _conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> Result<(), replay::Error> {
+        self.batches
+            .lock()
+            .unwrap()
+            .push(events.iter().map(|event| event.id).collect());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn inline_projection_rebuild_excludes_compaction_snapshots_postgres_test() {
+    assert_inline_projection_rebuilds_true_log(StreamFilter::All).await;
+}
+
+#[tokio::test]
+async fn filtered_inline_projection_rebuild_excludes_compaction_snapshots_postgres_test() {
+    let account = BankAccountUrn::new("rebuild-true-log").unwrap();
+    assert_inline_projection_rebuilds_true_log(StreamFilter::with_stream_id::<BankAccount>(
+        &account,
+    ))
+    .await;
+}
+
+async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
+    let container = start_postgres_server().await;
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(POSTGRES_PORT).await.unwrap();
+    let pool = connect_to_postgres(host, port).await;
+    sqlx::migrate!("./tests/migrations")
+        .run(&pool)
+        .await
+        .unwrap();
+
+    let store = replay_persistence::PostgresEventStore::new(pool.clone());
+    let account = BankAccountUrn::new("rebuild-true-log").unwrap();
+    let month = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let events = [
+        BankAccountEvent::Deposited {
+            operation_date: month,
+            amount: 100.0,
+        },
+        BankAccountEvent::MonthlyClosed {
+            month,
+            closing_balance: 100.0,
+        },
+    ];
+    let mut expected = Vec::new();
+    store
+        .store_events_stream::<BankAccount, _, _>(
+            &account,
+            BankAccount::stream_type(),
+            replay::Metadata::default(),
+            futures::stream::iter(events.into_iter().map(Ok)),
+            None,
+            |event: &PersistedEvent<BankAccountEvent>| expected.push(event.id),
+        )
+        .await
+        .unwrap();
+
+    let cqrs = replay_persistence::Cqrs::new(store);
+    let aggregate = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
+    assert!(matches!(
+        cqrs.compact(&aggregate, replay::Metadata::default())
+            .await
+            .unwrap(),
+        CompactionOutcome::Compacted { .. }
+    ));
+
+    let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rebuilt = replay_persistence::PostgresEventStore::builder(pool.clone())
+        .projection_flush_size(1)
+        .register(RebuildEventRecorder {
+            batches: batches.clone(),
+            version: 1,
+            filter: filter.clone(),
+        })
+        .build()
+        .await
+        .unwrap();
+
+    {
+        let batches = batches.lock().unwrap();
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 2);
+        assert_eq!(
+            batches.iter().flatten().copied().collect::<Vec<_>>(),
+            expected
+        );
+        assert!(batches.iter().all(|batch| batch.len() <= 1));
+    }
+
+    rebuilt
+        .store_events_stream::<BankAccount, _, _>(
+            &account,
+            BankAccount::stream_type(),
+            replay::Metadata::default(),
+            futures::stream::iter([Ok(BankAccountEvent::Deposited {
+                operation_date: month,
+                amount: 200.0,
+            })]),
+            None,
+            |event: &PersistedEvent<BankAccountEvent>| expected.push(event.id),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected,
+        "live append delivers the new real event exactly once"
+    );
+
+    let _v2 = replay_persistence::PostgresEventStore::builder(pool)
+        .projection_flush_size(1)
+        .register(RebuildEventRecorder {
+            batches: batches.clone(),
+            version: 2,
+            filter,
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let batches = batches.lock().unwrap();
+    assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 3);
+    assert_eq!(
+        batches.iter().flatten().copied().collect::<Vec<_>>(),
+        expected,
+        "version drift replays archived originals and post-compaction appends exactly once"
+    );
+    assert!(batches.iter().all(|batch| batch.len() <= 1));
+}
+
 /// A balance view that resets and rebuilds from history on a version bump.
 ///
 /// `version` is a field so the test can register the "same" projection at two

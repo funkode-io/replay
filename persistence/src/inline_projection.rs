@@ -38,6 +38,9 @@ pub trait InlineProjection: Send + Sync {
     ///
     /// Returned filter narrows which streams/events the store scans during a drift
     /// rebuild, so unrelated history is not read. Defaults to [`StreamFilter::All`].
+    /// Replays on first registration and version drift read the true log: archived
+    /// originals and real events appended after compaction, never compaction snapshots,
+    /// regardless of this filter.
     fn stream_filter(&self) -> StreamFilter {
         StreamFilter::All
     }
