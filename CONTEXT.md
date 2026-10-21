@@ -466,9 +466,12 @@ code, the projection is rebuilt: its state is reset and all events are replayed.
 
 ### Rebuild
 
-Discarding a projection's current state (reset) and replaying the full event
-history through it to reconstruct it. Triggered when a projection's code version
-is newer than the version recorded in the store.
+Discarding a projection's current state (reset) and replaying the true log through
+it to reconstruct it: every real event, archived originals included, and never a
+compaction snapshot
+([ADR-0004](docs/adr/0004-compaction-synthetic-event-marker-for-policy-feed.md)).
+Triggered when a projection's code version is newer than the version recorded in
+the store.
 
 ### WASM target
 
