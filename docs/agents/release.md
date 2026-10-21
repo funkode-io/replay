@@ -48,6 +48,7 @@ version:
 1. `es-replay` (`es/`)
 2. `es-replay-macros` (`macros/`) — depends on `es-replay`
 3. `es-replay-persistence` (`persistence/`) — depends on both
+4. `es-replay-map` (`map/`) — depends on no sibling, so its place in the order is free and it needs no pin
 
 `es-replay-macros-tests` (`macros-tests/`) is an internal test crate and is **not**
 published; the `0.1.1` on crates.io is a historical accident, leave it there.
@@ -56,6 +57,7 @@ published; the `0.1.1` on crates.io is a historical accident, leave it there.
 cargo publish -p es-replay --dry-run   # then without --dry-run
 cargo publish -p es-replay-macros
 cargo publish -p es-replay-persistence
+cargo publish -p es-replay-map
 ```
 
 ## Pre-flight gate

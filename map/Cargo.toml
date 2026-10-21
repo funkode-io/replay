@@ -1,0 +1,24 @@
+[package]
+name = "es-replay-map"
+version.workspace = true
+edition.workspace = true
+description = "Draws a Replay domain's aggregates, commands, events and policies as a Mermaid event-storming map"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["event-sourcing", "cqrs", "ddd", "mermaid", "event-storming"]
+categories = ["development-tools", "visualization"]
+
+[lib]
+name = "replay_map"
+
+# Run as `cargo replay-map`: Cargo finds a `cargo-<name>` binary on the PATH.
+[[bin]]
+name = "cargo-replay-map"
+path = "src/main.rs"
+
+[dependencies]
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+syn = { workspace = true, features = ["full"] }
+quote = { workspace = true }

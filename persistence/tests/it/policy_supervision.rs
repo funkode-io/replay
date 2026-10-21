@@ -86,6 +86,8 @@ impl DiesOutsideTheReaction {
             return;
         }
 
+        // `fetch_update` is deprecated in favour of `try_update` on newer stable, which older toolchains lack.
+        #[allow(deprecated)]
         let staged = self
             .deaths_to_stage
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {

@@ -75,6 +75,68 @@ use replay_macros::{define_aggregate, query_events};
 use replay_persistence::{db_error, InlineProjection, PersistedEvent, Query, StreamFilter};
 ```
 
+### The domain at a glance
+
+The two aggregates, with the fee ledger and the deposit-fee policy from [Policies](#policies), drawn as an
+event-storming map: each command leads to the events its `handle` arm emits, and the policy turns a `Deposited`
+event into a `ChargeFee` command for the ledger.
+
+```mermaid
+---
+config:
+  theme: base
+  themeVariables:
+    lineColor: "#808080"
+    primaryTextColor: "#000000"
+    nodeTextColor: "#000000"
+    titleColor: "#000000"
+---
+flowchart LR
+    classDef command fill:#9dc3e3,stroke:#4a7599,color:#000
+    classDef event fill:#eeb07c,stroke:#9c6232,color:#000
+    classDef policy fill:#c7b3de,stroke:#6f5790,color:#000
+
+    subgraph agg-BankAccount [BankAccount]
+        cmd-BankAccount-OpenAccount("OpenAccount"):::command
+        cmd-BankAccount-Deposit("Deposit"):::command
+        cmd-BankAccount-Withdraw("Withdraw"):::command
+        cmd-BankAccount-CloseMonth("CloseMonth"):::command
+        evt-BankAccount-AccountOpened("AccountOpened"):::event
+        evt-BankAccount-Deposited("Deposited"):::event
+        evt-BankAccount-Withdrawn("Withdrawn"):::event
+        evt-BankAccount-MonthlyClosed("MonthlyClosed"):::event
+    end
+    style agg-BankAccount fill:#eedc92,stroke:#8f7d33,color:#000
+    cmd-BankAccount-OpenAccount --> evt-BankAccount-AccountOpened
+    cmd-BankAccount-Deposit --> evt-BankAccount-Deposited
+    cmd-BankAccount-Withdraw --> evt-BankAccount-Withdrawn
+    cmd-BankAccount-CloseMonth --> evt-BankAccount-MonthlyClosed
+
+    subgraph agg-FeeLedger [FeeLedger]
+        cmd-FeeLedger-Credit("Credit"):::command
+        cmd-FeeLedger-ChargeFee("ChargeFee"):::command
+        evt-FeeLedger-Credited("Credited"):::event
+        evt-FeeLedger-FeeCharged("FeeCharged"):::event
+    end
+    style agg-FeeLedger fill:#eedc92,stroke:#8f7d33,color:#000
+    cmd-FeeLedger-Credit --> evt-FeeLedger-Credited
+    cmd-FeeLedger-ChargeFee --> evt-FeeLedger-FeeCharged
+
+    subgraph agg-User [User]
+        cmd-User-Register("Register"):::command
+        evt-User-Registered("Registered"):::event
+    end
+    style agg-User fill:#eedc92,stroke:#8f7d33,color:#000
+    cmd-User-Register --> evt-User-Registered
+
+    pol-FeePolicy-0("FeePolicy"):::policy
+    evt-BankAccount-Deposited --> pol-FeePolicy-0
+    pol-FeePolicy-0 --> cmd-FeeLedger-ChargeFee
+```
+
+> This diagram is generated from the example's source by `cargo replay-map`, the map tool that ships with Replay.
+> See [Domain map](#domain-map) to draw one for your own domain and keep it current in CI.
+
 ### Defining the aggregates
 
 The `define_aggregate!` macro generates the aggregate struct, its strongly-typed
@@ -3196,3 +3258,39 @@ gone, along with the `REPLAY_BLOCKED_WARN_AFTER_SECS` knob that paced it.
 
 A caught-up idle policy logs nothing at all.
 
+
+## Domain map
+
+`es-replay-map` draws a domain as an event-storming map: one group per aggregate holding its commands and events, an edge from each command to the events its `handle` arm builds, and `event → policy → command` for every command-issuing `react` arm. It writes one Mermaid flowchart, which GitHub renders in place.
+
+```sh
+cargo install es-replay-map
+cargo replay-map --src crates/domain/src --out docs/domain-map.md
+```
+
+`--src` is repeatable and defaults to `src`, and `--out` defaults to `docs/domain-map.md`.
+
+### Checking the map in CI
+
+With `--check` it writes nothing, and fails when the committed map differs from what the source generates. Two steps in a GitHub Actions job keep the map honest:
+
+```yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install replay-map
+        run: cargo install es-replay-map --version =0.12.0 --locked
+      - name: Domain map is up to date
+        run: cargo replay-map --src crates/domain/src --check
+```
+
+Pin the exact version, ideally the same one as the `es-replay` your domain depends on. A new release may draw the same domain differently, and an unpinned install would then fail the check with no change to your code. `cargo install` compiles the tool, which takes about a minute the first time; `rust-cache` keeps it after that.
+
+The map is read from source with `syn`, not from anything the macros expand to, since which command yields which event exists only in the match arms. So it asks one thing of the domain: each `handle` and `react` arm builds its events or commands inline, in result position, never through a helper call.
+
+| Where | Built as |
+| --- | --- |
+| `Aggregate::handle` | `Ok(vec![BankAccountEvent::Deposited { .. }])`, `Vec::new()` or `Err(..)` |
+| `AggregatePolicy::react` | `vec![(urn, BankAccountCommand::Freeze)]`, or a `.map` to such a pair |
+| `Policy::react` | `vec![Dispatch::to::<BankAccount>(urn, BankAccountCommand::Freeze)]`, optionally `.with_metadata(..)` |
+
+A policy whose `Event` is a `query_events!` wrapper matches each event as `Wrapper::BankAccountEvent(BankAccountEvent::Deposited { .. })`. A `_` arm may only issue nothing. An arm the map cannot read fails the run with its `file:line`. Nothing is skipped silently.
