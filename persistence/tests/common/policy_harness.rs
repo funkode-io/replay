@@ -21,6 +21,8 @@
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
 //! - [`PolicyDaemonHarness::status`] — the policy as the status read model
 //!   reports it, which is what a consumer's health endpoint shows.
+//! - [`PolicyDaemonHarness::status_store`] — the read model itself, for a test
+//!   that lists or counts parked reactions the way a consumer does.
 //! - [`PolicyDaemonHarness::archived_dead_letters`] — the parked reactions that
 //!   have left the active set, and what settled them.
 //! - [`PolicyDaemonHarness::stopped_workers`] — the workers the runner gave up
@@ -783,6 +785,12 @@ impl PolicyDaemonHarness {
 
         self.await_passed(event.global_position).await;
         self.move_place_to(&event.stream_id, place - 1).await;
+    }
+
+    /// The read model a consumer builds over this database: what it lists and
+    /// counts parked reactions through.
+    pub fn status_store(&self) -> PolicyStatusStore {
+        PolicyStatusStore::new(self.pool.clone())
     }
 
     /// The policy's status as a consumer reads it off [`PolicyStatusStore`] —

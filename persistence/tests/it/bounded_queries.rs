@@ -107,6 +107,13 @@ const REVIEWED: &[Reviewed] = &[
                         them, not by data — the per-stream frontier each row carries is \
                         aggregated in SQL, so it costs a scan and not a row.",
     },
+    Reviewed {
+        file: "src/policy_status.rs",
+        function: "read_dead_letter_chunk",
+        justification: "`LIMIT DEAD_LETTER_CHUNK` (100): one keyset chunk of the \
+                        `dead_letters` stream, which reads the next chunk only after the \
+                        consumer has taken this one.",
+    },
     // ── Known unbounded ──────────────────────────────────────────────────────
     Reviewed {
         file: "src/infrastructure/postgres.rs",
