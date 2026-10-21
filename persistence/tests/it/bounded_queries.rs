@@ -34,10 +34,11 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "sweep_for_streams",
-        justification: "The sweep carries LIMIT $limit, the policy's resolved \
-                        read_batch_size (default 100); the one-statement snapshot's \
-                        in-progress id aggregate is separately capped at \
-                        UNSEEN_TRANSACTION_CAP + 1 (4097).",
+        justification: "At most limit + 1 rows: the sweep carries LIMIT $limit, the \
+                        policy's resolved read_batch_size (default 100), and the \
+                        snapshot is one row of its own. That row alone carries the \
+                        in-progress id aggregate, capped at UNSEEN_TRANSACTION_CAP + 1 \
+                        (4097), so the ids are held once, not once per swept row.",
     },
     Reviewed {
         file: "src/policy_runner.rs",

@@ -2395,10 +2395,20 @@ policy is [filtered by stream type](#a-policy-filtered-by-stream-type-tracks-onl
 | `REPLAY_POLICY_RECONCILE_SECS` | 300 | Safety-net comparison cadence in seconds. Never *whether*. |
 
 Lower it for faster recovery from a defect; normal late-write delivery does not wait for it.
+`PolicyRunnerBuilder::reconcile_every(Duration)` sets it per runner instead;
+`Duration::ZERO` compares on every poll, which is what a test that moves places by hand
+wants rather than waiting out a cadence. On a poll that compares, the comparison's streams
+take their slots first; a late write that gets no slot is carried to the next poll.
 
-A policy's first full comparison after its worker starts or is elected leader begins on its
-first poll because the commit-stamp state is in memory only. A manual `PolicyRunner::drain`
-also always compares on the spot.
+A policy's first full comparison after its worker starts or is elected leader runs **within
+three poll intervals**, at a phase derived from the policy's name, rather than on its first
+poll, so the policies of one runner do not all scan at once (see `startup_window` and
+`reconcile_phase` in `persistence/src/policy_runner.rs`). The window is the poll interval's,
+not the comparison cadence's: the late-write state is in memory only, so that first
+comparison is how a new leader finds writes that were in flight during a failover, and it
+must not wait a cadence
+([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A manual
+`PolicyRunner::drain` always compares on the spot.
 
 The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
 left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
@@ -2528,7 +2538,7 @@ because a place is only read for a stream that poll is looking at:
 | The stream you moved | When it is picked up |
 |---|---|
 | is still being written to | the next poll, on the sweep |
-| is quiet and the sweep has passed it | the next poll after its writing transaction ends |
+| is quiet and the sweep has passed it | the next full comparison that reaches it — `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). A moved place has no writing transaction for the late-write lookup to find, so this is the one case that waits for the safety net; `PolicyRunner::drain` picks it up at once. |
 
 Places themselves are never held in memory between polls, so no running process carries a
 stale copy of one forward.

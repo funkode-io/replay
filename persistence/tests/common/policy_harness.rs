@@ -112,24 +112,18 @@ pub const DAEMON_HEARTBEAT_CADENCE: Duration = replay_persistence::HEARTBEAT_MIN
 /// How long an `await_*` observation may go unsatisfied before it is a failure.
 pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The reconciliation cadence the daemon under test runs on: what
-/// `REPLAY_POLICY_RECONCILE_SECS` resolves to, by the runner's own rule — a positive
-/// whole number of seconds, else 300s. No test sets it, so this is the default.
+/// The reconciliation cadence the daemon under test runs on: every poll. A test that
+/// moves a place by hand is answered on the next poll rather than after the 300 s
+/// production default. A test about the late-write lookup sets its own, far away, so the
+/// comparison cannot be what finds the write.
 pub fn reconcile_cadence() -> Duration {
-    std::env::var("REPLAY_POLICY_RECONCILE_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map_or(Duration::from_secs(300), Duration::from_secs)
+    Duration::ZERO
 }
 
-/// How long an observation that only a reconciliation can satisfy may take.
-///
-/// The next reconciliation is up to one cadence away, and a rotation standing past the
-/// stream spends one more wrapping (ADR-0026). Three cadences leave a third for a slow
-/// machine, where [`OBSERVE_TIMEOUT`] would be exactly the two.
+/// How long an observation that only a reconciliation can satisfy may take: the
+/// comparison runs every poll, so as long as any other observation.
 pub fn reconciliation_timeout() -> Duration {
-    reconcile_cadence() * 3
+    OBSERVE_TIMEOUT
 }
 
 /// How often an unsatisfied observation is re-read. Not a delay before
@@ -1560,6 +1554,7 @@ fn spawn_daemon(
         PolicyRunner::builder(cqrs.clone())
             .register_services::<Probe>(())
             .with_heartbeat(DAEMON_HEARTBEAT_CADENCE)
+            .reconcile_every(reconcile_cadence())
             .replica_id(replica_id)
             .on_escalation(escalations.hook()),
         policy_name,

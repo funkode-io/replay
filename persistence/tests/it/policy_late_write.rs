@@ -7,14 +7,19 @@ use crate::common;
 use common::policy_harness::{PolicyDaemonHarness, ProbeEvent};
 use replay_persistence::{PolicySettings, StartAt};
 
+/// The production safety net: far enough away that it cannot be what finds a late write.
+const SAFETY_NET: Duration = Duration::from_secs(300);
+
 #[tokio::test]
 async fn a_write_is_delivered_on_the_poll_after_its_transaction_commits_postgres_test() {
     let mut harness = PolicyDaemonHarness::start("late_write", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(
-            policy,
-            PolicySettings::new().starting_at(StartAt::Beginning),
-            |_| Vec::new(),
-        )
+        builder
+            .reconcile_every(SAFETY_NET)
+            .register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                |_| Vec::new(),
+            )
     })
     .await;
 
@@ -60,11 +65,13 @@ async fn a_write_is_delivered_on_the_poll_after_its_transaction_commits_postgres
 async fn an_aborted_transaction_nominates_no_stream_and_does_not_delay_later_writes_postgres_test()
 {
     let harness = PolicyDaemonHarness::start("aborted_write", |builder, policy| {
-        builder.register_policy_fn::<ProbeEvent, _>(
-            policy,
-            PolicySettings::new().starting_at(StartAt::Beginning),
-            |_| Vec::new(),
-        )
+        builder
+            .reconcile_every(SAFETY_NET)
+            .register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                |_| Vec::new(),
+            )
     })
     .await;
 
@@ -81,6 +88,49 @@ async fn an_aborted_transaction_nominates_no_stream_and_does_not_delay_later_wri
             .all(|(stream, _)| stream != "urn:probe:aborted"),
         "an aborted append creates no committed stream nomination"
     );
+
+    harness.shutdown().await;
+}
+
+/// A write in flight when its leader stops, and committed before the next one starts, is
+/// below that leader's sweep from its first poll and in no snapshot it ever takes: the
+/// late-write state that knew about it went with the old leader. The new leader's first
+/// comparison, due within its start-up window, is what finds it (ADR-0030, #269).
+#[tokio::test]
+async fn a_write_in_flight_across_a_leader_change_is_delivered_postgres_test() {
+    let mut harness = PolicyDaemonHarness::start("late_write_failover", |builder, policy| {
+        builder
+            .reconcile_every(SAFETY_NET)
+            .register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                |_| Vec::new(),
+            )
+    })
+    .await;
+
+    let held = harness.hold_a_ping_open("in-flight", "held").await;
+    let position = held.global_position;
+    let overtaking = harness.ping("overtaking", "overtook").await;
+    harness.await_passed(overtaking.global_position).await;
+    let swept_past = overtaking.global_position;
+    harness
+        .observe("the sweep to pass the held write", || async {
+            (harness.swept_through().await? >= swept_past).then_some(())
+        })
+        .await;
+
+    harness.stop().await;
+    held.commit().await;
+    harness.resume();
+
+    harness
+        .observe_within(
+            "the new leader to deliver the write in flight across the election",
+            Duration::from_secs(2),
+            || async { harness.has_passed(position).await.then_some(()) },
+        )
+        .await;
 
     harness.shutdown().await;
 }

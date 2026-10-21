@@ -3,12 +3,12 @@
 //!
 //! The sweep is deliberately allowed to be wrong in one direction. It reads the log by
 //! `global_position` and never waits for an uncommitted position, so a write held open in
-//! one stream delays nothing else (funkode-io/replay#164). A later commit-stamp lookup
+//! one stream delays nothing else (funkode-io/replay#164). A later late-write lookup
 //! nominates writes the sweep could not see; the full comparison remains a safety net.
 //!
 //! What makes the miss safe is that discovery decides nothing. It nominates streams; what
 //! each stream is owed is read from `policy_stream_cursors` against the stream's own
-//! sequence, which has no holes. A stream the sweep missed is found by the commit-stamp
+//! sequence, which has no holes. A stream the sweep missed is found by the late-write
 //! lookup or, as a safety net, the reconciliation ([`crate::policy_runner`],
 //! [ADR-0030](../../docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)).
 //!
@@ -52,14 +52,14 @@ pub(crate) fn discovered_from_sweep(from: i64, rows: Vec<(i64, String)>) -> Disc
 /// What the database returned for one poll, and the knobs the poll is bounded by.
 ///
 /// The four nominations a poll shares its slots between, plus the two facts that decide how
-/// they are shared. Late nominations and comparison candidates share a source, but late
-/// writes lead it.
+/// they are shared. Late nominations and comparison candidates share a source, the
+/// comparison's page first.
 pub(crate) struct Nominations {
     /// What the last poll could not finish, oldest claim first.
     pub(crate) carried: Vec<String>,
     /// What the sweep just found.
     pub(crate) swept: Vec<String>,
-    /// What the commit-stamp lookup found, which leads the poll because it may not be
+    /// What the late-write lookup found, which leads the poll because it may not be
     /// nominated again.
     pub(crate) late: Vec<String>,
     /// What the reconciliation compared, empty when none is due — and empty when one is
@@ -73,8 +73,10 @@ pub(crate) struct Nominations {
     pub(crate) share_from: usize,
 }
 
-/// Which source the reconciliation is, in the array a poll is shared between. It leads on
-/// the poll it runs, so it is the one index that has to be named.
+/// Which source the late-write lookup and the reconciliation are, in the array a poll is
+/// shared between: what the sweep has passed. It leads on the poll a reconciliation runs,
+/// or one the late-write lookup found a stream on, so it is the one index that has to be
+/// named.
 const RECOVERED: usize = 2;
 
 /// One poll's decision: which streams it reads, in what order, how far its budget got,
@@ -161,13 +163,23 @@ impl PollPlan {
         // reconciliation read, which its own `LIMIT` capped, and the queue is what the
         // last poll handed on, which this one caps again before it hands it on.
         let page = examined.clone();
-        let mut recovered = late.clone();
-        for stream in examined {
-            if !recovered.contains(&stream) {
-                recovered.push(stream);
+        // A late write the queue already holds is offered there, so it does not lead: a
+        // stream written late on every poll would otherwise take the first slot of every
+        // poll, and a burst the size of the batch spend each poll's budget on it alone.
+        let late: Vec<String> = late
+            .into_iter()
+            .filter(|stream| !carried.contains(stream))
+            .collect();
+        // Bounded by twice the batch: `examined` is what the reconciliation's `LIMIT` read,
+        // `late` what the lookup read under `read_batch`. The page first, so a late write
+        // never costs the reconciliation's rotation a slot and ADR-0026's bound holds.
+        let mut recovered = examined;
+        for stream in &late {
+            if !recovered.contains(stream) {
+                recovered.push(stream.clone());
             }
         }
-        let queue = carried.clone();
+        let mut queue = carried.clone();
         let Shared { taken, left } = share_the_poll(
             read_batch,
             // Except on the poll a reconciliation runs, where it leads. Its candidates are
@@ -177,6 +189,10 @@ impl PollPlan {
             // divides into the poll interval: `share_from` moves per poll and a
             // reconciliation samples it per cadence, so a cadence of three poll intervals
             // would sample the same phase for ever (funkode-io/replay#231 review).
+            //
+            // And on a poll the late-write lookup found something: the lookup has let go of
+            // its transaction, so nothing would nominate it again before the
+            // reconciliation.
             if reconciling || !late.is_empty() {
                 RECOVERED
             } else {
@@ -184,7 +200,16 @@ impl PollPlan {
             },
             [carried, swept, recovered],
         );
-        drop(left);
+        // A late write that won no slot is carried, not dropped: the lookup has let go of
+        // its transaction, so nothing would nominate it again before the reconciliation.
+        // The queue is capped at the batch when the poll settles, so a crowded poll can
+        // still drop one; the reconciliation is the net for that.
+        let [_, _, recovered_left] = left;
+        for stream in recovered_left {
+            if late.contains(&stream) && !queue.contains(&stream) {
+                queue.push(stream);
+            }
+        }
 
         Self {
             streams: taken,
@@ -547,6 +572,49 @@ mod sharing_tests {
         );
     }
 
+    /// A late write the queue already holds will be offered again, so it does not lead:
+    /// a stream written late on every poll would otherwise take every poll's first slot.
+    #[test]
+    fn a_late_write_the_queue_holds_takes_its_turn() {
+        let mut plan = super::PollPlan::plan(super::Nominations {
+            carried: streams(&["carried", "late"]),
+            swept: streams(&["swept"]),
+            late: streams(&["late"]),
+            examined: Vec::new(),
+            reconciling: false,
+            read_batch: 1,
+            share_from: 0,
+        });
+
+        assert_eq!(
+            plan.turn()
+                .expect("the carried queue has the turn")
+                .stream_id,
+            "carried"
+        );
+    }
+
+    /// On a reconciliation's poll the page goes first; a late write that gets no slot is
+    /// carried to the next poll rather than left for the safety net.
+    #[test]
+    fn a_late_write_without_a_slot_is_carried() {
+        let plan = super::PollPlan::plan(super::Nominations {
+            carried: Vec::new(),
+            swept: streams(&["swept"]),
+            late: streams(&["late"]),
+            examined: streams(&["behind-a", "behind-b"]),
+            reconciling: true,
+            read_batch: 2,
+            share_from: 0,
+        });
+
+        assert_eq!(plan.streams(), &streams(&["behind-a", "swept"])[..]);
+        assert!(
+            plan.settle().carried.contains(&"late".to_string()),
+            "the late write is offered again next poll"
+        );
+    }
+
     #[test]
     fn a_late_write_leads_even_when_the_other_sources_have_the_turn() {
         let mut plan = super::PollPlan::plan(super::Nominations {
@@ -876,7 +944,7 @@ mod rotation_tests {
 /// a failure is a seed and a printed schedule rather than a rerun.
 ///
 /// What is modelled outside the decision is only what the database answers: which streams
-/// the sweep, commit-stamp lookup and reconciliation would return, and how many events a
+/// the sweep, late-write lookup and reconciliation would return, and how many events a
 /// read yields.
 #[cfg(test)]
 mod liveness_simulation {
@@ -917,11 +985,13 @@ mod liveness_simulation {
         /// Events the Policy has read from it.
         place: u64,
         /// Whether its writes are ones the sweep passed — every one of them, for the life
-        /// of the schedule. The model gives it one late-write nomination; later writes
-        /// stand in for recovery by the safety-net comparison.
+        /// of the schedule.
         quiet: bool,
-        /// Whether this stream has already supplied its modeled late-write nomination.
-        late_once: bool,
+        /// For a quiet stream, whether the late-write lookup finds its writes: each one
+        /// nominated on the next poll, as a write whose transaction has ended is. One it
+        /// does not find stands for what only the reconciliation can — a place moved by
+        /// hand, or late-write state lost to an overflow or an election.
+        found_late: bool,
         /// Whether it is written to on every poll, which is what crowds a batch.
         busy: bool,
         /// How many events one of its writes carries. A number at or above the batch
@@ -958,6 +1028,8 @@ mod liveness_simulation {
         pages_at_the_batch: u32,
         /// Polls no reconciliation ran on, which only exist when a cadence spans several.
         polls_between_cadences: u32,
+        /// Polls the late-write lookup nominated a stream on.
+        late_nominations: u32,
     }
 
     impl Coverage {
@@ -967,6 +1039,7 @@ mod liveness_simulation {
             self.budgets_spent_early += other.budgets_spent_early;
             self.pages_at_the_batch += other.pages_at_the_batch;
             self.polls_between_cadences += other.polls_between_cadences;
+            self.late_nominations += other.late_nominations;
         }
     }
 
@@ -1036,7 +1109,7 @@ mod liveness_simulation {
                     head: 0,
                     place: 0,
                     quiet,
-                    late_once: false,
+                    found_late: quiet && rng.chance(2),
                     busy: rng.chance(2),
                     burst: rng.between(1, u64::from(read_batch) + 2),
                     waited: 0,
@@ -1062,12 +1135,11 @@ mod liveness_simulation {
                 for _ in 0..count {
                     self.log.push(stream);
                 }
-            } else if !self.streams[stream].late_once {
+            } else if self.streams[stream].found_late {
                 let id = self.streams[stream].id.clone();
                 if !self.late.contains(&id) {
                     self.late.push(id);
                 }
-                self.streams[stream].late_once = true;
             }
         }
 
@@ -1117,6 +1189,9 @@ mod liveness_simulation {
             let carried = std::mem::take(&mut self.carried);
             let swept = self.swept();
             let late = std::mem::take(&mut self.late);
+            if !late.is_empty() {
+                self.seen.late_nominations += 1;
+            }
             let examined = if reconciling {
                 self.examined()
             } else {
@@ -1349,6 +1424,11 @@ mod liveness_simulation {
             "every poll ran a reconciliation, so a cadence spanning several polls \
              — the phase a rotating turn could sample the same way for ever — was never \
              reached"
+        );
+        assert!(
+            seen.late_nominations > 0,
+            "no poll carried a late-write nomination, so the lookup's source was never \
+             shared against the others"
         );
     }
 }

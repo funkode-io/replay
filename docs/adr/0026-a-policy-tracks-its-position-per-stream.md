@@ -59,8 +59,10 @@ columns and no index can answer it. Two paths, with different costs and differen
 - **The reconciliation, as a safety net.** `streams.stream_seq > COALESCE(cursor, 0)` —
   one row per stream, bounded by the same batch, default every 300 seconds
   (`REPLAY_POLICY_RECONCILE_SECS`). Late writes are normally found by their commit stamp
-  (ADR-0030). A worker that has just started or been elected begins a full comparison on
-  its first poll; a manual drain compares on its first poll too.
+  (ADR-0030). A worker that has just started or been elected first compares **within
+  three poll intervals**, at a per-Policy phase (`reconcile_phase`, funkode-io/replay#269,
+  #273) — that comparison is how it finds the writes in flight across the election; a
+  manual drain compares on its first poll.
 
 The sweep is allowed to be wrong because it decides nothing. It nominates; what a stream
 is owed is read from that stream's own sequence, which has no holes.
@@ -80,7 +82,8 @@ is owed is read from that stream's own sequence, which has no holes.
   cadences ≤ ceil(streams behind / streams read per cadence) + 1
   ```
 
-  The first safety-net comparison starts on the first poll after an election. The `+ 1` is
+  The count starts at the first safety-net comparison after an election, which comes up
+  to three poll intervals after the election itself (the Policy's phase, above). The `+ 1` is
   the cadence that ends a pass. A rotation standing after the last stream id reads an empty
   page, so that poll compares nothing and spends itself wrapping the cursor back to the
   start; a stream sorting before it waits that cadence out (funkode-io/replay#243).
