@@ -2096,6 +2096,38 @@ it — including a stream that has never been compacted but has events. The chec
 best-effort maintenance, so an append that lands just after a `false` read is simply
 picked up on the next run. Both the Postgres and in-memory stores implement it.
 
+### Compacting a whole scope (`streams_needing_compaction`)
+
+A job that compacts every stream of a scope at once — everything in one tenant when it
+publishes, say — does not need a list of ids, nor one `needs_compaction` round-trip per
+stream. `streams_needing_compaction` streams, in stream-id order, the ids of one
+aggregate type that `needs_compaction` would say yes to:
+
+```rust,ignore
+use replay_persistence::StreamScope;
+
+// Every BankAccount stream scoped under the tenant (`urn:bank-account:…@tenant:acme`,
+// nested scopes included) that changed since its last compaction.
+let due = cqrs.streams_needing_compaction::<BankAccountAggregate>(
+    StreamScope::within(&tenant_urn),
+    None, // or Some(last_id_seen) to resume
+);
+futures::pin_mut!(due);
+while let Some(stream_id) = due.try_next().await? {
+    let aggregate = cqrs.fetch_aggregate::<BankAccountAggregate>(&stream_id).await?;
+    cqrs.compact(&aggregate, meta.clone()).await?;
+}
+```
+
+It applies the same watermark, so a stream whose compaction came back `Skipped` is not
+offered again until a new event is appended. The scope is over the stream id only —
+`StreamScope::All`, `Prefix`, `Suffix`, or `within` a scoped URN — with `%`, `_` and `\`
+matched literally. The stream reads in short keyset chunks — 100 ids per query, tunable
+with `Cqrs::compaction_chunk_size` — so a compaction pass holds one chunk of ids at a
+time and no database snapshot between them; a caller that pages across requests takes
+`.take(n)` and resumes with `after` set to the last id it saw
+([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)).
+
 ## Policies
 
 A `Policy` is a checkpointed background subscriber that **reacts to events by

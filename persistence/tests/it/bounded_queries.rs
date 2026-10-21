@@ -132,6 +132,14 @@ const REVIEWED: &[Reviewed] = &[
                         `dead_letters` stream, which reads the next chunk only after the \
                         consumer has taken this one.",
     },
+    Reviewed {
+        file: "src/infrastructure/postgres.rs",
+        function: "streams_needing_compaction_page",
+        justification: "SQL carries LIMIT $limit, the caller's page size; one id per row. \
+                        `Cqrs::streams_needing_compaction` calls it with \
+                        its compaction_chunk_size (default 100) and resumes after the last \
+                        id, so a pass over a whole scope holds one chunk at a time.",
+    },
     // ── Known unbounded ──────────────────────────────────────────────────────
     Reviewed {
         file: "src/infrastructure/postgres.rs",

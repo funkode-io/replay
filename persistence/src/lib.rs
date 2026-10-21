@@ -14,6 +14,7 @@ mod policy_runner;
 mod policy_status;
 mod query;
 mod store;
+mod stream_scope;
 
 pub use aggregate_version::AggregateVersion;
 pub use cqrs::Cqrs;
@@ -38,6 +39,7 @@ pub use policy_status::{
 pub use query::Query;
 pub use replay::{AggregatePolicy, Dispatch, ObservedEvent, Policy, TargetedCommand};
 pub use store::{CompactionOutcome, EventSink, EventStore, NoSink};
+pub use stream_scope::StreamScope;
 
 /// Convenience re-exports of the most commonly used types and traits across
 /// `replay`, `replay_macros`, and `replay_persistence`.
@@ -63,7 +65,7 @@ pub mod prelude {
         EventStore, InMemoryEventStore, InlineProjection, Liveness, NoSink, ObservedEvent,
         PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
         PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
-        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, WorkerLiveness,
-        WorkerSupervision,
+        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, StreamScope,
+        WorkerLiveness, WorkerSupervision,
     };
 }
