@@ -6292,18 +6292,24 @@ async fn policy_status_degraded_with_dead_letters_postgres_test() {
     );
 }
 
-// ── PostgresEventStore::contiguous_high_water_mark (issue #135) ───────────────
+// ── PostgresEventStore::contiguous_high_water_mark (issues #135, #259) ────────
 
-/// The gap-free contiguous high-water-mark reflects the longest prefix of
-/// `global_position` values present with no holes.
+/// The contiguous high-water-mark freezes at the first burned `global_position`,
+/// which is why it is deprecated (#259).
 ///
-/// Setup covers three regimes:
+/// `global_position` comes from a sequence and `nextval` is not transactional, so an
+/// append that rolls back burns its position forever. The mark assumes every gap is
+/// in flight and will fill; a burned one never does, so the mark stops there for good
+/// and every event committed after it stays above it.
+///
+/// Setup:
 ///   1. Empty log → `0`.
-///   2. Three contiguous events (gp 1,2,3) → `3`.
-///   3. A manufactured gap (delete gp=2, leaving 1,3) → `1`, even though
-///      `MAX(global_position)` is still `3`.
+///   2. Three committed events (gp 1, 2, 3) → `3`.
+///   3. An append that rolls back burns gp 4; a later append commits gp 5 → the mark
+///      is still `3`, below the committed event, and stays there.
 #[tokio::test]
-async fn contiguous_high_water_mark_postgres_test() {
+#[allow(deprecated)]
+async fn contiguous_high_water_mark_freezes_at_a_burned_position_postgres_test() {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
     let port = container
@@ -6332,14 +6338,15 @@ async fn contiguous_high_water_mark_postgres_test() {
 
     // 2. Append three events (one stream): global_position 1, 2, 3 contiguous.
     let account = BankAccountUrn::new("hwm-1").unwrap();
+    let deposit = |day: u32| BankAccountCommand::Deposit {
+        effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
+        amount: 10.0,
+    };
     for day in 1..=3 {
         cqrs.execute::<BankAccount>(
             &account,
             replay::Metadata::default(),
-            BankAccountCommand::Deposit {
-                effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
-                amount: 10.0,
-            },
+            deposit(day),
             &(),
             None,
         )
@@ -6356,29 +6363,40 @@ async fn contiguous_high_water_mark_postgres_test() {
         "three contiguous positions yield a high-water-mark of 3"
     );
 
-    // 3. Manufacture a gap: delete the middle position (gp=2), leaving 1 and 3.
-    //    The contiguous prefix now stops at 1, even though MAX(global_position)
-    //    is still 3.
-    sqlx::query("DELETE FROM events WHERE global_position = 2")
-        .execute(&pg_pool)
+    // 3. An append that rolls back: the INSERT draws gp 4 from the sequence, the
+    //    transaction aborts, and gp 4 is gone for good.
+    let mut tx = pg_pool.begin().await.expect("begin must succeed");
+    let burned: i64 = sqlx::query_scalar(
+        "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq) \
+         VALUES ($1, '{}'::jsonb, '{}'::jsonb, $2, 'Deposited', 4, 4) \
+         RETURNING global_position",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(account.to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the doomed append must insert before rolling back");
+    tx.rollback().await.expect("rollback must succeed");
+    assert_eq!(burned, 4, "the rolled-back append drew gp 4");
+
+    // A later append commits normally, above the burned position.
+    cqrs.execute::<BankAccount>(&account, replay::Metadata::default(), deposit(4), &(), None)
         .await
-        .expect("delete must succeed");
+        .unwrap();
 
     let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(global_position), 0) FROM events")
         .fetch_one(&pg_pool)
         .await
         .expect("head query must succeed");
-    assert_eq!(
-        head, 3,
-        "raw head still reports the gappy MAX(global_position)"
-    );
+    assert_eq!(head, 5, "the later append committed at gp 5");
 
+    // The mark is frozen below the committed event: nothing will ever fill gp 4.
     assert_eq!(
         store
             .contiguous_high_water_mark()
             .await
             .expect("hwm query must succeed"),
-        1,
-        "a gap at position 2 caps the contiguous high-water-mark at 1"
+        3,
+        "a burned position freezes the contiguous high-water-mark below every later event"
     );
 }
