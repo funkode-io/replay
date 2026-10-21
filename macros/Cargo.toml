@@ -2,6 +2,7 @@
 name = "es-replay-macros"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Procedural macros for the Replay event sourcing library"
 license.workspace = true
 repository.workspace = true

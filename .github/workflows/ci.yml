@@ -28,6 +28,22 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  msrv:
+    name: builds on the declared rust-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep in step with `rust-version` in the workspace Cargo.toml. The other jobs
+      # float on `stable`, so without this one nothing notices code that needs a
+      # newer toolchain than the one the crates promise.
+      - uses: dtolnay/rust-toolchain@1.95
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets --all-features
+
   wasm:
     name: core builds for wasm32
     runs-on: ubuntu-latest
