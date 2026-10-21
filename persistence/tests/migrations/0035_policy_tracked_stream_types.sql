@@ -2,7 +2,7 @@
 --
 -- A Policy whose filter is `StreamFilter::ForStreamTypes(types)` compares, reads and keeps
 -- places for the streams of those types only:
--- docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md. The runner
+-- docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md. The runner
 -- records the types here each time a worker takes the Policy on, so the status read model
 -- — which has no Policy to ask — counts lag over the same streams the Policy tracks.
 --

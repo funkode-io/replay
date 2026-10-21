@@ -18,7 +18,7 @@ pub enum StreamFilter {
     /// the streams of any other type it finds, and it never reads such a stream or keeps a
     /// place in `policy_stream_cursors` for one. Its lag in
     /// [`PolicyStatusStore`](crate::PolicyStatusStore) is counted over these streams only
-    /// ([ADR-0030](https://github.com/funkode-io/replay/blob/main/docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+    /// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
     ///
     /// Only this filter, given as the Policy's whole filter, narrows what is tracked. One
     /// nested inside [`StreamFilter::And`] or any other combinator still decides delivery,

@@ -1,5 +1,5 @@
 //! A Policy whose filter is `StreamFilter::ForStreamTypes` tracks only those stream types
-//! (funkode-io/replay#267, ADR-0030).
+//! (funkode-io/replay#267, ADR-0031).
 //!
 //! Every test pits a Policy that tracks `Probe` streams against streams of another type,
 //! `Ledger`, that it has no business with. Under ADR-0026 alone the Policy compared, read

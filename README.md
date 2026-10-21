@@ -218,6 +218,52 @@ impl Aggregate for BankAccount {
 }
 ```
 
+### Events record facts, not state
+
+An event is something that happened, named in the past tense and in the words of whoever made it happen: `Registered`, `Deposited`, `AccountOpened`. It carries the data of that act and nothing the domain derives from it. State — a status, an ownership flag, "may a later import overwrite this?" — is decided in `apply`, *because of* the fact.
+
+The difference matters because events are stored forever and rules are not. Take a product that a person can rename in an app and a nightly file can also rename, where the person's edit must win over later files:
+
+```rust
+// State in the event: the rule "a person's edit is final" is frozen into every stored event.
+events: {
+    ProductRenamed { name: String, status: Status },
+}
+
+// Facts in the event: who did what. The rule lives in the code that reads them.
+events: {
+    RenamedByUser { name: String },
+    RenamedByFile { name: String },
+}
+
+fn apply(&mut self, event: Self::Event) {
+    match event {
+        ProductEvent::RenamedByUser { name } => {
+            self.name = name;
+            self.status = Status::Final; // a person decided, so later files are ignored
+        }
+        ProductEvent::RenamedByFile { name } => {
+            if self.status != Status::Final {
+                self.name = name; // a file only wins until a person has decided
+            }
+        }
+    }
+}
+
+// `handle` records every file rename as a `RenamedByFile`; `apply` decides whether it wins.
+```
+
+With the second shape, changing the rule — say, a later file wins after all — is a code change and a replay, because every file rename is in the log. With the first, every stored event already claims a status the new rule disagrees with: `apply` has to second-guess what the log says, or the log gets rewritten. Replay can only re-decide over facts that were recorded: a rule that needs something never stored, such as who signed the file, applies from the day the event starts carrying it.
+
+Rules of thumb:
+
+- **No derived field in the payload**, and none in the command either: a caller cannot ask for an authority it is not entitled to when the command it picks is its whole claim.
+- **Name the act, not the resulting state**: `RenamedByUser`, not `Promoted` or `MarkedFinal`.
+- **Each way a thing comes about is its own event** (`CreatedByUser`, `ImportedFromFile`), so the handler can tell them apart.
+- **A correction is its own fact** (`MergeCorrected`), not the original event re-emitted with new values, and it carries what the actor did, not what the state was before: the previous value is already in the stream.
+- **An attested value is part of the fact.** `MonthlyClosed { closing_balance }` records the figure the month was closed with, which must not move if the rules change later. The test: if the rule that produced the value changed tomorrow, should the stored value change too? If yes, it is state — derive it in `apply`.
+- **Compaction follows the same rule.** `compacted_events` returns events that rebuild the state through `apply`, so the rules stay in one place; it never writes the state itself into a made-up event.
+
 ### Compaction
 
 Implement `Compactable` to keep streams short. Each `MonthlyClosed` snapshots the
@@ -2317,6 +2363,12 @@ policy is [filtered by stream type](#a-policy-filtered-by-stream-type-tracks-onl
 Lower it if that tail latency matters more than the scan; raise it if you have millions of
 streams and no long-running writes.
 
+A policy's first reconciliation after its worker starts or is elected leader runs **within
+one cadence**, at a phase derived from the policy's name, rather than on its first poll —
+so the policies of one runner do not all scan at once (see `reconcile_phase` in
+`persistence/src/policy_runner.rs`). A manual `PolicyRunner::drain` always reconciles on
+the spot.
+
 The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
 left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
 while the policy is keeping up, plus the one a pass spends wrapping — a rotation standing
@@ -2345,7 +2397,7 @@ bootstrapped according to the registration's `starting_at`:
 A policy whose `stream_filter` is `StreamFilter::ForStreamTypes(types)` — what
 `StreamFilter::for_stream_type::<A>()` builds — **tracks** only the streams of those types,
 not just delivers from them
-([ADR-0030](docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)):
+([ADR-0031](docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)):
 
 - the reconciliation compares only streams of those types, through the index on
   `streams (type, id)`, and never reads a row of another type — its cost follows the

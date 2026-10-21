@@ -1,5 +1,5 @@
 -- no-transaction
--- The reconciliation of a Policy that tracks some stream types (ADR-0030) reads
+-- The reconciliation of a Policy that tracks some stream types (ADR-0031) reads
 -- `WHERE type = ANY($types) AND id > $rotation ORDER BY id`: the type leads, and the
 -- rotation's id is the second column, so a pass examines the tracked streams sorting
 -- after the rotation and not one row of any other type. `idx_streams_type` from 0005 is

@@ -162,7 +162,7 @@ impl PolicyStatusStore {
     /// [`StreamFilter::ForStreamTypes`](crate::StreamFilter::ForStreamTypes) the streams of
     /// those types. A stream it does not track is never behind — counted against every
     /// stream, each one with no place would read as behind for ever
-    /// ([ADR-0030](https://github.com/funkode-io/replay/blob/main/docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+    /// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
     ///
     /// **Until a runner records it, every stream counts.** The column is `NULL` — every
     /// stream — on a row written before it existed, so a policy filtered by type reports
@@ -186,7 +186,7 @@ impl PolicyStatusStore {
                     SUM(s.stream_seq - COALESCE(c.stream_seq, 0))::bigint AS lag,
                     COUNT(*)                                      AS streams_behind
                 FROM (
-                    -- The streams this Policy tracks (ADR-0030). Two branches rather than
+                    -- The streams this Policy tracks (ADR-0031). Two branches rather than
                     -- one `IS NULL OR type = ANY` predicate, so each is planned on its own:
                     -- the first is a one-time filter that skips the scan entirely for a
                     -- Policy that tracks some types, and the second is an index scan on

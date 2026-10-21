@@ -3118,7 +3118,7 @@ async fn drain_policy_once(
     // laid out.
     let filter = policy.stream_filter();
     // What the Policy tracks follows from that filter, and bounds every source below: a
-    // stream it does not track is never read, so it never gets a place (ADR-0030).
+    // stream it does not track is never read, so it never gets a place (ADR-0031).
     let tracked = TrackedStreams::of(&filter);
     progress.track(pool, &name, &tracked).await?;
 
@@ -3367,7 +3367,7 @@ async fn drain_policy_once(
             .unwrap_or_else(|| progress.reconciled_through.clone());
         write_reconciled(pool, &name, &rotation).await?;
         progress.reconciled_through = rotation;
-        progress.reconciled_at = Some(Instant::now());
+        progress.reconciled();
     }
 
     if exhausted {
@@ -4259,7 +4259,7 @@ async fn sweep_for_streams(
 }
 
 /// The streams a Policy **tracks** — compares, reads and keeps a place for — which its
-/// filter decides ([ADR-0030](https://github.com/funkode-io/replay/blob/main/docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+/// filter decides ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 ///
 /// Every stream, unless the Policy's whole filter is [`StreamFilter::ForStreamTypes`].
 /// Everything that depends on the answer asks this type, so what "every stream" looks like
@@ -4341,7 +4341,7 @@ impl TrackedStreams {
 /// What it compares is what the Policy **tracks**: every stream, or — for a Policy whose
 /// filter is [`StreamFilter::ForStreamTypes`] — the streams of those types, found through
 /// `idx_streams_type_id` without reading a row of any other type
-/// ([ADR-0030](https://github.com/funkode-io/replay/blob/main/docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+/// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 /// A stream it does not track is never behind, because it is never owed anything.
 ///
 /// It resumes after the last id it examined instead of restarting at the lowest, because
@@ -4665,20 +4665,12 @@ struct PolicyProgress {
     /// Persisted, because a runner that restarts often would otherwise rotate from the
     /// start every time and never reach the end of the sort order.
     reconciled_through: String,
-    /// When the frontier was last compared with the places. `None` until the first
-    /// reconciliation, so a worker that has just been elected does one straight away —
-    /// which is what makes a crash mid-backlog cost a cadence rather than a deployment.
-    reconciled_at: Option<Instant>,
-    /// How long the sweep is trusted on its own. This is the whole exposure of the
-    /// design: a write that commits below the sweep is delivered within a bounded number
-    /// of these, which
-    /// [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) states
-    /// and this is the unit of.
-    reconcile_every: Duration,
+    /// When the frontier is next compared with the places.
+    reconcile: ReconcileSchedule,
     /// The streams this Policy tracks, as this worker last recorded them in
     /// `policy_cursors.tracked_stream_types`. Held so that a poll writes the column, and
     /// re-checks its carried queue, only when the filter it asked for has changed
-    /// ([ADR-0030](https://github.com/funkode-io/replay/blob/main/docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+    /// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
     tracked: TrackedStreams,
 }
 
@@ -4708,8 +4700,11 @@ impl PolicyProgress {
             unfinished: Vec::new(),
             share_from: 0,
             reconciled_through,
-            reconciled_at: None,
-            reconcile_every: resolve_reconcile_cadence(),
+            reconcile: ReconcileSchedule::after_load(
+                name,
+                resolve_reconcile_cadence(),
+                Instant::now(),
+            ),
             tracked,
         })
     }
@@ -4739,13 +4734,63 @@ impl PolicyProgress {
 
     /// Make the next poll pay for the frontier scan whatever the cadence says.
     fn reconcile_now(&mut self) {
-        self.reconciled_at = None;
+        self.reconcile.force();
     }
 
     /// Whether this poll pays for the frontier scan.
     fn reconcile_is_due(&self) -> bool {
-        self.reconciled_at
-            .is_none_or(|last| last.elapsed() >= self.reconcile_every)
+        self.reconcile.is_due(Instant::now())
+    }
+
+    /// Record that this poll compared the frontier with the places.
+    fn reconciled(&mut self) {
+        self.reconcile.reconciled(Instant::now());
+    }
+}
+
+/// When a Policy next compares the frontier with its places.
+///
+/// The first comparison after a load — a start, or an election — is due at the Policy's
+/// [`reconcile_phase`] into the cadence, so a worker that has just been elected
+/// reconciles within one cadence; that bound is what makes a crash mid-backlog cost a
+/// cadence rather than a deployment. Every later comparison is due one cadence after the
+/// one before. A manual drain [forces](Self::force) one regardless.
+///
+/// Pure over the `now` it is handed, so the decision is tested without a clock.
+struct ReconcileSchedule {
+    /// The moment the next comparison is due. `None` when one is due whatever the
+    /// cadence says: a manual drain has asked for it.
+    due_at: Option<Instant>,
+    /// How long the sweep is trusted on its own. This is the whole exposure of the
+    /// design: a write that commits below the sweep is delivered within a bounded number
+    /// of these, which
+    /// [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) states
+    /// and this is the unit of.
+    every: Duration,
+}
+
+impl ReconcileSchedule {
+    /// The schedule of the Policy `name`, loaded at `now`: first due at its phase.
+    fn after_load(name: &str, every: Duration, now: Instant) -> Self {
+        Self {
+            due_at: Some(now + reconcile_phase(name, every)),
+            every,
+        }
+    }
+
+    /// Make the next comparison due on the next poll, whatever the phase or cadence.
+    fn force(&mut self) {
+        self.due_at = None;
+    }
+
+    /// Record a comparison made at `now`: the next one is a cadence later.
+    fn reconciled(&mut self, now: Instant) {
+        self.due_at = Some(now + self.every);
+    }
+
+    /// Whether a poll at `now` pays for the comparison.
+    fn is_due(&self, now: Instant) -> bool {
+        self.due_at.is_none_or(|due_at| now >= due_at)
     }
 }
 
@@ -4770,6 +4815,42 @@ fn resolve_reconcile_cadence() -> Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map_or(DEFAULT_RECONCILE_CADENCE, Duration::from_secs)
+}
+
+/// How far into its first cadence after a load a Policy's first reconciliation is due:
+/// its *phase*, always within `[0, every)`.
+///
+/// Every Policy in a runner shares one cadence. Were the first reconciliation due on the
+/// first poll, every Policy would compare the frontier with its places in the same moment
+/// after a start or an election, and — each next one being a cadence after the last —
+/// keep doing so in lockstep (funkode-io/replay#269). The phase staggers those first
+/// reconciliations across the cadence instead.
+///
+/// What is guaranteed is the first one only: it is due at load plus the phase, and runs
+/// on the first poll at or after that moment. Later ones are due a cadence after the
+/// previous one *finished* — the time is taken after the scan — and run on a poll tick,
+/// so the phases drift and Policies may draw together again over a long leadership. They
+/// do not all start together, which is the burst this exists to break up.
+///
+/// Derived from the name, not drawn at random: a Policy keeps its phase across polls,
+/// processes and runs, and the hash is FNV-1a written here rather than `DefaultHasher`,
+/// whose output a Rust release is free to change.
+fn reconcile_phase(name: &str, every: Duration) -> Duration {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let hash = name.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    });
+
+    let span = every.as_nanos();
+    if span == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = u128::from(hash) % span;
+    Duration::from_nanos(
+        u64::try_from(nanos).expect("a remainder of a u64 hash is no larger than the hash"),
+    )
 }
 
 /// Read how far a Policy has swept and where its rotation left off, or `None` when it has
@@ -4861,7 +4942,7 @@ async fn bootstrap(
     };
 
     // Only the streams the Policy tracks: a row for any other would be one it never reads
-    // or writes again (ADR-0030). `$2` NULL is every stream. One statement for both, unlike
+    // or writes again (ADR-0031). `$2` NULL is every stream. One statement for both, unlike
     // the reconciliation: this runs once in a Policy's life.
     if matches!(start_at, StartAt::Now) {
         sqlx::query(
@@ -6909,7 +6990,7 @@ mod progress_tests {
     /// A stream left unfinished under a filter that has since narrowed past it is not
     /// carried into the next poll. It is no longer tracked, so that poll must neither read
     /// it nor write it a place, and the carried queue is the one source the sweep's and
-    /// the reconciliation's own type checks never see (ADR-0030).
+    /// the reconciliation's own type checks never see (ADR-0031).
     #[tokio::test]
     async fn a_narrowed_filter_carries_no_stream_it_no_longer_tracks_postgres_test() {
         let (pool, _container) = start_postgres().await;
@@ -6956,7 +7037,7 @@ mod progress_tests {
     }
 
     /// A Policy filtered by stream type compares only the streams of those types, and
-    /// reads no row of any other type to find them (funkode-io/replay#267, ADR-0030).
+    /// reads no row of any other type to find them (funkode-io/replay#267, ADR-0031).
     ///
     /// The other type is deliberately the bulk of the table and entirely behind — no
     /// place for any of it — so a reconciliation that walked it would both return its
@@ -7330,5 +7411,152 @@ mod settlement_tests {
             3,
             "and the command parked meanwhile is in the table, for the next retry"
         );
+    }
+}
+
+/// When a Policy's reconciliation is due (funkode-io/replay#269): pure over an injected
+/// `now`, so no test waits on a clock.
+#[cfg(test)]
+mod reconcile_schedule_tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    use super::{reconcile_phase, ReconcileSchedule};
+
+    const CADENCE: Duration = Duration::from_secs(5);
+
+    /// The phase is FNV-1a of the name, reduced to the cadence. A cadence wider than any
+    /// 64-bit hash leaves the hash itself, which pins it to the published FNV-1a test
+    /// vectors: a value no compiler release, platform or process can move.
+    #[test]
+    fn the_phase_is_a_stable_hash_of_the_name() {
+        let widest = Duration::from_nanos(u64::MAX);
+
+        assert_eq!(
+            reconcile_phase("a", widest),
+            Duration::from_nanos(0xaf63_dc4c_8601_ec8c)
+        );
+        assert_eq!(
+            reconcile_phase("foobar", widest),
+            Duration::from_nanos(0x8594_4171_f739_67e8)
+        );
+    }
+
+    #[test]
+    fn the_same_name_gets_the_same_phase_every_time() {
+        assert_eq!(
+            reconcile_phase("billing", CADENCE),
+            reconcile_phase("billing", CADENCE)
+        );
+    }
+
+    /// Several Policies in one runner share the cadence; their first reconciliations are
+    /// spread across it rather than bunched: eight names, and every quarter of the
+    /// cadence holds at least one of them.
+    #[test]
+    fn different_names_spread_across_the_cadence() {
+        let names = [
+            "billing",
+            "shipping",
+            "notifications",
+            "inventory",
+            "loyalty",
+            "fraud_screening",
+            "refunds",
+            "invoicing",
+        ];
+
+        let phases: Vec<Duration> = names
+            .iter()
+            .map(|name| reconcile_phase(name, CADENCE))
+            .collect();
+
+        assert!(
+            phases.iter().all(|phase| *phase < CADENCE),
+            "every phase falls within one cadence: {phases:?}"
+        );
+        let distinct: HashSet<&Duration> = phases.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            names.len(),
+            "every Policy has its own moment"
+        );
+        let quarters: HashSet<u128> = phases
+            .iter()
+            .map(|phase| phase.as_nanos() * 4 / CADENCE.as_nanos())
+            .collect();
+        assert_eq!(
+            quarters.len(),
+            4,
+            "every quarter of the cadence has a Policy reconciling in it: {phases:?}"
+        );
+    }
+
+    /// A name whose phase is well inside the cadence, so "before it" and "at it" are
+    /// both moments a load could see.
+    const NAME: &str = "billing";
+
+    fn phase() -> Duration {
+        let phase = reconcile_phase(NAME, CADENCE);
+        assert!(
+            phase > Duration::from_millis(1),
+            "the name under test has a phase to wait for"
+        );
+        phase
+    }
+
+    /// A freshly loaded Policy — just started, or just elected — waits for its phase
+    /// rather than reconciling on its first poll.
+    #[test]
+    fn a_loaded_policy_first_reconciles_at_its_phase() {
+        let loaded = Instant::now();
+        let schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+
+        assert!(!schedule.is_due(loaded), "not on the first poll");
+        assert!(!schedule.is_due(loaded + phase() - Duration::from_nanos(1)));
+        assert!(schedule.is_due(loaded + phase()), "at its phase");
+        assert!(
+            schedule.is_due(loaded + CADENCE),
+            "within one cadence, whatever the name"
+        );
+    }
+
+    /// A manual drain is one poll and has to be a whole one: the phase does not apply.
+    #[test]
+    fn a_forced_reconciliation_is_due_on_the_first_poll() {
+        let loaded = Instant::now();
+        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+
+        schedule.force();
+
+        assert!(schedule.is_due(loaded));
+    }
+
+    /// The phase places the first reconciliation only; every later one follows the
+    /// cadence from the one before, as it always has.
+    #[test]
+    fn after_the_first_reconciliation_the_cadence_is_unchanged() {
+        let loaded = Instant::now();
+        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+        let first = loaded + phase();
+
+        schedule.reconciled(first);
+
+        assert!(!schedule.is_due(first));
+        assert!(!schedule.is_due(first + CADENCE - Duration::from_nanos(1)));
+        assert!(schedule.is_due(first + CADENCE));
+    }
+
+    /// A forced reconciliation, once done, hands back to the cadence too.
+    #[test]
+    fn a_forced_reconciliation_hands_back_to_the_cadence() {
+        let loaded = Instant::now();
+        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+        schedule.force();
+
+        schedule.reconciled(loaded);
+
+        assert!(!schedule.is_due(loaded + CADENCE - Duration::from_nanos(1)));
+        assert!(schedule.is_due(loaded + CADENCE));
     }
 }

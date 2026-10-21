@@ -4,6 +4,15 @@ The ubiquitous language for the `replay` event-sourcing library.
 
 ## Glossary
 
+### Event
+
+A fact: something that happened, named in the past tense after the act and the
+actor that caused it. An event carries the data of that act and never state the
+domain derives from it — a status, an ownership flag or any other rule's outcome
+is decided where events fold into an [Aggregate], so the rule can change without
+rewriting the stream. A value attested at that moment (a month's closing balance)
+is part of the fact. See README, *Events record facts, not state*.
+
 ### Projection
 
 An umbrella term for a derived read model built from events. "Projection" on its
@@ -97,10 +106,13 @@ size. Nothing orders one stream against another, and nothing waits — a stream'
 arrive in order, so the feed has no holes to reason about
 ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
-Which streams to read is found two ways: a sweep of the log by [Global position] every
-poll, which is fast and may pass a write that had not committed yet, and a reconciliation
-on a cadence, which compares every stream's head with the Policy's place and catches what
-the sweep passed. The sweep nominates streams; it never decides what is owed. Both take a
+Which streams to read is found three ways. A sweep of the log by [Global position] every
+poll is fast, and may pass a write that had not committed yet (a [Late write]). A
+late-write lookup every poll finds those by their [Commit stamp] once their transaction
+ends ([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A
+reconciliation compares every stream's head with the Policy's place: at leader start,
+on a manual drain, and on a slow cadence as a safety net. None of them decides what is
+owed; they nominate streams. The sweep and the reconciliation take a
 batch and resume where the last one stopped, so "bounded" costs a rotation rather than a
 stream nobody looks at.
 
@@ -120,7 +132,7 @@ The one exception is which streams the Policy **tracks**: every stream, unless i
 filter is `ForStreamTypes(types)`, in which case only the streams of those types. Both
 nomination queries and the places honour that set — a stream the Policy does not track is
 never compared, read or given a place, and is never behind
-([ADR-0030](docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+([ADR-0031](docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation
@@ -267,6 +279,17 @@ that Postgres never hears about; this one is the server's, which is what lets an
 abandoned append hand its connection back.
 _Avoid_: lock timeout (unqualified), statement timeout, deadlock detection.
 
+### Late write
+
+An append whose transaction had not committed when a Policy's sweep read past its
+[Global position], so the sweep did not see it, and after it commits no later position
+nominates its stream. Found by its [Commit stamp] on the first poll after its transaction
+ends; when the leader has just started, or its in-memory state was discarded, found by
+the reconciliation
+([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). Late, never
+lost.
+_Avoid_: missed write, lost event, gap, hole.
+
 ### Burned position
 A `global_position` taken from the sequence by a transaction that then aborted.
 `nextval` is not transactional, so the value is never returned to the sequence and no
@@ -285,11 +308,13 @@ and written by every insert path
 ordering the [Policy feed] can trust without reasoning about holes: a transaction id
 can be compared against a snapshot of transactions that have ended, whereas a
 `global_position` can be a [Burned position]. Events that predate the stamp carry the
-sentinel `0`, which orders before every real id. Nothing in the library reads it: the
-ordering it was carried for was the [Policy feed]'s, and that feed is ordered per stream
-now ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). It stays on
-the event as an operator's diagnostic — which write wrote this row, and what else that
-write wrote.
+sentinel `0`, which orders before every real id. The [Policy feed] no longer orders by it
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)), but it is
+load-bearing again: the late-write lookup finds a [Late write] by the stamp of a
+transaction the sweep could not see
+([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)), so the column,
+its index and the top-level transaction id every insert stamps must stay. It is also an
+operator's diagnostic: which write wrote this row, and what else that write wrote.
 _Avoid_: commit id, transaction number, xmin, sequence.
 
 ### Policy runner

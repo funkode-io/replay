@@ -1,4 +1,4 @@
-# 30. A Policy filtered by stream type tracks only those types
+# 31. A Policy filtered by stream type tracks only those types
 
 Date: 2026-10-21
 

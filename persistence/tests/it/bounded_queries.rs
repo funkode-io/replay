@@ -61,7 +61,7 @@ const REVIEWED: &[Reviewed] = &[
                         is what the Policy tracks: every stream, or for a \
                         ForStreamTypes(types) filter the streams of those types after the \
                         rotation, read off idx_streams_type_id without a row of any other \
-                        type (ADR-0030). It costs Postgres a scan, not this process memory: \
+                        type (ADR-0031). It costs Postgres a scan, not this process memory: \
                         only the LIMIT reaches the Vec.",
     },
     Reviewed {
@@ -81,7 +81,7 @@ const REVIEWED: &[Reviewed] = &[
                         the policy's stream filter, which selects what is delivered from \
                         the batch rather than what is read (ADR-0013). The stream itself is \
                         one the Policy tracks: a ForStreamTypes filter keeps every other \
-                        type out of the candidate list before this runs (ADR-0030).",
+                        type out of the candidate list before this runs (ADR-0031).",
     },
     Reviewed {
         file: "src/policy_runner.rs",

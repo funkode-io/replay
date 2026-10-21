@@ -10,6 +10,9 @@ a hole in `global_position` — no longer exists. Narrows
 [ADR-0018](0018-every-event-read-is-ordered-by-global-position.md) to the reads it was
 written about. Moves the control surface of
 [ADR-0012](0012-policy-cursor-is-an-operator-writable-control-surface.md) to a new table.
+Amended by [ADR-0030](0030-a-late-write-is-found-by-its-commit-stamp.md): a write that
+commits below the sweep is found by its commit stamp on the next poll, and the
+reconciliation below becomes a safety net on a slower cadence.
 
 ## Context
 
@@ -56,7 +59,10 @@ columns and no index can answer it. Two paths, with different costs and differen
 - **The reconciliation, on a cadence.** `streams.stream_seq > COALESCE(cursor, 0)` — one
   row per stream, bounded by the same batch, default every 5 seconds
   (`REPLAY_POLICY_RECONCILE_SECS`). It finds what the sweep swept past: a write that had
-  not committed when the sweep passed its position.
+  not committed when the sweep passed its position. A worker that has just started or
+  been elected first reconciles **within one cadence**, at a per-Policy phase
+  (`reconcile_phase`, funkode-io/replay#269); a manual drain reconciles on its first
+  poll.
 
 The sweep is allowed to be wrong because it decides nothing. It nominates; what a stream
 is owed is read from that stream's own sequence, which has no holes.
@@ -75,10 +81,11 @@ is owed is read from that stream's own sequence, which has no holes.
   cadences ≤ ceil(streams behind / streams read per cadence) + 1
   ```
 
-  The `+ 1` is the cadence that ends a pass. A rotation standing after the last stream id
-  reads an empty page, so that poll compares nothing and spends itself wrapping the cursor
-  back to the start; a stream sorting before it waits that cadence out
-  (funkode-io/replay#243).
+  The count starts at the first reconciliation after an election, which comes up to one
+  cadence after the election itself (the Policy's phase, above). The `+ 1` is the cadence
+  that ends a pass. A rotation standing after the last stream id reads an empty page, so
+  that poll compares nothing and spends itself wrapping the cursor back to the start; a
+  stream sorting before it waits that cadence out (funkode-io/replay#243).
 
   `REPLAY_POLICY_RECONCILE_SECS` (default 5s) is the cadence. A Policy behind on no more
   streams than it reads in one compares them in a single cadence — two if its rotation is
@@ -114,7 +121,7 @@ is owed is read from that stream's own sequence, which has no holes.
   number of streams and not with the log. A Policy that starts at `Now` writes one row per
   *existing* stream, once, at bootstrap — worth knowing before pointing a new Policy at a
   database with millions of them (of the types it tracks, since
-  [ADR-0030](0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+  [ADR-0031](0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 - **The reconciliation scan is proportional to total streams, not to streams behind.**
   Affordable on a cadence at ten thousand streams; at ten million it is the thing to
   measure first. A frontier table — a row per `(policy, stream)` written on append and
@@ -122,7 +129,7 @@ is owed is read from that stream's own sequence, which has no holes.
   now because keeping it small means the *write* path has to know the set of deployed
   policies, so an append's cost would scale with how many there are.
 
-  Amended by [ADR-0030](0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md):
+  Amended by [ADR-0031](0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md):
   a Policy whose filter is `ForStreamTypes` compares, reads and keeps places for the streams
   of those types only, so its scan is proportional to the streams it tracks rather than to
   every stream (funkode-io/replay#267).

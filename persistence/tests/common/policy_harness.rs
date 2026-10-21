@@ -110,6 +110,27 @@ pub const DAEMON_HEARTBEAT_CADENCE: Duration = replay_persistence::HEARTBEAT_MIN
 /// How long an `await_*` observation may go unsatisfied before it is a failure.
 pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The reconciliation cadence the daemon under test runs on: what
+/// `REPLAY_POLICY_RECONCILE_SECS` resolves to, by the runner's own rule — a positive
+/// whole number of seconds, else 5s. No test sets it, so this is the default.
+pub fn reconcile_cadence() -> Duration {
+    std::env::var("REPLAY_POLICY_RECONCILE_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(Duration::from_secs(5), Duration::from_secs)
+}
+
+/// How long an observation that only a reconciliation can satisfy may take.
+///
+/// The next reconciliation is up to one cadence away — a whole one after a load, where
+/// the first is due at the Policy's phase (funkode-io/replay#269) — and a rotation
+/// standing past the stream spends one more wrapping (ADR-0026). Three cadences leave a
+/// third for a slow machine, where [`OBSERVE_TIMEOUT`] would be exactly the two.
+pub fn reconciliation_timeout() -> Duration {
+    reconcile_cadence() * 3
+}
+
 /// How often an unsatisfied observation is re-read. Not a delay before
 /// asserting: the wait ends as soon as the observation holds.
 const OBSERVE_RECHECK: Duration = Duration::from_millis(20);
@@ -477,9 +498,23 @@ impl PolicyDaemonHarness {
     /// survives. That is what makes this the way to ask whether an event is
     /// re-delivered after a restart.
     pub async fn restart(&mut self) {
+        self.stop().await;
+        self.resume();
+    }
+
+    /// Stop the daemon, awaiting every task it spawned, and leave it stopped: the
+    /// first half of [`restart`](Self::restart), for a test that changes something
+    /// while no worker is running to see it.
+    pub async fn stop(&mut self) {
         if let Some(daemon) = self.daemon.take() {
             daemon.shutdown().await;
         }
+    }
+
+    /// Start an identically configured daemon after [`stop`](Self::stop): a new
+    /// process, whose worker is elected afresh.
+    pub fn resume(&mut self) {
+        assert!(self.daemon.is_none(), "resume follows stop");
         // After the shutdown has joined every task, so nothing can record into
         // the cleared recorder afterwards.
         self.escalations.cleared();
@@ -1281,12 +1316,29 @@ impl PolicyDaemonHarness {
     /// [`common::wait::wait_for_count`](super::wait::wait_for_count) is the same
     /// idea for a bare count; this one yields the observation itself and reports
     /// the whole set when it never arrives.
-    pub async fn observe<T, F, Fut>(&self, what: &str, mut observation: F) -> T
+    pub async fn observe<T, F, Fut>(&self, what: &str, observation: F) -> T
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Option<T>>,
     {
-        let deadline = Instant::now() + OBSERVE_TIMEOUT;
+        self.observe_within(what, OBSERVE_TIMEOUT, observation)
+            .await
+    }
+
+    /// [`observe`](Self::observe) under a deadline of `timeout` rather than
+    /// [`OBSERVE_TIMEOUT`]: for an observation whose bound is a number the daemon
+    /// documents, such as [`reconciliation_timeout`].
+    pub async fn observe_within<T, F, Fut>(
+        &self,
+        what: &str,
+        timeout: Duration,
+        mut observation: F,
+    ) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Option<T>>,
+    {
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if let Ok(Some(observed)) = tokio::time::timeout(remaining, observation()).await {
@@ -1307,7 +1359,7 @@ impl PolicyDaemonHarness {
                 .await
                 .unwrap_or_else(|_| "  (the database stopped answering too)".to_string());
 
-                panic!("timed out after {OBSERVE_TIMEOUT:?} waiting for {what}\n{diagnosis}");
+                panic!("timed out after {timeout:?} waiting for {what}\n{diagnosis}");
             }
             tokio::time::sleep(OBSERVE_RECHECK).await;
         }
