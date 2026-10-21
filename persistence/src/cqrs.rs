@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use futures::{StreamExt, TryStream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 
 use replay::{Aggregate, Event};
 use urn::Urn;
@@ -202,7 +202,7 @@ impl<ES: EventStore> Cqrs<ES> {
         &self,
         scope: crate::StreamScope,
         after: Option<A::StreamId>,
-    ) -> impl TryStream<Ok = A::StreamId, Error = replay::Error> + Send
+    ) -> impl Stream<Item = Result<A::StreamId, replay::Error>> + Send
     where
         A: replay::Aggregate,
     {

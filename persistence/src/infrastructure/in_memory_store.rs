@@ -1095,6 +1095,20 @@ mod tests {
             due::<BankAccountStream>(&cqrs, StreamScope::All, Some(make_stream_id("0149"))).await;
         assert_eq!(resumed, expected[150..], "resumes strictly after the key");
 
+        // A page is the documented `.take(n)` over the stream.
+        let page: Vec<BankAccountUrn> = futures::StreamExt::take(
+            cqrs.streams_needing_compaction::<BankAccountStream>(StreamScope::All, None),
+            3,
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        let page: Vec<String> = page
+            .into_iter()
+            .map(|id| Into::<Urn>::into(id).to_string())
+            .collect();
+        assert_eq!(page, expected[..3], "a page is the first n ids");
+
         // The chunk size is tunable and only changes how the read is split, never what
         // it yields; 0 is clamped to 1 so every query makes progress.
         for chunk_size in [0, 1, 7, 250, 1000] {
