@@ -2096,7 +2096,7 @@ it — including a stream that has never been compacted but has events. The chec
 best-effort maintenance, so an append that lands just after a `false` read is simply
 picked up on the next run. Both the Postgres and in-memory stores implement it.
 
-### Sweeping a whole scope (`streams_needing_compaction`)
+### Compacting a whole scope (`streams_needing_compaction`)
 
 A job that compacts every stream of a scope at once — everything in one tenant when it
 publishes, say — does not need a list of ids, nor one `needs_compaction` round-trip per
@@ -2122,9 +2122,10 @@ while let Some(stream_id) = due.try_next().await? {
 It applies the same watermark, so a stream whose compaction came back `Skipped` is not
 offered again until a new event is appended. The scope is over the stream id only —
 `StreamScope::All`, `Prefix`, `Suffix`, or `within` a scoped URN — with `%`, `_` and `\`
-matched literally. The stream reads in short keyset chunks, so a sweep holds one chunk of
-ids at a time and no database snapshot between them; a caller that pages across requests
-takes `.take(n)` and resumes with `after` set to the last id it saw
+matched literally. The stream reads in short keyset chunks — 100 ids per query, tunable
+with `Cqrs::compaction_chunk_size` — so a compaction pass holds one chunk of ids at a
+time and no database snapshot between them; a caller that pages across requests takes
+`.take(n)` and resumes with `after` set to the last id it saw
 ([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)).
 
 ## Policies

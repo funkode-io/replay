@@ -1,4 +1,3 @@
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -983,14 +982,7 @@ impl EventStore for PostgresEventStore {
             })?;
 
         ids.into_iter()
-            .map(|id| {
-                Urn::from_str(&id).map_err(|e| {
-                    replay::Error::internal("stored stream id is not a URN")
-                        .with_operation("streams_needing_compaction_page")
-                        .with_context("stream_id", id.clone())
-                        .with_context("error", format!("{:?}", e))
-                })
-            })
+            .map(|id| crate::error::stored_stream_id(&id, "streams_needing_compaction_page"))
             .collect()
     }
 

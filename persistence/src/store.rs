@@ -132,23 +132,30 @@ pub trait EventStore: Send + Sync {
         stream_id: &Urn,
     ) -> impl Future<Output = Result<bool, replay::Error>> + Send;
 
-    /// One page of the streams of type `stream_type` within `scope` that
-    /// [`needs_compaction`](EventStore::needs_compaction) would answer `true` for — the
-    /// same watermark test, `version > last_compacted_version` (never compacted counts as
+    /// The store seam behind
+    /// [`Cqrs::streams_needing_compaction`](crate::Cqrs::streams_needing_compaction):
+    /// one page of the streams of type `stream_type` within `scope` that
+    /// [`needs_compaction`](EventStore::needs_compaction) would answer `true` for.
+    ///
+    /// Consumers read through the `Cqrs` stream, not this method: the public API is
+    /// stream-first, and the library rather than the consumer picks how a long read is
+    /// chunked (`docs/adr/0029-the-public-api-is-stream-first.md`). A store implements it
+    /// so that stream has something to page over.
+    ///
+    /// It applies the same watermark test as `needs_compaction`, `version > last_compacted_version` (never compacted counts as
     /// `0`), so a stream whose last compaction was `Skipped` is not returned until a new
     /// event is appended.
     ///
-    /// Pages are keyset pages in the store's stream-id order: the first page starts at
-    /// `after: None`, the next after the last id of the previous one, and a page shorter
-    /// than `limit` is the last. The page is a `Vec` because its length is bounded by the
-    /// caller's `limit`, never by the number of matching streams.
+    /// An implementation returns keyset pages in the store's stream-id order, consistent
+    /// with its own `>` on ids: the first page starts at `after: None`, the next strictly
+    /// after the last id of the previous one, and a page shorter than `limit` is the
+    /// last. The page is a `Vec` because its length is bounded by `limit`, never by the
+    /// number of matching streams; an implementation must not buffer more than that.
     ///
     /// `scope` selects by stream id only (see [`StreamScope`](crate::StreamScope) for why
     /// it is not a [`StreamFilter`](crate::StreamFilter)). Like `needs_compaction`, the
     /// read takes no lock: a stream appended to just after it was read is picked up by
-    /// the next sweep. Most callers want
-    /// [`Cqrs::streams_needing_compaction`](crate::Cqrs::streams_needing_compaction), which
-    /// streams every page for one aggregate type.
+    /// the next compaction pass.
     fn streams_needing_compaction_page(
         &self,
         stream_type: &str,

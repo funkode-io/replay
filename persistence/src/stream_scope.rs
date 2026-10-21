@@ -2,8 +2,10 @@ use urn::Urn;
 
 /// Which streams a stream-level read covers, by **stream id** alone.
 ///
-/// Used by [`EventStore::streams_needing_compaction`](crate::EventStore::streams_needing_compaction)
-/// to narrow a sweep to, for example, every stream of one tenant. It is deliberately
+/// Used by [`Cqrs::streams_needing_compaction`](crate::Cqrs::streams_needing_compaction)
+/// (and the store seam behind it,
+/// [`EventStore::streams_needing_compaction_page`](crate::EventStore::streams_needing_compaction_page))
+/// to narrow a compaction pass to, for example, every stream of one tenant. It is deliberately
 /// not a [`StreamFilter`](crate::StreamFilter): that filter's variants select *events*
 /// (by metadata, `created`, `aggregate_version`, ...) and have no meaning for a row of
 /// the `streams` table, which carries only an id, a type and its versions. The aggregate

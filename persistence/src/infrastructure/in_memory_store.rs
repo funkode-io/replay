@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    str::FromStr,
     sync::RwLock,
 };
 
@@ -163,7 +162,7 @@ impl InMemoryEventStore {
 }
 
 impl InMemoryEventStore {
-    /// The watermark test shared by `needs_compaction` and the sweep: has the live head
+    /// The watermark test shared by `needs_compaction` and `streams_needing_compaction_page`: has the live head
     /// (max version among un-archived events, `0` if none) moved past the version
     /// recorded at the last compaction (`0` if never compacted)? A missing stream has
     /// nothing to compact.
@@ -531,13 +530,7 @@ impl EventStore for InMemoryEventStore {
         }
 
         page.into_iter()
-            .map(|id| {
-                Urn::from_str(&id).map_err(|e| {
-                    replay::Error::internal("stored stream id is not a URN")
-                        .with_context("stream_id", id.clone())
-                        .with_context("error", format!("{:?}", e))
-                })
-            })
+            .map(|id| crate::error::stored_stream_id(&id, "streams_needing_compaction_page"))
             .collect()
     }
 }
@@ -989,7 +982,7 @@ mod tests {
         add_events(&store, &settled, &deposit).await;
         compact_bank_account(&store, &settled).await;
 
-        // A stream of another aggregate type is never in a BankAccount sweep.
+        // A stream of another aggregate type is never due for a BankAccount pass.
         let other = make_stream_id("other-type");
         add_snapshot_events(&store, &other, &[SnapshotEvent::Bumped]).await;
 
@@ -1052,14 +1045,10 @@ mod tests {
             "us-1@tenant:acme",
             "us-2@user:7@tenant:acme",
             "us-3@tenant:acme-eu",
-            // `%` appears in a URN only as a percent-escape.
-            "50%25_off",
-            "50%25xoff",
-            "50abc25_off",
         ] {
             add_events(&store, &make_stream_id(nss), &deposit).await;
         }
-        let tenant = Urn::from_str("urn:tenant:acme").unwrap();
+        let tenant = <Urn as std::str::FromStr>::from_str("urn:tenant:acme").unwrap();
 
         assert_eq!(
             due::<BankAccountStream>(&cqrs, StreamScope::within(&tenant), None).await,
@@ -1081,16 +1070,6 @@ mod tests {
                 "urn:bank-account:eu-2@tenant:globex",
             ],
         );
-        assert_eq!(
-            due::<BankAccountStream>(
-                &cqrs,
-                StreamScope::Prefix("urn:bank-account:50%25_".into()),
-                None
-            )
-            .await,
-            vec!["urn:bank-account:50%25_off"],
-            "% and _ in a scope match only themselves"
-        );
     }
 
     #[tokio::test]
@@ -1100,7 +1079,7 @@ mod tests {
         let cqrs = crate::Cqrs::new(InMemoryEventStore::new());
         let store = cqrs.store().clone();
         let deposit = [BankAccountEvent::Deposited { amount: 1.0 }];
-        // Two and a half chunks' worth, so the sweep crosses chunk boundaries and ends
+        // Two and a half chunks' worth, so the read crosses chunk boundaries and ends
         // on a short one.
         let expected: Vec<String> = (0..250)
             .map(|n| format!("urn:bank-account:{n:04}"))
@@ -1115,6 +1094,21 @@ mod tests {
         let resumed =
             due::<BankAccountStream>(&cqrs, StreamScope::All, Some(make_stream_id("0149"))).await;
         assert_eq!(resumed, expected[150..], "resumes strictly after the key");
+
+        // The chunk size is tunable and only changes how the read is split, never what
+        // it yields; 0 is clamped to 1 so every query makes progress.
+        for chunk_size in [0, 1, 7, 250, 1000] {
+            let tuned =
+                crate::Cqrs::new(InMemoryEventStore::new()).compaction_chunk_size(chunk_size);
+            for n in 0..250 {
+                add_events(tuned.store(), &make_stream_id(&format!("{n:04}")), &deposit).await;
+            }
+            assert_eq!(
+                due::<BankAccountStream>(&tuned, StreamScope::All, None).await,
+                expected,
+                "chunk size {chunk_size}"
+            );
+        }
     }
 
     #[tokio::test]

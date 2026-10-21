@@ -432,6 +432,16 @@ is an identity, not a [Query]: the event store treats the whole string as an
 opaque stream id.
 _Avoid_: qualified URN, namespaced URN, parent/child URN, compound key.
 
+### Stream scope
+
+Which streams a stream-level read covers, chosen by the text of the stream id alone:
+every stream, a prefix of the id, or a suffix of it (`StreamScope`). Not the **scope**
+of a [Scoped URN], though it reaches it: `StreamScope::within(scope)` is the suffix
+`@<scope>`, which takes every stream scoped under that URN, nested scopes included —
+"everything in one tenant". It selects ids, never events, which is why it is not a
+stream filter. Used to narrow the streams due for compaction to one tenant.
+_Avoid_: stream filter (that selects events), tenant filter.
+
 ### Query
 
 The existing on-demand, in-memory fold over filtered events. It is the
@@ -530,6 +540,7 @@ it:
 [Narration]: #narration
 [Query]: #query
 [Scoped URN]: #scoped-urn
+[Stream scope]: #stream-scope
 [Live projection]: #live-projection
 [Inline projection]: #inline-projection
 [Async projection]: #async-projection

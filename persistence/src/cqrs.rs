@@ -7,21 +7,34 @@ use urn::Urn;
 
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
 
-/// How many stream ids [`Cqrs::streams_needing_compaction`] reads per store query. It
-/// bounds the ids held at once and how long one query runs; the consumer still sees one
-/// stream and decides how much of it to read.
-const COMPACTION_SWEEP_CHUNK: u32 = 100;
+/// Built-in default for [`Cqrs::compaction_chunk_size`].
+const DEFAULT_COMPACTION_CHUNK_SIZE: u32 = 100;
 
 #[derive(Clone)]
 pub struct Cqrs<ES: EventStore> {
     store: Arc<ES>,
+    /// How many stream ids [`Cqrs::streams_needing_compaction`] reads per store query.
+    compaction_chunk_size: u32,
 }
 
 impl<ES: EventStore> Cqrs<ES> {
     pub fn new(event_store: ES) -> Self {
         Self {
             store: Arc::new(event_store),
+            compaction_chunk_size: DEFAULT_COMPACTION_CHUNK_SIZE,
         }
+    }
+
+    /// Cap how many stream ids [`streams_needing_compaction`](Self::streams_needing_compaction)
+    /// reads per store query (the `LIMIT` of each
+    /// [`EventStore::streams_needing_compaction_page`](crate::EventStore::streams_needing_compaction_page)).
+    ///
+    /// It bounds the ids held at once and how long one query runs; the consumer still
+    /// sees one stream and decides how much of it to read. Defaults to 100. Values below
+    /// 1 are clamped to 1, so every query makes progress.
+    pub fn compaction_chunk_size(mut self, ids: u32) -> Self {
+        self.compaction_chunk_size = ids.max(1);
+        self
     }
 
     /// Shared handle to the underlying event store.
@@ -166,7 +179,7 @@ impl<ES: EventStore> Cqrs<ES> {
     /// [`needs_compaction`](Self::needs_compaction) would answer `true` for, in stream-id
     /// order, starting after `after` (`None` for the beginning).
     ///
-    /// The batch form of the pre-check for a sweep that compacts a whole scope — for
+    /// The batch form of the pre-check, for a compaction pass over a whole scope — for
     /// example every stream of one tenant, `StreamScope::within(&tenant)`:
     ///
     /// ```rust,ignore
@@ -179,9 +192,9 @@ impl<ES: EventStore> Cqrs<ES> {
     /// ```
     ///
     /// Same watermark as `needs_compaction`, so a stream whose compaction was `Skipped`
-    /// drops out of the next sweep until a new event is appended. The stream reads in
-    /// short keyset chunks rather than through one long query, so a sweep that holds it
-    /// for minutes holds no connection or snapshot between chunks
+    /// drops out of the next pass until a new event is appended. The stream reads in
+    /// short keyset chunks of [`compaction_chunk_size`](Self::compaction_chunk_size) ids
+    /// rather than through one long query, so a pass that holds it for minutes holds no connection or snapshot between chunks
     /// (`docs/adr/0029-the-public-api-is-stream-first.md`); a caller that cannot hold it
     /// across requests resumes with `after` set to the last id it saw, and takes a page
     /// with `.take(n)`. `scope` selects by stream id only; see [`crate::StreamScope`].
@@ -193,29 +206,30 @@ impl<ES: EventStore> Cqrs<ES> {
     where
         A: replay::Aggregate,
     {
-        struct Sweep<ES> {
+        struct Pass<ES> {
             store: Arc<ES>,
             stream_type: String,
             scope: crate::StreamScope,
             cursor: Option<Urn>,
-            // Bounded by COMPACTION_SWEEP_CHUNK: one store page at a time, never the
-            // whole scope.
+            // Bounded by `chunk_size`: one store page at a time, never the whole scope.
             chunk: std::vec::IntoIter<Urn>,
             last_chunk: bool,
+            chunk_size: u32,
         }
 
-        let sweep = Sweep {
+        let pass = Pass {
             store: self.store.clone(),
             stream_type: A::stream_type(),
             scope,
             cursor: after.map(Into::into),
             chunk: Vec::new().into_iter(),
             last_chunk: false,
+            chunk_size: self.compaction_chunk_size,
         };
 
-        futures::stream::try_unfold(sweep, |mut sweep| async move {
+        futures::stream::try_unfold(pass, |mut pass| async move {
             loop {
-                if let Some(urn) = sweep.chunk.next() {
+                if let Some(urn) = pass.chunk.next() {
                     let id = A::StreamId::try_from(urn.clone()).map_err(|e| {
                         replay::Error::internal(
                             "stored stream id does not parse as the aggregate's StreamId",
@@ -224,25 +238,25 @@ impl<ES: EventStore> Cqrs<ES> {
                         .with_context("stream_id", urn.to_string())
                         .with_context("error", format!("{:?}", e))
                     })?;
-                    return Ok(Some((id, sweep)));
+                    return Ok(Some((id, pass)));
                 }
-                if sweep.last_chunk {
+                if pass.last_chunk {
                     return Ok(None);
                 }
-                let chunk = sweep
+                let chunk = pass
                     .store
                     .streams_needing_compaction_page(
-                        &sweep.stream_type,
-                        &sweep.scope,
-                        sweep.cursor.as_ref(),
-                        COMPACTION_SWEEP_CHUNK,
+                        &pass.stream_type,
+                        &pass.scope,
+                        pass.cursor.as_ref(),
+                        pass.chunk_size,
                     )
                     .await?;
-                sweep.last_chunk = chunk.len() < COMPACTION_SWEEP_CHUNK as usize;
+                pass.last_chunk = chunk.len() < pass.chunk_size as usize;
                 if let Some(last) = chunk.last() {
-                    sweep.cursor = Some(last.clone());
+                    pass.cursor = Some(last.clone());
                 }
-                sweep.chunk = chunk.into_iter();
+                pass.chunk = chunk.into_iter();
             }
         })
     }

@@ -112,8 +112,8 @@ const REVIEWED: &[Reviewed] = &[
         function: "streams_needing_compaction_page",
         justification: "SQL carries LIMIT $limit, the caller's page size; one id per row. \
                         `Cqrs::streams_needing_compaction` calls it with \
-                        COMPACTION_SWEEP_CHUNK (100) and resumes after the last id, so a \
-                        sweep over a whole scope holds one chunk at a time.",
+                        its compaction_chunk_size (default 100) and resumes after the last \
+                        id, so a pass over a whole scope holds one chunk at a time.",
     },
     // ── Known unbounded ──────────────────────────────────────────────────────
     Reviewed {

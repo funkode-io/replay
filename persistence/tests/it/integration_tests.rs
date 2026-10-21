@@ -1509,7 +1509,7 @@ async fn deposit(
 /// The batch pre-check answers exactly what `needs_compaction` answers per stream: a
 /// never-compacted stream is due, a compacted-and-unchanged one is not, a `Skipped`
 /// compaction drops its stream out too, an append past the watermark brings a stream
-/// back, and a stream of another aggregate type is never in the sweep.
+/// back, and a stream of another aggregate type is never due for that pass.
 #[tokio::test]
 async fn streams_needing_compaction_follows_the_watermark_postgres_test() {
     let (_container, store) = migrated_store().await;
@@ -1523,7 +1523,7 @@ async fn streams_needing_compaction_follows_the_watermark_postgres_test() {
     let aggregate = cqrs.fetch_aggregate::<BankAccount>(&settled).await.unwrap();
     cqrs.compact(&aggregate, meta.clone()).await.unwrap();
 
-    // Another aggregate type, born minimal: due in its own sweep until a Skipped compaction.
+    // Another aggregate type, born minimal: due in its own pass until a Skipped compaction.
     let minimal = SnapshotBoxUrn::new("minimal").unwrap();
     store
         .store_events::<SnapshotBox>(
@@ -1627,14 +1627,14 @@ async fn streams_needing_compaction_narrows_by_scope_postgres_test() {
     );
 }
 
-/// The sweep reads in keyset chunks: across several of them it yields every due stream
+/// The stream reads in keyset chunks: across several of them it yields every due stream
 /// once, in id order, and resumes strictly after a given key.
 #[tokio::test]
 async fn streams_needing_compaction_reads_across_chunks_postgres_test() {
     let (_container, store) = migrated_store().await;
     let cqrs = replay_persistence::Cqrs::new(store.clone());
 
-    // Two and a half chunks' worth, so the sweep crosses chunk boundaries and ends on a
+    // Two and a half chunks' worth, so the read crosses chunk boundaries and ends on a
     // short one. Every tenth stream is settled, so chunks are not just id ranges.
     let mut expected = Vec::new();
     for n in 0..275 {
