@@ -22,6 +22,8 @@ pub struct PersistedEvent<E> {
     /// `Some(n)` identifies events that were archived during the nth compaction.
     /// Matches the `INTEGER` column type in the database.
     pub aggregate_version: Option<i32>,
+    /// Whether this is a synthetic row emitted by compaction rather than a real event.
+    pub compacted_snapshot: bool,
     /// The half a [`Policy`](replay::Policy) sees. Read it through the deref, not
     /// through this name.
     pub observed: ObservedEvent<E>,
@@ -59,6 +61,7 @@ impl<E: Event> PersistedEvent<E> {
             r#type: data.event_type(),
             version: 1,
             aggregate_version: None,
+            compacted_snapshot: false,
             observed: ObservedEvent::of(stream_id, data).with_created(Utc::now()),
         }
     }
@@ -91,6 +94,13 @@ impl<E> PersistedEvent<E> {
         }
     }
 
+    pub fn with_compacted_snapshot(self, compacted_snapshot: bool) -> Self {
+        PersistedEvent {
+            compacted_snapshot,
+            ..self
+        }
+    }
+
     /// The payload, taken out of the envelope. The counterpart to reading `event.data`
     /// through the deref, which cannot move.
     pub fn into_data(self) -> E {
@@ -109,6 +119,7 @@ impl<E> PersistedEvent<E> {
             r#type: self.r#type,
             version: self.version,
             aggregate_version: self.aggregate_version,
+            compacted_snapshot: self.compacted_snapshot,
             observed: ObservedEvent {
                 data: Other::from(data),
                 stream_id,
@@ -124,6 +135,7 @@ impl<E> PersistedEvent<E> {
             r#type: self.r#type,
             version: self.version,
             aggregate_version: self.aggregate_version,
+            compacted_snapshot: self.compacted_snapshot,
             observed: ObservedEvent {
                 data,
                 stream_id: self.observed.stream_id,
@@ -146,6 +158,7 @@ impl<E> PersistedEvent<E> {
             r#type: self.r#type.clone(),
             version: self.version,
             aggregate_version: self.aggregate_version,
+            compacted_snapshot: self.compacted_snapshot,
             observed: self.observed_with_data(data),
         }
     }
@@ -202,6 +215,7 @@ mod tests {
             r#type: "Deposited".to_string(),
             version: 7,
             aggregate_version: Some(2),
+            compacted_snapshot: false,
             observed: ObservedEvent {
                 data: BankAccountEvent::Deposited { amount: 123.0 },
                 stream_id: account().into(),
@@ -218,6 +232,7 @@ mod tests {
         assert_eq!(built.created, literal.created);
         assert_eq!(built.metadata, literal.metadata);
         assert_eq!(built.aggregate_version, literal.aggregate_version);
+        assert_eq!(built.compacted_snapshot, literal.compacted_snapshot);
     }
 
     /// The stores write `Event::event_type()` — the variant, not the enum name — so a
@@ -237,8 +252,17 @@ mod tests {
         assert_eq!(event.version, 1);
         assert_eq!(event.metadata, Metadata::default());
         assert_eq!(event.aggregate_version, None);
+        assert!(!event.compacted_snapshot);
         assert!(event.created >= before && event.created <= Utc::now());
         assert_eq!(event.id.get_version_num(), 4);
+    }
+
+    #[test]
+    fn with_compacted_snapshot_marks_the_event() {
+        let event = PersistedEvent::of(account(), BankAccountEvent::Deposited { amount: 1.0 })
+            .with_compacted_snapshot(true);
+
+        assert!(event.compacted_snapshot);
     }
 
     /// The observed half is what a rule is handed, and it is the same values the

@@ -405,6 +405,7 @@ mod tests {
             r#type: "Frozen".to_string(),
             version: 7,
             aggregate_version: None,
+            compacted_snapshot: false,
             observed: ObservedEvent {
                 data: json!({ "Frozen": { "reason": "fraud-review" } }),
                 stream_id: UrnBuilder::new("account", "42").build().unwrap(),

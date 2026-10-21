@@ -312,6 +312,11 @@ impl PostgresEventStore {
                         .push_bind(version);
                 }
             },
+            StreamFilter::CompactedSnapshot(compacted_snapshot) => {
+                query_builder
+                    .push(" compacted_snapshot = ")
+                    .push_bind(compacted_snapshot);
+            }
             StreamFilter::And(left, right) => {
                 query_builder.push(" (");
                 Self::add_filters(query_builder, *left);
@@ -647,11 +652,12 @@ impl PostgresEventStoreBuilder {
         chunk_size: usize,
     ) -> Result<(Vec<PersistedEvent<Value>>, Option<ReplayCursor>), replay::Error> {
         let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-            "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, global_position \
-             FROM events WHERE (",
+            "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
+             compacted_snapshot, global_position FROM events \
+             WHERE (compacted_snapshot = FALSE AND (",
         );
         PostgresEventStore::add_filters(&mut query_builder, filter);
-        query_builder.push(")");
+        query_builder.push("))");
 
         if let Some(ReplayCursor { global_position }) = after {
             query_builder
@@ -833,6 +839,7 @@ impl EventStore for PostgresEventStore {
                 r#type: event_type.clone(),
                 version,
                 aggregate_version: None,
+                compacted_snapshot: false,
                 observed: ObservedEvent {
                     data: event,
                     stream_id: stream_id.clone(),
@@ -847,6 +854,7 @@ impl EventStore for PostgresEventStore {
                     r#type: event_type,
                     version,
                     aggregate_version: None,
+                    compacted_snapshot: false,
                     observed: ObservedEvent {
                         data: event_data,
                         stream_id: stream_id.clone(),
@@ -895,7 +903,7 @@ impl EventStore for PostgresEventStore {
         filter: StreamFilter,
     ) -> impl TryStream<Ok = PersistedEvent<E>, Error = replay::Error> + Send {
         async_stream::stream! {
-            let sql = "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version
+            let sql = "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, compacted_snapshot
                 FROM events 
                 WHERE " ;
 
@@ -1123,12 +1131,14 @@ impl<D: DeserializeOwned> TryFrom<PgRow> for PersistedEvent<D> {
         // serializer, which would deep-copy the document for every row.
         let metadata: Metadata = Metadata::from_json(metadata);
         let aggregate_version: Option<i32> = value.get("aggregate_version");
+        let compacted_snapshot: bool = value.get("compacted_snapshot");
 
         Ok(PersistedEvent {
             id,
             r#type,
             version,
             aggregate_version,
+            compacted_snapshot,
             observed: ObservedEvent {
                 data,
                 stream_id,

@@ -40,6 +40,8 @@ pub enum StreamFilter {
     /// Matches events whose `aggregate_version` equals the given value.
     /// `None` selects current (non-archived) events; `Some(n)` selects version n.
     WithAggregateVersion(Option<i32>),
+    /// Matches events whose `compacted_snapshot` flag equals the given value.
+    CompactedSnapshot(bool),
     And(Box<StreamFilter>, Box<StreamFilter>),
     Or(Box<StreamFilter>, Box<StreamFilter>),
     Not(Box<StreamFilter>),
@@ -57,6 +59,9 @@ impl StreamFilter {
             StreamFilter::CreatedAfter(timestamp) => event.created > *timestamp,
             StreamFilter::CreatedBefore(timestamp) => event.created <= *timestamp,
             StreamFilter::WithAggregateVersion(v) => event.aggregate_version == *v,
+            StreamFilter::CompactedSnapshot(compacted_snapshot) => {
+                event.compacted_snapshot == *compacted_snapshot
+            }
             StreamFilter::And(left, right) => left.passes::<S>(event) && right.passes::<S>(event),
             StreamFilter::Or(left, right) => left.passes::<S>(event) || right.passes::<S>(event),
             StreamFilter::Not(filter) => !filter.passes::<S>(event),
@@ -142,6 +147,14 @@ impl StreamFilter {
 
     pub fn and_aggregate_version(self, aggregate_version: Option<i32>) -> StreamFilter {
         self.and(StreamFilter::WithAggregateVersion(aggregate_version))
+    }
+
+    pub fn compacted_snapshot(compacted_snapshot: bool) -> StreamFilter {
+        StreamFilter::CompactedSnapshot(compacted_snapshot)
+    }
+
+    pub fn and_compacted_snapshot(self, compacted_snapshot: bool) -> StreamFilter {
+        self.and(StreamFilter::CompactedSnapshot(compacted_snapshot))
     }
 }
 
@@ -343,5 +356,34 @@ mod tests {
         let persisted_event = crate::PersistedEvent::of(bank_account_urn, event).with_version(1);
 
         assert!(filter.passes::<BankAccountStream>(&persisted_event));
+    }
+
+    #[test]
+    fn compacted_snapshot_filter_composes_with_and_and_not() {
+        let bank_account_urn =
+            BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
+        let real = crate::PersistedEvent::of(
+            bank_account_urn.clone(),
+            BankAccountEvent::Deposited { amount: 1.0 },
+        );
+        let snapshot = crate::PersistedEvent::of(
+            bank_account_urn.clone(),
+            BankAccountEvent::Deposited { amount: 1.0 },
+        )
+        .with_compacted_snapshot(true);
+        let stream = super::StreamFilter::with_stream_id::<BankAccountStream>(&bank_account_urn);
+
+        let not_snapshot = super::StreamFilter::compacted_snapshot(false);
+        let snapshot_only = super::StreamFilter::compacted_snapshot(true);
+
+        assert!(not_snapshot.passes::<BankAccountStream>(&real));
+        assert!(!not_snapshot.passes::<BankAccountStream>(&snapshot));
+        assert!(stream
+            .clone()
+            .and(snapshot_only.clone())
+            .passes::<BankAccountStream>(&snapshot));
+        assert!(!stream
+            .and(snapshot_only.not())
+            .passes::<BankAccountStream>(&snapshot));
     }
 }
