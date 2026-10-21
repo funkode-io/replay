@@ -9,7 +9,12 @@
 
 use crate::common;
 
-use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
+use std::time::Duration;
+
+use common::policy_harness::{
+    reconcile_cadence, reconciliation_timeout, PolicyDaemonHarness, Probe, ProbeCommand,
+    ProbeEvent, ProbeUrn,
+};
 use replay_persistence::{Dispatch, ObservedEvent, PolicySettings, StartAt};
 
 /// A Policy that echoes every ping, so what it has delivered is readable as the commands
@@ -98,8 +103,8 @@ async fn a_position_burned_by_a_failed_write_delays_nobody_postgres_test() {
 ///
 /// The Policy's search sweeps past the held write's position while it is open — that is
 /// the design, and it is what makes the event before this test's held one arrive
-/// immediately. Finding it afterwards is the reconciliation's job, so this test waits for
-/// one cadence of it.
+/// immediately. Finding it afterwards is the reconciliation's job, so this test waits as
+/// long as a reconciliation can take to reach it.
 #[tokio::test]
 async fn an_overtaken_write_is_delivered_when_it_commits_postgres_test() {
     let harness = PolicyDaemonHarness::start("overtaken", |builder, policy| {
@@ -129,8 +134,26 @@ async fn an_overtaken_write_is_delivered_when_it_commits_postgres_test() {
 
     // Waited for, not asserted: the reaction fires before the checkpoint that records it,
     // so reading the place the instant a dispatch appears is reading it one write early.
-    harness.await_dispatch_caused_by(position).await;
-    harness.await_passed(position).await;
+    harness
+        .observe_within(
+            &format!("the reconciliation to deliver the event at position {position}"),
+            reconciliation_timeout(),
+            || async {
+                harness
+                    .dispatches()
+                    .await
+                    .into_iter()
+                    .find(|dispatch| dispatch.caused_by_position == position)
+            },
+        )
+        .await;
+    harness
+        .observe_within(
+            &format!("the policy to pass the event at position {position}"),
+            reconciliation_timeout(),
+            || async { harness.has_passed(position).await.then_some(()) },
+        )
+        .await;
 
     harness.shutdown().await;
 }
@@ -290,10 +313,58 @@ async fn an_operator_moves_a_place_on_a_running_daemon_postgres_test() {
     // a *re*delivery: an event this policy has already reacted to once.
     harness.redeliver(&ping).await;
 
+    // The stream is quiet and the sweep is past it, so only a reconciliation finds it.
     harness
-        .observe("the policy to react to the same event twice", || async {
-            (harness.dispatches().await.len() > delivered_once).then_some(())
-        })
+        .observe_within(
+            "the policy to react to the same event twice",
+            reconciliation_timeout(),
+            || async { (harness.dispatches().await.len() > delivered_once).then_some(()) },
+        )
+        .await;
+
+    harness.shutdown().await;
+}
+
+/// A worker that has just been elected reconciles within one cadence: not on its first
+/// poll, which would have every Policy of a runner scan at once, and not a cadence later
+/// either (funkode-io/replay#269, ADR-0026).
+///
+/// The place is rewound while no worker runs, on a stream the sweep has already passed.
+/// The new leader's sweep starts past it and it has nothing in memory, so a reconciliation
+/// is the only way it can deliver that event again — and how soon it does is how soon it
+/// reconciled.
+#[tokio::test]
+async fn a_newly_elected_worker_reconciles_within_one_cadence_postgres_test() {
+    /// What the election, the progress load and the poll tick that runs the
+    /// reconciliation may add to the phase — about 30ms on a laptop. Kept well under a
+    /// cadence so a first reconciliation pushed a whole cadence late fails here for any
+    /// Policy whose phase is past it.
+    const SETTLING: Duration = Duration::from_secs(1);
+
+    let mut harness = PolicyDaemonHarness::start("elected", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(
+            policy,
+            PolicySettings::new().starting_at(StartAt::Beginning),
+            echo_back,
+        )
+    })
+    .await;
+
+    let ping = harness.ping("found-on-election", "again").await;
+    harness.await_dispatch_caused_by(ping.global_position).await;
+    harness.await_passed(ping.global_position).await;
+    let delivered_once = harness.dispatches().await.len();
+
+    harness.stop().await;
+    harness.redeliver(&ping).await;
+    harness.resume();
+
+    harness
+        .observe_within(
+            "the newly elected worker to reconcile and redeliver the rewound event",
+            reconcile_cadence() + SETTLING,
+            || async { (harness.dispatches().await.len() > delivered_once).then_some(()) },
+        )
         .await;
 
     harness.shutdown().await;
