@@ -2414,6 +2414,13 @@ not just delivers from them
 - the index on `streams (type, id)` (migration 0036) replaces the one on `type` alone,
   which migration 0037 drops once its replacement exists.
 
+**Migrate, then deploy.** This version reads and writes
+`policy_cursors.tracked_stream_types` when a worker starts a policy and on every status
+read, so it fails against a schema without migration 0035. Run 0035, 0036 and 0037 in that
+order before deploying it; 0036 and 0037 build and drop an index `CONCURRENTLY`, so each
+runs outside a transaction. The previous version runs unchanged against the migrated
+schema, so the policy daemons can stay up while you migrate.
+
 Every other filter — `All`, `WithStreamId`, `WithMetadata`, and any combinator, including
 an `And` containing a `ForStreamTypes` — tracks every stream. So declare the stream type as
 the policy's whole filter when that is what it reads: a policy reading one type out of
@@ -2421,9 +2428,26 @@ dozens then pays for that type alone.
 
 **Widening the types starts each newly tracked stream from its first event**, whatever the
 policy's `starting_at`: the policy holds no place in a stream it never tracked, and a
-stream with no place is at its beginning. Move those places first
-([Moving a policy on a running system](#moving-a-policy-on-a-running-system)) if that
-history must not be redelivered.
+stream with no place is at its beginning. If that history must not be redelivered, give
+those streams a place before deploying the wider filter. A stream it never tracked has no
+row to `UPDATE`, so insert one at the stream's head, leaving any place it already holds
+alone:
+
+```sql
+-- 'price_fanout' is about to track 'Quote' too: start its Quote streams at their heads.
+INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq)
+SELECT 'price_fanout', s.id, s.stream_seq
+FROM streams s
+WHERE s.type = ANY (ARRAY['Quote'])
+  AND s.stream_seq > 0
+ON CONFLICT (policy, stream_id) DO NOTHING;
+```
+
+The running policy never reads a stream it does not track, so it leaves these rows alone;
+events appended to those streams after the insert are delivered once the wider filter is
+deployed. See
+[Moving a policy on a running system](#moving-a-policy-on-a-running-system) for moving a
+place that exists.
 
 **Places a policy kept before it tracked by type are left where they are.** A policy that
 ran on an earlier release, or under a wider filter, may hold one row per stream of every
