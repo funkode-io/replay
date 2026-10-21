@@ -11,6 +11,22 @@ pub enum StreamFilter {
     #[default]
     All,
     WithStreamId(Urn),
+    /// Matches events of streams whose type is one of these.
+    ///
+    /// As a Policy's filter it also bounds what the Policy **tracks**, not only what it
+    /// delivers: its reconciliation compares only streams of these types, its sweep drops
+    /// the streams of any other type it finds, and it never reads such a stream or keeps a
+    /// place in `policy_stream_cursors` for one. Its lag in
+    /// [`PolicyStatusStore`](crate::PolicyStatusStore) is counted over these streams only
+    /// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+    ///
+    /// Only this filter, given as the Policy's whole filter, narrows what is tracked. One
+    /// nested inside [`StreamFilter::And`] or any other combinator still decides delivery,
+    /// but the Policy tracks every stream, as it does under every other filter.
+    ///
+    /// Widening the types later starts every newly tracked stream from its first event,
+    /// whatever the Policy's [`StartAt`](crate::StartAt): it has no place in a stream it
+    /// never tracked, and a stream with no place is at its beginning.
     ForStreamTypes(Vec<String>),
     WithMetadata(replay::Metadata),
     /// Matches events whose sequence version is strictly greater than the given value.

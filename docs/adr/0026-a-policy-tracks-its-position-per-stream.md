@@ -120,13 +120,19 @@ is owed is read from that stream's own sequence, which has no holes.
 - **State is one row per stream the Policy has delivered from**, so it grows with the
   number of streams and not with the log. A Policy that starts at `Now` writes one row per
   *existing* stream, once, at bootstrap — worth knowing before pointing a new Policy at a
-  database with millions of them.
+  database with millions of them (of the types it tracks, since
+  [ADR-0031](0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 - **The reconciliation scan is proportional to total streams, not to streams behind.**
   Affordable on a cadence at ten thousand streams; at ten million it is the thing to
   measure first. A frontier table — a row per `(policy, stream)` written on append and
   deleted when caught up — would make it proportional to work instead, and was rejected for
   now because keeping it small means the *write* path has to know the set of deployed
   policies, so an append's cost would scale with how many there are.
+
+  Amended by [ADR-0031](0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md):
+  a Policy whose filter is `ForStreamTypes` compares, reads and keeps places for the streams
+  of those types only, so its scan is proportional to the streams it tracks rather than to
+  every stream (funkode-io/replay#267).
 - **An operator's control surface moves** from `policy_cursors.position` to a place in
   `policy_stream_cursors`, and gets finer: a redelivery can be forced for one stream
   without rewinding the Policy over every other. The refresh machinery ADR-0012 needed is

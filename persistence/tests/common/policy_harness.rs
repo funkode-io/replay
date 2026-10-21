@@ -271,6 +271,18 @@ pub struct AppendedEvent {
     pub stream_id: String,
 }
 
+impl From<&HeldPing> for AppendedEvent {
+    /// The event a held append will be once it commits: its identity is fixed from the
+    /// moment the append drew it.
+    fn from(held: &HeldPing) -> Self {
+        AppendedEvent {
+            event_id: held.event_id,
+            global_position: held.global_position,
+            stream_id: held.stream_id.clone(),
+        }
+    }
+}
+
 /// A command the policy dispatched, observed as the event it wrote.
 ///
 /// The runner stamps every policy-issued command with causation metadata naming
@@ -609,7 +621,39 @@ impl PolicyDaemonHarness {
     /// is the only window in which a feed's order can be observed at all.
     pub async fn hold_a_ping_open(&self, stream: &str, tag: &str) -> HeldPing {
         let id = ProbeUrn::new(stream).expect("stream name must be a valid URN NSS");
-        let stream_id = id.to_urn().to_string();
+        self.hold_a_ping_of_type_open("Probe", id.to_urn().as_ref(), tag)
+            .await
+    }
+
+    /// Append a `Pinged` event to `stream_id`, a stream of `stream_type` — a stream of
+    /// another aggregate, as far as any Policy can tell, for a test about a Policy that
+    /// tracks some stream types and not others.
+    ///
+    /// The payload is a probe's, so a Policy that reads it can parse it: what makes a
+    /// stream another type's is the type its row carries, which is all a filter on it
+    /// reads.
+    pub async fn ping_of_type(
+        &self,
+        stream_type: &str,
+        stream_id: &str,
+        tag: &str,
+    ) -> AppendedEvent {
+        let held = self
+            .hold_a_ping_of_type_open(stream_type, stream_id, tag)
+            .await;
+        let appended = AppendedEvent::from(&held);
+        held.commit().await;
+        appended
+    }
+
+    /// [`hold_a_ping_open`](Self::hold_a_ping_open) into a stream of any type.
+    pub async fn hold_a_ping_of_type_open(
+        &self,
+        stream_type: &str,
+        stream_id: &str,
+        tag: &str,
+    ) -> HeldPing {
+        let stream_id = stream_id.to_string();
         let event = ProbeEvent::Pinged {
             tag: tag.to_string(),
         };
@@ -622,7 +666,7 @@ impl PolicyDaemonHarness {
             .bind(serde_json::json!({ PING_MARKER_KEY: Uuid::new_v4() }))
             .bind(replay::Event::event_type(&event))
             .bind(&stream_id)
-            .bind("Probe")
+            .bind(stream_type)
             .fetch_one(&mut *tx)
             .await
             .expect("the append must succeed inside the held transaction");

@@ -40,13 +40,29 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/policy_runner.rs",
+        function: "keep_tracked",
+        justification: "One row per stream nominated: by the sweep, which nominates at \
+                        most one stream per row it read, bounded by its LIMIT; or by the \
+                        carried queue, which `PollPlan::plan` caps at the read batch. Either \
+                        way the policy's resolved read_batch_size (default 100). The rows it \
+                        examines are the same ids, each one primary-key lookup.",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
         function: "streams_behind",
-        justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
-                        (default 100). Bounded by the tunable rather than by the number \
-                        of streams behind, which is why a Policy far behind catches up \
+        justification: "Rows returned: SQL carries LIMIT $limit, the policy's resolved \
+                        read_batch_size (default 100), so a Policy far behind catches up \
                         over several cadences instead of in one allocation; the batch \
                         resumes after the last id it examined, so the bound costs a \
-                        rotation rather than leaving a stream unexamined (ADR-0026).",
+                        rotation rather than leaving a stream unexamined (ADR-0026). Rows \
+                        examined: not bounded by the LIMIT — the behind predicate compares \
+                        two tables and is applied after the join, so a caught-up Policy \
+                        walks every stream it tracks to return nothing. What bounds that \
+                        is what the Policy tracks: every stream, or for a \
+                        ForStreamTypes(types) filter the streams of those types after the \
+                        rotation, read off idx_streams_type_id without a row of any other \
+                        type (ADR-0031). It costs Postgres a scan, not this process memory: \
+                        only the LIMIT reaches the Vec.",
     },
     Reviewed {
         file: "src/policy_runner.rs",
@@ -63,7 +79,9 @@ const REVIEWED: &[Reviewed] = &[
                         spent across the streams the poll looks at rather than per \
                         stream. One stream's events past its place, and not bounded by \
                         the policy's stream filter, which selects what is delivered from \
-                        the batch rather than what is read (ADR-0013).",
+                        the batch rather than what is read (ADR-0013). The stream itself is \
+                        one the Policy tracks: a ForStreamTypes filter keeps every other \
+                        type out of the candidate list before this runs (ADR-0031).",
     },
     Reviewed {
         file: "src/policy_runner.rs",
