@@ -217,7 +217,7 @@ _Avoid_: dismiss, drop, ignore.
 The _controlling_ act of an operator repositioning a [Policy] by writing its
 `policy_stream_cursors` row directly while the system runs. The third controlling action
 alongside [Retry] and [Discard], and the coarsest: it moves the Policy itself rather than
-one parked reaction, skipping events when it moves forward and re-delivering them when it
+one parked command, skipping events when it moves forward and re-delivering them when it
 moves backward. The instruction is a [Stream place] in one stream, so a redelivery can be
 forced for that stream alone. The running leader adopts it on the next poll, because it
 reads its places fresh every poll rather than holding them between polls

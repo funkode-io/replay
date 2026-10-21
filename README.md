@@ -2881,6 +2881,12 @@ the command and instance that failed (`aggregate_name`, `target_stream_id`,
 `PersistedEvent<serde_json::Value>`. `dead_letters_all(filter)` collects the stream
 for a caller that has decided to hold everything; the library never calls it.
 
+The rows one reaction parked share an `event_id`. `retry_dead_letter` on any of their
+ids replays the reaction once and settles **every** sibling row with it
+([ADR-0021](docs/adr/0021-retry-settles-a-reaction-not-a-row.md)), so a screen read
+before a retry can show siblings that are gone after it. `discard_dead_letter` archives
+only the row it names.
+
 #### Retrying and discarding dead letters
 
 Three operator controls on `PolicyRunner` resolve parked dead letters out of
