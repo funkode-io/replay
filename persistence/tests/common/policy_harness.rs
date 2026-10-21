@@ -646,13 +646,62 @@ impl PolicyDaemonHarness {
         stream_id: &str,
         tag: &str,
     ) -> HeldPing {
+        let tx = self.pool.begin().await.expect("beginning must succeed");
+        Self::append_held(tx, stream_type, stream_id, tag).await
+    }
+
+    /// Start a transaction that has taken its id and written nothing: an older writer, to
+    /// [`ping_in`](Self::ping_in) later, after a younger one has drawn its position.
+    pub async fn take_an_id(&self) -> Transaction<'static, Postgres> {
+        let mut tx = self.pool.begin().await.expect("beginning must succeed");
+        sqlx::query("SELECT pg_current_xact_id()")
+            .execute(&mut *tx)
+            .await
+            .expect("taking an id must succeed");
+        tx
+    }
+
+    /// Append a ping inside `tx`, which [`take_an_id`](Self::take_an_id) started.
+    pub async fn ping_in(
+        &self,
+        tx: Transaction<'static, Postgres>,
+        stream: &str,
+        tag: &str,
+    ) -> HeldPing {
+        let id = ProbeUrn::new(stream).expect("stream name must be a valid URN NSS");
+        Self::append_held(tx, "Probe", id.to_urn().as_ref(), tag).await
+    }
+
+    /// Make every poll fail once it has written its sweep: the table of places is
+    /// renamed away, so reading one fails. [`mend_places`](Self::mend_places) undoes it.
+    pub async fn break_places(&self) {
+        sqlx::query("ALTER TABLE policy_stream_cursors RENAME TO policy_stream_cursors_away")
+            .execute(&self.pool)
+            .await
+            .expect("renaming the places away must succeed");
+    }
+
+    /// Undo [`break_places`](Self::break_places).
+    pub async fn mend_places(&self) {
+        sqlx::query("ALTER TABLE policy_stream_cursors_away RENAME TO policy_stream_cursors")
+            .execute(&self.pool)
+            .await
+            .expect("renaming the places back must succeed");
+    }
+
+    /// Append a ping inside `tx` and hold it open.
+    async fn append_held(
+        mut tx: Transaction<'static, Postgres>,
+        stream_type: &str,
+        stream_id: &str,
+        tag: &str,
+    ) -> HeldPing {
         let stream_id = stream_id.to_string();
         let event = ProbeEvent::Pinged {
             tag: tag.to_string(),
         };
         let event_id = Uuid::new_v4();
 
-        let mut tx = self.pool.begin().await.expect("beginning must succeed");
         sqlx::query("SELECT id FROM append_event($1, $2, $3, $4, $5, $6, NULL)")
             .bind(event_id)
             .bind(serde_json::to_value(&event).expect("a probe event must serialise"))
@@ -939,7 +988,15 @@ impl PolicyDaemonHarness {
             .fetch_one(&mut *tx)
             .await
             .expect("the cursor row must exist before it can be held");
-        HeldCursorRow(tx)
+        let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the holder's backend must be readable");
+        HeldCursorRow {
+            tx,
+            holder,
+            pool: self.pool.clone(),
+        }
     }
 
     /// Hold the row lock on this policy's place in `stream_id` until the returned guard
@@ -1447,12 +1504,45 @@ impl PolicyDaemonReplica {
 
 /// Somebody else's open transaction on a cursor row. Dropping it rolls back, so
 /// a test that panics releases the row with its runtime.
-pub struct HeldCursorRow(sqlx::Transaction<'static, sqlx::Postgres>);
+pub struct HeldCursorRow {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    /// The backend the transaction is on, so "somebody is waiting" can be narrowed to
+    /// "somebody is waiting for *this*".
+    holder: i32,
+    pool: PgPool,
+}
 
 impl HeldCursorRow {
     /// Let the row go, without having changed it.
     pub async fn release(self) {
-        let _ = self.0.rollback().await;
+        let _ = self.tx.rollback().await;
+    }
+
+    /// Wait until a poll is queued behind this lock writing its sweep: it has swept and
+    /// looked up its late writes, and is recording how far it got.
+    pub async fn await_a_sweep_waiting(&self) {
+        let deadline = Instant::now() + OBSERVE_TIMEOUT;
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid)) \
+                    AND query LIKE '%discovered_through%'",
+            )
+            .bind(self.holder)
+            .fetch_one(&self.pool)
+            .await
+            .expect("reading who is blocked must succeed");
+
+            if waiting > 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {OBSERVE_TIMEOUT:?} waiting for a sweep to queue behind \
+                 the held cursor row"
+            );
+            tokio::time::sleep(OBSERVE_RECHECK).await;
+        }
     }
 }
 

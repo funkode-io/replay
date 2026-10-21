@@ -3221,6 +3221,14 @@ async fn drain_policy_once(
 
     // Everything from here to the settle is I/O against what the plan decided, and every
     // way out of it — including a failed statement — goes through the settle below.
+    // The late-write state goes with the sweep it was computed against, so it is taken
+    // before that sweep is written: a poll that fails, or a future dropped, after the
+    // sweep is persisted must not leave the tail of an older sweep behind it — the retry
+    // would search from the new position with the old tail, and a writer between the two
+    // would wait for the reconciliation. Taken earlier than the write it can only cover
+    // more: a retry from the old position re-reads what this tail already covers.
+    progress.late_writes = std::mem::take(&mut late.state);
+
     let drained: Result<usize, replay::Error> = async {
         // The sweep has read this stretch of log whatever the streams in it turn out to
         // owe, and a stream left unfinished is remembered rather than re-swept for.
@@ -3413,8 +3421,6 @@ async fn drain_policy_once(
         progress.reconciled_through = rotation;
         progress.reconciled();
     }
-
-    progress.late_writes = late.state;
 
     if exhausted {
         reporting.tell(&name, Poll::Exhausted);
@@ -4412,60 +4418,89 @@ async fn lookup_late_writes(
         };
         force_comparison = true;
     } else {
-        if let Some(tail) = state.tail.as_mut() {
-            let page = late_tail_page(pool, tail, sweep, read_batch).await?;
-            rows_read += page.rows.len() as u32;
-            nominate(&mut streams, page.rows);
-            if page.complete {
-                *tail = Tail::at(sweep, swept_through);
-            } else {
-                // The walk resumes from its cursor, but now also owes the ids assigned
-                // since this sweep — invisible to it, possibly at positions it passed.
-                // Raising the position bound to this sweep covers them; the rows it adds
-                // below the cursor's id are ones this sweep could see, so it only
-                // re-nominates, within the same batch.
-                tail.after = page.after;
-                tail.swept_through = swept_through;
-            }
+        // The tail and the ended transactions share the batch, and take turns leading it:
+        // were the tail always first, traffic that keeps its page full would leave an
+        // ended transaction to the reconciliation.
+        state.pending_first = !state.pending_first;
+        let order = if state.pending_first {
+            [LookupPart::Pending, LookupPart::Tail]
         } else {
-            state.tail = Some(Tail::at(sweep, swept_through));
-        }
-
-        if rows_read < read_batch {
-            // Bounded by `UNSEEN_TRANSACTION_CAP`, which `remember_open_transactions` holds
-            // `pending` under.
-            let mut ids: Vec<u64> = state.pending.keys().copied().collect();
-            if let Some(after) = state.unseen_after {
-                let split = ids.partition_point(|txid| *txid <= after);
-                ids.rotate_left(split);
-            }
-            let mut last_seen = None;
-            for txid in ids {
-                last_seen = Some(txid);
-                if active.contains(&txid) {
-                    continue;
-                }
-                let cursor = state.pending.get(&txid).copied().flatten();
-                // What is left of the batch now, not when the loop began: every page of
-                // this poll shares the one budget.
-                let remaining = read_batch - rows_read;
-                let page = ended_transaction_page(pool, txid, cursor, remaining).await?;
-                rows_read += page.rows.len() as u32;
-                nominate(&mut streams, page.rows);
-                match page.after {
-                    Some(after) if !page.complete => {
-                        state.pending.insert(txid, Some(after.1));
+            [LookupPart::Tail, LookupPart::Pending]
+        };
+        for part in order {
+            match part {
+                LookupPart::Tail => {
+                    let Some(tail) = state.tail.as_mut() else {
+                        state.tail = Some(Tail::at(sweep, swept_through));
+                        continue;
+                    };
+                    let page = if rows_read < read_batch {
+                        Some(late_tail_page(pool, tail, sweep, read_batch - rows_read).await?)
+                    } else {
+                        None
+                    };
+                    match page {
+                        Some(page) if page.complete => {
+                            rows_read += page.rows.len() as u32;
+                            nominate(&mut streams, page.rows);
+                            *tail = Tail::at(sweep, swept_through);
+                        }
+                        page => {
+                            // The walk resumes from its cursor, but now also owes the ids
+                            // assigned since this sweep — invisible to it, possibly at
+                            // positions it passed. Raising the position bound to this sweep
+                            // covers them; the rows it adds below the cursor's id are ones
+                            // this sweep could see, so it only re-nominates, within the
+                            // same batch.
+                            if let Some(page) = page {
+                                rows_read += page.rows.len() as u32;
+                                nominate(&mut streams, page.rows);
+                                tail.after = page.after;
+                            }
+                            tail.swept_through = swept_through;
+                        }
                     }
-                    _ => {
-                        state.pending.remove(&txid);
+                }
+                LookupPart::Pending => {
+                    if rows_read >= read_batch {
+                        continue;
+                    }
+                    // Bounded by `UNSEEN_TRANSACTION_CAP`, which `remember_open_transactions`
+                    // holds `pending` under.
+                    let mut ids: Vec<u64> = state.pending.keys().copied().collect();
+                    if let Some(after) = state.unseen_after {
+                        let split = ids.partition_point(|txid| *txid <= after);
+                        ids.rotate_left(split);
+                    }
+                    let mut last_seen = None;
+                    for txid in ids {
+                        last_seen = Some(txid);
+                        if active.contains(&txid) {
+                            continue;
+                        }
+                        let cursor = state.pending.get(&txid).copied().flatten();
+                        // What is left of the batch now, not when the loop began: every
+                        // page of this poll shares the one budget.
+                        let remaining = read_batch - rows_read;
+                        let page = ended_transaction_page(pool, txid, cursor, remaining).await?;
+                        rows_read += page.rows.len() as u32;
+                        nominate(&mut streams, page.rows);
+                        match page.after {
+                            Some(after) if !page.complete => {
+                                state.pending.insert(txid, Some(after.1));
+                            }
+                            _ => {
+                                state.pending.remove(&txid);
+                            }
+                        }
+                        if rows_read >= read_batch {
+                            break;
+                        }
+                    }
+                    if let Some(last_seen) = last_seen {
+                        state.unseen_after = Some(last_seen);
                     }
                 }
-                if rows_read >= read_batch {
-                    break;
-                }
-            }
-            if let Some(last_seen) = last_seen {
-                state.unseen_after = Some(last_seen);
             }
         }
 
@@ -5020,6 +5055,15 @@ struct LateWriteState {
     tail: Option<Tail>,
     unseen_after: Option<u64>,
     needs_reconciliation: bool,
+    /// Whether the ended transactions lead this poll's batch rather than the tail.
+    pending_first: bool,
+}
+
+/// The two halves of the late-write lookup, which take turns leading a poll's batch.
+#[derive(Clone, Copy)]
+enum LookupPart {
+    Tail,
+    Pending,
 }
 
 impl LateWriteState {
@@ -7009,6 +7053,51 @@ mod progress_tests {
         assert!(
             sweeps > 10,
             "the sweeps ran while writers committed: {sweeps}"
+        );
+    }
+
+    /// The tail and the ended transactions take turns leading the batch: a tail that
+    /// traffic keeps full, with a batch of one, still leaves an ended transaction its turn.
+    #[tokio::test]
+    async fn a_full_tail_does_not_starve_an_ended_transaction_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut first = None;
+        let mut through = 0;
+        for n in 0..5 {
+            let mut tx = pool.begin().await.expect("starting a traffic writer");
+            let (txid, position) = write_in(&mut tx, &format!("urn:probe:traffic-{n}")).await;
+            tx.commit().await.expect("committing a traffic writer");
+            first.get_or_insert(txid);
+            through = position;
+        }
+        let mut ended = pool.begin().await.expect("starting the ended writer");
+        let (ended_txid, ended_position) = write_in(&mut ended, "urn:probe:ended").await;
+        ended.commit().await.expect("committing the ended writer");
+
+        let mut state = LateWriteState {
+            tail: Some(Tail {
+                xmax: first.expect("traffic was written"),
+                swept_through: through,
+                after: None,
+            }),
+            pending: [(ended_txid, None)].into(),
+            ..LateWriteState::default()
+        };
+        let mut found = Vec::new();
+        for _ in 0..2 {
+            let sweep = sweep_for_streams(&pool, ended_position, 10)
+                .await
+                .expect("a sweep");
+            let late = lookup_late_writes(&pool, &state, &sweep, ended_position, 1)
+                .await
+                .expect("a lookup");
+            found.extend(late.streams);
+            state = late.state;
+        }
+
+        assert!(
+            found.contains(&"urn:probe:ended".to_string()),
+            "the ended transaction had its turn within two polls: {found:?}"
         );
     }
 

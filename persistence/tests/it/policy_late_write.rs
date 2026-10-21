@@ -134,3 +134,58 @@ async fn a_write_in_flight_across_a_leader_change_is_delivered_postgres_test() {
 
     harness.shutdown().await;
 }
+
+/// A poll that fails after writing its sweep keeps the late-write tail it computed
+/// against that sweep. Every poll fails while the places are away. One sweeps past a
+/// writer above its `xmax`, and is held at the write of its sweep while that writer
+/// commits — so the next poll sees it ended, below a sweep that has passed it. Were the
+/// failed poll to have kept an older tail, only the safety net — far away here — would
+/// find the write.
+#[tokio::test]
+async fn a_poll_that_fails_after_its_sweep_keeps_its_tail_postgres_test() {
+    let harness = PolicyDaemonHarness::start("late_write_failed_poll", |builder, policy| {
+        builder
+            .reconcile_every(SAFETY_NET)
+            .register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                |_| Vec::new(),
+            )
+    })
+    .await;
+
+    // A place moved back is found only by a comparison, so its redelivery proves the
+    // leader's start-up comparison has run: the next is the safety net's, far away.
+    let seed = harness.ping("seed", "seed").await;
+    harness.await_passed(seed.global_position).await;
+    harness.move_place_to(&seed.stream_id, 0).await;
+    harness.await_passed(seed.global_position).await;
+
+    harness.break_places().await;
+    let cursor_row = harness.hold_cursor_row(harness.policy_name()).await;
+    let older = harness.take_an_id().await;
+    let younger = harness.hold_a_ping_open("younger", "held").await;
+    let older = harness.ping_in(older, "older", "overtook").await;
+    older.commit().await;
+    cursor_row.await_a_sweep_waiting().await;
+    let position = younger.global_position;
+    younger.commit().await;
+    cursor_row.release().await;
+    let swept_past = position;
+    harness
+        .observe("the failed poll to write its sweep", || async {
+            (harness.swept_through().await? > swept_past).then_some(())
+        })
+        .await;
+    harness.mend_places().await;
+
+    harness
+        .observe_within(
+            "the write the failing polls swept past to be delivered",
+            Duration::from_secs(2),
+            || async { harness.has_passed(position).await.then_some(()) },
+        )
+        .await;
+
+    harness.shutdown().await;
+}
