@@ -11,7 +11,7 @@ use replay::{prelude::*, Compactable};
 use replay_macros::{define_aggregate, Urn};
 use replay_persistence::{
     AggregateVersion, CompactionOutcome, EventStore, ObservedEvent, PersistedEvent, PolicySettings,
-    StreamFilter,
+    StreamFilter, StreamScope,
 };
 
 // Re-use the README walkthrough verbatim as the source of truth. The example's
@@ -1448,6 +1448,231 @@ async fn already_compacted_skips_postgres_test() {
     );
 }
 
+// ── Batch compaction pre-check (issue #261) ──────────────────────────────────
+
+async fn migrated_store() -> (
+    common::postgres_image::PostgresServer,
+    replay_persistence::PostgresEventStore,
+) {
+    let container = start_postgres_server().await;
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+    (
+        container,
+        replay_persistence::PostgresEventStore::new(pg_pool),
+    )
+}
+
+/// The ids `Cqrs::streams_needing_compaction` yields, as text.
+async fn due<A: replay::Aggregate>(
+    cqrs: &replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
+    scope: StreamScope,
+    after: Option<A::StreamId>,
+) -> Vec<String> {
+    cqrs.streams_needing_compaction::<A>(scope, after)
+        .map_ok(|id| Into::<Urn>::into(id).to_string())
+        .try_collect()
+        .await
+        .unwrap()
+}
+
+fn bank_account(id: &str) -> BankAccountUrn {
+    BankAccountUrn::try_from(Urn::from_str(&format!("urn:bank-account:{id}")).unwrap()).unwrap()
+}
+
+async fn deposit(
+    cqrs: &replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
+    id: &BankAccountUrn,
+) {
+    cqrs.execute::<BankAccount>(
+        id,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            amount: 10.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// The batch pre-check answers exactly what `needs_compaction` answers per stream: a
+/// never-compacted stream is due, a compacted-and-unchanged one is not, a `Skipped`
+/// compaction drops its stream out too, an append past the watermark brings a stream
+/// back, and a stream of another aggregate type is never due for that pass.
+#[tokio::test]
+async fn streams_needing_compaction_follows_the_watermark_postgres_test() {
+    let (_container, store) = migrated_store().await;
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+    let meta = replay::Metadata::default();
+
+    let fresh = bank_account("fresh");
+    let settled = bank_account("settled");
+    deposit(&cqrs, &fresh).await;
+    deposit(&cqrs, &settled).await;
+    let aggregate = cqrs.fetch_aggregate::<BankAccount>(&settled).await.unwrap();
+    cqrs.compact(&aggregate, meta.clone()).await.unwrap();
+
+    // Another aggregate type, born minimal: due in its own pass until a Skipped compaction.
+    let minimal = SnapshotBoxUrn::new("minimal").unwrap();
+    store
+        .store_events::<SnapshotBox>(
+            &minimal,
+            "SnapshotBox".to_string(),
+            meta.clone(),
+            &[SnapshotBoxEvent::Snapshot { total: 5 }],
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        due::<BankAccount>(&cqrs, StreamScope::All, None).await,
+        vec!["urn:bank-account:fresh"],
+        "never compacted is due; compacted and unchanged is not; another type is not"
+    );
+    assert_eq!(
+        due::<SnapshotBox>(&cqrs, StreamScope::All, None).await,
+        vec!["urn:snapshot-box:minimal"],
+    );
+
+    let snapshot = cqrs.fetch_aggregate::<SnapshotBox>(&minimal).await.unwrap();
+    assert_eq!(
+        cqrs.compact(&snapshot, meta.clone()).await.unwrap(),
+        CompactionOutcome::Skipped
+    );
+    assert!(
+        due::<SnapshotBox>(&cqrs, StreamScope::All, None)
+            .await
+            .is_empty(),
+        "a Skipped compaction still advances the watermark"
+    );
+
+    deposit(&cqrs, &settled).await;
+    assert_eq!(
+        due::<BankAccount>(&cqrs, StreamScope::All, None).await,
+        vec!["urn:bank-account:fresh", "urn:bank-account:settled"],
+        "an append past the watermark brings the stream back"
+    );
+}
+
+/// Prefix and suffix scopes select by stream id; a tenant scope is a scoped-URN suffix
+/// that also takes nested scopes under the tenant, and `%` / `_` in a scope are literal.
+#[tokio::test]
+async fn streams_needing_compaction_narrows_by_scope_postgres_test() {
+    let (_container, store) = migrated_store().await;
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    for nss in [
+        "eu-1@tenant:acme",
+        "eu-2@tenant:globex",
+        "us-1@tenant:acme",
+        "us-2@user:7@tenant:acme",
+        "us-3@tenant:acme-eu",
+        "us-4@tenant:acme_x",
+        "us-5@tenant:acmeyx",
+        // `%` appears in a URN only as a percent-escape.
+        "50%25_off",
+        "50%25xoff",
+        "50abc25_off",
+    ] {
+        deposit(&cqrs, &bank_account(nss)).await;
+    }
+    let tenant = Urn::from_str("urn:tenant:acme").unwrap();
+
+    assert_eq!(
+        due::<BankAccount>(&cqrs, StreamScope::within(&tenant), None).await,
+        vec![
+            "urn:bank-account:eu-1@tenant:acme",
+            "urn:bank-account:us-1@tenant:acme",
+            "urn:bank-account:us-2@user:7@tenant:acme",
+        ],
+    );
+    assert_eq!(
+        due::<BankAccount>(
+            &cqrs,
+            StreamScope::Prefix("urn:bank-account:eu-".into()),
+            None
+        )
+        .await,
+        vec![
+            "urn:bank-account:eu-1@tenant:acme",
+            "urn:bank-account:eu-2@tenant:globex",
+        ],
+    );
+    assert_eq!(
+        due::<BankAccount>(&cqrs, StreamScope::Suffix("@tenant:acme_x".into()), None).await,
+        vec!["urn:bank-account:us-4@tenant:acme_x"],
+        "_ in a suffix matches only itself"
+    );
+    assert_eq!(
+        due::<BankAccount>(
+            &cqrs,
+            StreamScope::Prefix("urn:bank-account:50%25_".into()),
+            None
+        )
+        .await,
+        vec!["urn:bank-account:50%25_off"],
+        "% and _ in a prefix match only themselves"
+    );
+}
+
+/// The stream reads in keyset chunks: across several of them it yields every due stream
+/// once, in id order, and resumes strictly after a given key.
+#[tokio::test]
+async fn streams_needing_compaction_reads_across_chunks_postgres_test() {
+    let (_container, store) = migrated_store().await;
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+
+    // Two and a half chunks' worth, so the read crosses chunk boundaries and ends on a
+    // short one. Every tenth stream is settled, so chunks are not just id ranges.
+    let mut expected = Vec::new();
+    for n in 0..275 {
+        let id = bank_account(&format!("{n:04}"));
+        deposit(&cqrs, &id).await;
+        if n % 10 == 0 {
+            let aggregate = cqrs.fetch_aggregate::<BankAccount>(&id).await.unwrap();
+            cqrs.compact(&aggregate, replay::Metadata::default())
+                .await
+                .unwrap();
+        } else {
+            expected.push(format!("urn:bank-account:{n:04}"));
+        }
+    }
+
+    let all = due::<BankAccount>(&cqrs, StreamScope::All, None).await;
+    assert_eq!(all.len(), 247);
+    assert_eq!(all, expected, "every due stream once, in id order");
+
+    let resumed = due::<BankAccount>(&cqrs, StreamScope::All, Some(bank_account("0149"))).await;
+    let after: Vec<String> = expected
+        .iter()
+        .filter(|id| id.as_str() > "urn:bank-account:0149")
+        .cloned()
+        .collect();
+    assert_eq!(resumed, after, "resumes strictly after the key");
+
+    // The store page itself honours its limit.
+    let page = store
+        .streams_needing_compaction_page("BankAccount", &StreamScope::All, None, 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(Urn::to_string).collect::<Vec<_>>(),
+        expected[..7]
+    );
+}
+
 // ── Inline projection (issue #58) ─────────────────────────────────────────────
 
 /// End-to-end test for the inline-projection walking skeleton.
@@ -1696,6 +1921,223 @@ async fn bank_account_inline_projection_failure_rolls_back_postgres_test() {
             .expect("counting projection writes must succeed");
 
     assert_eq!(projection_write_count, 0);
+}
+
+// ── Inline projection rebuild reads the true log (issue #274) ─────────────────
+
+/// Records the ids of every batch an inline projection is handed, on append and on
+/// rebuild alike, so a test can tell which events reached it and how many times.
+///
+/// `version` is a field so a test can register the same projection at a higher code
+/// version and trigger a drift rebuild; `filter` is the projection's `stream_filter`.
+struct RebuildEventRecorder {
+    batches: std::sync::Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>,
+    version: i32,
+    filter: StreamFilter,
+}
+
+impl replay_persistence::InlineProjection for RebuildEventRecorder {
+    type Exec = sqlx::PgConnection;
+    type Event = BankAccountEvent;
+
+    fn name(&self) -> &str {
+        "rebuild_event_recorder"
+    }
+
+    fn version(&self) -> i32 {
+        self.version
+    }
+
+    fn stream_filter(&self) -> StreamFilter {
+        self.filter.clone()
+    }
+
+    async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        Ok(())
+    }
+
+    async fn reset(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        self.batches.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        _conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> Result<(), replay::Error> {
+        self.batches
+            .lock()
+            .unwrap()
+            .push(events.iter().map(|event| event.id).collect());
+        Ok(())
+    }
+}
+
+/// The account every true-log rebuild test compacts, and the stream their filters name.
+fn rebuild_account() -> BankAccountUrn {
+    BankAccountUrn::new("rebuild-true-log").expect("a valid account id")
+}
+
+/// A projection that reads everything still sees no compaction snapshot on rebuild.
+#[tokio::test]
+async fn inline_projection_rebuild_excludes_compaction_snapshots_postgres_test() {
+    assert_inline_projection_rebuilds_true_log(StreamFilter::All).await;
+}
+
+/// A projection narrowed to the compacted stream itself, the stream its snapshot rows
+/// are written to, still sees none of them.
+#[tokio::test]
+async fn filtered_inline_projection_rebuild_excludes_compaction_snapshots_postgres_test() {
+    assert_inline_projection_rebuilds_true_log(StreamFilter::with_stream_id::<BankAccount>(
+        &rebuild_account(),
+    ))
+    .await;
+}
+
+/// An `Or` filter cannot escape the snapshot predicate: the rebuild query wraps the
+/// projection's filter in parentheses, so `snapshot = false AND (a OR b)` holds for
+/// both branches, the one naming the compacted stream included.
+#[tokio::test]
+async fn or_filtered_inline_projection_rebuild_excludes_compaction_snapshots_postgres_test() {
+    let elsewhere = BankAccountUrn::new("rebuild-true-log-elsewhere").expect("a valid account id");
+    assert_inline_projection_rebuilds_true_log(
+        StreamFilter::with_stream_id::<BankAccount>(&elsewhere).or(StreamFilter::with_stream_id::<
+            BankAccount,
+        >(&rebuild_account())),
+    )
+    .await;
+}
+
+/// Appends a deposit and a month close to an unrelated account and then to
+/// [`rebuild_account`], compacting each into one snapshot row, then registers a
+/// recorder under `filter`. Its first replay must deliver the real events `filter`
+/// selects once each (the unrelated account's only under [`StreamFilter::All`], so
+/// a narrow filter visibly narrows); a later append must be delivered once live; and
+/// a version bump must replay the same real events plus that append once each, never
+/// a snapshot, one per batch at a flush size of one.
+async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
+    let container = start_postgres_server().await;
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(POSTGRES_PORT).await.unwrap();
+    let pool = connect_to_postgres(host, port).await;
+    sqlx::migrate!("./tests/migrations")
+        .run(&pool)
+        .await
+        .unwrap();
+
+    let store = replay_persistence::PostgresEventStore::new(pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+    let unrelated = BankAccountUrn::new("rebuild-true-log-unrelated").expect("a valid account id");
+    let account = rebuild_account();
+    let month = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+    // The real events `filter` selects, in global-position order.
+    let mut expected = Vec::new();
+    for stream in [&unrelated, &account] {
+        let selected = matches!(filter, StreamFilter::All) || stream == &account;
+        let events = [
+            BankAccountEvent::Deposited {
+                operation_date: month,
+                amount: 100.0,
+            },
+            BankAccountEvent::MonthlyClosed {
+                month,
+                closing_balance: 100.0,
+            },
+        ];
+        store
+            .store_events_stream::<BankAccount, _, _>(
+                stream,
+                BankAccount::stream_type(),
+                replay::Metadata::default(),
+                futures::stream::iter(events.into_iter().map(Ok)),
+                None,
+                |event: &PersistedEvent<BankAccountEvent>| {
+                    if selected {
+                        expected.push(event.id)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        let aggregate = cqrs.fetch_aggregate::<BankAccount>(stream).await.unwrap();
+        assert!(matches!(
+            cqrs.compact(&aggregate, replay::Metadata::default())
+                .await
+                .unwrap(),
+            CompactionOutcome::Compacted { .. }
+        ));
+    }
+
+    let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rebuilt = replay_persistence::PostgresEventStore::builder(pool.clone())
+        .projection_flush_size(1)
+        .register(RebuildEventRecorder {
+            batches: batches.clone(),
+            version: 1,
+            filter: filter.clone(),
+        })
+        .build()
+        .await
+        .unwrap();
+
+    {
+        let batches = batches.lock().unwrap();
+        assert_eq!(
+            batches.iter().flatten().copied().collect::<Vec<_>>(),
+            expected,
+            "first registration replays the selected real events once each"
+        );
+        assert!(batches.iter().all(|batch| batch.len() <= 1));
+    }
+
+    rebuilt
+        .store_events_stream::<BankAccount, _, _>(
+            &account,
+            BankAccount::stream_type(),
+            replay::Metadata::default(),
+            futures::stream::iter([Ok(BankAccountEvent::Deposited {
+                operation_date: month,
+                amount: 200.0,
+            })]),
+            None,
+            |event: &PersistedEvent<BankAccountEvent>| expected.push(event.id),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected,
+        "live append delivers the new real event exactly once"
+    );
+
+    let _drift_rebuilt = replay_persistence::PostgresEventStore::builder(pool)
+        .projection_flush_size(1)
+        .register(RebuildEventRecorder {
+            batches: batches.clone(),
+            version: 2,
+            filter,
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let batches = batches.lock().unwrap();
+    assert_eq!(
+        batches.iter().flatten().copied().collect::<Vec<_>>(),
+        expected,
+        "version drift replays archived originals and post-compaction appends exactly once"
+    );
+    assert!(batches.iter().all(|batch| batch.len() <= 1));
 }
 
 // ── Inline projection version drift rebuild (issue #60) ───────────────────────

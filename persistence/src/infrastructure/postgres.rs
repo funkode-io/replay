@@ -195,7 +195,7 @@ impl PostgresEventStore {
 
     /// Begin configuring a store with inline projections.
     ///
-    /// Projections are registered on the builder and frozen by [`PostgresEventStoreBuilder::build`],
+    /// Projections are registered on the builder and frozen by the builder's `build`,
     /// which runs their first-time `init` and records their version in the `projections` table.
     pub fn builder(pool: Pool<Postgres>) -> PostgresEventStoreBuilder {
         PostgresEventStoreBuilder {
@@ -509,7 +509,8 @@ impl PostgresEventStoreBuilder {
                     // Replay matching history through the projection so a projection added to
                     // a store that already contains events catches up to the full backlog
                     // (not just events appended after registration). The projection's
-                    // stream_filter narrows which events are scanned.
+                    // stream_filter narrows which events are scanned; compaction snapshots
+                    // are never replayed (funkode-io/replay#274).
                     let replayed =
                         Self::replay_history(&mut tx, &mut *projection, chunk_size).await?;
                     tracing::info!(
@@ -540,7 +541,8 @@ impl PostgresEventStoreBuilder {
                     projection.reset(&mut tx).await?;
 
                     // Replay matching history through the projection. The projection's
-                    // stream_filter narrows which events are scanned.
+                    // stream_filter narrows which events are scanned; compaction snapshots
+                    // are never replayed (funkode-io/replay#274).
                     let replayed =
                         Self::replay_history(&mut tx, &mut *projection, chunk_size).await?;
                     tracing::info!(
@@ -648,7 +650,7 @@ impl PostgresEventStoreBuilder {
     ) -> Result<(Vec<PersistedEvent<Value>>, Option<ReplayCursor>), replay::Error> {
         let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
             "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, global_position \
-             FROM events WHERE (",
+             FROM events WHERE compacted_snapshot = FALSE AND (",
         );
         PostgresEventStore::add_filters(&mut query_builder, filter);
         query_builder.push(")");
@@ -937,6 +939,53 @@ impl EventStore for PostgresEventStore {
         .map_err(crate::db_error)?;
 
         Ok(needs.unwrap_or(false))
+    }
+
+    async fn streams_needing_compaction_page(
+        &self,
+        stream_type: &str,
+        scope: &crate::StreamScope,
+        after: Option<&Urn>,
+        limit: u32,
+    ) -> Result<Vec<Urn>, replay::Error> {
+        // `needs_compaction`'s predicate over a keyset page of `streams`. Walked in `id`
+        // order on the primary key, with the type and scope as filters: no index serves a
+        // suffix, and under a non-C collation the primary key's btree cannot serve a
+        // `LIKE` prefix either, so the scan stops after `limit` matches rather than
+        // narrowing to the scope first.
+        let mut query: QueryBuilder<Postgres> = QueryBuilder::new(
+            "SELECT id FROM streams \
+             WHERE version > COALESCE(last_compacted_version, 0) AND type = ",
+        );
+        query.push_bind(stream_type);
+        if let Some(after) = after {
+            query.push(" AND id > ").push_bind(after.to_string());
+        }
+        if let Some(pattern) = scope.like_pattern() {
+            query
+                .push(" AND id LIKE ")
+                .push_bind(pattern)
+                .push(" ESCAPE '\\'");
+        }
+        query
+            .push(" ORDER BY id LIMIT ")
+            .push_bind(i64::from(limit));
+
+        // Bounded by `limit`, the caller's page size: never by the number of due streams.
+        let ids: Vec<String> = query
+            .build_query_scalar()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                crate::db_error(e)
+                    .with_operation("reading the streams that need compaction")
+                    .with_context("stream_type", stream_type.to_string())
+                    .with_context("scope", format!("{:?}", scope))
+            })?;
+
+        ids.into_iter()
+            .map(|id| crate::error::stored_stream_id(&id, "streams_needing_compaction_page"))
+            .collect()
     }
 
     async fn compact<A>(

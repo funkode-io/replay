@@ -140,14 +140,29 @@ const REVIEWED: &[Reviewed] = &[
                         them, not by data — the per-stream frontier each row carries is \
                         aggregated in SQL, so it costs a scan and not a row.",
     },
-    // ── Known unbounded ──────────────────────────────────────────────────────
+    Reviewed {
+        file: "src/policy_status.rs",
+        function: "read_dead_letter_chunk",
+        justification: "`LIMIT DEAD_LETTER_CHUNK` (100): one keyset chunk of the \
+                        `dead_letters` stream, which reads the next chunk only after the \
+                        consumer has taken this one.",
+    },
     Reviewed {
         file: "src/infrastructure/postgres.rs",
-        function: "load_events_for_replay",
-        justification: "UNBOUNDED — loads all history matching a projection's filter, and \
-                        holds the rows and the parsed events at once. Tracked by \
-                        funkode-io/replay#157; this entry must be deleted when it is fixed, \
-                        not amended.",
+        function: "streams_needing_compaction_page",
+        justification: "SQL carries LIMIT $limit, the caller's page size; one id per row. \
+                        `Cqrs::streams_needing_compaction` calls it with \
+                        its compaction_chunk_size (default 100) and resumes after the last \
+                        id, so a pass over a whole scope holds one chunk at a time.",
+    },
+    Reviewed {
+        file: "src/infrastructure/postgres.rs",
+        function: "load_replay_chunk",
+        justification: "SQL carries LIMIT $chunk_size, the store's projection_flush_size \
+                        (default 500): one keyset page of an inline projection's history \
+                        replay, handed to the projection before the next is read \
+                        (funkode-io/replay#157). Compaction snapshots are excluded, so a \
+                        rebuild reads the true log once (funkode-io/replay#274).",
     },
 ];
 

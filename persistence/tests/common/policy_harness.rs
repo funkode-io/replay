@@ -21,7 +21,9 @@
 //! - [`PolicyDaemonHarness::dead_letters`] — the reactions it parked.
 //! - [`PolicyDaemonHarness::status`] — the policy as the status read model
 //!   reports it, which is what a consumer's health endpoint shows.
-//! - [`PolicyDaemonHarness::archived_dead_letters`] — the parked reactions that
+//! - [`PolicyDaemonHarness::status_store`] — the read model itself, for a test
+//!   that lists or counts parked commands the way a consumer does.
+//! - [`PolicyDaemonHarness::archived_dead_letters`] — the parked commands that
 //!   have left the active set, and what settled them.
 //! - [`PolicyDaemonHarness::stopped_workers`] — the workers the runner gave up
 //!   on, which is what an operator reads off the daemon in their own service.
@@ -828,6 +830,12 @@ impl PolicyDaemonHarness {
         self.move_place_to(&event.stream_id, place - 1).await;
     }
 
+    /// The read model a consumer builds over this database: what it lists and
+    /// counts parked commands through.
+    pub fn status_store(&self) -> PolicyStatusStore {
+        PolicyStatusStore::new(self.pool.clone())
+    }
+
     /// The policy's status as a consumer reads it off [`PolicyStatusStore`] —
     /// the read model, not the tables it derives from.
     ///
@@ -1176,6 +1184,18 @@ impl PolicyDaemonHarness {
         .expect("a pre-migration row must still be insertable")
     }
 
+    /// Delete `event` from the log, as no running code does: an operator's hand, or a
+    /// restore that lost it, leaving the commands it parked behind.
+    pub async fn remove_from_log(&self, event: &AppendedEvent) {
+        let removed = sqlx::query("DELETE FROM events WHERE id = $1")
+            .bind(event.event_id)
+            .execute(&self.pool)
+            .await
+            .expect("the event must be deletable by hand")
+            .rows_affected();
+        assert_eq!(removed, 1, "the event must have been in the log");
+    }
+
     /// Park a second copy of `id`, the way a redelivery did before the table
     /// had a key for a parked command (funkode-io/replay#220).
     ///
@@ -1295,7 +1315,7 @@ impl PolicyDaemonHarness {
     /// Wait until the policy has parked at least `count` reactions, and return
     /// every dead letter it has.
     pub async fn await_dead_letters(&self, count: usize) -> Vec<DeadLetter> {
-        self.observe(&format!("{count} parked reaction(s)"), || async {
+        self.observe(&format!("{count} parked command(s)"), || async {
             let parked = self.dead_letters().await;
             (parked.len() >= count).then_some(parked)
         })
