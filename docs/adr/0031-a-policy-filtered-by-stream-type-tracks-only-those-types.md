@@ -34,13 +34,27 @@ the `streams` row, fixed when the stream is created.
 **When a Policy's filter is `StreamFilter::ForStreamTypes(types)`, the streams it tracks
 are the streams whose `streams.type` is in `types`, and every path honours that set:**
 
-- **The reconciliation** compares only those streams:
-  `WHERE s.type = ANY($types) AND s.id > $rotation`, served by an index on
-  `streams (type, id)` (migration 0036, which supersedes 0005's index on `type` alone;
-  migration 0037 drops that one once its replacement exists). Its
-  cost is proportional to the tracked streams after the rotation, and it reads no row of
-  another type. The rotation rules of ADR-0026 are unchanged: it rotates through the
-  tracked streams, and moves only through streams the poll read.
+- **The reconciliation** compares only those streams, by one walk of an index on
+  `streams (type, id)` per tracked type (migration 0036, which supersedes 0005's index on
+  `type` alone; migration 0037 drops that one once its replacement exists). Each walk is a
+  range of that index, `(s.type, s.id) > ($type, $rotation) AND s.type <= $type`, ordered
+  by `(type, id)` and stopped at the `LIMIT`; the walks are merged in id order under the
+  same `LIMIT`. Its cost is proportional to the tracked streams after the rotation, it
+  reads no row of another type, and what Postgres holds before the outer `LIMIT` is at
+  most `types × LIMIT` ids. The rotation rules of ADR-0026 are unchanged: it rotates
+  through the tracked streams, and moves only through streams the poll read.
+
+  The plan is type-first by the statement's shape, not by the planner's choice. The first
+  form, `WHERE s.type = ANY($types) AND s.id > $rotation ORDER BY s.id`, was planned
+  through the type index only at test scale. Where the heap lies in id order and the
+  planner guesses the `LIMIT` will stop early — from 1,024 streams over 8 interleaved
+  types on PostgreSQL 15 — it walks `streams_pkey` instead and filters by type, so a
+  caught-up Policy read every row of every type; #277 measured the same plan at 131,072
+  streams over 24 types (funkode-io/replay#277). Rewriting it per type as
+  `s.type = $type AND s.id > $rotation ORDER BY s.id` is not enough: the equality makes
+  `type` a constant, the ordering is `id` alone again, and on such a heap the primary key
+  is still chosen, once per type. Only the range form leaves `type` in the ordering, so
+  that one index serves the walk without a sort.
 - **The sweep** is exactly as cheap as before. It reads its `LIMIT` of new events by
   position and advances `swept_through` over all of them, then *drops* the nominations
   whose type is not tracked — one primary-key lookup per nominated stream, bounded by the
