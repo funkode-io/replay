@@ -102,7 +102,7 @@ async fn seed_events(pool: &PgPool, stream_id: &str, events: impl Iterator<Item 
 
 async fn fetch_event_rows(pool: &PgPool, stream_id: &str) -> Vec<PgRow> {
     sqlx::query(
-        "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version \
+        "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, compacted_snapshot \
          FROM events WHERE stream_id = $1 ORDER BY version",
     )
     .bind(stream_id)
@@ -140,6 +140,7 @@ async fn reading_a_batch_of_events_allocates_once_per_payload() {
 
     assert_eq!(events.len() as i64, EVENTS);
     assert_eq!(events[0].data.blocks.len(), BLOCKS_PER_EVENT);
+    assert!(!events[0].compacted_snapshot);
 
     // 1× the payload, not 2×: a deep copy of the decoded document (the old
     // `data_raw.clone()`) would push this to ~200%.
