@@ -169,8 +169,13 @@ A reaction that panicked before building a dispatch has nothing to name, and its
 identity columns are null.
 A row also records what has been tried on it: how many times a [Retry] has
 settled it, and when the last one did.
-Dead letters are queryable so an operator can later inspect them and either
-[Retry] or [Discard] them.
+Dead letters are listed, each with its triggering event, so an operator or a
+consumer's UI can inspect them and either [Retry] or [Discard] them without
+reading Replay's tables. The listing is a stream that resumes after a row's id and
+is narrowed by the Policy, the triggering event's stream and its type; its count is
+a call of its own
+([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)). Listing is
+_observing_, as [Policy status] is.
 _Avoid_: poison message, failed event, error queue.
 
 ### Retry
