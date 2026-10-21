@@ -4690,6 +4690,9 @@ impl PolicyProgress {
         tracked: Option<&[String]>,
     ) -> Result<(), replay::Error> {
         if self.tracked.as_deref() != tracked {
+            if let Some(types) = tracked {
+                self.unfinished = tracked_among(pool, self.unfinished.clone(), types).await?;
+            }
             write_tracked(pool, name, tracked).await?;
             self.tracked = tracked.map(<[String]>::to_vec);
         }
@@ -6822,6 +6825,33 @@ mod progress_tests {
         );
     }
 
+    /// A stream left unfinished under a filter that has since narrowed past it is not
+    /// carried into the next poll. It is no longer tracked, so that poll must neither read
+    /// it nor write it a place, and the carried queue is the one source the sweep's and
+    /// the reconciliation's own type checks never see (ADR-0030).
+    #[tokio::test]
+    async fn a_narrowed_filter_carries_no_stream_it_no_longer_tracks_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 1).await;
+        append_streams_of(&pool, "Ledger", "urn:ledger:b", 1).await;
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
+            .await
+            .expect("loading must succeed");
+        progress.unfinished = vec!["urn:ledger:b1".to_string(), "urn:probe:a".to_string()];
+
+        let tracked = probes_only();
+        progress
+            .track(&pool, POLICY, Some(&tracked))
+            .await
+            .expect("tracking must succeed");
+
+        assert_eq!(
+            progress.unfinished,
+            vec!["urn:probe:a".to_string()],
+            "the ledger stream is no longer tracked, so it is no longer owed"
+        );
+    }
+
     /// Every row a plan node of `relation` produced or threw away, summed over the plan:
     /// what the statement *examined* there, as opposed to what it returned.
     fn rows_examined(plan: &serde_json::Value, relation: &str) -> f64 {
@@ -6878,6 +6908,60 @@ mod progress_tests {
             "the streams of the tracked type, and none of the other however far behind"
         );
 
+        let (examined, plan) = streams_examined_by_reconciliation(&pool, &tracked).await;
+        assert!(
+            examined <= 3.0,
+            "the reconciliation examined {examined} rows of `streams` to compare 3: it \
+             walked streams the Policy does not track\n{plan:#}"
+        );
+    }
+
+    /// A Policy tracking several types compares the streams of each, and still reads no
+    /// row of a type it does not track — even one that sorts between them, which a scan
+    /// of a range from the lowest tracked type to the highest would walk.
+    #[tokio::test]
+    async fn a_policy_tracking_two_stream_types_examines_no_stream_of_a_third_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        // `Ledger` sorts between `Audit` and `Probe`, by type and by id.
+        append_streams_of(&pool, "Audit", "urn:audit:a", 2).await;
+        append_streams_of(&pool, "Ledger", "urn:ledger:b", 2_000).await;
+        append_streams_of(&pool, "Probe", "urn:probe:c", 2).await;
+        sqlx::query("ANALYZE streams")
+            .execute(&pool)
+            .await
+            .expect("analyzing must succeed");
+        let tracked = vec!["Audit".to_string(), "Probe".to_string()];
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, Some(&tracked))
+            .await
+            .expect("loading must succeed");
+
+        assert_eq!(
+            streams_behind(&pool, POLICY, Some(&tracked), "", 10)
+                .await
+                .unwrap(),
+            vec![
+                "urn:audit:a1".to_string(),
+                "urn:audit:a2".to_string(),
+                "urn:probe:c1".to_string(),
+                "urn:probe:c2".to_string()
+            ],
+            "the streams of both tracked types, in id order, and none of the third"
+        );
+
+        let (examined, plan) = streams_examined_by_reconciliation(&pool, &tracked).await;
+        assert!(
+            examined <= 4.0,
+            "the reconciliation examined {examined} rows of `streams` to compare 4: it \
+             walked streams the Policy does not track\n{plan:#}"
+        );
+    }
+
+    /// The rows of `streams` the reconciliation of a Policy tracking `tracked` examines
+    /// from the start of its rotation, and the plan that says so.
+    async fn streams_examined_by_reconciliation(
+        pool: &PgPool,
+        tracked: &[String],
+    ) -> (f64, serde_json::Value) {
         // The production statement, verbatim: a constant, so nothing is interpolated.
         let plan: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "EXPLAIN (ANALYZE, FORMAT JSON) {STREAMS_BEHIND_OF_TYPES}"
@@ -6885,16 +6969,11 @@ mod progress_tests {
         .bind(POLICY)
         .bind("")
         .bind(10_i64)
-        .bind(&tracked)
-        .fetch_one(&pool)
+        .bind(tracked)
+        .fetch_one(pool)
         .await
         .expect("explaining must succeed");
-        let examined = rows_examined(&plan[0]["Plan"], "streams");
-        assert!(
-            examined <= 3.0,
-            "the reconciliation examined {examined} rows of `streams` to compare 3: it \
-             walked streams the Policy does not track\n{plan:#}"
-        );
+        (rows_examined(&plan[0]["Plan"], "streams"), plan)
     }
 }
 

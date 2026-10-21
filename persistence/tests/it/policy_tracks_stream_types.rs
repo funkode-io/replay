@@ -19,8 +19,8 @@ use common::policy_harness::{
 };
 use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
 use replay_persistence::{
-    Cqrs, Dispatch, ObservedEvent, PolicyRunner, PolicySettings, PostgresEventStore, StartAt,
-    StreamFilter,
+    Cqrs, Dispatch, ObservedEvent, PolicyRunner, PolicySettings, PolicyStatusStore,
+    PostgresEventStore, StartAt, StreamFilter,
 };
 
 /// The stream type nothing in these tests tracks.
@@ -294,4 +294,71 @@ async fn the_sweep_passes_a_batch_of_untracked_events_one_limit_at_a_time_postgr
             .await
             .expect("the places must be readable");
     assert_eq!(places, 0, "and no untracked stream was given a place");
+}
+
+/// The status read model knows what a Policy tracks only from what its runner recorded.
+/// A row with no record — written before `tracked_stream_types` existed, by a deployment
+/// whose runner has not restarted since — reads as tracking every stream, so every
+/// untracked stream counts as behind. The first runner to start the Policy records its
+/// types, and from then on the lag is counted over those streams alone.
+#[tokio::test]
+async fn status_counts_every_stream_until_a_runner_records_what_the_policy_tracks_postgres_test() {
+    let container = start_postgres_server().await;
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to read the container host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("failed to read the container port");
+    let pool = migrated_pool(port, &host).await;
+
+    let policy = "tracks_types_unrecorded";
+    let runner = || {
+        PolicyRunner::builder(Cqrs::new(PostgresEventStore::new(pool.clone())))
+            .register_services::<Probe>(())
+            .register_policy_fn::<ProbeEvent, _>(policy, probes_only(), echo_back)
+            .build()
+    };
+    let status = || async {
+        PolicyStatusStore::new(pool.clone())
+            .list()
+            .await
+            .expect("the status must be readable")
+            .into_iter()
+            .find(|status| status.name == policy)
+            .map(|status| (status.lag, status.streams_behind))
+            .expect("the Policy has a cursor row")
+    };
+
+    append(&pool, UNTRACKED, &ledger("a")).await;
+    append(&pool, UNTRACKED, &ledger("a")).await;
+    append(&pool, UNTRACKED, &ledger("b")).await;
+    runner().drain().await.expect("a drain must succeed");
+    assert_eq!(
+        status().await,
+        (0, 0),
+        "recorded: the ledger streams are not this Policy's"
+    );
+
+    // What a row written before the column existed looks like.
+    sqlx::query("UPDATE policy_cursors SET tracked_stream_types = NULL WHERE name = $1")
+        .bind(policy)
+        .execute(&pool)
+        .await
+        .expect("clearing the record must succeed");
+    assert_eq!(
+        status().await,
+        (3, 2),
+        "unrecorded: every stream is counted, and the ledger streams have no place"
+    );
+
+    runner().drain().await.expect("a drain must succeed");
+    assert_eq!(
+        status().await,
+        (0, 0),
+        "a runner starting the Policy records its types, and the lag narrows to them"
+    );
 }
