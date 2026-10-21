@@ -195,7 +195,7 @@ impl PostgresEventStore {
 
     /// Begin configuring a store with inline projections.
     ///
-    /// Projections are registered on the builder and frozen by [`PostgresEventStoreBuilder::build`],
+    /// Projections are registered on the builder and frozen by the builder's `build`,
     /// which runs their first-time `init` and records their version in the `projections` table.
     pub fn builder(pool: Pool<Postgres>) -> PostgresEventStoreBuilder {
         PostgresEventStoreBuilder {
@@ -945,6 +945,53 @@ impl EventStore for PostgresEventStore {
         .map_err(crate::db_error)?;
 
         Ok(needs.unwrap_or(false))
+    }
+
+    async fn streams_needing_compaction_page(
+        &self,
+        stream_type: &str,
+        scope: &crate::StreamScope,
+        after: Option<&Urn>,
+        limit: u32,
+    ) -> Result<Vec<Urn>, replay::Error> {
+        // `needs_compaction`'s predicate over a keyset page of `streams`. Walked in `id`
+        // order on the primary key, with the type and scope as filters: no index serves a
+        // suffix, and under a non-C collation the primary key's btree cannot serve a
+        // `LIKE` prefix either, so the scan stops after `limit` matches rather than
+        // narrowing to the scope first.
+        let mut query: QueryBuilder<Postgres> = QueryBuilder::new(
+            "SELECT id FROM streams \
+             WHERE version > COALESCE(last_compacted_version, 0) AND type = ",
+        );
+        query.push_bind(stream_type);
+        if let Some(after) = after {
+            query.push(" AND id > ").push_bind(after.to_string());
+        }
+        if let Some(pattern) = scope.like_pattern() {
+            query
+                .push(" AND id LIKE ")
+                .push_bind(pattern)
+                .push(" ESCAPE '\\'");
+        }
+        query
+            .push(" ORDER BY id LIMIT ")
+            .push_bind(i64::from(limit));
+
+        // Bounded by `limit`, the caller's page size: never by the number of due streams.
+        let ids: Vec<String> = query
+            .build_query_scalar()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                crate::db_error(e)
+                    .with_operation("reading the streams that need compaction")
+                    .with_context("stream_type", stream_type.to_string())
+                    .with_context("scope", format!("{:?}", scope))
+            })?;
+
+        ids.into_iter()
+            .map(|id| crate::error::stored_stream_id(&id, "streams_needing_compaction_page"))
+            .collect()
     }
 
     async fn compact<A>(

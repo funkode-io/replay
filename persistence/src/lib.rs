@@ -14,6 +14,7 @@ mod policy_runner;
 mod policy_status;
 mod query;
 mod store;
+mod stream_scope;
 
 pub use aggregate_version::AggregateVersion;
 pub use cqrs::Cqrs;
@@ -32,10 +33,13 @@ pub use policy_runner::{
     ESCALATION_EXIT_CODE, HEARTBEAT_CADENCE, HEARTBEAT_MIN_CADENCE, PANIC_ERROR_KIND,
     REPLAY_NOTIFY_CHANNEL, TIMEOUT_ERROR_KIND,
 };
-pub use policy_status::{PolicyCondition, PolicyStatus, PolicyStatusStore};
+pub use policy_status::{
+    DeadLetter, DeadLetterFilter, PolicyCondition, PolicyStatus, PolicyStatusStore,
+};
 pub use query::Query;
 pub use replay::{AggregatePolicy, Dispatch, ObservedEvent, Policy, TargetedCommand};
 pub use store::{CompactionOutcome, EventSink, EventStore, NoSink};
+pub use stream_scope::StreamScope;
 
 /// Convenience re-exports of the most commonly used types and traits across
 /// `replay`, `replay_macros`, and `replay_persistence`.
@@ -56,12 +60,12 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, CompactionOutcome, Cqrs, DeadLetterDiscard, DeadLetterRetry,
-        DeadLetterRetrySummary, Dispatch, Escalation, EscalationReason, EventSink, EventStore,
-        InMemoryEventStore, InlineProjection, Liveness, NoSink, ObservedEvent, PersistedEvent,
-        Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon,
-        PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
-        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, WorkerLiveness,
-        WorkerSupervision,
+        AggregateVersion, CompactionOutcome, Cqrs, DeadLetter, DeadLetterDiscard, DeadLetterFilter,
+        DeadLetterRetry, DeadLetterRetrySummary, Dispatch, Escalation, EscalationReason, EventSink,
+        EventStore, InMemoryEventStore, InlineProjection, Liveness, NoSink, ObservedEvent,
+        PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
+        PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
+        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, StreamScope,
+        WorkerLiveness, WorkerSupervision,
     };
 }

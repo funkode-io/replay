@@ -1,5 +1,17 @@
 use urn::Urn;
 
+/// Parse a stream id read back from a store's own storage (`streams.id`, or the
+/// in-memory store's keys) as a URN. Ids are written from a `Urn`, so a failure is
+/// corrupt storage, reported as internal with the `operation` that read it.
+pub(crate) fn stored_stream_id(id: &str, operation: &'static str) -> Result<Urn, replay::Error> {
+    <Urn as std::str::FromStr>::from_str(id).map_err(|e| {
+        replay::Error::internal("stored stream id is not a URN")
+            .with_operation(operation)
+            .with_context("stream_id", id.to_string())
+            .with_context("error", format!("{:?}", e))
+    })
+}
+
 /// Convert a deserialization error to replay::Error
 pub fn deser_error(error: serde_json::Error) -> replay::Error {
     replay::Error::internal(format!("Deserialization failed: {}", error))

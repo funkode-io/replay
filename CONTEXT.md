@@ -175,8 +175,13 @@ A reaction that panicked before building a dispatch has nothing to name, and its
 identity columns are null.
 A row also records what has been tried on it: how many times a [Retry] has
 settled it, and when the last one did.
-Dead letters are queryable so an operator can later inspect them and either
-[Retry] or [Discard] them.
+Dead letters are listed, each with its triggering event, so an operator or a
+consumer's UI can inspect them and either [Retry] or [Discard] them without
+reading Replay's tables. The listing is a stream that resumes after a row's id and
+is narrowed by the Policy, the triggering event's stream and its type; its count is
+a call of its own
+([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)). Listing is
+_observing_, as [Policy status] is.
 _Avoid_: poison message, failed event, error queue.
 
 ### Retry
@@ -218,7 +223,7 @@ _Avoid_: dismiss, drop, ignore.
 The _controlling_ act of an operator repositioning a [Policy] by writing its
 `policy_stream_cursors` row directly while the system runs. The third controlling action
 alongside [Retry] and [Discard], and the coarsest: it moves the Policy itself rather than
-one parked reaction, skipping events when it moves forward and re-delivering them when it
+one parked command, skipping events when it moves forward and re-delivering them when it
 moves backward. The instruction is a [Stream place] in one stream, so a redelivery can be
 forced for that stream alone. The running leader adopts it on the next poll, because it
 reads its places fresh every poll rather than holding them between polls
@@ -438,6 +443,16 @@ is an identity, not a [Query]: the event store treats the whole string as an
 opaque stream id.
 _Avoid_: qualified URN, namespaced URN, parent/child URN, compound key.
 
+### Stream scope
+
+Which streams a stream-level read covers, chosen by the text of the stream id alone:
+every stream, a prefix of the id, or a suffix of it (`StreamScope`). Not the **scope**
+of a [Scoped URN], though it reaches it: `StreamScope::within(scope)` is the suffix
+`@<scope>`, which takes every stream scoped under that URN, nested scopes included —
+"everything in one tenant". It selects ids, never events, which is why it is not a
+stream filter. Used to narrow the streams due for compaction to one tenant.
+_Avoid_: stream filter (that selects events), tenant filter.
+
 ### Query
 
 The existing on-demand, in-memory fold over filtered events. It is the
@@ -536,6 +551,7 @@ it:
 [Narration]: #narration
 [Query]: #query
 [Scoped URN]: #scoped-urn
+[Stream scope]: #stream-scope
 [Live projection]: #live-projection
 [Inline projection]: #inline-projection
 [Async projection]: #async-projection

@@ -17,6 +17,7 @@ mod common;
 
 mod bounded_queries;
 mod created_filter_index;
+mod dead_letter_listing;
 mod dead_letter_unique_command;
 mod event_commit_txid;
 mod event_ordering_postgres;
