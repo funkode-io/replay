@@ -3128,8 +3128,9 @@ never filled, so any global watermark either freezes at the first burned positio
 behind the longest write transaction on the server. If a consumer needs to know what
 changed — to refresh a view, or to freeze a version at publish time — use an **inline
 projection**, which commits in the same transaction as the append so a rollback leaves
-nothing behind, or read **per-stream sequences** and record how far you got in each stream,
-as Policies do ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
+nothing behind, or read each stream in its own order and record the **stream place**
+(`stream_seq`) you reached in it, as Policies do
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
 > **Deprecated in 0.12.0, removed in the release after.**
 > `PostgresEventStore::contiguous_high_water_mark()` freezes at the first position burned

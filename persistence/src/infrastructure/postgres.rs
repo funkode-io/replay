@@ -212,38 +212,34 @@ impl PostgresEventStore {
         &self.pool
     }
 
-    /// The gap-free contiguous high-water-mark of the event log.
+    /// Deprecated: a contiguous high-water-mark of the event log that stops at the
+    /// first burned position.
     ///
     /// Returns the largest position `H` such that every `global_position` in
-    /// `1..=H` is present in the `events` table, with no gaps. Returns `0` when the
-    /// log is empty or its very first position has not yet committed.
+    /// `1..=H` is present in the `events` table. Returns `0` when the log is empty
+    /// or its very first position has not yet committed.
     ///
     /// # Deprecated
     ///
-    /// Do not use this as a stable cut of the log. It assumes every gap is an
-    /// append still in flight that will fill, and that is false: `global_position`
-    /// comes from a sequence, `nextval` is not transactional, and an append that
-    /// rolls back burns its position forever. The mark then **freezes at the first
-    /// burned position** and never moves again, however many events commit after
-    /// it (#259). It also scans the whole `events` table on every call.
+    /// Do not use this as a stable cut of the log. It assumes every missing
+    /// position is an append still in flight that will commit, and that is false:
+    /// `global_position` comes from a sequence, `nextval` is not transactional, and
+    /// an append that rolls back leaves a burned position no event will ever hold.
+    /// The mark then **freezes at the first burned position** and never moves
+    /// again, however many events commit after it (#259). It also scans the whole
+    /// `events` table on every call.
     ///
-    /// Nothing in the library detects, proves or reports a hole in the position
-    /// numbers any more (#195). To know what changed, use one of the supported
-    /// routes instead:
-    ///
-    /// - an **inline projection**, which commits in the same transaction as the
-    ///   append, so a rollback leaves nothing behind; or
-    /// - **per-stream sequences**: read a stream in its own order and record how
-    ///   far you got in that stream, the model Policies use
-    ///   ([ADR-0026](https://github.com/funkode-io/replay/blob/main/docs/adr/0026-a-policy-tracks-its-position-per-stream.md),
-    ///   #195, #224).
+    /// Nothing else in the library reads a burned position as anything but a
+    /// number nobody holds (#195). For the supported ways to learn what changed,
+    /// see the README's
+    /// [stable-cut note](https://github.com/funkode-io/replay#monitoring-policy-status).
     ///
     /// This function will be removed in the release after 0.12.0.
     #[deprecated(
         since = "0.12.0",
-        note = "freezes at the first global_position burned by a rolled-back append and \
-                never recovers (#259); use an inline projection or per-stream sequences \
-                (ADR-0026, #195, #224) instead. Will be removed in the next release."
+        note = "freezes at the first burned global_position (#259); use an inline \
+                projection or stream places (ADR-0026) instead, see the README. \
+                Will be removed in the release after 0.12.0."
     )]
     pub async fn contiguous_high_water_mark(&self) -> Result<i64, replay::Error> {
         // Number the rows in global order: the first position whose row number

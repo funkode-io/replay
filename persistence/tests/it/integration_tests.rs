@@ -6304,9 +6304,9 @@ async fn policy_status_degraded_with_dead_letters_postgres_test() {
 ///
 /// Setup:
 ///   1. Empty log → `0`.
-///   2. Three committed events (gp 1, 2, 3) → `3`.
-///   3. An append that rolls back burns gp 4; a later append commits gp 5 → the mark
-///      is still `3`, below the committed event, and stays there.
+///   2. `n` committed events (gp `1..=n`) → `n`.
+///   3. An append that rolls back burns gp `n + 1`; a later append commits gp `n + 2`
+///      → the mark is still `n`, below the committed event, and stays there.
 #[tokio::test]
 #[allow(deprecated)]
 async fn contiguous_high_water_mark_freezes_at_a_burned_position_postgres_test() {
@@ -6336,13 +6336,16 @@ async fn contiguous_high_water_mark_freezes_at_a_burned_position_postgres_test()
         "an empty log has a contiguous high-water-mark of 0"
     );
 
-    // 2. Append three events (one stream): global_position 1, 2, 3 contiguous.
+    // 2. Append `n` events (one stream): global_position 1..=n, contiguous.
     let account = BankAccountUrn::new("hwm-1").unwrap();
+    // Every append below is one event into this one stream, so after `n` committed
+    // appends both the stream's version and its last global_position are `n`.
+    const COMMITTED_BEFORE_ROLLBACK: i64 = 3;
     let deposit = |day: u32| BankAccountCommand::Deposit {
         effective_on: chrono::NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
         amount: 10.0,
     };
-    for day in 1..=3 {
+    for day in 1..=COMMITTED_BEFORE_ROLLBACK as u32 {
         cqrs.execute::<BankAccount>(
             &account,
             replay::Metadata::default(),
@@ -6359,44 +6362,61 @@ async fn contiguous_high_water_mark_freezes_at_a_burned_position_postgres_test()
             .contiguous_high_water_mark()
             .await
             .expect("hwm query must succeed"),
-        3,
-        "three contiguous positions yield a high-water-mark of 3"
+        COMMITTED_BEFORE_ROLLBACK,
+        "contiguous positions yield a high-water-mark at the last of them"
     );
 
-    // 3. An append that rolls back: the INSERT draws gp 4 from the sequence, the
-    //    transaction aborts, and gp 4 is gone for good.
+    // 3. An append that rolls back: the INSERT draws the next global_position from
+    //    the sequence, the transaction aborts, and that position is burned for good.
+    //    It writes what the next append to this stream would: the next version and
+    //    stream place.
+    let next = COMMITTED_BEFORE_ROLLBACK + 1;
     let mut tx = pg_pool.begin().await.expect("begin must succeed");
     let burned: i64 = sqlx::query_scalar(
         "INSERT INTO events (id, data, metadata, stream_id, type, version, stream_seq) \
-         VALUES ($1, '{}'::jsonb, '{}'::jsonb, $2, 'Deposited', 4, 4) \
+         VALUES ($1, '{}'::jsonb, '{}'::jsonb, $2, 'Deposited', $3, $3) \
          RETURNING global_position",
     )
     .bind(uuid::Uuid::new_v4())
     .bind(account.to_string())
+    .bind(next)
     .fetch_one(&mut *tx)
     .await
     .expect("the doomed append must insert before rolling back");
     tx.rollback().await.expect("rollback must succeed");
-    assert_eq!(burned, 4, "the rolled-back append drew gp 4");
+    assert_eq!(
+        burned, next,
+        "the rolled-back append drew the next position"
+    );
 
     // A later append commits normally, above the burned position.
-    cqrs.execute::<BankAccount>(&account, replay::Metadata::default(), deposit(4), &(), None)
-        .await
-        .unwrap();
+    cqrs.execute::<BankAccount>(
+        &account,
+        replay::Metadata::default(),
+        deposit(next as u32),
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
 
     let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(global_position), 0) FROM events")
         .fetch_one(&pg_pool)
         .await
         .expect("head query must succeed");
-    assert_eq!(head, 5, "the later append committed at gp 5");
+    assert_eq!(
+        head,
+        burned + 1,
+        "the later append committed one past the burned position"
+    );
 
-    // The mark is frozen below the committed event: nothing will ever fill gp 4.
+    // The mark is frozen below the committed event: nothing will ever fill the burned position.
     assert_eq!(
         store
             .contiguous_high_water_mark()
             .await
             .expect("hwm query must succeed"),
-        3,
+        COMMITTED_BEFORE_ROLLBACK,
         "a burned position freezes the contiguous high-water-mark below every later event"
     );
 }
