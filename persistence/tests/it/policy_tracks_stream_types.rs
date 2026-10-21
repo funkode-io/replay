@@ -15,7 +15,8 @@ use sqlx::PgPool;
 use crate::common;
 
 use common::policy_harness::{
-    PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn, OBSERVE_TIMEOUT,
+    reconciliation_timeout, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
+    OBSERVE_TIMEOUT,
 };
 use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
 use replay_persistence::{
@@ -103,10 +104,31 @@ async fn a_policy_tracking_one_stream_type_delivers_a_late_write_and_keeps_no_ot
         !harness.has_passed(held.global_position).await,
         "an uncommitted write has been passed by nobody"
     );
+    // The overtaking event may have been delivered by a reconciliation rather than the
+    // sweep, so wait for the sweep itself to pass the held position: only then is the
+    // reconciliation the one thing that can deliver it.
+    let overtook = overtaking.global_position;
+    harness
+        .observe("the sweep to pass the held write", || async {
+            (harness.swept_through().await? >= overtook).then_some(())
+        })
+        .await;
 
     let position = held.global_position;
     held.commit().await;
-    harness.await_dispatch_caused_by(position).await;
+    harness
+        .observe_within(
+            &format!("the reconciliation to deliver the event at position {position}"),
+            reconciliation_timeout(),
+            || async {
+                harness
+                    .dispatches()
+                    .await
+                    .into_iter()
+                    .find(|dispatch| dispatch.caused_by_position == position)
+            },
+        )
+        .await;
     harness.await_passed(position).await;
 
     // The sweep has read past every untracked event — it did not stop at them — and the
