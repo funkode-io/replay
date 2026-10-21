@@ -125,14 +125,14 @@ const REVIEWED: &[Reviewed] = &[
                         them, not by data — the per-stream frontier each row carries is \
                         aggregated in SQL, so it costs a scan and not a row.",
     },
-    // ── Known unbounded ──────────────────────────────────────────────────────
     Reviewed {
         file: "src/infrastructure/postgres.rs",
-        function: "load_events_for_replay",
-        justification: "UNBOUNDED — loads all history matching a projection's filter, and \
-                        holds the rows and the parsed events at once. Tracked by \
-                        funkode-io/replay#157; this entry must be deleted when it is fixed, \
-                        not amended.",
+        function: "load_replay_chunk",
+        justification: "SQL carries LIMIT $chunk_size, the store's projection_flush_size \
+                        (default 500): one keyset page of an inline projection's history \
+                        replay, handed to the projection before the next is read \
+                        (funkode-io/replay#157). Compaction snapshots are excluded, so a \
+                        rebuild reads the true log once (funkode-io/replay#274).",
     },
 ];
 

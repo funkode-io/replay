@@ -1698,8 +1698,13 @@ async fn bank_account_inline_projection_failure_rolls_back_postgres_test() {
     assert_eq!(projection_write_count, 0);
 }
 
-// ── Inline projection version drift rebuild (issue #60) ───────────────────────
+// ── Inline projection rebuild reads the true log (issue #274) ─────────────────
 
+/// Records the ids of every batch an inline projection is handed, on append and on
+/// rebuild alike, so a test can tell which events reached it and how many times.
+///
+/// `version` is a field so a test can register the same projection at a higher code
+/// version and trigger a drift rebuild; `filter` is the projection's `stream_filter`.
 struct RebuildEventRecorder {
     batches: std::sync::Arc<std::sync::Mutex<Vec<Vec<uuid::Uuid>>>>,
     version: i32,
@@ -1744,20 +1749,46 @@ impl replay_persistence::InlineProjection for RebuildEventRecorder {
     }
 }
 
+/// The account every true-log rebuild test compacts, and the stream their filters name.
+fn rebuild_account() -> BankAccountUrn {
+    BankAccountUrn::new("rebuild-true-log").expect("a valid account id")
+}
+
+/// A projection that reads everything still sees no compaction snapshot on rebuild.
 #[tokio::test]
 async fn inline_projection_rebuild_excludes_compaction_snapshots_postgres_test() {
     assert_inline_projection_rebuilds_true_log(StreamFilter::All).await;
 }
 
+/// A projection narrowed to the compacted stream itself, the stream its snapshot rows
+/// are written to, still sees none of them.
 #[tokio::test]
 async fn filtered_inline_projection_rebuild_excludes_compaction_snapshots_postgres_test() {
-    let account = BankAccountUrn::new("rebuild-true-log").unwrap();
     assert_inline_projection_rebuilds_true_log(StreamFilter::with_stream_id::<BankAccount>(
-        &account,
+        &rebuild_account(),
     ))
     .await;
 }
 
+/// An `Or` filter cannot escape the snapshot predicate: the rebuild query wraps the
+/// projection's filter in parentheses, so `snapshot = false AND (a OR b)` holds for
+/// both branches, the one naming the compacted stream included.
+#[tokio::test]
+async fn or_filtered_inline_projection_rebuild_excludes_compaction_snapshots_postgres_test() {
+    let elsewhere = BankAccountUrn::new("rebuild-true-log-elsewhere").expect("a valid account id");
+    assert_inline_projection_rebuilds_true_log(
+        StreamFilter::with_stream_id::<BankAccount>(&elsewhere).or(StreamFilter::with_stream_id::<
+            BankAccount,
+        >(&rebuild_account())),
+    )
+    .await;
+}
+
+/// Appends a deposit and a month close, compacts them into one snapshot row, then
+/// registers a recorder under `filter`. Its first replay must deliver the two real
+/// events once each; a later append must be delivered once live; and a version bump
+/// must replay all three real events once each, never the snapshot, one per batch at
+/// a flush size of one.
 async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
@@ -1769,7 +1800,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
         .unwrap();
 
     let store = replay_persistence::PostgresEventStore::new(pool.clone());
-    let account = BankAccountUrn::new("rebuild-true-log").unwrap();
+    let account = rebuild_account();
     let month = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let events = [
         BankAccountEvent::Deposited {
@@ -1852,7 +1883,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
         "live append delivers the new real event exactly once"
     );
 
-    let _v2 = replay_persistence::PostgresEventStore::builder(pool)
+    let _drift_rebuilt = replay_persistence::PostgresEventStore::builder(pool)
         .projection_flush_size(1)
         .register(RebuildEventRecorder {
             batches: batches.clone(),
@@ -1872,6 +1903,8 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
     );
     assert!(batches.iter().all(|batch| batch.len() <= 1));
 }
+
+// ── Inline projection version drift rebuild (issue #60) ───────────────────────
 
 /// A balance view that resets and rebuilds from history on a version bump.
 ///
