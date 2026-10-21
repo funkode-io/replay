@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -1641,7 +1641,16 @@ impl PolicyRunner {
         let progress = match drained.entry(name.clone()) {
             Entry::Occupied(kept) => kept.into_mut(),
             Entry::Vacant(first) => {
-                first.insert(PolicyProgress::load(&self.pool, &name, policy.start_at()).await?)
+                let filter = policy.stream_filter();
+                first.insert(
+                    PolicyProgress::load(
+                        &self.pool,
+                        &name,
+                        policy.start_at(),
+                        filter.tracked_stream_types(),
+                    )
+                    .await?,
+                )
             }
         };
 
@@ -2106,21 +2115,24 @@ impl PolicyWorker {
             liveness.leading();
 
             // Initialize progress from the stored places (or bootstrap).
-            let mut progress = match PolicyProgress::load(&pool, &name, policy.start_at()).await {
-                Ok(progress) => progress,
-                Err(error) => {
-                    tracing::error!(
-                        policy = %name,
-                        error = %error,
-                        "leader failed to initialize its progress; retrying"
-                    );
-                    tokio::select! {
-                        _ = shutdown_rx.changed() => return Stop::Shutdown,
-                        _ = tokio::time::sleep(interval) => {}
+            let filter = policy.stream_filter();
+            let tracked = filter.tracked_stream_types();
+            let mut progress =
+                match PolicyProgress::load(&pool, &name, policy.start_at(), tracked).await {
+                    Ok(progress) => progress,
+                    Err(error) => {
+                        tracing::error!(
+                            policy = %name,
+                            error = %error,
+                            "leader failed to initialize its progress; retrying"
+                        );
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => return Stop::Shutdown,
+                            _ = tokio::time::sleep(interval) => {}
+                        }
+                        continue 'lifetime;
                     }
-                    continue 'lifetime;
-                }
-            };
+                };
 
             // Where this worker picks up, once per election. A Policy resumes per
             // stream, so what it announces is where its search resumes; what it has
@@ -3112,13 +3124,31 @@ async fn drain_policy_once(
     // number of times a library calls back into it should not depend on how the log is
     // laid out.
     let filter = policy.stream_filter();
+    // What the Policy tracks follows from that filter, and bounds every source below: a
+    // stream it does not track is never read, so it never gets a place (ADR-0030).
+    let tracked = filter.tracked_stream_types();
+    progress.track(pool, &name, tracked).await?;
 
     // Three sources: what the last poll could not finish, what the sweep just found, and
     // — on its own cadence — what the sweep has missed.
-    let discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
+    let mut discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
+    if let Some(types) = tracked {
+        // After the sweep, not in it: the sweep reads its `LIMIT` of positions whatever
+        // streams they name, and `swept_through` passes all of them. Filtering in its SQL
+        // would make it search ahead for a matching row, examining rows in proportion to
+        // the ones it skips — the cost #258 measured, moved rather than removed.
+        discovered.streams = tracked_among(pool, discovered.streams, types).await?;
+    }
     let reconciling = progress.reconcile_is_due();
     let examined = if reconciling {
-        streams_behind(pool, &name, &progress.reconciled_through, read_batch).await?
+        streams_behind(
+            pool,
+            &name,
+            tracked,
+            &progress.reconciled_through,
+            read_batch,
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -4237,14 +4267,51 @@ async fn sweep_for_streams(
     ))
 }
 
+/// Of the streams a sweep nominated, the ones whose type is in `types`, in the order the
+/// sweep found them.
+///
+/// One indexed lookup per nominated stream, and the nominations are at most one per row
+/// the sweep read, so the sweep's `LIMIT` bounds this too.
+async fn tracked_among(
+    pool: &Pool<Postgres>,
+    nominated: Vec<String>,
+    types: &[String],
+) -> Result<Vec<String>, replay::Error> {
+    if nominated.is_empty() {
+        return Ok(nominated);
+    }
+
+    let tracked: HashSet<String> =
+        sqlx::query_scalar("SELECT id FROM streams WHERE id = ANY($1) AND type = ANY($2)")
+            .bind(&nominated)
+            .bind(types)
+            .fetch_all(pool)
+            .await
+            .map_err(crate::db_error)?
+            .into_iter()
+            .collect();
+
+    Ok(nominated
+        .into_iter()
+        .filter(|stream| tracked.contains(stream))
+        .collect())
+}
+
 /// The streams this Policy is behind on, compared head to cursor, taking the batch that
 /// sorts after `after`.
 ///
 /// This is the correctness half: it finds what the sweep missed, which is any write that
 /// committed below a position the sweep had already passed. No index answers a comparison
-/// between two tables' columns, so it scans one row per stream and is bounded by `limit`
-/// rather than by an index — which is why it runs on a cadence and the sweep runs on every
-/// poll (ADR-0026).
+/// between two tables' columns, so it scans one row per stream it compares — `limit`
+/// bounds the ids it *returns*, not the rows it examines, and a Policy caught up on
+/// everything examines every stream it tracks to find that out. That is why it runs on a
+/// cadence and the sweep runs on every poll (ADR-0026).
+///
+/// What it compares is what the Policy **tracks**: every stream, or — for a Policy whose
+/// filter is [`StreamFilter::ForStreamTypes`] — the streams of those types, found through
+/// `idx_streams_type_id` without reading a row of any other type
+/// ([ADR-0030](../../docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+/// A stream it does not track is never behind, because it is never owed anything.
 ///
 /// It resumes after the last id it examined instead of restarting at the lowest, because
 /// `limit` is a batch and not a snapshot: a Policy with `limit` permanently-behind streams
@@ -4258,24 +4325,39 @@ async fn sweep_for_streams(
 async fn streams_behind(
     pool: &Pool<Postgres>,
     name: &str,
+    tracked: Option<&[String]>,
     after: &str,
     limit: u32,
 ) -> Result<Vec<String>, replay::Error> {
-    let rows = sqlx::query(
-        "SELECT s.id FROM streams s \
-         LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
-         WHERE s.id > $2 AND s.stream_seq > COALESCE(c.stream_seq, 0) \
-         ORDER BY s.id LIMIT $3",
-    )
-    .bind(name)
-    .bind(after)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-    .map_err(crate::db_error)?;
+    let query = match tracked {
+        None => sqlx::query(STREAMS_BEHIND)
+            .bind(name)
+            .bind(after)
+            .bind(limit as i64),
+        Some(types) => sqlx::query(STREAMS_BEHIND_OF_TYPES)
+            .bind(name)
+            .bind(after)
+            .bind(limit as i64)
+            .bind(types),
+    };
+    let rows = query.fetch_all(pool).await.map_err(crate::db_error)?;
 
     Ok(rows.into_iter().map(|row| row.get("id")).collect())
 }
+
+/// [`streams_behind`] for a Policy that tracks every stream.
+const STREAMS_BEHIND: &str = "SELECT s.id FROM streams s \
+     LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
+     WHERE s.id > $2 AND s.stream_seq > COALESCE(c.stream_seq, 0) \
+     ORDER BY s.id LIMIT $3";
+
+/// [`streams_behind`] for a Policy that tracks the stream types in `$4`. The type is the
+/// leading column of `idx_streams_type_id` and the rotation's `id > $2` the second, so the
+/// rows a pass examines are the tracked streams sorting after the rotation, and no others.
+const STREAMS_BEHIND_OF_TYPES: &str = "SELECT s.id FROM streams s \
+     LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
+     WHERE s.type = ANY($4) AND s.id > $2 AND s.stream_seq > COALESCE(c.stream_seq, 0) \
+     ORDER BY s.id LIMIT $3";
 
 /// A Policy's place in one stream, as a poll read it.
 ///
@@ -4559,19 +4641,32 @@ struct PolicyProgress {
     /// [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) states
     /// and this is the unit of.
     reconcile_every: Duration,
+    /// The stream types this Policy tracks, as last recorded in
+    /// `policy_cursors.tracked_stream_types`; `None` for every stream. Held so that a poll
+    /// writes the column only when the filter it asked for has changed
+    /// ([ADR-0030](../../docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+    tracked: Option<Vec<String>>,
 }
 
 impl PolicyProgress {
-    /// Load the Policy's sweep position, creating its row the first time it runs.
+    /// Load the Policy's sweep position, creating its row the first time it runs, and
+    /// record which stream types it tracks.
+    ///
+    /// The record is what [`crate::PolicyStatusStore`] reads to compute lag over the
+    /// streams this Policy tracks: the status store has no Policy to ask. Written on
+    /// every load rather than only at bootstrap, so a filter changed between two
+    /// deployments is recorded by the first worker to lead under the new one.
     async fn load(
         pool: &Pool<Postgres>,
         name: &str,
         start_at: StartAt,
+        tracked: Option<&[String]>,
     ) -> Result<Self, replay::Error> {
         let (swept_through, reconciled_through) = match read_sweep(pool, name).await? {
             Some(progress) => progress,
-            None => bootstrap(pool, name, start_at).await?,
+            None => bootstrap(pool, name, start_at, tracked).await?,
         };
+        write_tracked(pool, name, tracked).await?;
 
         Ok(Self {
             swept_through,
@@ -4580,7 +4675,25 @@ impl PolicyProgress {
             reconciled_through,
             reconciled_at: None,
             reconcile_every: resolve_reconcile_cadence(),
+            tracked: tracked.map(<[String]>::to_vec),
         })
+    }
+
+    /// Record the stream types a poll was asked to track, if they are not what was last
+    /// recorded. A Policy's filter is its own code and is asked once per poll, so nothing
+    /// stops it changing between two of them; it almost never does, and then this is a
+    /// comparison and no statement.
+    async fn track(
+        &mut self,
+        pool: &Pool<Postgres>,
+        name: &str,
+        tracked: Option<&[String]>,
+    ) -> Result<(), replay::Error> {
+        if self.tracked.as_deref() != tracked {
+            write_tracked(pool, name, tracked).await?;
+            self.tracked = tracked.map(<[String]>::to_vec);
+        }
+        Ok(())
     }
 
     /// Make the next poll pay for the frontier scan whatever the cadence says.
@@ -4665,6 +4778,7 @@ async fn bootstrap(
     pool: &Pool<Postgres>,
     name: &str,
     start_at: StartAt,
+    tracked: Option<&[String]>,
 ) -> Result<(i64, String), replay::Error> {
     let mut tx = pool.begin().await.map_err(crate::db_error)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -4705,13 +4819,17 @@ async fn bootstrap(
         }
     };
 
+    // Only the streams the Policy tracks: a row for any other would be one it never reads
+    // or writes again (ADR-0030). `$2` NULL is every stream.
     if matches!(start_at, StartAt::Now) {
         sqlx::query(
             "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
-             SELECT $1, s.id, s.stream_seq FROM streams s WHERE s.stream_seq > 0 \
+             SELECT $1, s.id, s.stream_seq FROM streams s \
+              WHERE s.stream_seq > 0 AND ($2::text[] IS NULL OR s.type = ANY($2)) \
              ON CONFLICT DO NOTHING",
         )
         .bind(name)
+        .bind(tracked)
         .execute(&mut *tx)
         .await
         .map_err(crate::db_error)?;
@@ -4731,6 +4849,26 @@ async fn bootstrap(
     // The rotation starts at the beginning of the stream ids, which is what the row this
     // transaction just inserted carries.
     Ok((swept_through, String::new()))
+}
+
+/// Record which stream types a Policy tracks — `None` for every stream — where
+/// [`crate::PolicyStatusStore`] can read it. Only when it differs, so a reload under an
+/// unchanged filter writes nothing.
+async fn write_tracked(
+    pool: &Pool<Postgres>,
+    name: &str,
+    tracked: Option<&[String]>,
+) -> Result<(), replay::Error> {
+    sqlx::query(
+        "UPDATE policy_cursors SET tracked_stream_types = $2 \
+         WHERE name = $1 AND tracked_stream_types IS DISTINCT FROM $2",
+    )
+    .bind(name)
+    .bind(tracked)
+    .execute(pool)
+    .await
+    .map_err(crate::db_error)?;
+    Ok(())
 }
 
 /// Record how far discovery has swept.
@@ -5862,7 +6000,7 @@ mod progress_tests {
 
     use super::{
         bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, Place,
-        PolicyProgress, StartAt,
+        PolicyProgress, StartAt, STREAMS_BEHIND_OF_TYPES,
     };
 
     /// Move the rotation the way a poll that compared `page` and read `read` of it would,
@@ -5980,7 +6118,7 @@ mod progress_tests {
         append_events(&pool, "urn:probe:a", 2).await;
         append_events(&pool, "urn:probe:b", 1).await;
 
-        let progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        let progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
 
@@ -5991,7 +6129,7 @@ mod progress_tests {
             "no place is stored, and no place means the start of the stream"
         );
         assert_eq!(
-            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            streams_behind(&pool, POLICY, None, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
             "so both streams are behind"
         );
@@ -6004,7 +6142,7 @@ mod progress_tests {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 3).await;
 
-        let progress = PolicyProgress::load(&pool, POLICY, StartAt::Now)
+        let progress = PolicyProgress::load(&pool, POLICY, StartAt::Now, None)
             .await
             .expect("loading must succeed");
 
@@ -6018,7 +6156,7 @@ mod progress_tests {
             "and the stream is recorded where it already is"
         );
         assert!(
-            streams_behind(&pool, POLICY, "", 10)
+            streams_behind(&pool, POLICY, None, "", 10)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -6032,14 +6170,14 @@ mod progress_tests {
     async fn a_stream_born_after_a_now_policy_started_is_delivered_whole_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:before", 1).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Now)
+        PolicyProgress::load(&pool, POLICY, StartAt::Now, None)
             .await
             .expect("loading must succeed");
 
         append_events(&pool, "urn:probe:after", 2).await;
 
         assert_eq!(
-            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            streams_behind(&pool, POLICY, None, "", 10).await.unwrap(),
             vec!["urn:probe:after".to_string()],
             "the new stream is behind; the one that predates the Policy is not"
         );
@@ -6076,7 +6214,7 @@ mod progress_tests {
     async fn a_pass_that_ends_on_an_empty_poll_still_wraps_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 1).await;
-        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
 
@@ -6087,7 +6225,7 @@ mod progress_tests {
             .expect("writing the rotation must succeed");
 
         assert!(
-            streams_behind(&pool, POLICY, &progress.reconciled_through, 10)
+            streams_behind(&pool, POLICY, None, &progress.reconciled_through, 10)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -6101,7 +6239,7 @@ mod progress_tests {
             "an empty page ends the pass, whatever the poll went on to do"
         );
         assert_eq!(
-            streams_behind(&pool, POLICY, &progress.reconciled_through, 10)
+            streams_behind(&pool, POLICY, None, &progress.reconciled_through, 10)
                 .await
                 .unwrap(),
             vec!["urn:probe:a".to_string()],
@@ -6123,11 +6261,11 @@ mod progress_tests {
         for stream in ["urn:probe:a1", "urn:probe:a2", "urn:probe:z"] {
             append_events(&pool, stream, 1).await;
         }
-        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
 
-        let first = streams_behind(&pool, POLICY, &progress.reconciled_through, 2)
+        let first = streams_behind(&pool, POLICY, None, &progress.reconciled_through, 2)
             .await
             .unwrap();
         assert_eq!(
@@ -6142,12 +6280,12 @@ mod progress_tests {
 
         // A restart resumes the pass rather than starting it again, which is why the
         // rotation is persisted and not held in memory.
-        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
         assert_eq!(progress.reconciled_through, "urn:probe:a2");
 
-        let second = streams_behind(&pool, POLICY, &progress.reconciled_through, 2)
+        let second = streams_behind(&pool, POLICY, None, &progress.reconciled_through, 2)
             .await
             .unwrap();
         assert_eq!(
@@ -6168,14 +6306,14 @@ mod progress_tests {
     async fn a_checkpointed_place_takes_a_stream_off_the_frontier_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 3).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
 
         checkpoint(&pool, "urn:probe:a", 2).await;
 
         assert_eq!(
-            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            streams_behind(&pool, POLICY, None, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string()],
             "two of three places processed is still behind"
         );
@@ -6183,7 +6321,7 @@ mod progress_tests {
         checkpoint(&pool, "urn:probe:a", 3).await;
 
         assert!(
-            streams_behind(&pool, POLICY, "", 10)
+            streams_behind(&pool, POLICY, None, "", 10)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -6198,7 +6336,7 @@ mod progress_tests {
     async fn a_checkpoint_from_a_stale_view_is_refused_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 5).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
 
@@ -6227,7 +6365,7 @@ mod progress_tests {
     async fn an_operator_rewinding_mid_poll_is_not_overwritten_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 20).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
         checkpoint(&pool, "urn:probe:a", 10).await;
@@ -6267,7 +6405,7 @@ mod progress_tests {
     ) {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 20).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
         checkpoint(&pool, "urn:probe:a", 10).await;
@@ -6305,7 +6443,7 @@ mod progress_tests {
     async fn an_operator_deleting_a_place_mid_poll_is_not_overwritten_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 20).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
         checkpoint(&pool, "urn:probe:a", 10).await;
@@ -6342,7 +6480,7 @@ mod progress_tests {
     async fn an_operator_deleting_a_place_during_a_checkpoint_is_not_overwritten_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 20).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
         checkpoint(&pool, "urn:probe:a", 10).await;
@@ -6395,7 +6533,7 @@ mod progress_tests {
     {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 20).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
 
@@ -6436,7 +6574,7 @@ mod progress_tests {
     async fn an_operator_can_move_a_place_back_to_force_a_redelivery_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 5).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
         checkpoint(&pool, "urn:probe:a", 5).await;
@@ -6458,7 +6596,7 @@ mod progress_tests {
             "the next poll reads what the operator wrote"
         );
         assert_eq!(
-            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            streams_behind(&pool, POLICY, None, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string()],
             "and the stream is owed its last three events again"
         );
@@ -6493,7 +6631,7 @@ mod progress_tests {
 
         // `bootstrap` rather than `load`, which would see the row and never get here:
         // this is the losing half of two runners that both found no row.
-        let progress = bootstrap(&pool, POLICY, StartAt::Now)
+        let progress = bootstrap(&pool, POLICY, StartAt::Now, None)
             .await
             .expect("bootstrapping must succeed");
 
@@ -6509,7 +6647,7 @@ mod progress_tests {
             "and writes no places of its own, which would say this stream was processed"
         );
         assert_eq!(
-            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            streams_behind(&pool, POLICY, None, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string()],
             "so the stream is owed, as the winner's own bootstrap decided"
         );
@@ -6539,7 +6677,7 @@ mod progress_tests {
 
         let bootstrapping = tokio::spawn({
             let pool = pool.clone();
-            async move { PolicyProgress::load(&pool, POLICY, StartAt::Now).await }
+            async move { PolicyProgress::load(&pool, POLICY, StartAt::Now, None).await }
         });
         await_blocked_on(&pool, "policy_stream_cursors").await;
 
@@ -6563,7 +6701,7 @@ mod progress_tests {
             "and the stream is seeded where it was in that same snapshot"
         );
         assert_eq!(
-            streams_behind(&pool, POLICY, "", 10).await.unwrap(),
+            streams_behind(&pool, POLICY, None, "", 10).await.unwrap(),
             vec!["urn:probe:a".to_string()],
             "so the event that committed in the window is owed"
         );
@@ -6623,17 +6761,140 @@ mod progress_tests {
     async fn the_sweep_position_only_moves_forwards_postgres_test() {
         let (pool, _container) = start_postgres().await;
         append_events(&pool, "urn:probe:a", 3).await;
-        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
 
         super::write_sweep(&pool, POLICY, 3).await.unwrap();
         super::write_sweep(&pool, POLICY, 1).await.unwrap();
 
-        let reloaded = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+        let reloaded = PolicyProgress::load(&pool, POLICY, StartAt::Beginning, None)
             .await
             .expect("loading must succeed");
         assert_eq!(reloaded.swept_through, 3);
+    }
+
+    /// The types a `ForStreamTypes(["Probe"])` Policy tracks, as the runner derives them.
+    fn probes_only() -> Vec<String> {
+        vec!["Probe".to_string()]
+    }
+
+    /// `count` streams of `stream_type`, one event each, named `{prefix}{n}` — in one
+    /// statement, because the point of the streams that use it is that there are many.
+    async fn append_streams_of(pool: &PgPool, stream_type: &str, prefix: &str, count: i32) {
+        sqlx::query(
+            "SELECT append_event(gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, \
+             'Appended', $1 || n, $2, NULL) FROM generate_series(1, $3) AS n",
+        )
+        .bind(prefix)
+        .bind(stream_type)
+        .bind(count)
+        .execute(pool)
+        .await
+        .expect("appending must succeed");
+    }
+
+    /// A Policy that starts `Now` and tracks some stream types seeds a place in those
+    /// streams only. One per existing stream of every type was the 3.2M rows of
+    /// funkode-io/replay#258: a place the Policy would never read or move again.
+    #[tokio::test]
+    async fn a_policy_starting_now_seeds_no_place_in_a_stream_it_does_not_track_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 2).await;
+        append_streams_of(&pool, "Ledger", "urn:ledger:b", 3).await;
+
+        let tracked = probes_only();
+        PolicyProgress::load(&pool, POLICY, StartAt::Now, Some(&tracked))
+            .await
+            .expect("loading must succeed");
+
+        let seeded: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM policy_stream_cursors WHERE policy = $1")
+                .bind(POLICY)
+                .fetch_one(&pool)
+                .await
+                .expect("the places must be readable");
+        assert_eq!(seeded, 1, "one place, in the one stream the Policy tracks");
+        assert_eq!(
+            places(&pool, &["urn:probe:a"]).await,
+            HashMap::from([("urn:probe:a".to_string(), 2)]),
+            "at its head, as a `Now` Policy starts every stream it tracks"
+        );
+    }
+
+    /// Every row a plan node of `relation` produced or threw away, summed over the plan:
+    /// what the statement *examined* there, as opposed to what it returned.
+    fn rows_examined(plan: &serde_json::Value, relation: &str) -> f64 {
+        let own = if plan["Relation Name"] == relation {
+            let loops = plan["Actual Loops"].as_f64().unwrap_or(1.0);
+            let produced = plan["Actual Rows"].as_f64().unwrap_or_default() * loops;
+            let removed = ["Rows Removed by Filter", "Rows Removed by Index Recheck"]
+                .iter()
+                .map(|key| plan[*key].as_f64().unwrap_or_default())
+                .sum::<f64>();
+            produced + removed
+        } else {
+            0.0
+        };
+        let children: f64 = plan["Plans"]
+            .as_array()
+            .map(|plans| plans.iter().map(|p| rows_examined(p, relation)).sum())
+            .unwrap_or_default();
+        own + children
+    }
+
+    /// A Policy filtered by stream type compares only the streams of those types, and
+    /// reads no row of any other type to find them (funkode-io/replay#267, ADR-0030).
+    ///
+    /// The other type is deliberately the bulk of the table and entirely behind — no
+    /// place for any of it — so a reconciliation that walked it would both return its
+    /// ids and show its rows in the plan. The plan is read rather than timed: the rows a
+    /// node examined is a count, and a count does not depend on how busy the machine is.
+    #[tokio::test]
+    async fn a_policy_tracking_one_stream_type_examines_no_stream_of_another_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_streams_of(&pool, "Probe", "urn:probe:a", 3).await;
+        append_streams_of(&pool, "Ledger", "urn:ledger:b", 2_000).await;
+        // The statistics the planner chooses by: without them a table this young looks
+        // empty, and any plan is as good as any other.
+        sqlx::query("ANALYZE streams")
+            .execute(&pool)
+            .await
+            .expect("analyzing must succeed");
+        let tracked = probes_only();
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, Some(&tracked))
+            .await
+            .expect("loading must succeed");
+
+        assert_eq!(
+            streams_behind(&pool, POLICY, Some(&tracked), "", 10)
+                .await
+                .unwrap(),
+            vec![
+                "urn:probe:a1".to_string(),
+                "urn:probe:a2".to_string(),
+                "urn:probe:a3".to_string()
+            ],
+            "the streams of the tracked type, and none of the other however far behind"
+        );
+
+        // The production statement, verbatim: a constant, so nothing is interpolated.
+        let plan: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, FORMAT JSON) {STREAMS_BEHIND_OF_TYPES}"
+        )))
+        .bind(POLICY)
+        .bind("")
+        .bind(10_i64)
+        .bind(&tracked)
+        .fetch_one(&pool)
+        .await
+        .expect("explaining must succeed");
+        let examined = rows_examined(&plan[0]["Plan"], "streams");
+        assert!(
+            examined <= 3.0,
+            "the reconciliation examined {examined} rows of `streams` to compare 3: it \
+             walked streams the Policy does not track\n{plan:#}"
+        );
     }
 }
 

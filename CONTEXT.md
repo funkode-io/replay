@@ -115,6 +115,12 @@ A `stream_filter` decides what a Policy *reacts to*, never how far it *gets*: an
 event advances the place and fires nothing, like a compaction snapshot
 ([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md),
 [ADR-0004](docs/adr/0004-compaction-synthetic-event-marker-for-policy-feed.md)).
+
+The one exception is which streams the Policy **tracks**: every stream, unless its whole
+filter is `ForStreamTypes(types)`, in which case only the streams of those types. Both
+nomination queries and the places honour that set — a stream the Policy does not track is
+never compared, read or given a place, and is never behind
+([ADR-0030](docs/adr/0030-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 _Avoid_: subscription, stream, queue, backlog.
 
 ### Causation

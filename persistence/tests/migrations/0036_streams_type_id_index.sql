@@ -1,0 +1,15 @@
+-- no-transaction
+-- The reconciliation of a Policy that tracks some stream types (ADR-0030) reads
+-- `WHERE type = ANY($types) AND id > $rotation ORDER BY id`: the type leads, and the
+-- rotation's id is the second column, so a pass examines the tracked streams sorting
+-- after the rotation and not one row of any other type. `idx_streams_type` from 0005 is
+-- this index's prefix; 0037 drops it once this one exists.
+--
+-- Neither column changes after a stream is created, so appends — which update the
+-- stream's row on every event — stay heap-only updates and never touch this index.
+--
+-- CONCURRENTLY, so appends keep running while the index is built on a populated table;
+-- that cannot run inside a transaction, hence `-- no-transaction` above. No
+-- IF NOT EXISTS: a concurrent build that fails leaves an *invalid* index behind, and
+-- IF NOT EXISTS would step over it and report success with no usable index.
+CREATE INDEX CONCURRENTLY idx_streams_type_id ON streams (type, id);
