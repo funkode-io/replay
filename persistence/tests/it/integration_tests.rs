@@ -2009,11 +2009,13 @@ async fn or_filtered_inline_projection_rebuild_excludes_compaction_snapshots_pos
     .await;
 }
 
-/// Appends a deposit and a month close, compacts them into one snapshot row, then
-/// registers a recorder under `filter`. Its first replay must deliver the two real
-/// events once each; a later append must be delivered once live; and a version bump
-/// must replay all three real events once each, never the snapshot, one per batch at
-/// a flush size of one.
+/// Appends a deposit and a month close to an unrelated account and then to
+/// [`rebuild_account`], compacting each into one snapshot row, then registers a
+/// recorder under `filter`. Its first replay must deliver the real events `filter`
+/// selects once each (the unrelated account's only under [`StreamFilter::All`], so
+/// a narrow filter visibly narrows); a later append must be delivered once live; and
+/// a version bump must replay the same real events plus that append once each, never
+/// a snapshot, one per batch at a flush size of one.
 async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
     let container = start_postgres_server().await;
     let host = container.get_host().await.unwrap().to_string();
@@ -2025,39 +2027,49 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
         .unwrap();
 
     let store = replay_persistence::PostgresEventStore::new(pool.clone());
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+    let unrelated = BankAccountUrn::new("rebuild-true-log-unrelated").expect("a valid account id");
     let account = rebuild_account();
     let month = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-    let events = [
-        BankAccountEvent::Deposited {
-            operation_date: month,
-            amount: 100.0,
-        },
-        BankAccountEvent::MonthlyClosed {
-            month,
-            closing_balance: 100.0,
-        },
-    ];
-    let mut expected = Vec::new();
-    store
-        .store_events_stream::<BankAccount, _, _>(
-            &account,
-            BankAccount::stream_type(),
-            replay::Metadata::default(),
-            futures::stream::iter(events.into_iter().map(Ok)),
-            None,
-            |event: &PersistedEvent<BankAccountEvent>| expected.push(event.id),
-        )
-        .await
-        .unwrap();
 
-    let cqrs = replay_persistence::Cqrs::new(store);
-    let aggregate = cqrs.fetch_aggregate::<BankAccount>(&account).await.unwrap();
-    assert!(matches!(
-        cqrs.compact(&aggregate, replay::Metadata::default())
+    // The real events `filter` selects, in global-position order.
+    let mut expected = Vec::new();
+    for stream in [&unrelated, &account] {
+        let selected = matches!(filter, StreamFilter::All) || stream == &account;
+        let events = [
+            BankAccountEvent::Deposited {
+                operation_date: month,
+                amount: 100.0,
+            },
+            BankAccountEvent::MonthlyClosed {
+                month,
+                closing_balance: 100.0,
+            },
+        ];
+        store
+            .store_events_stream::<BankAccount, _, _>(
+                stream,
+                BankAccount::stream_type(),
+                replay::Metadata::default(),
+                futures::stream::iter(events.into_iter().map(Ok)),
+                None,
+                |event: &PersistedEvent<BankAccountEvent>| {
+                    if selected {
+                        expected.push(event.id)
+                    }
+                },
+            )
             .await
-            .unwrap(),
-        CompactionOutcome::Compacted { .. }
-    ));
+            .unwrap();
+
+        let aggregate = cqrs.fetch_aggregate::<BankAccount>(stream).await.unwrap();
+        assert!(matches!(
+            cqrs.compact(&aggregate, replay::Metadata::default())
+                .await
+                .unwrap(),
+            CompactionOutcome::Compacted { .. }
+        ));
+    }
 
     let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let rebuilt = replay_persistence::PostgresEventStore::builder(pool.clone())
@@ -2073,10 +2085,10 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
 
     {
         let batches = batches.lock().unwrap();
-        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 2);
         assert_eq!(
             batches.iter().flatten().copied().collect::<Vec<_>>(),
-            expected
+            expected,
+            "first registration replays the selected real events once each"
         );
         assert!(batches.iter().all(|batch| batch.len() <= 1));
     }
@@ -2120,7 +2132,6 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
         .unwrap();
 
     let batches = batches.lock().unwrap();
-    assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 3);
     assert_eq!(
         batches.iter().flatten().copied().collect::<Vec<_>>(),
         expected,
