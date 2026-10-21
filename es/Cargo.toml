@@ -2,6 +2,7 @@
 name = "es-replay"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Event Sourcing and CQRS library with WASM support"
 license.workspace = true
 repository.workspace = true
