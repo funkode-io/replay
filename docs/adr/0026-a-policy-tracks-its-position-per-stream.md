@@ -10,6 +10,9 @@ a hole in `global_position` — no longer exists. Narrows
 [ADR-0018](0018-every-event-read-is-ordered-by-global-position.md) to the reads it was
 written about. Moves the control surface of
 [ADR-0012](0012-policy-cursor-is-an-operator-writable-control-surface.md) to a new table.
+Amended by [ADR-0030](0030-a-late-write-is-found-by-its-commit-stamp.md): a write that
+commits below the sweep is found by its commit stamp on the next poll, and the
+reconciliation below becomes a safety net on a slower cadence.
 
 ## Context
 
