@@ -2,6 +2,7 @@
 name = "es-replay-persistence"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Persistence layer for the Replay event sourcing library (PostgreSQL and in-memory backends)"
 license.workspace = true
 repository.workspace = true
