@@ -11,7 +11,7 @@ use sqlx::PgPool;
 use urn::Urn;
 
 use replay_macros::define_aggregate;
-use replay_persistence::{AggregateVersion, CompactionOutcome, EventStore};
+use replay_persistence::{AggregateVersion, CompactionOutcome, EventStore, StreamFilter};
 
 use crate::common;
 use common::postgres_image::start_postgres_server;
@@ -329,6 +329,93 @@ async fn compaction_writes_snapshot_rows_in_the_order_the_rewrite_returned_postg
         ],
         "`compacted_events` must be a fixpoint"
     );
+}
+
+#[tokio::test]
+async fn stream_events_identifies_and_filters_compaction_snapshots_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let cqrs =
+        replay_persistence::Cqrs::new(replay_persistence::PostgresEventStore::new(pool.clone()));
+    let stream_id = AclUrn::new("acl-snapshot-filter-1").unwrap();
+    let metadata = replay::Metadata::default();
+
+    for command in [
+        AclCommand::Grant {
+            member: "alice".to_string(),
+        },
+        AclCommand::Grant {
+            member: "bob".to_string(),
+        },
+        AclCommand::Revoke {
+            member: "alice".to_string(),
+        },
+    ] {
+        cqrs.execute::<Acl>(&stream_id, metadata.clone(), command, &(), None)
+            .await
+            .expect("append must succeed");
+    }
+
+    let acl = cqrs.fetch_aggregate::<Acl>(&stream_id).await.unwrap();
+    cqrs.compact(&acl, metadata.clone())
+        .await
+        .expect("compaction succeeds");
+    cqrs.execute::<Acl>(
+        &stream_id,
+        metadata,
+        AclCommand::Grant {
+            member: "carol".to_string(),
+        },
+        &(),
+        None,
+    )
+    .await
+    .expect("post-compaction append must succeed");
+
+    let store = replay_persistence::PostgresEventStore::new(pool);
+    let stream_filter = StreamFilter::with_stream_id::<Acl>(&stream_id);
+    let all: Vec<_> = store
+        .stream_events::<AclEvent>(stream_filter.clone())
+        .try_collect()
+        .await
+        .expect("reading the stream must succeed");
+    let real_log: Vec<_> = store
+        .stream_events::<AclEvent>(
+            stream_filter
+                .clone()
+                .and(StreamFilter::compacted_snapshot(false)),
+        )
+        .try_collect()
+        .await
+        .expect("filtering real events must succeed");
+    let snapshots: Vec<_> = store
+        .stream_events::<AclEvent>(
+            stream_filter
+                .clone()
+                .and(StreamFilter::compacted_snapshot(true)),
+        )
+        .try_collect()
+        .await
+        .expect("filtering snapshot events must succeed");
+    let real_log_via_not: Vec<_> = store
+        .stream_events::<AclEvent>(stream_filter.and(!StreamFilter::compacted_snapshot(true)))
+        .try_collect()
+        .await
+        .expect("negated snapshot filter must succeed");
+
+    assert_eq!(
+        all.iter()
+            .map(|event| event.compacted_snapshot)
+            .collect::<Vec<_>>(),
+        vec![false, false, false, true, false]
+    );
+    assert_eq!(real_log.len(), 4);
+    assert!(real_log.iter().all(|event| !event.compacted_snapshot));
+    assert_eq!(snapshots.len(), 1);
+    assert!(snapshots[0].compacted_snapshot);
+    assert_eq!(real_log_via_not.len(), 4);
+    assert!(real_log_via_not
+        .iter()
+        .all(|event| !event.compacted_snapshot));
 }
 
 /// `created` stays a legitimate *filter* for time-travel reads. It selects which rows a

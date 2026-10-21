@@ -1483,6 +1483,7 @@ mod tests {
     #[derive(Default)]
     struct DepositRecorder {
         deposits: Arc<StdMutex<Vec<f64>>>,
+        snapshot_flags: Arc<StdMutex<Vec<bool>>>,
         handle_calls: Arc<AtomicUsize>,
     }
 
@@ -1513,6 +1514,10 @@ mod tests {
                 let DepositOnlyEvent::Deposited { amount } = &event.data;
                 deposits.push(*amount);
             }
+            self.snapshot_flags
+                .lock()
+                .unwrap()
+                .extend(events.iter().map(|event| event.compacted_snapshot));
             Ok(())
         }
     }
@@ -1555,6 +1560,7 @@ mod tests {
     async fn inline_projection_routes_and_batches() {
         let recorder = DepositRecorder::default();
         let deposits = recorder.deposits.clone();
+        let snapshot_flags = recorder.snapshot_flags.clone();
         let handle_calls = recorder.handle_calls.clone();
 
         let store = InMemoryEventStore::new().register_projection(recorder);
@@ -1580,6 +1586,7 @@ mod tests {
         // Only the Deposited events reached the projection (Withdrawn failed to deserialize
         // into DepositOnlyEvent and was skipped), delivered as ONE batched handle call.
         assert_eq!(*deposits.lock().unwrap(), vec![100.0, 25.0]);
+        assert_eq!(*snapshot_flags.lock().unwrap(), vec![false, false]);
         assert_eq!(handle_calls.load(Ordering::SeqCst), 1);
     }
 

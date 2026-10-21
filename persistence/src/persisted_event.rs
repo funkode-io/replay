@@ -53,8 +53,9 @@ impl<E: Event> PersistedEvent<E> {
     /// drift from stored data the way a hand-written type string does.
     ///
     /// Override the rest with [`with_version`](Self::with_version),
-    /// [`with_created`](Self::with_created), [`with_metadata`](Self::with_metadata) and
-    /// [`with_aggregate_version`](Self::with_aggregate_version).
+    /// [`with_created`](Self::with_created), [`with_metadata`](Self::with_metadata),
+    /// [`with_aggregate_version`](Self::with_aggregate_version) and
+    /// [`with_compacted_snapshot`](Self::with_compacted_snapshot).
     pub fn of(stream_id: impl Into<Urn>, data: E) -> Self {
         PersistedEvent {
             id: Uuid::new_v4(),
@@ -94,6 +95,7 @@ impl<E> PersistedEvent<E> {
         }
     }
 
+    /// Set whether this is a synthetic row emitted by compaction.
     pub fn with_compacted_snapshot(self, compacted_snapshot: bool) -> Self {
         PersistedEvent {
             compacted_snapshot,

@@ -92,6 +92,7 @@ async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
 #[derive(Clone, Default)]
 struct CallLog {
     batches: Arc<Mutex<Vec<Vec<f64>>>>,
+    snapshot_flags: Arc<Mutex<Vec<bool>>>,
 }
 
 impl CallLog {
@@ -112,6 +113,10 @@ impl CallLog {
             .flatten()
             .copied()
             .collect()
+    }
+
+    fn all_snapshot_flags(&self) -> Vec<bool> {
+        self.snapshot_flags.lock().unwrap().clone()
     }
 }
 
@@ -147,6 +152,11 @@ impl InlineProjection for RecordingProjection {
             })
             .collect();
         self.log.batches.lock().unwrap().push(batch);
+        self.log
+            .snapshot_flags
+            .lock()
+            .unwrap()
+            .extend(events.iter().map(|event| event.compacted_snapshot));
         Ok(())
     }
 }
@@ -196,6 +206,11 @@ async fn streamed_append_flushes_inline_projections_in_bounded_chunks_postgres_t
         log.all_amounts(),
         (0..35).map(|i| i as f64).collect::<Vec<_>>(),
         "chunking must not change which events arrive, or their order"
+    );
+    assert_eq!(
+        log.all_snapshot_flags(),
+        vec![false; 35],
+        "a normal append must hand projections only non-snapshot events"
     );
 }
 
