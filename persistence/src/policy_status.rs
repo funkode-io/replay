@@ -252,6 +252,12 @@ impl PolicyStatusStore {
     /// the walk is under way is met if its id is still ahead. To resume across requests,
     /// pass the last id shown to [`dead_letters_after`](Self::dead_letters_after).
     ///
+    /// The filter is taken by value, where [`dead_letter_count`](Self::dead_letter_count)
+    /// borrows it: the stream is `'static` — it owns a pool handle and its filter, so a
+    /// consumer can return it from a handler or move it into a task — and a borrowed
+    /// filter would tie it to the caller's frame. Clone the filter to count and list
+    /// with the same one.
+    ///
     /// ```rust,ignore
     /// let first_screen: Vec<DeadLetter> = store
     ///     .dead_letters(DeadLetterFilter::new().policy("import_readiness"))
@@ -302,7 +308,8 @@ impl PolicyStatusStore {
         let mut query: QueryBuilder<Postgres> =
             QueryBuilder::new("SELECT COUNT(*) FROM policy_dead_letters dl");
         // The event is joined only for a criterion that reads it: a count by Policy
-        // stays on the dead-letter table's own index.
+        // stays on the dead-letter table's own index. An inner join, which selects the
+        // rows the listing's LEFT JOIN does — see `read_dead_letter_chunk`.
         if filter.reads_trigger() {
             query.push(" JOIN events e ON e.id = dl.event_id");
         }
@@ -401,6 +408,13 @@ impl DeadLetterFilter {
 ///
 /// The glossary's *Dead letter*: one command per reaction, not one per delivery
 /// ([ADR-0024](../../docs/adr/0024-a-parked-command-is-one-row.md)).
+///
+/// The rows one reaction parked share an [`event_id`](Self::event_id), and the two
+/// controls treat them differently. [`crate::PolicyRunner::retry_dead_letter`] on any
+/// one of their ids replays the reaction once and settles **every** sibling row with it
+/// ([ADR-0021](../../docs/adr/0021-retry-settles-a-reaction-not-a-row.md)), so a listing
+/// read before the retry may show siblings that are gone after it.
+/// [`crate::PolicyRunner::discard_dead_letter`] archives only the row it names.
 #[derive(Debug, Clone)]
 pub struct DeadLetter {
     /// The row's id: what [`crate::PolicyRunner::retry_dead_letter`] and
@@ -428,8 +442,9 @@ pub struct DeadLetter {
     /// that names no dispatch: parked before the identity migration, or for a panic in
     /// the reaction itself (funkode-io/replay#210).
     pub aggregate_name: Option<String>,
-    /// URN of the aggregate instance the failed command was addressed to.
-    pub target_stream_id: Option<String>,
+    /// URN of the aggregate instance the failed command was addressed to — the same
+    /// type as a [`PersistedEvent`]'s `stream_id` and [`DeadLetterFilter::triggered_in`].
+    pub target_stream_id: Option<Urn>,
     /// Rust type name of the failed command (its variant and payload are not recorded).
     pub command_name: Option<String>,
     /// The failed dispatch's index in what the reaction returned; negative on a row
@@ -456,7 +471,20 @@ impl DeadLetter {
         let retry_count: i32 = row.get("retry_count");
         let last_retried_at: Option<DateTime<Utc>> = row.get("last_retried_at");
         let aggregate_name: Option<String> = row.get("aggregate_name");
-        let target_stream_id: Option<String> = row.get("target_stream_id");
+        // Written from `Dispatch::target_stream_id`, a `Urn`, so it always parses back.
+        let target_stream_id: Option<Urn> = row
+            .get::<Option<String>, _>("target_stream_id")
+            .map(|raw| {
+                Urn::try_from(raw.clone()).map_err(|e| {
+                    replay::Error::internal(
+                        "failed to parse a dead letter's target_stream_id as URN",
+                    )
+                    .with_operation("dead_letters")
+                    .with_context("target_stream_id", raw)
+                    .with_source(e)
+                })
+            })
+            .transpose()?;
         let command_name: Option<String> = row.get("command_name");
         let dispatch_ordinal: Option<i32> = row.get("dispatch_ordinal");
         let event_id: Uuid = row.get("trigger_event_id");
@@ -489,6 +517,14 @@ impl DeadLetter {
 
 /// Read the chunk of parked rows matching `filter` whose ids follow `after`, in id
 /// order: at most [`DEAD_LETTER_CHUNK`] of them.
+///
+/// The event is LEFT JOINed so a parked command whose triggering event has left the
+/// log is still listed (with no event), as [`PolicyStatusStore::dead_letter_count`]
+/// counts it. That count joins with an inner JOIN, and only when a criterion reads the
+/// event. Both select the same rows: with no `e.*` criterion, the count does not join
+/// and the LEFT JOIN drops nothing; with one, the criterion compares a column the LEFT
+/// JOIN leaves null for a missing event, which is never true, so the LEFT JOIN drops
+/// exactly the rows the inner join does. Change one side and the other must follow.
 async fn read_dead_letter_chunk(
     pool: &Pool<Postgres>,
     filter: &DeadLetterFilter,

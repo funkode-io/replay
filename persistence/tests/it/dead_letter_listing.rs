@@ -1,4 +1,4 @@
-//! A consumer lists its parked reactions, with the event that triggered each, through
+//! A consumer lists its parked commands, with the event that triggered each, through
 //! the status read model rather than through Replay's tables (funkode-io/replay#260).
 //!
 //! The listing is a stream ([ADR-0029](../../../docs/adr/0029-the-public-api-is-stream-first.md)):
@@ -166,8 +166,8 @@ async fn a_listed_dead_letter_carries_its_triggering_event_and_failed_command_po
         Some(std::any::type_name::<Probe>())
     );
     assert_eq!(
-        row.target_stream_id.as_deref(),
-        Some(urn_of("customer-1-target").as_str())
+        row.target_stream_id,
+        Some(ProbeUrn::new("customer-1-target").unwrap().to_urn().clone())
     );
     assert_eq!(
         row.command_name.as_deref(),
@@ -345,6 +345,57 @@ async fn the_listing_resumes_after_a_key_across_chunks_postgres_test() {
         .await
         .unwrap();
     assert_eq!(resumed, all[screen..2 * screen]);
+
+    harness.shutdown().await;
+}
+
+/// A parked command whose triggering event is no longer in the log is still listed,
+/// with no event, so the listing agrees with the count. A criterion on the trigger's
+/// stream or type cannot match it, in the listing or in the count.
+#[tokio::test]
+async fn a_parked_command_whose_trigger_left_the_log_is_listed_without_it_postgres_test() {
+    let harness = PolicyDaemonHarness::start("listing-gone", refusing_policy()).await;
+
+    let gone = harness.ping("customer-gone", "refused-gone").await;
+    let kept = harness.ping("customer-kept", "refused-kept").await;
+    harness.await_dead_letters(2).await;
+    harness.remove_from_log(&gone).await;
+
+    let store = harness.status_store();
+    let mine = DeadLetterFilter::new().policy(harness.policy_name());
+    for filter in [DeadLetterFilter::new(), mine] {
+        let rows = store.dead_letters_all(filter.clone()).await.unwrap();
+        assert_eq!(rows.len(), 2, "both parked commands are listed: {rows:#?}");
+        assert_eq!(store.dead_letter_count(&filter).await.unwrap(), 2);
+        let orphan = rows
+            .iter()
+            .find(|row| row.event_id == gone.event_id)
+            .expect("the orphaned row is listed");
+        assert!(orphan.triggering_event.is_none(), "{orphan:#?}");
+        let intact = rows
+            .iter()
+            .find(|row| row.event_id == kept.event_id)
+            .expect("the intact row is listed");
+        assert_eq!(
+            intact.triggering_event.as_ref().map(|event| event.id),
+            Some(kept.event_id)
+        );
+    }
+
+    let in_gone_stream =
+        DeadLetterFilter::new().triggered_in(ProbeUrn::new("customer-gone").unwrap());
+    assert!(listed_ids(&harness, in_gone_stream.clone())
+        .await
+        .is_empty());
+    assert_eq!(counted(&harness, in_gone_stream).await, 0);
+
+    let pinged = DeadLetterFilter::new().triggered_by("Pinged");
+    let rows = store.dead_letters_all(pinged.clone()).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.event_id).collect::<Vec<_>>(),
+        vec![kept.event_id]
+    );
+    assert_eq!(counted(&harness, pinged).await, 1);
 
     harness.shutdown().await;
 }
