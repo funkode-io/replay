@@ -4,6 +4,15 @@ The ubiquitous language for the `replay` event-sourcing library.
 
 ## Glossary
 
+### Event
+
+A fact: something that happened, named in the past tense after the act and the
+actor that caused it. An event carries the data of that act and never state the
+domain derives from it — a status, an ownership flag or any other rule's outcome
+is decided where events fold into an [Aggregate], so the rule can change without
+rewriting the stream. A value attested at that moment (a month's closing balance)
+is part of the fact. See README, *Events record facts, not state*.
+
 ### Projection
 
 An umbrella term for a derived read model built from events. "Projection" on its
