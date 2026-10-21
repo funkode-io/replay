@@ -2362,9 +2362,12 @@ Lower it if that tail latency matters more than the scan; raise it if you have m
 streams and no long-running writes.
 
 A policy's first reconciliation after its worker starts or is elected leader runs **within
-one cadence**, at a phase derived from the policy's name, rather than on its first poll —
-so the policies of one runner do not all scan at once (see `reconcile_phase` in
-`persistence/src/policy_runner.rs`). A manual `PolicyRunner::drain` always reconciles on
+three poll intervals**, at a phase derived from the policy's name, rather than on its first
+poll, so the policies of one runner do not all scan at once (see `startup_window` and
+`reconcile_phase` in `persistence/src/policy_runner.rs`). The window is the poll interval's,
+not the reconciliation cadence's: that first comparison is how a new leader finds writes
+that were in flight during a failover, so it must not wait a cadence
+([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A manual `PolicyRunner::drain` always reconciles on
 the spot.
 
 The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
