@@ -2311,9 +2311,12 @@ costs a scan of one row per stream, so it runs on a cadence rather than per poll
 | Setting | Default | What it bounds |
 |---------|---------|----------------|
 | `REPLAY_POLICY_RECONCILE_SECS` | 5 | How often the reconciliation runs, and so the unit the delivery bound below is counted in. Never *whether*. |
+| `REPLAY_POLICY_RECONCILE_WINDOW` | 10000 | How many stream ids one reconciliation examines, behind or not, so its cost does not grow with the stream count. A pass spans `ceil(streams / window)` cadences. |
 
 Lower it if that tail latency matters more than the scan; raise it if you have millions of
-streams and no long-running writes.
+streams and no long-running writes. Each policy worker starts its first reconciliation at a
+point within one cadence derived from its name, so policies sharing a runner do not all
+scan at once.
 
 The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
 left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
@@ -2369,7 +2372,7 @@ because a place is only read for a stream that poll is looking at:
 | The stream you moved | When it is picked up |
 |---|---|
 | is still being written to | the next poll, on the sweep |
-| is quiet and the sweep has passed it | the next reconciliation that reaches it — `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)) |
+| is quiet and the sweep has passed it | the next reconciliation that reaches it — `ceil(streams behind / read_batch_size) + ceil(streams / REPLAY_POLICY_RECONCILE_WINDOW)` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the second term being the windows a pass steps through, the wrap past the last stream id included ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)) |
 
 Places themselves are never held in memory between polls, so no running process carries a
 stale copy of one forward.
@@ -3184,7 +3187,7 @@ None of the three stops a policy, and none of them needs an operator:
 |---------------|----------------------|
 | A write failed after taking a `global_position` | Nothing. The number is burned — `nextval` is not transactional — and a policy that reads no global order never looks at it. The place the write took in its stream *is* handed back, because that counter is a row and rolls back with the transaction. |
 | A write is still running | Its stream waits for it, and only its stream. Every other stream is delivered meanwhile. |
-| A write commits below a policy's sweep | It is delivered by the reconciliation, within `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS` — the `+ 1` is the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). |
+| A write commits below a policy's sweep | It is delivered by the reconciliation, within `ceil(streams behind / read_batch_size) + ceil(streams / REPLAY_POLICY_RECONCILE_WINDOW)` cadences of `REPLAY_POLICY_RECONCILE_SECS` — the second term is the windows a pass steps through, the wrap past the last stream id included ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). |
 
 This is the structural fix for
 [#164](https://github.com/funkode-io/replay/issues/164), where a burned position

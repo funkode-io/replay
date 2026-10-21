@@ -33,7 +33,7 @@ use crate::policy::{
     AggregateClosurePolicy, ClosurePolicy, PolicySettings, RegisteredPolicy, StartAt,
 };
 use crate::policy_frontier::{
-    discovered_from_sweep, recovering, Discovered, Nominations, PollPlan,
+    discovered_from_sweep, examined_through, recovering, Discovered, Nominations, PollPlan,
 };
 use crate::policy_liveness::{
     Beat, HeartbeatColumns, HeartbeatWriter, LivenessHandle, LivenessRegistry, WorkerLiveness,
@@ -2121,6 +2121,7 @@ impl PolicyWorker {
                     continue 'lifetime;
                 }
             };
+            progress.stagger(&name);
 
             // Where this worker picks up, once per election. A Policy resumes per
             // stream, so what it announces is where its search resumes; what it has
@@ -3118,9 +3119,16 @@ async fn drain_policy_once(
     let discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
     let reconciling = progress.reconcile_is_due();
     let examined = if reconciling {
-        streams_behind(pool, &name, &progress.reconciled_through, read_batch).await?
+        streams_behind(
+            pool,
+            &name,
+            &progress.reconciled_through,
+            read_batch,
+            progress.reconcile_window,
+        )
+        .await?
     } else {
-        Vec::new()
+        Examined::default()
     };
 
     // Everything this poll decides is decided in one place: which streams it reads and in
@@ -3138,7 +3146,8 @@ async fn drain_policy_once(
     let mut plan = PollPlan::plan(Nominations {
         carried: progress.unfinished.clone(),
         swept: discovered.streams,
-        examined,
+        examined: examined.streams,
+        examined_through: examined.through,
         reconciling,
         read_batch,
         share_from: progress.share_from,
@@ -4237,22 +4246,36 @@ async fn sweep_for_streams(
     ))
 }
 
-/// The streams this Policy is behind on, compared head to cursor, taking the batch that
-/// sorts after `after`.
+/// What one reconciliation compared: the streams it found behind, and where the rotation
+/// lands once they are all read.
+#[derive(Debug, Default)]
+struct Examined {
+    streams: Vec<String>,
+    through: String,
+}
+
+/// The streams this Policy is behind on, compared head to cursor, among the `window`
+/// stream ids that sort after `after`, at most `limit` of them.
 ///
 /// This is the correctness half: it finds what the sweep missed, which is any write that
 /// committed below a position the sweep had already passed. No index answers a comparison
-/// between two tables' columns, so it scans one row per stream and is bounded by `limit`
-/// rather than by an index — which is why it runs on a cadence and the sweep runs on every
-/// poll (ADR-0026).
+/// between two tables' columns, so it compares one row per stream — which is why it runs
+/// on a cadence and the sweep runs on every poll (ADR-0026).
 ///
-/// It resumes after the last id it examined instead of restarting at the lowest, because
-/// `limit` is a batch and not a snapshot: a Policy with `limit` permanently-behind streams
-/// low in the sort order would otherwise return those same ids every time, and a quiet
-/// stream sorting after them — one whose only write the sweep passed, so no future event
-/// will nominate it — would never be examined again. Rotating bounds that at one pass over
-/// the streams: `ceil(streams / limit)` cadences while the Policy is keeping up, and one
-/// stream a cadence at worst, because the poll it runs on gives it the first slot
+/// What it *examines* is bounded by `window`, not just what it returns by `limit`: a
+/// Policy that is caught up, which is the steady state, has no row pass the comparison,
+/// and a scan bounded only by the rows it returns walks every stream to find that out
+/// (funkode-io/replay#258). The window is taken off `streams_pkey` first and only its
+/// rows are joined, so a cadence costs O(`window`) whatever the stream count.
+///
+/// It resumes after what it examined instead of restarting at the lowest id, because
+/// neither bound is a snapshot: a Policy with `limit` permanently-behind streams low in
+/// the sort order would otherwise return those same ids every time, and a quiet stream
+/// sorting after them — one whose only write the sweep passed, so no future event will
+/// nominate it — would never be examined again. The rotation steps past a whole window
+/// whether or not anything in it was behind, so a pass costs `ceil(streams / window)`
+/// cadences plus one for each behind stream at worst, because the poll it runs on gives
+/// it the first slot
 /// ([ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) owns the
 /// bound).
 async fn streams_behind(
@@ -4260,21 +4283,48 @@ async fn streams_behind(
     name: &str,
     after: &str,
     limit: u32,
-) -> Result<Vec<String>, replay::Error> {
+    window: u32,
+) -> Result<Examined, replay::Error> {
+    // One row per behind stream, each carrying the window's extent; a single row with a
+    // NULL id when nothing in the window is behind, so the extent always comes back.
     let rows = sqlx::query(
-        "SELECT s.id FROM streams s \
-         LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
-         WHERE s.id > $2 AND s.stream_seq > COALESCE(c.stream_seq, 0) \
-         ORDER BY s.id LIMIT $3",
+        "WITH win AS ( \
+             SELECT id, stream_seq FROM streams WHERE id > $2 ORDER BY id LIMIT $4 \
+         ), \
+         extent AS (SELECT max(id) AS last, count(*) AS len FROM win) \
+         SELECT b.id, e.last, e.len FROM extent e \
+         LEFT JOIN LATERAL ( \
+             SELECT w.id FROM win w \
+             LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = w.id \
+             WHERE w.stream_seq > COALESCE(c.stream_seq, 0) \
+             ORDER BY w.id LIMIT $3 \
+         ) b ON true \
+         ORDER BY b.id",
     )
     .bind(name)
     .bind(after)
     .bind(limit as i64)
+    .bind(window as i64)
     .fetch_all(pool)
     .await
     .map_err(crate::db_error)?;
 
-    Ok(rows.into_iter().map(|row| row.get("id")).collect())
+    let (window_last, window_len) = rows
+        .first()
+        .map(|row| {
+            (
+                row.get::<Option<String>, _>("last"),
+                row.get::<i64, _>("len"),
+            )
+        })
+        .unwrap_or((None, 0));
+    let streams: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.get::<Option<String>, _>("id"))
+        .collect();
+    let through = examined_through(&streams, window_last, window_len as u32, window, limit);
+
+    Ok(Examined { streams, through })
 }
 
 /// A Policy's place in one stream, as a poll read it.
@@ -4559,6 +4609,8 @@ struct PolicyProgress {
     /// [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md) states
     /// and this is the unit of.
     reconcile_every: Duration,
+    /// How many stream ids one reconciliation examines, behind or not.
+    reconcile_window: u32,
 }
 
 impl PolicyProgress {
@@ -4580,7 +4632,30 @@ impl PolicyProgress {
             reconciled_through,
             reconciled_at: None,
             reconcile_every: resolve_reconcile_cadence(),
+            reconcile_window: resolve_reconcile_window(),
         })
+    }
+
+    /// Put the first reconciliation of a worker at a point within one cadence that
+    /// depends on the Policy's name, rather than straight away.
+    ///
+    /// Every Policy of a runner shares the cadence and starts together, so without this
+    /// they all reconcile in the same instant on every start and on every cadence after
+    /// it (funkode-io/replay#258). The delay is under one cadence, which is the unit
+    /// ADR-0026's bound is already counted in.
+    fn stagger(&mut self, name: &str) {
+        use std::hash::{Hash, Hasher};
+
+        let every = self.reconcile_every.as_millis() as u64;
+        if every == 0 {
+            return;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut hasher);
+        let delay = Duration::from_millis(hasher.finish() % every);
+        // As if the last reconciliation ran `every - delay` ago, so the next is `delay`
+        // from now. An `Instant` that cannot go back that far reconciles straight away.
+        self.reconciled_at = Instant::now().checked_sub(self.reconcile_every - delay);
     }
 
     /// Make the next poll pay for the frontier scan whatever the cadence says.
@@ -4616,6 +4691,27 @@ fn resolve_reconcile_cadence() -> Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map_or(DEFAULT_RECONCILE_CADENCE, Duration::from_secs)
+}
+
+/// Built-in default for [`resolve_reconcile_window`].
+///
+/// Ten thousand stream ids is one cheap index range per cadence, and a pass over a
+/// hundred thousand streams in ten cadences.
+const DEFAULT_RECONCILE_WINDOW: u32 = 10_000;
+
+/// Environment variable overriding the built-in window, in stream ids.
+const RECONCILE_WINDOW_ENV_VAR: &str = "REPLAY_POLICY_RECONCILE_WINDOW";
+
+/// How many stream ids one reconciliation examines.
+///
+/// Precedence: `REPLAY_POLICY_RECONCILE_WINDOW` → 10 000. `0` and unparseable values fall
+/// back to the default.
+fn resolve_reconcile_window() -> u32 {
+    std::env::var(RECONCILE_WINDOW_ENV_VAR)
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|window| *window > 0)
+        .unwrap_or(DEFAULT_RECONCILE_WINDOW)
 }
 
 /// Read how far a Policy has swept and where its rotation left off, or `None` when it has
@@ -5858,18 +5954,30 @@ mod progress_tests {
     use testcontainers_modules::postgres;
     use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 
-    use crate::policy_frontier::rotation_after;
+    use crate::policy_frontier::{examined_through, rotation_after};
 
     use super::{
-        bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, Place,
-        PolicyProgress, StartAt,
+        bootstrap, checkpoint_places, places_of, streams_behind as examine, write_reconciled,
+        Place, PolicyProgress, StartAt,
     };
 
-    /// Move the rotation the way a poll that compared `page` and read `read` of it would,
-    /// without a poll: these tests are about what the next `streams_behind` returns from
-    /// where the rotation lands.
+    /// The behind streams of a reconciliation whose window covers every stream, which is
+    /// what the tests about the page and its rotation are about.
+    async fn streams_behind(
+        pool: &PgPool,
+        name: &str,
+        after: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, replay::Error> {
+        Ok(examine(pool, name, after, limit, u32::MAX).await?.streams)
+    }
+
+    /// Move the rotation the way a poll that compared `page` with a window covering every
+    /// stream, and read `read` of it, would, without a poll: these tests are about what the
+    /// next `streams_behind` returns from where the rotation lands.
     fn rotate(progress: &mut PolicyProgress, page: &[String], read: usize, limit: u32) {
-        if let Some(through) = rotation_after(page, read, limit) {
+        let through = examined_through(page, None, 0, 1, limit);
+        if let Some(through) = rotation_after(page, read, &through) {
             progress.reconciled_through = through;
         }
     }
@@ -6107,6 +6215,75 @@ mod progress_tests {
             vec!["urn:probe:a".to_string()],
             "and the next pass finds the stream that was behind the cursor"
         );
+    }
+
+    /// A caught-up Policy examines one window a cadence, not every stream.
+    ///
+    /// Bounded only by the rows it returned, a reconciliation that found nothing behind had
+    /// walked every stream to find that out, on every cadence (funkode-io/replay#258).
+    #[tokio::test]
+    async fn a_caught_up_policy_steps_through_the_streams_a_window_at_a_time_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        for stream in ["urn:probe:a", "urn:probe:b", "urn:probe:c"] {
+            append_events(&pool, stream, 1).await;
+            checkpoint(&pool, stream, 1).await;
+        }
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+
+        let first = examine(&pool, POLICY, "", 10, 2).await.unwrap();
+        assert!(first.streams.is_empty(), "nothing is behind");
+        assert_eq!(
+            first.through, "urn:probe:b",
+            "the rotation steps past the whole window all the same"
+        );
+
+        let second = examine(&pool, POLICY, &first.through, 10, 2).await.unwrap();
+        assert!(second.streams.is_empty());
+        assert_eq!(second.through, "", "a short window ends the pass");
+    }
+
+    /// A behind stream past the first window is found by the window that holds it.
+    #[tokio::test]
+    async fn a_behind_stream_is_found_in_its_window_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        for stream in ["urn:probe:a", "urn:probe:b", "urn:probe:c"] {
+            append_events(&pool, stream, 1).await;
+        }
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, "urn:probe:a", 1).await;
+        checkpoint(&pool, "urn:probe:b", 1).await;
+
+        let first = examine(&pool, POLICY, "", 10, 2).await.unwrap();
+        assert!(first.streams.is_empty());
+        let second = examine(&pool, POLICY, &first.through, 10, 2).await.unwrap();
+        assert_eq!(second.streams, vec!["urn:probe:c".to_string()]);
+        assert_eq!(second.through, "");
+    }
+
+    /// Policies sharing a cadence do not all reconcile in the instant their workers start,
+    /// and none waits a whole cadence for its first (funkode-io/replay#258).
+    #[tokio::test]
+    async fn a_worker_staggers_its_first_reconciliation_within_a_cadence_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Beginning)
+            .await
+            .expect("loading must succeed");
+        progress.reconcile_every = std::time::Duration::from_secs(3600);
+
+        let mut due_in = Vec::new();
+        for name in ["policy_one", "policy_two", "policy_three"] {
+            progress.stagger(name);
+            let last = progress.reconciled_at.expect("an hour back is representable");
+            due_in.push(progress.reconcile_every.saturating_sub(last.elapsed()));
+            assert!(!progress.reconcile_is_due(), "{name} waits for its slot");
+        }
+        due_in.sort();
+        due_in.dedup_by(|a, b| a.as_secs() == b.as_secs());
+        assert_eq!(due_in.len(), 3, "each Policy has a slot of its own");
     }
 
     /// The reconciliation rotates, so a stream sorting after a batch that never catches

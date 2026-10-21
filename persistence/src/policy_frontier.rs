@@ -63,6 +63,10 @@ pub(crate) struct Nominations {
     /// What the reconciliation compared, empty when none is due — and empty when one is
     /// due and found nothing, which is a different fact and the one `reconciling` carries.
     pub(crate) examined: Vec<String>,
+    /// Where the rotation lands once the poll has read the whole of `examined`: the end
+    /// of the key window the reconciliation compared, or the empty string when that window
+    /// reached the last stream id. See [`examined_through`].
+    pub(crate) examined_through: String,
     /// Whether a reconciliation ran on this poll.
     pub(crate) reconciling: bool,
     /// The poll's candidate cap and its event budget, which are the same knob.
@@ -88,6 +92,8 @@ pub(crate) struct PollPlan {
     /// What the reconciliation compared, kept whole: the rotation moves through *this*
     /// order, which is stream id order, and not through the order the poll read in.
     page: Vec<String>,
+    /// Where the rotation lands when the whole page is read.
+    page_through: String,
     reconciling: bool,
     read_batch: u32,
     /// The queue this poll started from, whole and in order — not just the part that
@@ -149,6 +155,7 @@ impl PollPlan {
             carried,
             swept,
             examined,
+            examined_through,
             reconciling,
             read_batch,
             share_from,
@@ -176,6 +183,7 @@ impl PollPlan {
         Self {
             streams: taken,
             page,
+            page_through: examined_through,
             reconciling,
             read_batch,
             carried: queue,
@@ -264,7 +272,7 @@ impl PollPlan {
                 .take_while(|stream| read.contains(stream))
                 .count();
 
-            rotation_after(&self.page, read_through, self.read_batch)
+            rotation_after(&self.page, read_through, &self.page_through)
         });
 
         // What the next poll starts from, oldest claim first.
@@ -381,16 +389,41 @@ pub(crate) fn recovering(
 /// Where the rotation lands after a reconciliation compared `page` and the poll read
 /// `read` of it, counted from the front. `None` leaves it where it was.
 ///
-/// A page read whole and short of the limit — no page at all included, which is what the
-/// last stream id looks like from the far side — is the end of a pass, and the next one
-/// starts over: the empty string sorts before every id.
-pub(crate) fn rotation_after(page: &[String], read: usize, limit: u32) -> Option<String> {
-    if read == page.len() && (page.len() as u32) < limit {
-        Some(String::new())
+/// A page read whole moves the rotation to `through`, the end of what the reconciliation
+/// examined — past the caught-up streams in its window as well as the behind ones, which
+/// is what keeps a pass over a Policy that is behind on nothing from being one scan of
+/// every stream (funkode-io/replay#258). `through` is empty at the end of a pass, and the
+/// next one starts over: the empty string sorts before every id.
+pub(crate) fn rotation_after(page: &[String], read: usize, through: &str) -> Option<String> {
+    if read == page.len() {
+        Some(through.to_string())
     } else if read > 0 {
         Some(page[read - 1].clone())
     } else {
         None
+    }
+}
+
+/// Where a reconciliation that examined a key window of `window_len` stream ids, the last
+/// of them `window_last`, leaves the rotation once its `behind` streams are read.
+///
+/// - `limit` behind streams is a page that may have left some of the window out, so the
+///   rotation stops at the last one returned and the rest of the window is examined again.
+/// - A window shorter than `window` reached the last stream id: the pass is over.
+/// - Otherwise the whole window was compared, and the rotation steps past all of it.
+pub(crate) fn examined_through(
+    behind: &[String],
+    window_last: Option<String>,
+    window_len: u32,
+    window: u32,
+    limit: u32,
+) -> String {
+    if behind.len() as u32 >= limit {
+        behind.last().cloned().unwrap_or_default()
+    } else if window_len < window {
+        String::new()
+    } else {
+        window_last.unwrap_or_default()
     }
 }
 
@@ -591,6 +624,7 @@ mod settling_tests {
             carried: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
             swept: vec!["urn:probe:c".to_string(), "urn:probe:d".to_string()],
             examined: Vec::new(),
+            examined_through: String::new(),
             reconciling: false,
             read_batch: 2,
             share_from: 1,
@@ -623,6 +657,7 @@ mod settling_tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             examined: Vec::new(),
+            examined_through: String::new(),
             reconciling: false,
             read_batch: 3,
             share_from: 1,
@@ -661,6 +696,7 @@ mod settling_tests {
             carried: vec!["urn:probe:a".to_string(), "urn:probe:z".to_string()],
             swept: vec!["urn:probe:a".to_string()],
             examined: vec!["urn:probe:p".to_string()],
+            examined_through: String::new(),
             reconciling: false,
             read_batch: 2,
             share_from: 1,
@@ -691,6 +727,7 @@ mod settling_tests {
             carried: vec!["urn:probe:old".to_string()],
             swept: vec!["urn:probe:swept".to_string()],
             examined: Vec::new(),
+            examined_through: String::new(),
             reconciling: false,
             read_batch: 1,
             share_from: 1,
@@ -721,6 +758,7 @@ mod settling_tests {
             carried: Vec::new(),
             swept: Vec::new(),
             examined: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            examined_through: String::new(),
             reconciling: true,
             read_batch: 4,
             share_from: 0,
@@ -751,35 +789,37 @@ mod settling_tests {
 /// stream examined once a pass and a stream never examined again.
 #[cfg(test)]
 mod rotation_tests {
-    use super::rotation_after;
+    use super::{examined_through, rotation_after};
 
     fn page(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
     }
 
-    /// The end of a pass: no page means nothing sorts after the rotation point, so the
-    /// next one starts over. Without this a rotation that reached the last stream id
-    /// queries past the end for ever, and a stream behind it is never compared again.
+    /// The end of a pass: no page and a window that reached the last id, so the next one
+    /// starts over. Without this a rotation that reached the last stream id queries past
+    /// the end for ever, and a stream behind it is never compared again.
     #[test]
     fn a_page_with_nothing_in_it_ends_the_pass() {
-        assert_eq!(rotation_after(&page(&[]), 0, 100), Some(String::new()));
+        assert_eq!(rotation_after(&page(&[]), 0, ""), Some(String::new()));
     }
 
-    /// A page shorter than the batch is the last of a pass, for the same reason.
+    /// A page taken whole moves the rotation to the end of the window it came from.
     #[test]
-    fn a_short_page_taken_whole_ends_the_pass() {
+    fn a_page_taken_whole_advances_to_the_end_of_its_window() {
         assert_eq!(
-            rotation_after(&page(&["urn:probe:b", "urn:probe:c"]), 2, 100),
-            Some(String::new())
+            rotation_after(&page(&["urn:probe:a", "urn:probe:b"]), 2, "urn:probe:m"),
+            Some("urn:probe:m".to_string())
         );
     }
 
-    /// A full page taken whole carries on after it.
+    /// A window with nothing behind in it still moves the rotation: a caught-up Policy
+    /// examines the next window next cadence instead of every stream on every cadence
+    /// (funkode-io/replay#258).
     #[test]
-    fn a_full_page_taken_whole_advances_the_rotation() {
+    fn an_empty_page_from_a_full_window_steps_past_the_window() {
         assert_eq!(
-            rotation_after(&page(&["urn:probe:a", "urn:probe:b"]), 2, 2),
-            Some("urn:probe:b".to_string())
+            rotation_after(&page(&[]), 0, "urn:probe:m"),
+            Some("urn:probe:m".to_string())
         );
     }
 
@@ -790,7 +830,11 @@ mod rotation_tests {
     #[test]
     fn a_page_the_poll_could_not_fit_stops_where_the_room_ran_out() {
         assert_eq!(
-            rotation_after(&page(&["urn:probe:a", "urn:probe:b", "urn:probe:c"]), 1, 3),
+            rotation_after(
+                &page(&["urn:probe:a", "urn:probe:b", "urn:probe:c"]),
+                1,
+                "urn:probe:z"
+            ),
             Some("urn:probe:a".to_string())
         );
     }
@@ -805,18 +849,48 @@ mod rotation_tests {
     #[test]
     fn a_page_admitted_but_not_read_is_compared_again() {
         assert_eq!(
-            rotation_after(&page(&["urn:probe:b", "urn:probe:c"]), 0, 10),
+            rotation_after(&page(&["urn:probe:b", "urn:probe:c"]), 0, ""),
             None,
             "the rotation stays where it was"
         );
     }
 
-    /// And a page nobody had room for leaves it exactly where it was.
+    /// A window that reached the last stream id ends the pass.
     #[test]
-    fn a_page_with_no_room_at_all_leaves_the_rotation_alone() {
+    fn a_short_window_ends_the_pass() {
         assert_eq!(
-            rotation_after(&page(&["urn:probe:b", "urn:probe:c"]), 0, 2),
-            None
+            examined_through(
+                &page(&["urn:probe:b"]),
+                Some("urn:probe:c".into()),
+                2,
+                10,
+                5
+            ),
+            ""
+        );
+    }
+
+    /// A full window with room to spare in the page is compared whole.
+    #[test]
+    fn a_full_window_is_stepped_past_whole() {
+        assert_eq!(
+            examined_through(&page(&[]), Some("urn:probe:j".into()), 10, 10, 5),
+            "urn:probe:j"
+        );
+    }
+
+    /// A full page may have left behind streams of the window out, so the rotation stops
+    /// at the last one it returned — whether or not the window was short.
+    #[test]
+    fn a_full_page_stops_at_its_last_stream() {
+        let behind = page(&["urn:probe:a", "urn:probe:b"]);
+        assert_eq!(
+            examined_through(&behind, Some("urn:probe:j".into()), 10, 10, 2),
+            "urn:probe:b"
+        );
+        assert_eq!(
+            examined_through(&behind, Some("urn:probe:j".into()), 4, 10, 2),
+            "urn:probe:b"
         );
     }
 }
@@ -843,7 +917,7 @@ mod rotation_tests {
 /// the sweep and the reconciliation would return, and how many events a read yields.
 #[cfg(test)]
 mod liveness_simulation {
-    use super::{Nominations, PollPlan};
+    use super::{examined_through, Nominations, PollPlan};
 
     /// How many cadences each seed is run for. Long enough that a starved stream is
     /// starved rather than merely waiting: the bound below is at most `STREAMS + 1`.
@@ -937,6 +1011,8 @@ mod liveness_simulation {
         seed: u64,
         streams: Vec<Stream>,
         read_batch: u32,
+        /// How many stream ids a reconciliation examines, behind or not.
+        window: u32,
         polls_per_cadence: u32,
         /// The log, as the sweep reads it: one entry per event of a stream it can see.
         log: Vec<usize>,
@@ -962,11 +1038,15 @@ mod liveness_simulation {
             // the poll interval, which is the phase a rotating turn would sample the same
             // way for ever.
             let polls_per_cadence = rng.between(1, 3) as u32;
+            // Sometimes smaller than the stream count, so a pass spans several windows of
+            // caught-up streams (funkode-io/replay#258).
+            let window = rng.between(1, count as u64 + 1) as u32;
 
             let mut schedule = Self {
                 seed,
                 streams: Vec::new(),
                 read_batch,
+                window,
                 polls_per_cadence,
                 log: Vec::new(),
                 swept_through: 0,
@@ -1037,15 +1117,30 @@ mod liveness_simulation {
             streams
         }
 
-        /// `streams_behind`, against the modelled streams: those owed events, sorting
-        /// after the rotation, in id order, capped by the batch.
-        fn examined(&self) -> Vec<String> {
-            self.streams
+        /// `streams_behind`, against the modelled streams: a window of `window` ids after
+        /// the rotation, those of it owed events in id order and capped by the batch, and
+        /// where the rotation lands once they are read.
+        fn examined(&self) -> (Vec<String>, String) {
+            let window: Vec<&Stream> = self
+                .streams
                 .iter()
-                .filter(|stream| stream.head > stream.place && stream.id > self.rotation)
+                .filter(|stream| stream.id > self.rotation)
+                .take(self.window as usize)
+                .collect();
+            let behind: Vec<String> = window
+                .iter()
+                .filter(|stream| stream.head > stream.place)
                 .map(|stream| stream.id.clone())
                 .take(self.read_batch as usize)
-                .collect()
+                .collect();
+            let through = examined_through(
+                &behind,
+                window.last().map(|stream| stream.id.clone()),
+                window.len() as u32,
+                self.window,
+                self.read_batch,
+            );
+            (behind, through)
         }
 
         fn behind(&self) -> Vec<&str> {
@@ -1068,10 +1163,10 @@ mod liveness_simulation {
         fn poll(&mut self, reconciling: bool) {
             let carried = std::mem::take(&mut self.carried);
             let swept = self.swept();
-            let examined = if reconciling {
+            let (examined, examined_through) = if reconciling {
                 self.examined()
             } else {
-                Vec::new()
+                (Vec::new(), String::new())
             };
             let page = examined.join(",");
             let page_len = examined.len();
@@ -1080,6 +1175,7 @@ mod liveness_simulation {
                 carried: carried.clone(),
                 swept: swept.clone(),
                 examined,
+                examined_through,
                 reconciling,
                 read_batch: self.read_batch,
                 share_from: self.share_from,
@@ -1180,6 +1276,10 @@ mod liveness_simulation {
                 .iter()
                 .filter(|stream| stream.head > stream.place)
                 .count() as u32;
+            // The cadences a pass spends on windows with nothing behind in them, the one
+            // that wraps included: one when a window covers every stream, which is the
+            // `+ 1` this bound had before the window (funkode-io/replay#258).
+            let windows = (self.streams.len() as u32).div_ceil(self.window);
             let mut starved: Vec<String> = Vec::new();
 
             for stream in &mut self.streams {
@@ -1189,12 +1289,12 @@ mod liveness_simulation {
                 } else {
                     stream.waited += 1;
                     stream.behind_while_waiting = stream.behind_while_waiting.max(behind_now);
-                    let bound = stream.behind_while_waiting + 1;
+                    let bound = stream.behind_while_waiting + windows;
                     if stream.waited > bound {
                         starved.push(format!(
                             "{} (owed {}, unread for {} cadences, bound {bound} = at most \
                              {} behind at once while it waited, read one a cadence, plus \
-                             the cadence a pass ends on)",
+                             {windows} for the windows a pass steps through)",
                             stream.id,
                             stream.head - stream.place,
                             stream.waited,
@@ -1214,13 +1314,14 @@ mod liveness_simulation {
                  bound, ceil(streams behind / streams read per cadence) + 1:\n  \
                  starved: {}\n  \
                  seed: {}\n  streams: {} ({} quiet, {} busy)\n  read_batch: {}\n  \
-                 polls per cadence: {}\n  schedule:\n    {}",
+                 window: {}\n  polls per cadence: {}\n  schedule:\n    {}",
                 starved.join("\n           "),
                 self.seed,
                 self.streams.len(),
                 self.streams.iter().filter(|s| s.quiet).count(),
                 self.streams.iter().filter(|s| s.busy).count(),
                 self.read_batch,
+                self.window,
                 self.polls_per_cadence,
                 self.transcript.join("\n    "),
             ))

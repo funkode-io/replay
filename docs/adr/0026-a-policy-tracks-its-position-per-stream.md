@@ -54,7 +54,8 @@ columns and no index can answer it. Two paths, with different costs and differen
   It advances `swept_through` to the last position it *read*, deliberately passing
   positions it never saw, which is what stops it waiting for anything.
 - **The reconciliation, on a cadence.** `streams.stream_seq > COALESCE(cursor, 0)` — one
-  row per stream, bounded by the same batch, default every 5 seconds
+  row per stream in a window of `REPLAY_POLICY_RECONCILE_WINDOW` stream ids (default
+  10 000), returning at most the same batch, default every 5 seconds
   (`REPLAY_POLICY_RECONCILE_SECS`). It finds what the sweep swept past: a write that had
   not committed when the sweep passed its position.
 
@@ -72,10 +73,14 @@ is owed is read from that stream's own sequence, which has no holes.
   is a number.** This ADR owns that number; everything else quoting it links here.
 
   ```text
-  cadences ≤ ceil(streams behind / streams read per cadence) + 1
+  cadences ≤ ceil(streams behind / streams read per cadence) + ceil(streams / window)
   ```
 
-  The `+ 1` is the cadence that ends a pass. A rotation standing after the last stream id
+  The second term is the windows a pass steps through. The rotation moves past a whole
+  window whether or not anything in it was behind, so a caught-up Policy pays O(window) a
+  cadence rather than O(streams): bounding only the rows *returned* had a caught-up Policy
+  walk every stream on every cadence to return nothing (funkode-io/replay#258). With a
+  window covering every stream the term is `1`, the cadence that ends a pass. A rotation standing after the last stream id
   reads an empty page, so that poll compares nothing and spends itself wrapping the cursor
   back to the start; a stream sorting before it waits that cadence out
   (funkode-io/replay#243).
