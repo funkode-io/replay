@@ -3346,7 +3346,7 @@ async fn drain_policy_once(
             .unwrap_or_else(|| progress.reconciled_through.clone());
         write_reconciled(pool, &name, &rotation).await?;
         progress.reconciled_through = rotation;
-        progress.reconcile.reconciled(Instant::now());
+        progress.reconciled();
     }
 
     if exhausted {
@@ -4587,16 +4587,20 @@ impl PolicyProgress {
     fn reconcile_is_due(&self) -> bool {
         self.reconcile.is_due(Instant::now())
     }
+
+    /// Record that this poll compared the frontier with the places.
+    fn reconciled(&mut self) {
+        self.reconcile.reconciled(Instant::now());
+    }
 }
 
 /// When a Policy next compares the frontier with its places.
 ///
-/// The first comparison after a load — a start, or an election — falls at the Policy's
-/// [`reconcile_offset`] into the cadence, so a worker that has just been elected
-/// reconciles within one cadence, and the Policies of one runner do not all reconcile
-/// in the same moment (funkode-io/replay#269). Within one cadence is still what makes a
-/// crash mid-backlog cost a cadence rather than a deployment. Every later comparison is
-/// one cadence after the one before.
+/// The first comparison after a load — a start, or an election — is due at the Policy's
+/// [`reconcile_phase`] into the cadence, so a worker that has just been elected
+/// reconciles within one cadence; that bound is what makes a crash mid-backlog cost a
+/// cadence rather than a deployment. Every later comparison is due one cadence after the
+/// one before. A manual drain [forces](Self::force) one regardless.
 ///
 /// Pure over the `now` it is handed, so the decision is tested without a clock.
 struct ReconcileSchedule {
@@ -4612,15 +4616,15 @@ struct ReconcileSchedule {
 }
 
 impl ReconcileSchedule {
-    /// The schedule of the Policy `name`, loaded at `now`: first due at its offset.
+    /// The schedule of the Policy `name`, loaded at `now`: first due at its phase.
     fn after_load(name: &str, every: Duration, now: Instant) -> Self {
         Self {
-            due_at: Some(now + reconcile_offset(name, every)),
+            due_at: Some(now + reconcile_phase(name, every)),
             every,
         }
     }
 
-    /// Make the next comparison due on the next poll, offset or no offset.
+    /// Make the next comparison due on the next poll, whatever the phase or cadence.
     fn force(&mut self) {
         self.due_at = None;
     }
@@ -4659,17 +4663,25 @@ fn resolve_reconcile_cadence() -> Duration {
         .map_or(DEFAULT_RECONCILE_CADENCE, Duration::from_secs)
 }
 
-/// How far into its first cadence a Policy's first reconciliation falls.
+/// How far into its first cadence after a load a Policy's first reconciliation is due:
+/// its *phase*, always within `[0, every)`.
 ///
-/// Every Policy in a runner shares one cadence, so a first reconciliation due on the first
-/// poll would have every Policy compare the frontier with its places in the same moment —
-/// at start, after each election, and every cadence after that. Spreading the first one
-/// spreads them all (funkode-io/replay#269).
+/// Every Policy in a runner shares one cadence. Were the first reconciliation due on the
+/// first poll, every Policy would compare the frontier with its places in the same moment
+/// after a start or an election, and — each next one being a cadence after the last —
+/// keep doing so in lockstep (funkode-io/replay#269). The phase staggers those first
+/// reconciliations across the cadence instead.
 ///
-/// Derived from the name, not drawn at random: a Policy keeps its moment across polls,
+/// What is guaranteed is the first one only: it is due at load plus the phase, and runs
+/// on the first poll at or after that moment. Later ones are due a cadence after the
+/// previous one *finished* — the time is taken after the scan — and run on a poll tick,
+/// so the phases drift and Policies may draw together again over a long leadership. They
+/// do not all start together, which is the burst this exists to break up.
+///
+/// Derived from the name, not drawn at random: a Policy keeps its phase across polls,
 /// processes and runs, and the hash is FNV-1a written here rather than `DefaultHasher`,
-/// whose output a Rust release is free to change. Always within `[0, every)`.
-fn reconcile_offset(name: &str, every: Duration) -> Duration {
+/// whose output a Rust release is free to change.
+fn reconcile_phase(name: &str, every: Duration) -> Duration {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -4681,9 +4693,10 @@ fn reconcile_offset(name: &str, every: Duration) -> Duration {
     if span == 0 {
         return Duration::ZERO;
     }
-    // Below `span` and below 2^64, so it fits the nanoseconds a `Duration` is built from.
     let nanos = u128::from(hash) % span;
-    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    Duration::from_nanos(
+        u64::try_from(nanos).expect("a remainder of a u64 hash is no larger than the hash"),
+    )
 }
 
 /// Read how far a Policy has swept and where its rotation left off, or `None` when it has
@@ -6986,37 +6999,38 @@ mod reconcile_schedule_tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
-    use super::{reconcile_offset, ReconcileSchedule};
+    use super::{reconcile_phase, ReconcileSchedule};
 
     const CADENCE: Duration = Duration::from_secs(5);
 
-    /// The offset is FNV-1a of the name, reduced to the cadence. A cadence wider than any
+    /// The phase is FNV-1a of the name, reduced to the cadence. A cadence wider than any
     /// 64-bit hash leaves the hash itself, which pins it to the published FNV-1a test
     /// vectors: a value no compiler release, platform or process can move.
     #[test]
-    fn the_offset_is_a_stable_hash_of_the_name() {
+    fn the_phase_is_a_stable_hash_of_the_name() {
         let widest = Duration::from_nanos(u64::MAX);
 
         assert_eq!(
-            reconcile_offset("a", widest),
+            reconcile_phase("a", widest),
             Duration::from_nanos(0xaf63_dc4c_8601_ec8c)
         );
         assert_eq!(
-            reconcile_offset("foobar", widest),
+            reconcile_phase("foobar", widest),
             Duration::from_nanos(0x8594_4171_f739_67e8)
         );
     }
 
     #[test]
-    fn the_same_name_gets_the_same_offset_every_time() {
+    fn the_same_name_gets_the_same_phase_every_time() {
         assert_eq!(
-            reconcile_offset("billing", CADENCE),
-            reconcile_offset("billing", CADENCE)
+            reconcile_phase("billing", CADENCE),
+            reconcile_phase("billing", CADENCE)
         );
     }
 
-    /// Several Policies in one runner share the cadence; their first reconciliations do
-    /// not share a moment.
+    /// Several Policies in one runner share the cadence; their first reconciliations are
+    /// spread across it rather than bunched: eight names, and every quarter of the
+    /// cadence holds at least one of them.
     #[test]
     fn different_names_spread_across_the_cadence() {
         let names = [
@@ -7026,54 +7040,66 @@ mod reconcile_schedule_tests {
             "inventory",
             "loyalty",
             "fraud_screening",
+            "refunds",
+            "invoicing",
         ];
 
-        let offsets: HashSet<Duration> = names
+        let phases: Vec<Duration> = names
             .iter()
-            .map(|name| reconcile_offset(name, CADENCE))
+            .map(|name| reconcile_phase(name, CADENCE))
             .collect();
 
+        assert!(
+            phases.iter().all(|phase| *phase < CADENCE),
+            "every phase falls within one cadence: {phases:?}"
+        );
+        let distinct: HashSet<&Duration> = phases.iter().collect();
         assert_eq!(
-            offsets.len(),
+            distinct.len(),
             names.len(),
             "every Policy has its own moment"
         );
-        assert!(
-            offsets.iter().all(|offset| *offset < CADENCE),
-            "every offset falls within one cadence: {offsets:?}"
+        let quarters: HashSet<u128> = phases
+            .iter()
+            .map(|phase| phase.as_nanos() * 4 / CADENCE.as_nanos())
+            .collect();
+        assert_eq!(
+            quarters.len(),
+            4,
+            "every quarter of the cadence has a Policy reconciling in it: {phases:?}"
         );
     }
 
-    /// A name whose offset is well inside the cadence, so "before it" and "at it" are
+    /// A name whose phase is well inside the cadence, so "before it" and "at it" are
     /// both moments a load could see.
     const NAME: &str = "billing";
 
-    fn offset() -> Duration {
-        let offset = reconcile_offset(NAME, CADENCE);
+    fn phase() -> Duration {
+        let phase = reconcile_phase(NAME, CADENCE);
         assert!(
-            offset > Duration::from_millis(1),
-            "the name under test has an offset to wait for"
+            phase > Duration::from_millis(1),
+            "the name under test has a phase to wait for"
         );
-        offset
+        phase
     }
 
-    /// A freshly loaded Policy — just started, or just elected — waits for its offset
+    /// A freshly loaded Policy — just started, or just elected — waits for its phase
     /// rather than reconciling on its first poll.
     #[test]
-    fn a_loaded_policy_first_reconciles_at_its_offset() {
+    fn a_loaded_policy_first_reconciles_at_its_phase() {
         let loaded = Instant::now();
         let schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
 
         assert!(!schedule.is_due(loaded), "not on the first poll");
-        assert!(!schedule.is_due(loaded + offset() - Duration::from_nanos(1)));
-        assert!(schedule.is_due(loaded + offset()), "at its offset");
+        assert!(!schedule.is_due(loaded + phase() - Duration::from_nanos(1)));
+        assert!(schedule.is_due(loaded + phase()), "at its phase");
         assert!(
             schedule.is_due(loaded + CADENCE),
             "within one cadence, whatever the name"
         );
     }
 
-    /// A manual drain is one poll and has to be a whole one: the offset does not apply.
+    /// A manual drain is one poll and has to be a whole one: the phase does not apply.
     #[test]
     fn a_forced_reconciliation_is_due_on_the_first_poll() {
         let loaded = Instant::now();
@@ -7084,13 +7110,13 @@ mod reconcile_schedule_tests {
         assert!(schedule.is_due(loaded));
     }
 
-    /// The offset places the first reconciliation only; every later one follows the
+    /// The phase places the first reconciliation only; every later one follows the
     /// cadence from the one before, as it always has.
     #[test]
     fn after_the_first_reconciliation_the_cadence_is_unchanged() {
         let loaded = Instant::now();
         let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
-        let first = loaded + offset();
+        let first = loaded + phase();
 
         schedule.reconciled(first);
 
