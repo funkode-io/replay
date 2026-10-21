@@ -149,10 +149,14 @@ impl StreamFilter {
         self.and(StreamFilter::WithAggregateVersion(aggregate_version))
     }
 
+    /// Filter on whether an event is a synthetic compaction snapshot row: `false` selects
+    /// the true event log, `true` only the rows compaction wrote.
     pub fn compacted_snapshot(compacted_snapshot: bool) -> StreamFilter {
         StreamFilter::CompactedSnapshot(compacted_snapshot)
     }
 
+    /// Narrow this filter to the true event log (`false`) or to compaction snapshot rows
+    /// (`true`).
     pub fn and_compacted_snapshot(self, compacted_snapshot: bool) -> StreamFilter {
         self.and(StreamFilter::CompactedSnapshot(compacted_snapshot))
     }
@@ -359,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn compacted_snapshot_filter_composes_with_and_and_not() {
+    fn compacted_snapshot_filter_composes_with_and_or_and_not() {
         let bank_account_urn =
             BankAccountUrn(UrnBuilder::new("bank-account", "123").build().unwrap());
         let real = crate::PersistedEvent::of(
@@ -383,7 +387,15 @@ mod tests {
             .and(snapshot_only.clone())
             .passes::<BankAccountStream>(&snapshot));
         assert!(!stream
-            .and(snapshot_only.not())
+            .clone()
+            .and(snapshot_only.clone().not())
             .passes::<BankAccountStream>(&snapshot));
+
+        let either = snapshot_only.or(not_snapshot);
+        assert!(either.passes::<BankAccountStream>(&real));
+        assert!(either.passes::<BankAccountStream>(&snapshot));
+        assert!(!super::StreamFilter::compacted_snapshot(true)
+            .or(super::StreamFilter::after_version(1))
+            .passes::<BankAccountStream>(&real));
     }
 }

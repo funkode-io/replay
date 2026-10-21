@@ -919,11 +919,19 @@ mod tests {
             .try_collect()
             .await
             .unwrap();
+        let either_via_or: Vec<_> = store
+            .stream_events::<BankAccountEvent>(
+                StreamFilter::compacted_snapshot(true).or(StreamFilter::compacted_snapshot(false)),
+            )
+            .try_collect()
+            .await
+            .unwrap();
 
         assert_eq!(real_log.len(), 4);
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots_in_stream.len(), 1);
         assert_eq!(real_log_via_not.len(), 4);
+        assert_eq!(either_via_or.len(), 5);
     }
 
     #[tokio::test]

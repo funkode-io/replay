@@ -397,10 +397,21 @@ async fn stream_events_identifies_and_filters_compaction_snapshots_postgres_test
         .await
         .expect("filtering snapshot events must succeed");
     let real_log_via_not: Vec<_> = store
-        .stream_events::<AclEvent>(stream_filter.and(!StreamFilter::compacted_snapshot(true)))
+        .stream_events::<AclEvent>(
+            stream_filter
+                .clone()
+                .and(!StreamFilter::compacted_snapshot(true)),
+        )
         .try_collect()
         .await
         .expect("negated snapshot filter must succeed");
+    let either_via_or: Vec<_> = store
+        .stream_events::<AclEvent>(stream_filter.and(
+            StreamFilter::compacted_snapshot(true).or(StreamFilter::compacted_snapshot(false)),
+        ))
+        .try_collect()
+        .await
+        .expect("disjunctive snapshot filter must succeed");
 
     assert_eq!(
         all.iter()
@@ -416,6 +427,13 @@ async fn stream_events_identifies_and_filters_compaction_snapshots_postgres_test
     assert!(real_log_via_not
         .iter()
         .all(|event| !event.compacted_snapshot));
+    assert_eq!(
+        either_via_or
+            .iter()
+            .map(|event| event.compacted_snapshot)
+            .collect::<Vec<_>>(),
+        vec![false, false, false, true, false]
+    );
 }
 
 /// `created` stays a legitimate *filter* for time-travel reads. It selects which rows a
