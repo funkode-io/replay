@@ -7046,15 +7046,19 @@ mod progress_tests {
 
     /// Every row a plan node of `relation` produced or threw away, summed over the plan:
     /// what the statement *examined* there, as opposed to what it returned.
+    ///
+    /// EXPLAIN reports a node's produced and removed rows alike as averages per loop, so
+    /// both are scaled by its loops: a scan that discards one row on each of 2,000 loops
+    /// examined 2,000.
     fn rows_examined(plan: &serde_json::Value, relation: &str) -> f64 {
         let own = if plan["Relation Name"] == relation {
             let loops = plan["Actual Loops"].as_f64().unwrap_or(1.0);
-            let produced = plan["Actual Rows"].as_f64().unwrap_or_default() * loops;
+            let produced = plan["Actual Rows"].as_f64().unwrap_or_default();
             let removed = ["Rows Removed by Filter", "Rows Removed by Index Recheck"]
                 .iter()
                 .map(|key| plan[*key].as_f64().unwrap_or_default())
                 .sum::<f64>();
-            produced + removed
+            (produced + removed) * loops
         } else {
             0.0
         };
@@ -7098,6 +7102,51 @@ mod progress_tests {
                 "urn:probe:a3".to_string()
             ],
             "the streams of the tracked type, and none of the other however far behind"
+        );
+
+        let (examined, plan) = streams_examined_by_reconciliation(&pool, &tracked).await;
+        assert!(
+            examined <= 3.0,
+            "the reconciliation examined {examined} rows of `streams` to compare 3: it \
+             walked streams the Policy does not track\n{plan:#}"
+        );
+    }
+
+    /// A Policy caught up on every stream it tracks finds nothing to compare, and still
+    /// reads no row of a type it does not track to find that out — the case #258
+    /// measured, where the reconciliation returned nothing and walked every stream.
+    ///
+    /// The tracked streams hold a place at their heads, the other type none, so the plan
+    /// joins a populated cursor table rather than an empty one.
+    #[tokio::test]
+    async fn a_caught_up_policy_tracking_one_stream_type_examines_no_stream_of_another_postgres_test(
+    ) {
+        let (pool, _container) = start_postgres().await;
+        append_streams_of(&pool, "Probe", "urn:probe:a", 3).await;
+        append_streams_of(&pool, "Ledger", "urn:ledger:b", 2_000).await;
+        let tracked = probes_only();
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, tracked.clone())
+            .await
+            .expect("loading must succeed");
+        sqlx::query(
+            "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+             SELECT $1, id, stream_seq FROM streams WHERE type = 'Probe'",
+        )
+        .bind(POLICY)
+        .execute(&pool)
+        .await
+        .expect("placing the tracked streams at their heads must succeed");
+        sqlx::query("ANALYZE streams, policy_stream_cursors")
+            .execute(&pool)
+            .await
+            .expect("analyzing must succeed");
+
+        assert!(
+            streams_behind(&pool, POLICY, &tracked, "", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "every tracked stream is caught up, and the other type is not compared"
         );
 
         let (examined, plan) = streams_examined_by_reconciliation(&pool, &tracked).await;
