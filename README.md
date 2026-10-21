@@ -2351,8 +2351,10 @@ Which streams to look at is found two ways. Every poll sweeps the log past
 `policy_cursors.discovered_through` for streams with new events — indexed, and bounded by
 `read_batch_size`. That sweep is fast because it never waits: it passes positions it
 cannot see, including one held by a write still in flight. A reconciliation then compares
-every stream's head with the policy's place, catching exactly what the sweep passed. It
-costs a scan of one row per stream, so it runs on a cadence rather than per poll:
+the head of every stream the policy tracks with the policy's place, catching exactly what
+the sweep passed. It costs a scan of one row per tracked stream — every stream, unless the
+policy is [filtered by stream type](#a-policy-filtered-by-stream-type-tracks-only-those-types)
+— so it runs on a cadence rather than per poll:
 
 | Setting | Default | What it bounds |
 |---------|---------|----------------|
@@ -2390,8 +2392,82 @@ bootstrapped according to the registration's `starting_at`:
 
 | `StartAt` | Behaviour |
 |-----------|-----------|
-| `StartAt::Now` (default) | Every existing stream is recorded at its current head, so only newly appended events are processed. Safe when you don't want to fire commands retroactively across existing history. This writes one row per existing stream, once. |
+| `StartAt::Now` (default) | Every existing stream it tracks is recorded at its current head, so only newly appended events are processed. Safe when you don't want to fire commands retroactively across existing history. This writes one row per existing tracked stream, once. |
 | `StartAt::Beginning` | No places are recorded, and a stream with no place starts at its first event; the full history is drained once, then the policy follows live appends. Use this for backfill or projections derived from audit events. |
+
+#### A policy filtered by stream type tracks only those types
+
+A policy whose `stream_filter` is `StreamFilter::ForStreamTypes(types)` — what
+`StreamFilter::for_stream_type::<A>()` builds — **tracks** only the streams of those types,
+not just delivers from them
+([ADR-0031](docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)):
+
+- the reconciliation compares only streams of those types, through the index on
+  `streams (type, id)`, and never reads a row of another type — its cost follows the
+  streams the policy tracks, not every stream in the database;
+- the sweep still reads its `read_batch_size` of new events by position and passes all of
+  them, then drops the streams of other types it found;
+- a stream of any other type is never read by the policy, and gets no row in
+  `policy_stream_cursors` — `StartAt::Now` included;
+- `PolicyStatusStore::list` counts `lag` and `streams_behind` over the tracked streams.
+  The runner records the types in `policy_cursors.tracked_stream_types` when a worker
+  starts the policy; `NULL` there means every stream. A policy's row from before the
+  upgrade holds `NULL` until a worker starts it under this version, so until then its lag
+  counts every stream of every type, untracked ones included;
+- the index on `streams (type, id)` (migration 0036) replaces the one on `type` alone,
+  which migration 0037 drops once its replacement exists.
+
+**Migrate, then deploy.** This version reads and writes
+`policy_cursors.tracked_stream_types` when a worker starts a policy and on every status
+read, so it fails against a schema without migration 0035. Run 0035, 0036 and 0037 in that
+order before deploying it; 0036 and 0037 build and drop an index `CONCURRENTLY`, so each
+runs outside a transaction. The previous version runs unchanged against the migrated
+schema, so the policy daemons can stay up while you migrate.
+
+Every other filter — `All`, `WithStreamId`, `WithMetadata`, and any combinator, including
+an `And` containing a `ForStreamTypes` — tracks every stream. So declare the stream type as
+the policy's whole filter when that is what it reads: a policy reading one type out of
+dozens then pays for that type alone.
+
+**Widening the types starts each newly tracked stream from its first event**, whatever the
+policy's `starting_at`: the policy holds no place in a stream it never tracked, and a
+stream with no place is at its beginning. If that history must not be redelivered, give
+those streams a place before deploying the wider filter. A stream it never tracked has no
+row to `UPDATE`, so insert one at the stream's head, leaving any place it already holds
+alone:
+
+```sql
+-- 'price_fanout' is about to track 'Quote' too: start its Quote streams at their heads.
+INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq)
+SELECT 'price_fanout', s.id, s.stream_seq
+FROM streams s
+WHERE s.type = ANY (ARRAY['Quote'])
+  AND s.stream_seq > 0
+ON CONFLICT (policy, stream_id) DO NOTHING;
+```
+
+The running policy never reads a stream it does not track, so it leaves these rows alone;
+events appended to those streams after the insert are delivered once the wider filter is
+deployed. See
+[Moving a policy on a running system](#moving-a-policy-on-a-running-system) for moving a
+place that exists.
+
+**Places a policy kept before it tracked by type are left where they are.** A policy that
+ran on an earlier release, or under a wider filter, may hold one row per stream of every
+type. They are never read again, and they are not deleted for you, because deleting them is
+not free: if the filter is ever widened to include those types, a missing row means place 0
+and the policy redelivers those streams' whole history — even a `StartAt::Now` policy. If
+you accept that, you can drop them once, on a running system:
+
+```sql
+-- Places of 'price_fanout' in streams of types it no longer tracks. Repeat per policy,
+-- with its own types; batch the DELETE on a large table if lock time matters.
+DELETE FROM policy_stream_cursors c
+USING streams s
+WHERE c.policy = 'price_fanout'
+  AND s.id = c.stream_id
+  AND s.type <> ALL (ARRAY['Price']);
+```
 
 Places are written to Postgres **at least every `checkpoint_batch_size` events** and
 unconditionally at the end of every drain pass. A crash after a command is executed but

@@ -87,8 +87,8 @@ impl fmt::Display for PolicyCondition {
 pub struct PolicyStatus {
     /// Stable name of the policy (the cursor key).
     pub name: String,
-    /// Events written and not yet passed, summed over every stream this Policy is behind
-    /// on.
+    /// Events written and not yet passed, summed over every stream this Policy tracks and
+    /// is behind on.
     ///
     /// An exact count, including the events its filter will skip and the snapshot rows
     /// compaction writes: those are passed rather than delivered, and until they are
@@ -152,9 +152,22 @@ impl PolicyStatusStore {
     /// payload column, so it stays an index-only scan (funkode-io/replay#227).
     ///
     /// The event log is never scanned, but the frontier lateral reads one row per stream
-    /// per policy, because no index can answer a comparison between two tables' columns
-    /// (ADR-0026). That is affordable for a status endpoint scraped every few seconds and
-    /// would not be on every poll, which is why the runner does not use it that way.
+    /// a policy tracks, because no index can answer a comparison between two tables'
+    /// columns (ADR-0026). That is affordable for a status endpoint scraped every few
+    /// seconds and would not be on every poll, which is why the runner does not use it
+    /// that way.
+    ///
+    /// What a policy tracks is what its runner last recorded in
+    /// `policy_cursors.tracked_stream_types`: every stream, or for a policy filtered by
+    /// [`StreamFilter::ForStreamTypes`](crate::StreamFilter::ForStreamTypes) the streams of
+    /// those types. A stream it does not track is never behind — counted against every
+    /// stream, each one with no place would read as behind for ever
+    /// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
+    ///
+    /// **Until a runner records it, every stream counts.** The column is `NULL` — every
+    /// stream — on a row written before it existed, so a policy filtered by type reports
+    /// the lag of every stream of every other type from the upgrade until a worker next
+    /// starts it under this version; that worker records the types, and the lag narrows.
     pub async fn list(&self) -> Result<Vec<PolicyStatus>, replay::Error> {
         let rows = sqlx::query(
             r#"
@@ -172,7 +185,18 @@ impl PolicyStatusStore {
                     -- `SUM` of a bigint is numeric in PostgreSQL; the count fits.
                     SUM(s.stream_seq - COALESCE(c.stream_seq, 0))::bigint AS lag,
                     COUNT(*)                                      AS streams_behind
-                FROM streams s
+                FROM (
+                    -- The streams this Policy tracks (ADR-0031). Two branches rather than
+                    -- one `IS NULL OR type = ANY` predicate, so each is planned on its own:
+                    -- the first is a one-time filter that skips the scan entirely for a
+                    -- Policy that tracks some types, and the second is an index scan on
+                    -- `idx_streams_type_id` that never reads a row of another type.
+                    SELECT id, stream_seq FROM streams
+                     WHERE pc.tracked_stream_types IS NULL
+                    UNION ALL
+                    SELECT id, stream_seq FROM streams
+                     WHERE type = ANY(pc.tracked_stream_types)
+                ) s
                 LEFT JOIN policy_stream_cursors c
                        ON c.policy = pc.name AND c.stream_id = s.id
                 WHERE s.stream_seq > COALESCE(c.stream_seq, 0)
