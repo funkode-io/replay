@@ -78,6 +78,12 @@ When a buffer is a deliberate bounded one, say what bounds it, in the code. The
 allocation-budget tests (`*_allocations.rs`) pin specific paths in bytes, but they are a
 point defence: they cannot see a new path, which is why this section exists.
 
+The same rule shapes the public API: a public function whose result grows with the data
+returns a stream, a collecting `_all` twin is an optional convenience built on it, and
+the library never calls such twins itself
+([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)). A new public `Vec` sized by
+data, or a page size chosen by the library, is a violation, not a style note.
+
 ## Events record facts, not state
 
 Consumers model their events on this repository's examples, so the examples, tests

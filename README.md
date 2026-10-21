@@ -3165,10 +3165,20 @@ one row per stream, which is affordable for a status endpoint scraped every few 
 would not be on every poll — which is why the runner does not find its work this way
 ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
-When you need a **stable cut** of the log — the largest position `H` such that every
-position in `1..=H` is present, e.g. to freeze a version at publish time — use
-`PostgresEventStore::contiguous_high_water_mark()`; replaying events with
-`global_position <= H` then observes the same set of events on every later read.
+Replay offers no **stable cut** of the whole log. A position burned by a failed write is
+never filled, so any global watermark either freezes at the first burned position or waits
+behind the longest write transaction on the server. If a consumer needs to know what
+changed — to refresh a view, or to freeze a version at publish time — use an **inline
+projection**, which commits in the same transaction as the append so a rollback leaves
+nothing behind, or read each stream in its own order and record the **stream place**
+(`stream_seq`) you reached in it, as Policies do
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
+
+> **Deprecated in 0.12.0, removed in the release after.**
+> `PostgresEventStore::contiguous_high_water_mark()` freezes at the first position burned
+> by a rolled-back append and never moves again
+> ([#259](https://github.com/funkode-io/replay/issues/259)). Move to one of the routes
+> above.
 
 `condition` is derived with a strict precedence — **dead letters outrank lag**:
 
