@@ -148,6 +148,9 @@ impl InMemoryEventStore {
             StreamFilter::CreatedAfter(timestamp) => event.created > *timestamp,
             StreamFilter::CreatedBefore(timestamp) => event.created <= *timestamp,
             StreamFilter::WithAggregateVersion(v) => event.aggregate_version == *v,
+            StreamFilter::CompactedSnapshot(compacted_snapshot) => {
+                event.compacted_snapshot == *compacted_snapshot
+            }
             StreamFilter::And(left, right) => {
                 Self::evaluate(left, event, stream_type)
                     && Self::evaluate(right, event, stream_type)
@@ -264,6 +267,7 @@ impl EventStore for InMemoryEventStore {
                 r#type: r#type.clone(),
                 version,
                 aggregate_version: None,
+                compacted_snapshot: false,
                 observed: ObservedEvent {
                     data: event,
                     stream_id: stream_id.clone(),
@@ -277,6 +281,7 @@ impl EventStore for InMemoryEventStore {
                 r#type,
                 version,
                 aggregate_version: None,
+                compacted_snapshot: false,
                 observed: ObservedEvent {
                     data,
                     stream_id: stream_id.clone(),
@@ -342,6 +347,7 @@ impl EventStore for InMemoryEventStore {
                     r#type,
                     version,
                     aggregate_version,
+                    compacted_snapshot,
                     observed,
                 } = event;
                 let data: E = serde_json::from_value(observed.data).map_err(crate::deser_error)?;
@@ -350,6 +356,7 @@ impl EventStore for InMemoryEventStore {
                     r#type,
                     version,
                     aggregate_version,
+                    compacted_snapshot,
                     observed: ObservedEvent {
                         data,
                         stream_id: observed.stream_id,
@@ -465,6 +472,7 @@ impl EventStore for InMemoryEventStore {
                         r#type: event.event_type(),
                         version: seq,
                         aggregate_version: None,
+                        compacted_snapshot: true,
                         observed: ObservedEvent {
                             data,
                             stream_id: stream_id.clone(),
@@ -860,6 +868,70 @@ mod tests {
         let archived = archived_events(&store, &id, 1).await;
         assert_eq!(archived.len(), 3);
         assert!(archived.iter().all(|e| e.aggregate_version == Some(1)));
+        assert!(archived.iter().all(|e| !e.compacted_snapshot));
+
+        store
+            .store_events::<BankAccountStream>(
+                &id,
+                "BankAccount".to_string(),
+                replay::Metadata::default(),
+                &[BankAccountEvent::Withdrawn { amount: 10.0 }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let all: Vec<_> = store
+            .stream_events::<BankAccountEvent>(StreamFilter::with_stream_id::<BankAccountStream>(
+                &id,
+            ))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|event| event.compacted_snapshot)
+                .collect::<Vec<_>>(),
+            vec![false, false, false, true, false],
+            "only the synthetic compaction row is marked"
+        );
+
+        let real_log: Vec<_> = store
+            .stream_events::<BankAccountEvent>(StreamFilter::compacted_snapshot(false))
+            .try_collect()
+            .await
+            .unwrap();
+        let snapshots: Vec<_> = store
+            .stream_events::<BankAccountEvent>(StreamFilter::compacted_snapshot(true))
+            .try_collect()
+            .await
+            .unwrap();
+        let snapshots_in_stream: Vec<_> = store
+            .stream_events::<BankAccountEvent>(
+                StreamFilter::with_stream_id::<BankAccountStream>(&id)
+                    .and(StreamFilter::compacted_snapshot(true)),
+            )
+            .try_collect()
+            .await
+            .unwrap();
+        let real_log_via_not: Vec<_> = store
+            .stream_events::<BankAccountEvent>(!StreamFilter::compacted_snapshot(true))
+            .try_collect()
+            .await
+            .unwrap();
+        let either_via_or: Vec<_> = store
+            .stream_events::<BankAccountEvent>(
+                StreamFilter::compacted_snapshot(true).or(StreamFilter::compacted_snapshot(false)),
+            )
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(real_log.len(), 4);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots_in_stream.len(), 1);
+        assert_eq!(real_log_via_not.len(), 4);
+        assert_eq!(either_via_or.len(), 5);
     }
 
     #[tokio::test]
@@ -1644,6 +1716,7 @@ mod tests {
     #[derive(Default)]
     struct DepositRecorder {
         deposits: Arc<StdMutex<Vec<f64>>>,
+        snapshot_flags: Arc<StdMutex<Vec<bool>>>,
         handle_calls: Arc<AtomicUsize>,
     }
 
@@ -1674,6 +1747,10 @@ mod tests {
                 let DepositOnlyEvent::Deposited { amount } = &event.data;
                 deposits.push(*amount);
             }
+            self.snapshot_flags
+                .lock()
+                .unwrap()
+                .extend(events.iter().map(|event| event.compacted_snapshot));
             Ok(())
         }
     }
@@ -1716,6 +1793,7 @@ mod tests {
     async fn inline_projection_routes_and_batches() {
         let recorder = DepositRecorder::default();
         let deposits = recorder.deposits.clone();
+        let snapshot_flags = recorder.snapshot_flags.clone();
         let handle_calls = recorder.handle_calls.clone();
 
         let store = InMemoryEventStore::new().register_projection(recorder);
@@ -1741,6 +1819,7 @@ mod tests {
         // Only the Deposited events reached the projection (Withdrawn failed to deserialize
         // into DepositOnlyEvent and was skipped), delivered as ONE batched handle call.
         assert_eq!(*deposits.lock().unwrap(), vec![100.0, 25.0]);
+        assert_eq!(*snapshot_flags.lock().unwrap(), vec![false, false]);
         assert_eq!(handle_calls.load(Ordering::SeqCst), 1);
     }
 

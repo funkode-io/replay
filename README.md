@@ -1448,6 +1448,18 @@ async fn test_aggregate_in_wasm() {
 | `StreamFilter::created_after(ts)` | creation timestamp **>** `ts` (exclusive) |
 | `StreamFilter::created_before(ts)` | creation timestamp **≤** `ts` (inclusive) |
 | `StreamFilter::with_aggregate_version(v)` | `aggregate_version` equals `v` (`None` = current events, `Some(n)` = archived snapshot `n`) |
+| `StreamFilter::compacted_snapshot(snapshot)` | `PersistedEvent::compacted_snapshot` equals `snapshot` |
+
+`PersistedEvent::compacted_snapshot` is `true` only for synthetic rows emitted by
+compaction; original events, including archived ones, and later appends are `false`.
+`stream_events` returns both kinds unless filtered. Use
+`StreamFilter::compacted_snapshot(false)` to read the true event log, or
+`StreamFilter::compacted_snapshot(true)` to select only the synthetic snapshot rows.
+These filters compose with `.and()`, `.or()` and `!` like the others.
+
+Policies and inline-projection history rebuilds exclude synthetic snapshot rows.
+Aggregate replay is different: it reads the current compacted stream, including those
+rows, to rebuild aggregate state efficiently.
 
 ### Combining filters
 
@@ -1523,6 +1535,13 @@ let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
 // Archived snapshot created during the 2nd compaction
 let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
     .and_aggregate_version(Some(2));
+```
+
+#### Exclude synthetic compaction rows from a true-log read
+
+```rust
+let filter = StreamFilter::with_stream_id::<BankAccountStream>(&account_id)
+    .and_compacted_snapshot(false);
 ```
 
 #### Filter by metadata (e.g. events tagged with a specific correlation ID)
