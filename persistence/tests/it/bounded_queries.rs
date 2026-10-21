@@ -126,6 +126,21 @@ const REVIEWED: &[Reviewed] = &[
                         aggregated in SQL, so it costs a scan and not a row.",
     },
     Reviewed {
+        file: "src/policy_status.rs",
+        function: "read_dead_letter_chunk",
+        justification: "`LIMIT DEAD_LETTER_CHUNK` (100): one keyset chunk of the \
+                        `dead_letters` stream, which reads the next chunk only after the \
+                        consumer has taken this one.",
+    },
+    Reviewed {
+        file: "src/infrastructure/postgres.rs",
+        function: "streams_needing_compaction_page",
+        justification: "SQL carries LIMIT $limit, the caller's page size; one id per row. \
+                        `Cqrs::streams_needing_compaction` calls it with \
+                        its compaction_chunk_size (default 100) and resumes after the last \
+                        id, so a pass over a whole scope holds one chunk at a time.",
+    },
+    Reviewed {
         file: "src/infrastructure/postgres.rs",
         function: "load_replay_chunk",
         justification: "SQL carries LIMIT $chunk_size, the store's projection_flush_size \

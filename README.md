@@ -2096,6 +2096,38 @@ it — including a stream that has never been compacted but has events. The chec
 best-effort maintenance, so an append that lands just after a `false` read is simply
 picked up on the next run. Both the Postgres and in-memory stores implement it.
 
+### Compacting a whole scope (`streams_needing_compaction`)
+
+A job that compacts every stream of a scope at once — everything in one tenant when it
+publishes, say — does not need a list of ids, nor one `needs_compaction` round-trip per
+stream. `streams_needing_compaction` streams, in stream-id order, the ids of one
+aggregate type that `needs_compaction` would say yes to:
+
+```rust,ignore
+use replay_persistence::StreamScope;
+
+// Every BankAccount stream scoped under the tenant (`urn:bank-account:…@tenant:acme`,
+// nested scopes included) that changed since its last compaction.
+let due = cqrs.streams_needing_compaction::<BankAccountAggregate>(
+    StreamScope::within(&tenant_urn),
+    None, // or Some(last_id_seen) to resume
+);
+futures::pin_mut!(due);
+while let Some(stream_id) = due.try_next().await? {
+    let aggregate = cqrs.fetch_aggregate::<BankAccountAggregate>(&stream_id).await?;
+    cqrs.compact(&aggregate, meta.clone()).await?;
+}
+```
+
+It applies the same watermark, so a stream whose compaction came back `Skipped` is not
+offered again until a new event is appended. The scope is over the stream id only —
+`StreamScope::All`, `Prefix`, `Suffix`, or `within` a scoped URN — with `%`, `_` and `\`
+matched literally. The stream reads in short keyset chunks — 100 ids per query, tunable
+with `Cqrs::compaction_chunk_size` — so a compaction pass holds one chunk of ids at a
+time and no database snapshot between them; a caller that pages across requests takes
+`.take(n)` and resumes with `after` set to the last id it saw
+([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)).
+
 ## Policies
 
 A `Policy` is a checkpointed background subscriber that **reacts to events by
@@ -2917,6 +2949,60 @@ WHERE  deliveries > 1
 ORDER  BY deliveries DESC;
 ```
 
+#### Listing dead letters
+
+To show "which records failed and why" without reading the tables above,
+`PolicyStatusStore` lists parked rows, each with the event that triggered it
+([#260](https://github.com/funkode-io/replay/issues/260)). The listing is a
+**stream**, not a page
+([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)): take what a screen
+shows, or walk all of it. It reads in short keyset chunks on the row id, so holding it
+holds no connection between chunks, and a paged UI resumes after the last id it
+showed. The count is its own call and loads no rows.
+
+```rust,ignore
+use futures::{StreamExt, TryStreamExt};
+use replay::Metadata;
+use replay_persistence::{DeadLetter, DeadLetterFilter, PolicyStatusStore};
+use serde_json::json;
+
+let store = PolicyStatusStore::new(pool.clone());
+let filter = DeadLetterFilter::new()
+    .policy("import_readiness")
+    .triggered_in(import_id)          // the triggering event's stream
+    .triggered_by("RecordRejected")   // the triggering event's type
+    .triggered_with(Metadata::new(json!({ "file_upload_urn": file })));  // its metadata contains this
+
+let total = store.dead_letter_count(&filter).await?;
+
+// First screen, then the next one after the last id shown.
+let screen: Vec<DeadLetter> = store.dead_letters(filter.clone()).take(50).try_collect().await?;
+let next: Vec<DeadLetter> = store
+    .dead_letters_after(filter, screen.last().unwrap().id)
+    .take(50)
+    .try_collect()
+    .await?;
+```
+
+`triggered_with` is for a unit of work a stream does not separate: one import stream
+can hold every file imported into a catalog, and the file is named in the events'
+metadata, so the errors of one file are the rows whose trigger's metadata contains it
+(JSON containment, `@>`).
+
+Each `DeadLetter` carries the row's `id` (what `retry_dead_letter` and
+`discard_dead_letter` take), `policy_name`, `error_kind` and `error_message`,
+`created_at` / `last_parked_at`, `deliveries`, `retry_count` / `last_retried_at`,
+the command and instance that failed (`aggregate_name`, `target_stream_id`,
+`command_name`, `dispatch_ordinal`), and `triggering_event` — the event as a
+`PersistedEvent<serde_json::Value>`. `dead_letters_all(filter)` collects the stream
+for a caller that has decided to hold everything; the library never calls it.
+
+The rows one reaction parked share an `event_id`. `retry_dead_letter` on any of their
+ids replays the reaction once and settles **every** sibling row with it
+([ADR-0021](docs/adr/0021-retry-settles-a-reaction-not-a-row.md)), so a screen read
+before a retry can show siblings that are gone after it. `discard_dead_letter` archives
+only the row it names.
+
 #### Retrying and discarding dead letters
 
 Three operator controls on `PolicyRunner` resolve parked dead letters out of
@@ -3244,7 +3330,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `streams_behind` | How many streams that lag is spread across. One stream a million events behind and a million streams one event behind are the same `lag` and very different problems. |
 | `discovered_through` | How far this policy's search of the log has swept. Not progress — progress is per stream — and not an operator control: a running worker reads it once per leadership term and keeps it in memory, so resetting it moves nothing until that worker restarts. To redeliver, move a place. |
 | `last_checkpoint_at` | When the policy last advanced in any stream (staleness signal). |
-| `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. |
+| `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. List them with `dead_letters` (see [Listing dead letters](#listing-dead-letters)). |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
 | `condition` | At-a-glance health label (see below). |
 
