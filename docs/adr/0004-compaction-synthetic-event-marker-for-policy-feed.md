@@ -50,3 +50,8 @@ never freeze write-model maintenance or grow the live stream unbounded.
   ([ADR-0023](0023-a-stream-is-numbered-twice.md)): the synthetic rows continue the
   sequence they were archived out of, so a reader counting a stream's events sees no jump
   across a compaction.
+- Inline projection replays read the true log too, like the policy feed (#274). First
+  registration and version-drift rebuilds skip `compacted_snapshot = true` rows whatever
+  the projection's `stream_filter()`. Compaction never runs inline projections, so a
+  projection never saw a snapshot row live, and a rebuild that read one would apply
+  compacted history twice.

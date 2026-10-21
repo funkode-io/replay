@@ -34,10 +34,16 @@ pub trait InlineProjection: Send + Sync {
     /// Author-managed code version of this projection's logic/schema.
     fn version(&self) -> i32;
 
-    /// Events to replay when this projection is rebuilt after a version bump.
+    /// Events to replay when this projection is first registered or rebuilt after a
+    /// version bump.
     ///
-    /// Returned filter narrows which streams/events the store scans during a drift
-    /// rebuild, so unrelated history is not read. Defaults to [`StreamFilter::All`].
+    /// Returned filter narrows which streams/events the store scans during either
+    /// replay, so unrelated history is not read. Defaults to [`StreamFilter::All`].
+    ///
+    /// Whatever the filter, a replay reads the true log (ADR-0004): archived
+    /// originals and the real events appended after a compaction, never compaction
+    /// snapshots. A rebuild therefore reproduces what the projection saw live, since
+    /// compaction never runs inline projections.
     fn stream_filter(&self) -> StreamFilter {
         StreamFilter::All
     }

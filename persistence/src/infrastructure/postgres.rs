@@ -514,7 +514,8 @@ impl PostgresEventStoreBuilder {
                     // Replay matching history through the projection so a projection added to
                     // a store that already contains events catches up to the full backlog
                     // (not just events appended after registration). The projection's
-                    // stream_filter narrows which events are scanned.
+                    // stream_filter narrows which events are scanned; compaction snapshots
+                    // are never replayed (funkode-io/replay#274).
                     let replayed =
                         Self::replay_history(&mut tx, &mut *projection, chunk_size).await?;
                     tracing::info!(
@@ -545,7 +546,8 @@ impl PostgresEventStoreBuilder {
                     projection.reset(&mut tx).await?;
 
                     // Replay matching history through the projection. The projection's
-                    // stream_filter narrows which events are scanned.
+                    // stream_filter narrows which events are scanned; compaction snapshots
+                    // are never replayed (funkode-io/replay#274).
                     let replayed =
                         Self::replay_history(&mut tx, &mut *projection, chunk_size).await?;
                     tracing::info!(
@@ -653,7 +655,7 @@ impl PostgresEventStoreBuilder {
     ) -> Result<(Vec<PersistedEvent<Value>>, Option<ReplayCursor>), replay::Error> {
         let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
             "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-             compacted_snapshot, global_position FROM events WHERE (",
+             compacted_snapshot, global_position FROM events WHERE compacted_snapshot = FALSE AND (",
         );
         PostgresEventStore::add_filters(&mut query_builder, filter);
         query_builder.push(")");

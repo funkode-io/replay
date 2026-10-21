@@ -140,14 +140,14 @@ const REVIEWED: &[Reviewed] = &[
                         its compaction_chunk_size (default 100) and resumes after the last \
                         id, so a pass over a whole scope holds one chunk at a time.",
     },
-    // ── Known unbounded ──────────────────────────────────────────────────────
     Reviewed {
         file: "src/infrastructure/postgres.rs",
-        function: "load_events_for_replay",
-        justification: "UNBOUNDED — loads all history matching a projection's filter, and \
-                        holds the rows and the parsed events at once. Tracked by \
-                        funkode-io/replay#157; this entry must be deleted when it is fixed, \
-                        not amended.",
+        function: "load_replay_chunk",
+        justification: "SQL carries LIMIT $chunk_size, the store's projection_flush_size \
+                        (default 500): one keyset page of an inline projection's history \
+                        replay, handed to the projection before the next is read \
+                        (funkode-io/replay#157). Compaction snapshots are excluded, so a \
+                        rebuild reads the true log once (funkode-io/replay#274).",
     },
 ];
 
