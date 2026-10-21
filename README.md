@@ -2316,10 +2316,10 @@ Lower it if that tail latency matters more than the scan; raise it if you have m
 streams and no long-running writes.
 
 A policy's first reconciliation after its worker starts or is elected leader runs **within
-one cadence**, not on its first poll: each policy waits a fixed offset into the cadence,
-derived from its name, so the policies of one runner do not all scan in the same moment.
-Every later reconciliation follows the cadence. A manual `PolicyRunner::drain` always
-reconciles on the spot.
+one cadence**, at a phase derived from the policy's name, rather than on its first poll —
+so the policies of one runner do not all scan at once (see `reconcile_phase` in
+`persistence/src/policy_runner.rs`). A manual `PolicyRunner::drain` always reconciles on
+the spot.
 
 The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
 left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
