@@ -2127,6 +2127,10 @@ impl PolicyWorker {
                     }
                 };
 
+            // A new leader compares the frontier with its places within a few polls, at
+            // its own phase, so the Policies of one runner do not all scan at once.
+            progress.spread_first_reconciliation(&name, interval);
+
             // Where this worker picks up, once per election. A Policy resumes per
             // stream, so what it announces is where its search resumes; what it has
             // processed is one row per stream in `policy_stream_cursors`, which is
@@ -4700,11 +4704,7 @@ impl PolicyProgress {
             unfinished: Vec::new(),
             share_from: 0,
             reconciled_through,
-            reconcile: ReconcileSchedule::after_load(
-                name,
-                resolve_reconcile_cadence(),
-                Instant::now(),
-            ),
+            reconcile: ReconcileSchedule::after_load(resolve_reconcile_cadence()),
             tracked,
         })
     }
@@ -4732,6 +4732,13 @@ impl PolicyProgress {
         Ok(())
     }
 
+    /// Move the first comparison after a load to the Policy's phase into the start-up
+    /// window of a runner polling every `poll_interval`.
+    fn spread_first_reconciliation(&mut self, name: &str, poll_interval: Duration) {
+        self.reconcile
+            .spread(name, startup_window(poll_interval), Instant::now());
+    }
+
     /// Make the next poll pay for the frontier scan whatever the cadence says.
     fn reconcile_now(&mut self) {
         self.reconcile.force();
@@ -4750,11 +4757,14 @@ impl PolicyProgress {
 
 /// When a Policy next compares the frontier with its places.
 ///
-/// The first comparison after a load — a start, or an election — is due at the Policy's
-/// [`reconcile_phase`] into the cadence, so a worker that has just been elected
-/// reconciles within one cadence; that bound is what makes a crash mid-backlog cost a
-/// cadence rather than a deployment. Every later comparison is due one cadence after the
-/// one before. A manual drain [forces](Self::force) one regardless.
+/// A loaded Policy is due on its next poll. The daemon then [spreads](Self::spread) a
+/// worker's first comparison after a start or an election to the Policy's
+/// [`reconcile_phase`] into the [`startup_window`], so a new leader reconciles within a
+/// few polls — not within the cadence, which may be minutes: that comparison is how a
+/// failover finds the writes that were in flight
+/// ([ADR-0030](../../docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). Every
+/// later comparison is due one cadence after the one before. A manual drain
+/// [forces](Self::force) one regardless.
 ///
 /// Pure over the `now` it is handed, so the decision is tested without a clock.
 struct ReconcileSchedule {
@@ -4770,12 +4780,19 @@ struct ReconcileSchedule {
 }
 
 impl ReconcileSchedule {
-    /// The schedule of the Policy `name`, loaded at `now`: first due at its phase.
-    fn after_load(name: &str, every: Duration, now: Instant) -> Self {
+    /// The schedule of a Policy just loaded: due on its next poll.
+    fn after_load(every: Duration) -> Self {
         Self {
-            due_at: Some(now + reconcile_phase(name, every)),
+            due_at: None,
             every,
         }
+    }
+
+    /// Make the next comparison due at the phase of `name` into `window`, counted from
+    /// `now`. A window wider than the cadence is cut to the cadence: spreading must never
+    /// make a first comparison later than an ordinary one.
+    fn spread(&mut self, name: &str, window: Duration, now: Instant) {
+        self.due_at = Some(now + reconcile_phase(name, window.min(self.every)));
     }
 
     /// Make the next comparison due on the next poll, whatever the phase or cadence.
@@ -4817,14 +4834,26 @@ fn resolve_reconcile_cadence() -> Duration {
         .map_or(DEFAULT_RECONCILE_CADENCE, Duration::from_secs)
 }
 
-/// How far into its first cadence after a load a Policy's first reconciliation is due:
-/// its *phase*, always within `[0, every)`.
+/// Polls a new leader's first reconciliations are spread over.
 ///
-/// Every Policy in a runner shares one cadence. Were the first reconciliation due on the
-/// first poll, every Policy would compare the frontier with its places in the same moment
-/// after a start or an election, and — each next one being a cadence after the last —
-/// keep doing so in lockstep (funkode-io/replay#269). The phase staggers those first
-/// reconciliations across the cadence instead.
+/// Three: wide enough that the Policies of one runner do not all scan on the same tick,
+/// narrow enough that a failover finds the writes that were in flight in seconds.
+const STARTUP_SPREAD_POLLS: u32 = 3;
+
+/// The window a new leader's first reconciliations are spread over: a few polls of a
+/// runner polling every `poll_interval`.
+fn startup_window(poll_interval: Duration) -> Duration {
+    poll_interval.saturating_mul(STARTUP_SPREAD_POLLS)
+}
+
+/// How far into its start-up window a Policy's first reconciliation is due: its *phase*,
+/// always within `[0, span)`.
+///
+/// Were the first reconciliation due on the first poll, every Policy would compare the
+/// frontier with its places in the same moment after a start or an election, and — each
+/// next one being a cadence after the last — keep doing so in lockstep
+/// (funkode-io/replay#269). The phase staggers those first reconciliations across the
+/// window instead.
 ///
 /// What is guaranteed is the first one only: it is due at load plus the phase, and runs
 /// on the first poll at or after that moment. Later ones are due a cadence after the
@@ -4835,7 +4864,7 @@ fn resolve_reconcile_cadence() -> Duration {
 /// Derived from the name, not drawn at random: a Policy keeps its phase across polls,
 /// processes and runs, and the hash is FNV-1a written here rather than `DefaultHasher`,
 /// whose output a Rust release is free to change.
-fn reconcile_phase(name: &str, every: Duration) -> Duration {
+fn reconcile_phase(name: &str, span: Duration) -> Duration {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -4843,7 +4872,7 @@ fn reconcile_phase(name: &str, every: Duration) -> Duration {
         (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
     });
 
-    let span = every.as_nanos();
+    let span = span.as_nanos();
     if span == 0 {
         return Duration::ZERO;
     }
@@ -7421,11 +7450,14 @@ mod reconcile_schedule_tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
-    use super::{reconcile_phase, ReconcileSchedule};
+    use super::{reconcile_phase, startup_window, ReconcileSchedule};
 
-    const CADENCE: Duration = Duration::from_secs(5);
+    /// The start-up window of a runner polling every five seconds.
+    const WINDOW: Duration = Duration::from_secs(15);
+    /// A safety-net cadence far wider than the window, as ADR-0030's default is.
+    const CADENCE: Duration = Duration::from_secs(300);
 
-    /// The phase is FNV-1a of the name, reduced to the cadence. A cadence wider than any
+    /// The phase is FNV-1a of the name, reduced to the span. A span wider than any
     /// 64-bit hash leaves the hash itself, which pins it to the published FNV-1a test
     /// vectors: a value no compiler release, platform or process can move.
     #[test]
@@ -7445,16 +7477,27 @@ mod reconcile_schedule_tests {
     #[test]
     fn the_same_name_gets_the_same_phase_every_time() {
         assert_eq!(
-            reconcile_phase("billing", CADENCE),
-            reconcile_phase("billing", CADENCE)
+            reconcile_phase("billing", WINDOW),
+            reconcile_phase("billing", WINDOW)
         );
     }
 
-    /// Several Policies in one runner share the cadence; their first reconciliations are
-    /// spread across it rather than bunched: eight names, and every quarter of the
-    /// cadence holds at least one of them.
+    /// The window is a few polls of the runner's interval.
     #[test]
-    fn different_names_spread_across_the_cadence() {
+    fn the_startup_window_is_three_polls() {
+        assert_eq!(startup_window(Duration::from_secs(5)), WINDOW);
+        assert_eq!(
+            startup_window(Duration::MAX),
+            Duration::MAX,
+            "saturates rather than overflowing"
+        );
+    }
+
+    /// Several Policies in one runner start together; their first reconciliations are
+    /// spread across the window rather than bunched: eight names, and every quarter of
+    /// the window holds at least one of them.
+    #[test]
+    fn different_names_spread_across_the_window() {
         let names = [
             "billing",
             "shipping",
@@ -7468,12 +7511,12 @@ mod reconcile_schedule_tests {
 
         let phases: Vec<Duration> = names
             .iter()
-            .map(|name| reconcile_phase(name, CADENCE))
+            .map(|name| reconcile_phase(name, WINDOW))
             .collect();
 
         assert!(
-            phases.iter().all(|phase| *phase < CADENCE),
-            "every phase falls within one cadence: {phases:?}"
+            phases.iter().all(|phase| *phase < WINDOW),
+            "every phase falls within the window: {phases:?}"
         );
         let distinct: HashSet<&Duration> = phases.iter().collect();
         assert_eq!(
@@ -7483,21 +7526,21 @@ mod reconcile_schedule_tests {
         );
         let quarters: HashSet<u128> = phases
             .iter()
-            .map(|phase| phase.as_nanos() * 4 / CADENCE.as_nanos())
+            .map(|phase| phase.as_nanos() * 4 / WINDOW.as_nanos())
             .collect();
         assert_eq!(
             quarters.len(),
             4,
-            "every quarter of the cadence has a Policy reconciling in it: {phases:?}"
+            "every quarter of the window has a Policy reconciling in it: {phases:?}"
         );
     }
 
-    /// A name whose phase is well inside the cadence, so "before it" and "at it" are
+    /// A name whose phase is well inside the window, so "before it" and "at it" are
     /// both moments a load could see.
     const NAME: &str = "billing";
 
     fn phase() -> Duration {
-        let phase = reconcile_phase(NAME, CADENCE);
+        let phase = reconcile_phase(NAME, WINDOW);
         assert!(
             phase > Duration::from_millis(1),
             "the name under test has a phase to wait for"
@@ -7505,27 +7548,50 @@ mod reconcile_schedule_tests {
         phase
     }
 
-    /// A freshly loaded Policy — just started, or just elected — waits for its phase
-    /// rather than reconciling on its first poll.
+    /// A Policy just loaded is due on its next poll, until its runner spreads it.
     #[test]
-    fn a_loaded_policy_first_reconciles_at_its_phase() {
+    fn a_loaded_policy_is_due_on_its_next_poll() {
+        let schedule = ReconcileSchedule::after_load(CADENCE);
+
+        assert!(schedule.is_due(Instant::now()));
+    }
+
+    /// A new leader waits for its phase into the start-up window — not into the
+    /// cadence, which may be minutes: that first comparison is how a failover finds the
+    /// writes that were in flight (ADR-0030).
+    #[test]
+    fn a_new_leader_first_reconciles_at_its_phase_within_the_window() {
         let loaded = Instant::now();
-        let schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+        let mut schedule = ReconcileSchedule::after_load(CADENCE);
+        schedule.spread(NAME, WINDOW, loaded);
 
         assert!(!schedule.is_due(loaded), "not on the first poll");
         assert!(!schedule.is_due(loaded + phase() - Duration::from_nanos(1)));
         assert!(schedule.is_due(loaded + phase()), "at its phase");
         assert!(
-            schedule.is_due(loaded + CADENCE),
-            "within one cadence, whatever the name"
+            schedule.is_due(loaded + WINDOW),
+            "within the window, whatever the name and however long the cadence"
         );
+    }
+
+    /// A window wider than the cadence is cut to it: spreading never makes the first
+    /// comparison later than an ordinary one would be.
+    #[test]
+    fn a_window_wider_than_the_cadence_is_cut_to_the_cadence() {
+        let short = Duration::from_secs(1);
+        let loaded = Instant::now();
+        let mut schedule = ReconcileSchedule::after_load(short);
+        schedule.spread(NAME, WINDOW, loaded);
+
+        assert!(schedule.is_due(loaded + short));
     }
 
     /// A manual drain is one poll and has to be a whole one: the phase does not apply.
     #[test]
     fn a_forced_reconciliation_is_due_on_the_first_poll() {
         let loaded = Instant::now();
-        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+        let mut schedule = ReconcileSchedule::after_load(CADENCE);
+        schedule.spread(NAME, WINDOW, loaded);
 
         schedule.force();
 
@@ -7537,7 +7603,8 @@ mod reconcile_schedule_tests {
     #[test]
     fn after_the_first_reconciliation_the_cadence_is_unchanged() {
         let loaded = Instant::now();
-        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+        let mut schedule = ReconcileSchedule::after_load(CADENCE);
+        schedule.spread(NAME, WINDOW, loaded);
         let first = loaded + phase();
 
         schedule.reconciled(first);
@@ -7551,7 +7618,7 @@ mod reconcile_schedule_tests {
     #[test]
     fn a_forced_reconciliation_hands_back_to_the_cadence() {
         let loaded = Instant::now();
-        let mut schedule = ReconcileSchedule::after_load(NAME, CADENCE, loaded);
+        let mut schedule = ReconcileSchedule::after_load(CADENCE);
         schedule.force();
 
         schedule.reconciled(loaded);
