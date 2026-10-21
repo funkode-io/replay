@@ -242,14 +242,18 @@ fn apply(&mut self, event: Self::Event) {
             self.name = name;
             self.status = Status::Final; // a person decided, so later files are ignored
         }
-        ProductEvent::RenamedByFile { name } => self.name = name,
+        ProductEvent::RenamedByFile { name } => {
+            if self.status != Status::Final {
+                self.name = name; // a file only wins until a person has decided
+            }
+        }
     }
 }
 
-// ...and `handle` emits no `RenamedByFile` while `self.status == Status::Final`.
+// `handle` records every file rename as a `RenamedByFile`; `apply` decides whether it wins.
 ```
 
-With the second shape, changing the rule — say, a file signed by the brand owner also wins — is a code change and a replay. With the first, every stored event already claims a status the new rule disagrees with, and the only fix is rewriting the log.
+With the second shape, changing the rule — say, a later file wins after all — is a code change and a replay, because every file rename is in the log. With the first, every stored event already claims a status the new rule disagrees with: `apply` has to second-guess what the log says, or the log gets rewritten. Replay can only re-decide over facts that were recorded: a rule that needs something never stored, such as who signed the file, applies from the day the event starts carrying it.
 
 Rules of thumb:
 
