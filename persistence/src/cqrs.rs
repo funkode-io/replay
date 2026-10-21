@@ -1,11 +1,16 @@
 use std::sync::Arc;
 
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStream, TryStreamExt};
 
 use replay::{Aggregate, Event};
 use urn::Urn;
 
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
+
+/// How many stream ids [`Cqrs::streams_needing_compaction`] reads per store query. It
+/// bounds the ids held at once and how long one query runs; the consumer still sees one
+/// stream and decides how much of it to read.
+const COMPACTION_SWEEP_CHUNK: u32 = 100;
 
 #[derive(Clone)]
 pub struct Cqrs<ES: EventStore> {
@@ -155,6 +160,91 @@ impl<ES: EventStore> Cqrs<ES> {
     {
         let stream_id: Urn = id.clone().into();
         self.store.needs_compaction(&stream_id).await
+    }
+
+    /// Every stream of aggregate `A` within `scope` that
+    /// [`needs_compaction`](Self::needs_compaction) would answer `true` for, in stream-id
+    /// order, starting after `after` (`None` for the beginning).
+    ///
+    /// The batch form of the pre-check for a sweep that compacts a whole scope — for
+    /// example every stream of one tenant, `StreamScope::within(&tenant)`:
+    ///
+    /// ```rust,ignore
+    /// let due = cqrs.streams_needing_compaction::<Account>(StreamScope::within(&tenant), None);
+    /// futures::pin_mut!(due);
+    /// while let Some(id) = due.try_next().await? {
+    ///     let account = cqrs.fetch_aggregate::<Account>(&id).await?;
+    ///     cqrs.compact(&account, metadata.clone()).await?;
+    /// }
+    /// ```
+    ///
+    /// Same watermark as `needs_compaction`, so a stream whose compaction was `Skipped`
+    /// drops out of the next sweep until a new event is appended. The stream reads in
+    /// short keyset chunks rather than through one long query, so a sweep that holds it
+    /// for minutes holds no connection or snapshot between chunks
+    /// (`docs/adr/0029-the-public-api-is-stream-first.md`); a caller that cannot hold it
+    /// across requests resumes with `after` set to the last id it saw, and takes a page
+    /// with `.take(n)`. `scope` selects by stream id only; see [`crate::StreamScope`].
+    pub fn streams_needing_compaction<A>(
+        &self,
+        scope: crate::StreamScope,
+        after: Option<A::StreamId>,
+    ) -> impl TryStream<Ok = A::StreamId, Error = replay::Error> + Send
+    where
+        A: replay::Aggregate,
+    {
+        struct Sweep<ES> {
+            store: Arc<ES>,
+            stream_type: String,
+            scope: crate::StreamScope,
+            cursor: Option<Urn>,
+            // Bounded by COMPACTION_SWEEP_CHUNK: one store page at a time, never the
+            // whole scope.
+            chunk: std::vec::IntoIter<Urn>,
+            last_chunk: bool,
+        }
+
+        let sweep = Sweep {
+            store: self.store.clone(),
+            stream_type: A::stream_type(),
+            scope,
+            cursor: after.map(Into::into),
+            chunk: Vec::new().into_iter(),
+            last_chunk: false,
+        };
+
+        futures::stream::try_unfold(sweep, |mut sweep| async move {
+            loop {
+                if let Some(urn) = sweep.chunk.next() {
+                    let id = A::StreamId::try_from(urn.clone()).map_err(|e| {
+                        replay::Error::internal(
+                            "stored stream id does not parse as the aggregate's StreamId",
+                        )
+                        .with_operation("streams_needing_compaction")
+                        .with_context("stream_id", urn.to_string())
+                        .with_context("error", format!("{:?}", e))
+                    })?;
+                    return Ok(Some((id, sweep)));
+                }
+                if sweep.last_chunk {
+                    return Ok(None);
+                }
+                let chunk = sweep
+                    .store
+                    .streams_needing_compaction_page(
+                        &sweep.stream_type,
+                        &sweep.scope,
+                        sweep.cursor.as_ref(),
+                        COMPACTION_SWEEP_CHUNK,
+                    )
+                    .await?;
+                sweep.last_chunk = chunk.len() < COMPACTION_SWEEP_CHUNK as usize;
+                if let Some(last) = chunk.last() {
+                    sweep.cursor = Some(last.clone());
+                }
+                sweep.chunk = chunk.into_iter();
+            }
+        })
     }
 
     pub async fn run_query<'a, Q, E>(&'a self, query: &'a mut Q) -> Result<(), replay::Error>

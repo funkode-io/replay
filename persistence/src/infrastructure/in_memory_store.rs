@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::RwLock};
+use std::{
+    collections::{BTreeSet, HashMap},
+    str::FromStr,
+    sync::RwLock,
+};
 
 use chrono::Utc;
 use futures::{TryStream, TryStreamExt};
@@ -155,6 +159,29 @@ impl InMemoryEventStore {
             }
             StreamFilter::Not(inner) => !Self::evaluate(inner, event, stream_type),
         }
+    }
+}
+
+impl InMemoryEventStore {
+    /// The watermark test shared by `needs_compaction` and the sweep: has the live head
+    /// (max version among un-archived events, `0` if none) moved past the version
+    /// recorded at the last compaction (`0` if never compacted)? A missing stream has
+    /// nothing to compact.
+    fn is_past_watermark(
+        events: &HashMap<Urn, Vec<PositionedEvent>>,
+        watermarks: &HashMap<Urn, i64>,
+        stream_id: &Urn,
+    ) -> bool {
+        let Some(stream) = events.get(stream_id) else {
+            return false;
+        };
+        let head = stream
+            .iter()
+            .filter(|(_, e)| e.aggregate_version.is_none())
+            .map(|(_, e)| e.version)
+            .max()
+            .unwrap_or(0);
+        head > watermarks.get(stream_id).copied().unwrap_or(0)
     }
 }
 
@@ -464,29 +491,54 @@ impl EventStore for InMemoryEventStore {
     }
 
     async fn needs_compaction(&self, stream_id: &Urn) -> Result<bool, replay::Error> {
-        // Current live head version (max version among un-archived events), 0 if none.
-        let head = {
-            let store = self.events.read().unwrap();
-            match store.get(stream_id) {
-                None => return Ok(false),
-                Some(stream) => stream
-                    .iter()
-                    .filter(|(_, e)| e.aggregate_version.is_none())
-                    .map(|(_, e)| e.version)
-                    .max()
-                    .unwrap_or(0),
+        let events = self.events.read().unwrap();
+        let watermarks = self.last_compacted_version.read().unwrap();
+        Ok(Self::is_past_watermark(&events, &watermarks, stream_id))
+    }
+
+    async fn streams_needing_compaction_page(
+        &self,
+        stream_type: &str,
+        scope: &crate::StreamScope,
+        after: Option<&Urn>,
+        limit: u32,
+    ) -> Result<Vec<Urn>, replay::Error> {
+        // Same lock order as the rest of the store: events, stream types, watermarks.
+        let events = self.events.read().unwrap();
+        let stream_types = self.stream_types.read().unwrap();
+        let watermarks = self.last_compacted_version.read().unwrap();
+        let after = after.map(Urn::to_string);
+
+        // The `limit` smallest matching ids, in id order: the set is capped at `limit`
+        // (its largest is evicted on overflow), so it never grows with the number of
+        // matching streams.
+        let mut page: BTreeSet<String> = BTreeSet::new();
+        for (stream_id, _) in stream_types
+            .iter()
+            .filter(|(_, t)| t.as_str() == stream_type)
+        {
+            let id = stream_id.to_string();
+            if after.as_ref().is_some_and(|after| &id <= after)
+                || !scope.matches(&id)
+                || !Self::is_past_watermark(&events, &watermarks, stream_id)
+            {
+                continue;
             }
-        };
+            page.insert(id);
+            if page.len() > limit as usize {
+                page.pop_last();
+            }
+        }
 
-        let watermark = self
-            .last_compacted_version
-            .read()
-            .unwrap()
-            .get(stream_id)
-            .copied()
-            .unwrap_or(0);
-
-        Ok(head > watermark)
+        page.into_iter()
+            .map(|id| {
+                Urn::from_str(&id).map_err(|e| {
+                    replay::Error::internal("stored stream id is not a URN")
+                        .with_context("stream_id", id.clone())
+                        .with_context("error", format!("{:?}", e))
+                })
+            })
+            .collect()
     }
 }
 
@@ -898,6 +950,171 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), replay::ErrorKind::NotFound);
+    }
+
+    async fn due<A: replay::Aggregate>(
+        cqrs: &crate::Cqrs<InMemoryEventStore>,
+        scope: crate::StreamScope,
+        after: Option<A::StreamId>,
+    ) -> Vec<String> {
+        cqrs.streams_needing_compaction::<A>(scope, after)
+            .map_ok(|id| Into::<Urn>::into(id).to_string())
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    async fn compact_bank_account(store: &InMemoryEventStore, id: &BankAccountUrn) {
+        let mut account = BankAccountStream::with_id(id.clone());
+        for ev in live_events(store, id).await {
+            account.apply(ev);
+        }
+        store
+            .compact(&account, replay::Metadata::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn streams_needing_compaction_follows_the_watermark() {
+        use crate::StreamScope;
+
+        let cqrs = crate::Cqrs::new(InMemoryEventStore::new());
+        let store = cqrs.store().clone();
+        let deposit = [BankAccountEvent::Deposited { amount: 1.0 }];
+
+        let fresh = make_stream_id("fresh");
+        let settled = make_stream_id("settled");
+        add_events(&store, &fresh, &deposit).await;
+        add_events(&store, &settled, &deposit).await;
+        compact_bank_account(&store, &settled).await;
+
+        // A stream of another aggregate type is never in a BankAccount sweep.
+        let other = make_stream_id("other-type");
+        add_snapshot_events(&store, &other, &[SnapshotEvent::Bumped]).await;
+
+        assert_eq!(
+            due::<BankAccountStream>(&cqrs, StreamScope::All, None).await,
+            vec!["urn:bank-account:fresh"],
+            "never compacted is due; compacted and unchanged is not; other types are not"
+        );
+
+        // An append past the watermark brings the settled stream back.
+        add_events(&store, &settled, &deposit).await;
+        assert_eq!(
+            due::<BankAccountStream>(&cqrs, StreamScope::All, None).await,
+            vec!["urn:bank-account:fresh", "urn:bank-account:settled"],
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_needing_compaction_drops_a_skipped_stream() {
+        use crate::StreamScope;
+
+        let cqrs = crate::Cqrs::new(InMemoryEventStore::new());
+        let store = cqrs.store().clone();
+        let minimal = make_stream_id("minimal");
+        add_snapshot_events(&store, &minimal, &[SnapshotEvent::Snapshot { total: 3 }]).await;
+
+        assert_eq!(
+            due::<SnapshotStream>(&cqrs, StreamScope::All, None).await,
+            vec!["urn:bank-account:minimal"],
+        );
+
+        let mut snapshot = SnapshotStream::with_id(minimal.clone());
+        for ev in live_snapshot_events(&store, &minimal).await {
+            snapshot.apply(ev);
+        }
+        let outcome = store
+            .compact(&snapshot, replay::Metadata::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome, CompactionOutcome::Skipped);
+
+        assert!(
+            due::<SnapshotStream>(&cqrs, StreamScope::All, None)
+                .await
+                .is_empty(),
+            "a Skipped compaction still advances the watermark"
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_needing_compaction_narrows_by_scope() {
+        use crate::StreamScope;
+
+        let cqrs = crate::Cqrs::new(InMemoryEventStore::new());
+        let store = cqrs.store().clone();
+        let deposit = [BankAccountEvent::Deposited { amount: 1.0 }];
+        for nss in [
+            "eu-1@tenant:acme",
+            "eu-2@tenant:globex",
+            "us-1@tenant:acme",
+            "us-2@user:7@tenant:acme",
+            "us-3@tenant:acme-eu",
+            // `%` appears in a URN only as a percent-escape.
+            "50%25_off",
+            "50%25xoff",
+            "50abc25_off",
+        ] {
+            add_events(&store, &make_stream_id(nss), &deposit).await;
+        }
+        let tenant = Urn::from_str("urn:tenant:acme").unwrap();
+
+        assert_eq!(
+            due::<BankAccountStream>(&cqrs, StreamScope::within(&tenant), None).await,
+            vec![
+                "urn:bank-account:eu-1@tenant:acme",
+                "urn:bank-account:us-1@tenant:acme",
+                "urn:bank-account:us-2@user:7@tenant:acme",
+            ],
+        );
+        assert_eq!(
+            due::<BankAccountStream>(
+                &cqrs,
+                StreamScope::Prefix("urn:bank-account:eu-".into()),
+                None
+            )
+            .await,
+            vec![
+                "urn:bank-account:eu-1@tenant:acme",
+                "urn:bank-account:eu-2@tenant:globex",
+            ],
+        );
+        assert_eq!(
+            due::<BankAccountStream>(
+                &cqrs,
+                StreamScope::Prefix("urn:bank-account:50%25_".into()),
+                None
+            )
+            .await,
+            vec!["urn:bank-account:50%25_off"],
+            "% and _ in a scope match only themselves"
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_needing_compaction_reads_across_chunks_and_resumes_after_a_key() {
+        use crate::StreamScope;
+
+        let cqrs = crate::Cqrs::new(InMemoryEventStore::new());
+        let store = cqrs.store().clone();
+        let deposit = [BankAccountEvent::Deposited { amount: 1.0 }];
+        // Two and a half chunks' worth, so the sweep crosses chunk boundaries and ends
+        // on a short one.
+        let expected: Vec<String> = (0..250)
+            .map(|n| format!("urn:bank-account:{n:04}"))
+            .collect();
+        for n in 0..250 {
+            add_events(&store, &make_stream_id(&format!("{n:04}")), &deposit).await;
+        }
+
+        let all = due::<BankAccountStream>(&cqrs, StreamScope::All, None).await;
+        assert_eq!(all, expected, "every stream once, in id order");
+
+        let resumed =
+            due::<BankAccountStream>(&cqrs, StreamScope::All, Some(make_stream_id("0149"))).await;
+        assert_eq!(resumed, expected[150..], "resumes strictly after the key");
     }
 
     #[tokio::test]

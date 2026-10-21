@@ -11,7 +11,7 @@ use replay::{prelude::*, Compactable};
 use replay_macros::{define_aggregate, Urn};
 use replay_persistence::{
     AggregateVersion, CompactionOutcome, EventStore, ObservedEvent, PersistedEvent, PolicySettings,
-    StreamFilter,
+    StreamFilter, StreamScope,
 };
 
 // Re-use the README walkthrough verbatim as the source of truth. The example's
@@ -1445,6 +1445,231 @@ async fn already_compacted_skips_postgres_test() {
     assert_eq!(
         outcome2,
         CompactionOutcome::Compacted { archive_version: 1 }
+    );
+}
+
+// ── Batch compaction pre-check (issue #261) ──────────────────────────────────
+
+async fn migrated_store() -> (
+    common::postgres_image::PostgresServer,
+    replay_persistence::PostgresEventStore,
+) {
+    let container = start_postgres_server().await;
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT)
+        .await
+        .expect("Error getting docker port");
+    let pg_pool = connect_to_postgres(host, port).await;
+    sqlx::migrate!("./tests/migrations")
+        .run(&pg_pool)
+        .await
+        .expect("Failed to run migrations");
+    (
+        container,
+        replay_persistence::PostgresEventStore::new(pg_pool),
+    )
+}
+
+/// The ids `Cqrs::streams_needing_compaction` yields, as text.
+async fn due<A: replay::Aggregate>(
+    cqrs: &replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
+    scope: StreamScope,
+    after: Option<A::StreamId>,
+) -> Vec<String> {
+    cqrs.streams_needing_compaction::<A>(scope, after)
+        .map_ok(|id| Into::<Urn>::into(id).to_string())
+        .try_collect()
+        .await
+        .unwrap()
+}
+
+fn bank_account(id: &str) -> BankAccountUrn {
+    BankAccountUrn::try_from(Urn::from_str(&format!("urn:bank-account:{id}")).unwrap()).unwrap()
+}
+
+async fn deposit(
+    cqrs: &replay_persistence::Cqrs<replay_persistence::PostgresEventStore>,
+    id: &BankAccountUrn,
+) {
+    cqrs.execute::<BankAccount>(
+        id,
+        replay::Metadata::default(),
+        BankAccountCommand::Deposit {
+            effective_on: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            amount: 10.0,
+        },
+        &(),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// The batch pre-check answers exactly what `needs_compaction` answers per stream: a
+/// never-compacted stream is due, a compacted-and-unchanged one is not, a `Skipped`
+/// compaction drops its stream out too, an append past the watermark brings a stream
+/// back, and a stream of another aggregate type is never in the sweep.
+#[tokio::test]
+async fn streams_needing_compaction_follows_the_watermark_postgres_test() {
+    let (_container, store) = migrated_store().await;
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+    let meta = replay::Metadata::default();
+
+    let fresh = bank_account("fresh");
+    let settled = bank_account("settled");
+    deposit(&cqrs, &fresh).await;
+    deposit(&cqrs, &settled).await;
+    let aggregate = cqrs.fetch_aggregate::<BankAccount>(&settled).await.unwrap();
+    cqrs.compact(&aggregate, meta.clone()).await.unwrap();
+
+    // Another aggregate type, born minimal: due in its own sweep until a Skipped compaction.
+    let minimal = SnapshotBoxUrn::new("minimal").unwrap();
+    store
+        .store_events::<SnapshotBox>(
+            &minimal,
+            "SnapshotBox".to_string(),
+            meta.clone(),
+            &[SnapshotBoxEvent::Snapshot { total: 5 }],
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        due::<BankAccount>(&cqrs, StreamScope::All, None).await,
+        vec!["urn:bank-account:fresh"],
+        "never compacted is due; compacted and unchanged is not; another type is not"
+    );
+    assert_eq!(
+        due::<SnapshotBox>(&cqrs, StreamScope::All, None).await,
+        vec!["urn:snapshot-box:minimal"],
+    );
+
+    let snapshot = cqrs.fetch_aggregate::<SnapshotBox>(&minimal).await.unwrap();
+    assert_eq!(
+        cqrs.compact(&snapshot, meta.clone()).await.unwrap(),
+        CompactionOutcome::Skipped
+    );
+    assert!(
+        due::<SnapshotBox>(&cqrs, StreamScope::All, None)
+            .await
+            .is_empty(),
+        "a Skipped compaction still advances the watermark"
+    );
+
+    deposit(&cqrs, &settled).await;
+    assert_eq!(
+        due::<BankAccount>(&cqrs, StreamScope::All, None).await,
+        vec!["urn:bank-account:fresh", "urn:bank-account:settled"],
+        "an append past the watermark brings the stream back"
+    );
+}
+
+/// Prefix and suffix scopes select by stream id; a tenant scope is a scoped-URN suffix
+/// that also takes nested scopes under the tenant, and `%` / `_` in a scope are literal.
+#[tokio::test]
+async fn streams_needing_compaction_narrows_by_scope_postgres_test() {
+    let (_container, store) = migrated_store().await;
+    let cqrs = replay_persistence::Cqrs::new(store);
+
+    for nss in [
+        "eu-1@tenant:acme",
+        "eu-2@tenant:globex",
+        "us-1@tenant:acme",
+        "us-2@user:7@tenant:acme",
+        "us-3@tenant:acme-eu",
+        "us-4@tenant:acme_x",
+        "us-5@tenant:acmeyx",
+        // `%` appears in a URN only as a percent-escape.
+        "50%25_off",
+        "50%25xoff",
+        "50abc25_off",
+    ] {
+        deposit(&cqrs, &bank_account(nss)).await;
+    }
+    let tenant = Urn::from_str("urn:tenant:acme").unwrap();
+
+    assert_eq!(
+        due::<BankAccount>(&cqrs, StreamScope::within(&tenant), None).await,
+        vec![
+            "urn:bank-account:eu-1@tenant:acme",
+            "urn:bank-account:us-1@tenant:acme",
+            "urn:bank-account:us-2@user:7@tenant:acme",
+        ],
+    );
+    assert_eq!(
+        due::<BankAccount>(
+            &cqrs,
+            StreamScope::Prefix("urn:bank-account:eu-".into()),
+            None
+        )
+        .await,
+        vec![
+            "urn:bank-account:eu-1@tenant:acme",
+            "urn:bank-account:eu-2@tenant:globex",
+        ],
+    );
+    assert_eq!(
+        due::<BankAccount>(&cqrs, StreamScope::Suffix("@tenant:acme_x".into()), None).await,
+        vec!["urn:bank-account:us-4@tenant:acme_x"],
+        "_ in a suffix matches only itself"
+    );
+    assert_eq!(
+        due::<BankAccount>(
+            &cqrs,
+            StreamScope::Prefix("urn:bank-account:50%25_".into()),
+            None
+        )
+        .await,
+        vec!["urn:bank-account:50%25_off"],
+        "% and _ in a prefix match only themselves"
+    );
+}
+
+/// The sweep reads in keyset chunks: across several of them it yields every due stream
+/// once, in id order, and resumes strictly after a given key.
+#[tokio::test]
+async fn streams_needing_compaction_reads_across_chunks_postgres_test() {
+    let (_container, store) = migrated_store().await;
+    let cqrs = replay_persistence::Cqrs::new(store.clone());
+
+    // Two and a half chunks' worth, so the sweep crosses chunk boundaries and ends on a
+    // short one. Every tenth stream is settled, so chunks are not just id ranges.
+    let mut expected = Vec::new();
+    for n in 0..275 {
+        let id = bank_account(&format!("{n:04}"));
+        deposit(&cqrs, &id).await;
+        if n % 10 == 0 {
+            let aggregate = cqrs.fetch_aggregate::<BankAccount>(&id).await.unwrap();
+            cqrs.compact(&aggregate, replay::Metadata::default())
+                .await
+                .unwrap();
+        } else {
+            expected.push(format!("urn:bank-account:{n:04}"));
+        }
+    }
+
+    let all = due::<BankAccount>(&cqrs, StreamScope::All, None).await;
+    assert_eq!(all.len(), 247);
+    assert_eq!(all, expected, "every due stream once, in id order");
+
+    let resumed = due::<BankAccount>(&cqrs, StreamScope::All, Some(bank_account("0149"))).await;
+    let after: Vec<String> = expected
+        .iter()
+        .filter(|id| id.as_str() > "urn:bank-account:0149")
+        .cloned()
+        .collect();
+    assert_eq!(resumed, after, "resumes strictly after the key");
+
+    // The store page itself honours its limit.
+    let page = store
+        .streams_needing_compaction_page("BankAccount", &StreamScope::All, None, 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(Urn::to_string).collect::<Vec<_>>(),
+        expected[..7]
     );
 }
 

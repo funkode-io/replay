@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -937,6 +938,60 @@ impl EventStore for PostgresEventStore {
         .map_err(crate::db_error)?;
 
         Ok(needs.unwrap_or(false))
+    }
+
+    async fn streams_needing_compaction_page(
+        &self,
+        stream_type: &str,
+        scope: &crate::StreamScope,
+        after: Option<&Urn>,
+        limit: u32,
+    ) -> Result<Vec<Urn>, replay::Error> {
+        // `needs_compaction`'s predicate over a keyset page of `streams`. Walked in `id`
+        // order on the primary key, with the type and scope as filters: no index serves a
+        // suffix, and under a non-C collation the primary key's btree cannot serve a
+        // `LIKE` prefix either, so the scan stops after `limit` matches rather than
+        // narrowing to the scope first.
+        let mut query: QueryBuilder<Postgres> = QueryBuilder::new(
+            "SELECT id FROM streams \
+             WHERE version > COALESCE(last_compacted_version, 0) AND type = ",
+        );
+        query.push_bind(stream_type);
+        if let Some(after) = after {
+            query.push(" AND id > ").push_bind(after.to_string());
+        }
+        if let Some(pattern) = scope.like_pattern() {
+            query
+                .push(" AND id LIKE ")
+                .push_bind(pattern)
+                .push(" ESCAPE '\\'");
+        }
+        query
+            .push(" ORDER BY id LIMIT ")
+            .push_bind(i64::from(limit));
+
+        // Bounded by `limit`, the caller's page size: never by the number of due streams.
+        let ids: Vec<String> = query
+            .build_query_scalar()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                crate::db_error(e)
+                    .with_operation("reading the streams that need compaction")
+                    .with_context("stream_type", stream_type.to_string())
+                    .with_context("scope", format!("{:?}", scope))
+            })?;
+
+        ids.into_iter()
+            .map(|id| {
+                Urn::from_str(&id).map_err(|e| {
+                    replay::Error::internal("stored stream id is not a URN")
+                        .with_operation("streams_needing_compaction_page")
+                        .with_context("stream_id", id.clone())
+                        .with_context("error", format!("{:?}", e))
+                })
+            })
+            .collect()
     }
 
     async fn compact<A>(
