@@ -4431,8 +4431,7 @@ async fn lookup_late_writes(
             state.tail = Some(Tail::at(sweep, swept_through));
         }
 
-        let remaining = read_batch.saturating_sub(rows_read);
-        if remaining > 0 {
+        if rows_read < read_batch {
             // Bounded by `UNSEEN_TRANSACTION_CAP`, which `remember_open_transactions` holds
             // `pending` under.
             let mut ids: Vec<u64> = state.pending.keys().copied().collect();
@@ -4447,6 +4446,9 @@ async fn lookup_late_writes(
                     continue;
                 }
                 let cursor = state.pending.get(&txid).copied().flatten();
+                // What is left of the batch now, not when the loop began: every page of
+                // this poll shares the one budget.
+                let remaining = read_batch - rows_read;
                 let page = ended_transaction_page(pool, txid, cursor, remaining).await?;
                 rows_read += page.rows.len() as u32;
                 nominate(&mut streams, page.rows);
@@ -6909,6 +6911,105 @@ mod progress_tests {
                 .expect("a transaction id is an unsigned 64-bit value"),
             position,
         )
+    }
+
+    /// Several ended transactions in one poll share the one batch: their pages together
+    /// never read more rows than it allows.
+    #[tokio::test]
+    async fn ended_transactions_share_one_batch_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut first = pool.begin().await.expect("starting the first writer");
+        let mut second = pool.begin().await.expect("starting the second writer");
+        let mut position = i64::MAX;
+        for n in 0..3 {
+            let (_, at) = write_in(&mut first, &format!("urn:probe:first-{n}")).await;
+            position = position.min(at);
+            let (_, at) = write_in(&mut second, &format!("urn:probe:second-{n}")).await;
+            position = position.min(at);
+        }
+        append_events(&pool, "urn:probe:advance-xmax", 1).await;
+        let sweep = sweep_for_streams(&pool, position - 1, 10)
+            .await
+            .expect("the sweep must read its snapshot");
+        let open = lookup_late_writes(&pool, &LateWriteState::default(), &sweep, position, 4)
+            .await
+            .expect("both transactions are remembered");
+        first.commit().await.expect("committing the first writer");
+        second.commit().await.expect("committing the second writer");
+
+        let sweep = sweep_for_streams(&pool, sweep.discovered.swept_through, 10)
+            .await
+            .expect("the next sweep must read its snapshot");
+        let late = lookup_late_writes(&pool, &open.state, &sweep, position, 4)
+            .await
+            .expect("the ended transactions are looked up");
+
+        assert_eq!(
+            late.streams.len(),
+            4,
+            "six rows owed, a batch of four read: {:?}",
+            late.streams
+        );
+    }
+
+    /// The sweep's rows and its snapshot come from one statement, under writers committing
+    /// throughout. Each sweep's rows must be exactly the writes its own snapshot calls
+    /// ended. Were they two statements, a commit landing between them would show a row
+    /// the snapshot calls in progress, or hide one it calls ended.
+    #[tokio::test]
+    async fn under_concurrent_commits_every_sweep_matches_its_own_snapshot_postgres_test() {
+        const WRITERS: usize = 3;
+        const WRITES: usize = 60;
+        let (pool, _container) = start_postgres().await;
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    for n in 0..WRITES {
+                        let mut tx = pool.begin().await.expect("starting a writer");
+                        write_in(&mut tx, &format!("urn:probe:stress-{writer}-{n}")).await;
+                        tokio::task::yield_now().await;
+                        tx.commit().await.expect("committing a writer");
+                    }
+                })
+            })
+            .collect();
+
+        let mut sweeps = 0;
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let sweep = sweep_for_streams(&pool, 0, 10_000)
+                .await
+                .expect("a sweep must read its snapshot");
+            let in_progress: Vec<String> = sweep.in_progress.iter().map(u64::to_string).collect();
+            // Every committed stress write, checked against this sweep's snapshot: ended
+            // (below xmax, not in progress) exactly when the sweep returned its stream.
+            let mismatched: Option<String> = sqlx::query_scalar(
+                "SELECT string_agg(stream_id || '@' || commit_txid::text, ', ') FROM events \
+                  WHERE stream_id LIKE 'urn:probe:stress-%' \
+                    AND (commit_txid < $1::xid8 AND commit_txid::text <> ALL($2::text[])) \
+                        <> (stream_id = ANY($3::text[]))",
+            )
+            .bind(sweep.xmax.to_string())
+            .bind(&in_progress)
+            .bind(&sweep.discovered.streams)
+            .fetch_one(&pool)
+            .await
+            .expect("checking the sweep against its snapshot");
+            assert_eq!(
+                mismatched, None,
+                "sweep {sweeps} disagrees with its own snapshot (xmax {}, in progress {:?})",
+                sweep.xmax, sweep.in_progress
+            );
+            sweeps += 1;
+        }
+        for writer in writers {
+            writer.await.expect("a writer finished");
+        }
+
+        assert!(
+            sweeps > 10,
+            "the sweeps ran while writers committed: {sweeps}"
+        );
     }
 
     /// ADR-0030's invariant: a transaction holding a position from `write_event` already

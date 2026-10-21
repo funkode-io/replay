@@ -615,6 +615,28 @@ mod sharing_tests {
         );
     }
 
+    /// Late writes that lose a slot to the other sources are carried, not dropped: the
+    /// lookup has already moved past them.
+    #[test]
+    fn late_writes_that_lose_a_slot_to_other_sources_are_carried() {
+        let plan = super::PollPlan::plan(super::Nominations {
+            carried: streams(&["c"]),
+            swept: streams(&["s"]),
+            late: streams(&["l1", "l2", "l3"]),
+            examined: Vec::new(),
+            reconciling: false,
+            read_batch: 3,
+            share_from: 0,
+        });
+
+        assert_eq!(plan.streams(), &streams(&["l1", "c", "s"])[..]);
+        let carried = plan.settle().carried;
+        assert!(
+            carried.contains(&"l2".to_string()) && carried.contains(&"l3".to_string()),
+            "the late writes without a slot are offered again: {carried:?}"
+        );
+    }
+
     #[test]
     fn a_late_write_leads_even_when_the_other_sources_have_the_turn() {
         let mut plan = super::PollPlan::plan(super::Nominations {
