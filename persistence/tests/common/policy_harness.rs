@@ -68,7 +68,9 @@
 //! panic at [`OBSERVE_TIMEOUT`] if it never does; no test ever sleeps for a
 //! fixed duration and then asserts, which is what makes them fast when they pass
 //! and honest when they fail. The panic message carries the full observation set
-//! so a timeout reads as a diagnosis rather than "assertion failed".
+//! so a timeout reads as a diagnosis rather than "assertion failed". One that can
+//! see its observation can no longer hold panics at once, saying why, rather than
+//! waiting out the timeout.
 //!
 //! ## Isolation
 //!
@@ -1543,7 +1545,9 @@ impl HeldCursorRow {
     /// Any other statement queued behind the row fails the wait at once, naming it. The
     /// worker polls one poll at a time, so a poll held at another write of the row never
     /// reaches a sweep, and the wait would otherwise run out its timeout with nothing to
-    /// say (funkode-io/replay#283).
+    /// say (funkode-io/replay#283). That holds because the heartbeat skips a locked row
+    /// (`FOR UPDATE SKIP LOCKED`) rather than queue behind it; a writer of the row that
+    /// queues would have to be told apart here.
     pub async fn await_a_sweep_waiting(&self) {
         let deadline = Instant::now() + OBSERVE_TIMEOUT;
         loop {
