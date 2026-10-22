@@ -1,7 +1,7 @@
 //! A Policy finds a write the sweep passed from the transaction that committed it
 //! (ADR-0030), rather than waiting for the full comparison.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::common;
 use common::policy_harness::{PolicyDaemonHarness, ProbeEvent};
@@ -163,6 +163,10 @@ async fn a_poll_that_fails_after_its_sweep_keeps_its_tail_postgres_test() {
     harness.move_place_to(&seed.stream_id, 0).await;
     harness.resume();
     harness.await_passed(seed.global_position).await;
+    // The comparison's poll is not over when the place is written: it still records its
+    // rotation on the cursor row held below. Held mid-poll, it would wait there, and no
+    // poll would come to sweep (funkode-io/replay#283).
+    harness.await_a_poll_finished_after(Instant::now()).await;
 
     harness.break_places().await;
     let cursor_row = harness.hold_cursor_row(harness.policy_name()).await;
