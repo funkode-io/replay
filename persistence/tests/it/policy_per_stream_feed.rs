@@ -128,6 +128,15 @@ async fn an_overtaken_write_is_delivered_when_it_commits_postgres_test() {
         !harness.has_passed(held.global_position).await,
         "an uncommitted write has been passed by nobody"
     );
+    // The overtaking event may have been delivered by a reconciliation rather than the
+    // sweep, so wait for the sweep itself to pass the held position: only then is the
+    // reconciliation the one thing that can deliver it.
+    let overtook = overtaking.global_position;
+    harness
+        .observe("the sweep to pass the held write", || async {
+            (harness.swept_through().await? >= overtook).then_some(())
+        })
+        .await;
 
     let position = held.global_position;
     held.commit().await;

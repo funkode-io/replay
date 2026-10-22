@@ -4708,7 +4708,7 @@ impl TrackedStreams {
 ///
 /// What it compares is what the Policy **tracks**: every stream, or — for a Policy whose
 /// filter is [`StreamFilter::ForStreamTypes`] — the streams of those types, found through
-/// `idx_streams_type_id` without reading a row of any other type
+/// `idx_streams_type_id`, one walk per type, without reading a row of any other type
 /// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 /// A stream it does not track is never behind, because it is never owed anything.
 ///
@@ -4753,13 +4753,30 @@ const STREAMS_BEHIND: &str = "SELECT s.id FROM streams s \
      WHERE s.id > $2 AND s.stream_seq > COALESCE(c.stream_seq, 0) \
      ORDER BY s.id LIMIT $3";
 
-/// [`streams_behind`] for a Policy that tracks the stream types in `$4`. The type is the
-/// leading column of `idx_streams_type_id` and the rotation's `id > $2` the second, so the
+/// [`streams_behind`] for a Policy that tracks the stream types in `$4`: one walk of
+/// `idx_streams_type_id` per tracked type, from `(type, $2)` to the end of that type, each
+/// stopping at `$3` streams behind, then the first `$3` of the merged walks in id order.
+/// It returns what `type = ANY($4) AND id > $2 … ORDER BY id LIMIT $3` returns, and the
 /// rows a pass examines are the tracked streams sorting after the rotation, and no others.
-const STREAMS_BEHIND_OF_TYPES: &str = "SELECT s.id FROM streams s \
-     LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
-     WHERE s.type = ANY($4) AND s.id > $2 AND s.stream_seq > COALESCE(c.stream_seq, 0) \
-     ORDER BY s.id LIMIT $3";
+///
+/// The plan is type-first by construction, not by the planner's choice
+/// (funkode-io/replay#277). Ordered by `id` alone, the per-type walk is also served by
+/// `streams_pkey` filtered by type, which PostgreSQL prefers when the heap lies in id
+/// order and it guesses the `LIMIT` stops the walk early — and a caught-up Policy then
+/// walks every stream of every type. Ordered by `(type, id)` and bounded as a range of
+/// that index, with no `type = …` equality to collapse the `type` out of the ordering,
+/// the walk has one index that serves it without a sort.
+///
+/// What Postgres holds before the outer `LIMIT` is at most `types × $3` ids, sorted in a
+/// top-N heap; `DISTINCT` keeps a type listed twice from returning its streams twice.
+const STREAMS_BEHIND_OF_TYPES: &str = "SELECT x.id \
+     FROM (SELECT DISTINCT type FROM unnest($4::text[]) AS u(type)) t \
+     CROSS JOIN LATERAL (SELECT s.id FROM streams s \
+       LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
+       WHERE (s.type, s.id) > (t.type, $2) AND s.type <= t.type \
+         AND s.stream_seq > COALESCE(c.stream_seq, 0) \
+       ORDER BY s.type, s.id LIMIT $3) x \
+     ORDER BY x.id LIMIT $3";
 
 /// A Policy's place in one stream, as a poll read it.
 ///
@@ -8404,6 +8421,119 @@ mod progress_tests {
             "the reconciliation examined {examined} rows of `streams` to compare 4: it \
              walked streams the Policy does not track\n{plan:#}"
         );
+    }
+
+    /// A type named twice in the filter is one tracked type: the reconciliation walks it
+    /// once and returns each of its streams once, as `type = ANY(...)` did.
+    #[tokio::test]
+    async fn a_stream_type_named_twice_is_compared_once_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_streams_of(&pool, "Probe", "urn:probe:a", 2).await;
+        let tracked = TrackedStreams::OfTypes(vec!["Probe".to_string(), "Probe".to_string()]);
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, tracked.clone())
+            .await
+            .expect("loading must succeed");
+
+        assert_eq!(
+            streams_behind(&pool, POLICY, &tracked, "", 10)
+                .await
+                .unwrap(),
+            vec!["urn:probe:a1".to_string(), "urn:probe:a2".to_string()],
+            "each stream of the type once"
+        );
+    }
+
+    /// `count` streams of one event each, their types taken in turn from `types`, named
+    /// `urn:stream:{n}` zero-padded so that id order is creation order: every type's ids
+    /// spread over the whole key range, and the heap lies in id order, as it does for
+    /// streams whose ids grow with time (a sequence, a ULID, a UUIDv7).
+    async fn append_interleaved_streams(pool: &PgPool, types: &[&str], count: i32) {
+        sqlx::query(
+            "SELECT append_event(gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, \
+             'Appended', 'urn:stream:' || lpad(n::text, 7, '0'), \
+             ($1::text[])[1 + n % cardinality($1::text[])], NULL) \
+             FROM generate_series(1, $2) AS n",
+        )
+        .bind(types)
+        .bind(count)
+        .execute(pool)
+        .await
+        .expect("appending must succeed");
+    }
+
+    /// The types [`append_interleaved_streams`] spreads the at-scale streams over.
+    const INTERLEAVED_TYPES: [&str; 8] = [
+        "Audit", "Billing", "Catalog", "Ledger", "Order", "Probe", "Shipment", "User",
+    ];
+
+    /// A caught-up Policy tracking `tracked_types` of [`INTERLEAVED_TYPES`], at a scale
+    /// where the planner, left to choose, walks the primary key and filters by type
+    /// (funkode-io/replay#277), compares its streams through `idx_streams_type_id` and
+    /// examines no row of any other type to find nothing.
+    ///
+    /// 4,096 streams over 8 types is four times the scale at which PostgreSQL 15 first
+    /// walked `streams_pkey` for a `WHERE type = ANY($4) … ORDER BY id LIMIT` comparison
+    /// (below it, a table of a few pages is read whole). The ids interleave the types and
+    /// the heap lies in id order, so a primary-key walk reads the heap in order and is
+    /// costed below the type index's jumps between pages, on the guess that a third of
+    /// the streams are behind and the `LIMIT` stops the walk early. A caught-up Policy has
+    /// nothing behind, and the walk reaches the end of the table. The per-type `s.type =
+    /// t.type` form funkode-io/replay#277 proposed is walked the same way, once per type.
+    /// The tests above, whose tracked type is 3 rows in 2,000, never offer that guess.
+    async fn assert_caught_up_reconciliation_at_scale_reads_only(tracked_types: &[&str]) {
+        let (pool, _container) = start_postgres().await;
+        append_interleaved_streams(&pool, &INTERLEAVED_TYPES, 4_096).await;
+        let tracked =
+            TrackedStreams::OfTypes(tracked_types.iter().map(|t| t.to_string()).collect());
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, tracked.clone())
+            .await
+            .expect("loading must succeed");
+        let placed = sqlx::query(
+            "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+             SELECT $1, id, stream_seq FROM streams WHERE type = ANY($2)",
+        )
+        .bind(POLICY)
+        .bind(tracked.as_column())
+        .execute(&pool)
+        .await
+        .expect("placing the tracked streams at their heads must succeed")
+        .rows_affected();
+        sqlx::query("ANALYZE streams, policy_stream_cursors")
+            .execute(&pool)
+            .await
+            .expect("analyzing must succeed");
+
+        assert!(
+            streams_behind(&pool, POLICY, &tracked, "", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "every tracked stream is caught up, and the other types are not compared"
+        );
+
+        let (examined, plan) = streams_examined_by_reconciliation(&pool, &tracked).await;
+        assert!(
+            examined <= placed as f64,
+            "the reconciliation examined {examined} rows of `streams` to compare {placed}: \
+             it walked streams the Policy does not track\n{plan:#}"
+        );
+        assert!(
+            plan.to_string().contains("\"idx_streams_type_id\""),
+            "the tracked streams are read off the type index\n{plan:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_scale_a_caught_up_policy_tracking_one_stream_type_examines_no_stream_of_another_postgres_test(
+    ) {
+        assert_caught_up_reconciliation_at_scale_reads_only(&["Order"]).await;
+    }
+
+    /// Two tracked types, with untracked ones sorting before, between and after them.
+    #[tokio::test]
+    async fn at_scale_a_caught_up_policy_tracking_two_stream_types_examines_no_stream_of_another_postgres_test(
+    ) {
+        assert_caught_up_reconciliation_at_scale_reads_only(&["Billing", "Probe"]).await;
     }
 
     /// The rows of `streams` the reconciliation of a Policy tracking `tracked` examines

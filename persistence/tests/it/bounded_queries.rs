@@ -76,8 +76,10 @@ const REVIEWED: &[Reviewed] = &[
                         walks every stream it tracks to return nothing. What bounds that \
                         is what the Policy tracks: every stream, or for a \
                         ForStreamTypes(types) filter the streams of those types after the \
-                        rotation, read off idx_streams_type_id without a row of any other \
-                        type (ADR-0031). It costs Postgres a scan, not this process memory: \
+                        rotation, read off idx_streams_type_id by one range walk per type \
+                        without a row of any other type (ADR-0031). Each walk stops at \
+                        the LIMIT, so Postgres holds at most types x LIMIT ids before the \
+                        outer LIMIT. It costs Postgres a scan, not this process memory: \
                         only the LIMIT reaches the Vec.",
     },
     Reviewed {
