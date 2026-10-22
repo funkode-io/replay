@@ -921,6 +921,25 @@ impl PolicyDaemonHarness {
         .await
     }
 
+    /// Wait until this policy's worker finishes a poll after `since`.
+    ///
+    /// A poll that has written a place still has writes to make: its checkpoint stamps
+    /// the cursor row, and a comparison records its rotation there. A test about to hold
+    /// that row waits out the poll in flight first, or holds it mid-poll
+    /// (funkode-io/replay#283).
+    pub async fn await_a_poll_finished_after(&self, since: Instant) {
+        self.observe("a poll to finish", || async {
+            self.liveness()
+                .into_iter()
+                .find(|worker| {
+                    worker.policy == self.policy_name
+                        && worker.last_polled_at.is_some_and(|at| at > since)
+                })
+                .map(|_| ())
+        })
+        .await
+    }
+
     /// The durable stamp on the policy's cursor row: when its Leader last
     /// polled, as any replica can read it.
     pub async fn last_polled_at(&self) -> Option<DateTime<Utc>> {
@@ -1520,22 +1539,35 @@ impl HeldCursorRow {
 
     /// Wait until a poll is queued behind this lock writing its sweep: it has swept and
     /// looked up its late writes, and is recording how far it got.
+    ///
+    /// Any other statement queued behind the row fails the wait at once, naming it. The
+    /// worker polls one poll at a time, so a poll held at another write of the row never
+    /// reaches a sweep, and the wait would otherwise run out its timeout with nothing to
+    /// say (funkode-io/replay#283).
     pub async fn await_a_sweep_waiting(&self) {
         let deadline = Instant::now() + OBSERVE_TIMEOUT;
         loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity \
-                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid)) \
-                    AND query LIKE '%discovered_through%'",
+            let waiting: Vec<String> = sqlx::query_scalar(
+                "SELECT query FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))",
             )
             .bind(self.holder)
-            .fetch_one(&self.pool)
+            .fetch_all(&self.pool)
             .await
             .expect("reading who is blocked must succeed");
 
-            if waiting > 0 {
+            if waiting
+                .iter()
+                .any(|query| query.contains("discovered_through"))
+            {
                 return;
             }
+            assert!(
+                waiting.is_empty(),
+                "waiting for a sweep to queue behind the held cursor row, found another \
+                 write queued there instead; the poll making it cannot reach its sweep: \
+                 {waiting:?}"
+            );
             assert!(
                 Instant::now() < deadline,
                 "timed out after {OBSERVE_TIMEOUT:?} waiting for a sweep to queue behind \
