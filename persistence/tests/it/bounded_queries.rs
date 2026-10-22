@@ -34,9 +34,25 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "sweep_for_streams",
-        justification: "SQL carries LIMIT $limit, the policy's resolved read_batch_size \
-                        (default 100). Two columns per row, and the rows are reduced to \
-                        the streams they name before anything else reads them.",
+        justification: "At most limit + 1 rows: the sweep carries LIMIT $limit, the \
+                        policy's resolved read_batch_size (default 100), and the \
+                        snapshot is one row of its own. That row alone carries the \
+                        in-progress id aggregate, capped at UNSEEN_TRANSACTION_CAP + 1 \
+                        (4097), so the ids are held once, not once per swept row.",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "late_tail_page",
+        justification: "SQL LIMIT is the policy's resolved read_batch_size (default 100); \
+                        the query also receives only the snapshot's capped in-progress ids \
+                        (at most UNSEEN_TRANSACTION_CAP + 1, or 4097).",
+    },
+    Reviewed {
+        file: "src/policy_runner.rs",
+        function: "ended_transaction_page",
+        justification: "SQL LIMIT is the remainder of the policy's resolved read_batch_size \
+                        (default 100). All ended-transaction pages in a poll share that \
+                        remainder, so the total returned rows stay within the batch.",
     },
     Reviewed {
         file: "src/policy_runner.rs",

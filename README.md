@@ -2398,30 +2398,36 @@ reads each stream in that stream's own order, and a write that is slow, stuck or
 back delays the stream it is writing to and no other
 ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 
-Which streams to look at is found two ways. Every poll sweeps the log past
+Which streams to look at is found three ways. Every poll sweeps the log past
 `policy_cursors.discovered_through` for streams with new events — indexed, and bounded by
-`read_batch_size`. That sweep is fast because it never waits: it passes positions it
-cannot see, including one held by a write still in flight. A reconciliation then compares
-the head of every stream the policy tracks with the policy's place, catching exactly what
-the sweep passed. It costs a scan of one row per tracked stream — every stream, unless the
+`read_batch_size`. The sweep and `pg_current_snapshot()` share one statement snapshot, so
+the runner knows which transactions it could not see. Once those transactions end, an
+indexed lookup of their `commit_txid`s nominates their streams on the next poll. A transaction
+whose id was assigned after the sweep snapshot is found by the carried transaction-id range.
+Both lookups are bounded by `read_batch_size` and lead the poll; the full comparison remains
+as a safety net. It costs a scan of one row per tracked stream — every stream, unless the
 policy is [filtered by stream type](#a-policy-filtered-by-stream-type-tracks-only-those-types)
 — so it runs on a cadence rather than per poll:
 
 | Setting | Default | What it bounds |
 |---------|---------|----------------|
-| `REPLAY_POLICY_RECONCILE_SECS` | 5 | How often the reconciliation runs, and so the unit the delivery bound below is counted in. Never *whether*. |
+| `REPLAY_POLICY_RECONCILE_SECS` | 300 | Safety-net comparison cadence in seconds. Never *whether*. |
 
-Lower it if that tail latency matters more than the scan; raise it if you have millions of
-streams and no long-running writes.
+Lower it for faster recovery from a defect; normal late-write delivery does not wait for it.
+`PolicyRunnerBuilder::reconcile_every(Duration)` sets it per runner instead;
+`Duration::ZERO` compares on every poll, which is what a test that moves places by hand
+wants rather than waiting out a cadence. On a poll that compares, the comparison's streams
+take their slots first; a late write that gets no slot is carried to the next poll.
 
-A policy's first reconciliation after its worker starts or is elected leader runs **within
+A policy's first full comparison after its worker starts or is elected leader runs **within
 three poll intervals**, at a phase derived from the policy's name, rather than on its first
 poll, so the policies of one runner do not all scan at once (see `startup_window` and
 `reconcile_phase` in `persistence/src/policy_runner.rs`). The window is the poll interval's,
-not the reconciliation cadence's: that first comparison is how a new leader finds writes
-that were in flight during a failover, so it must not wait a cadence
-([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A manual `PolicyRunner::drain` always reconciles on
-the spot.
+not the comparison cadence's: the late-write state is in memory only, so that first
+comparison is how a new leader finds writes that were in flight during a failover, and it
+must not wait a cadence
+([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A manual
+`PolicyRunner::drain` always compares on the spot.
 
 The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
 left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
@@ -2551,7 +2557,7 @@ because a place is only read for a stream that poll is looking at:
 | The stream you moved | When it is picked up |
 |---|---|
 | is still being written to | the next poll, on the sweep |
-| is quiet and the sweep has passed it | the next reconciliation that reaches it — `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)) |
+| is quiet and the sweep has passed it | the next full comparison that reaches it — `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). A moved place has no writing transaction for the late-write lookup to find, so this is the one case that waits for the safety net; `PolicyRunner::drain` picks it up at once. |
 
 Places themselves are never held in memory between polls, so no running process carries a
 stale copy of one forward.
@@ -3430,7 +3436,8 @@ None of the three stops a policy, and none of them needs an operator:
 |---------------|----------------------|
 | A write failed after taking a `global_position` | Nothing. The number is burned — `nextval` is not transactional — and a policy that reads no global order never looks at it. The place the write took in its stream *is* handed back, because that counter is a row and rolls back with the transaction. |
 | A write is still running | Its stream waits for it, and only its stream. Every other stream is delivered meanwhile. |
-| A write commits below a policy's sweep | It is delivered by the reconciliation, within `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS` — the `+ 1` is the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). |
+| A write commits below a policy's sweep, with its leader unchanged | It is nominated on the next poll after its transaction commits. |
+| A leader changes, transaction counter resets, or late-write state exceeds its cap | The full comparison finds the write within one `REPLAY_POLICY_RECONCILE_SECS` cadence, plus the rotation terms in [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md). |
 
 This is the structural fix for
 [#164](https://github.com/funkode-io/replay/issues/164), where a burned position
@@ -3441,4 +3448,3 @@ another — a `pg_locks` probe, a rate-gated `blocked` warning, a `Blocked` stat
 gone, along with the `REPLAY_BLOCKED_WARN_AFTER_SECS` knob that paced it.
 
 A caught-up idle policy logs nothing at all.
-
