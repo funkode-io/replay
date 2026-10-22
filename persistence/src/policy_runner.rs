@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -150,6 +150,7 @@ pub struct PolicyRunnerBuilder {
     replica_id: Option<String>,
     supervision: WorkerSupervision,
     on_escalation: EscalationHook,
+    reconcile_cadence: Duration,
 }
 
 impl PolicyRunnerBuilder {
@@ -224,6 +225,16 @@ impl PolicyRunnerBuilder {
             );
         }
         self.heartbeat = Some(cadence.max(HEARTBEAT_MIN_CADENCE));
+        self
+    }
+
+    /// Replace how often each Policy runs the full comparison, its safety net
+    /// (`REPLAY_POLICY_RECONCILE_SECS`, else 300 s).
+    ///
+    /// [`Duration::ZERO`] compares on every poll. That is for tests: a test that moves a
+    /// place by hand is then answered on the next poll instead of waiting out a cadence.
+    pub fn reconcile_every(mut self, cadence: Duration) -> Self {
+        self.reconcile_cadence = cadence;
         self
     }
 
@@ -425,6 +436,7 @@ impl PolicyRunnerBuilder {
             replica_id: self.replica_id,
             supervision: self.supervision,
             on_escalation: self.on_escalation,
+            reconcile_cadence: self.reconcile_cadence,
             drained: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -495,6 +507,8 @@ pub struct PolicyRunner {
     supervision: WorkerSupervision,
     /// What the consumer does about a worker this runner has given up on.
     on_escalation: EscalationHook,
+    /// How often each Policy runs the full comparison.
+    reconcile_cadence: Duration,
     /// Where each policy's search had got to at the end of the last [`Self::drain`].
     ///
     /// A daemon worker keeps this for its leadership term; a manual drain has no term, so
@@ -870,6 +884,7 @@ impl PolicyRunner {
             replica_id: std::env::var("HOSTNAME").ok().filter(|id| !id.is_empty()),
             supervision: WorkerSupervision::default(),
             on_escalation: exit_the_process(),
+            reconcile_cadence: resolve_reconcile_cadence(),
         }
     }
 
@@ -883,9 +898,9 @@ impl PolicyRunner {
     ///
     /// **The runner remembers where each policy's search had got to**, so repeated calls
     /// behave like a daemon's successive polls: the streams one call could not finish are
-    /// looked at by the next, and the turn that shares a poll between the sweep and the
-    /// reconciliation carries on rather than restarting. A fresh runner starts the search
-    /// afresh — from what is stored, never from the beginning.
+    /// looked at by the next, late-write candidates are checked after each sweep, and the
+    /// full comparison's rotation carries on rather than restarting. A fresh runner starts
+    /// the search afresh — from what is stored, never from the beginning.
     ///
     /// Unlike a daemon's poll, this one always compares every stream's head with the
     /// policy's places rather than doing it on a cadence, so a place moved by hand is
@@ -1568,6 +1583,7 @@ impl PolicyRunner {
                 leader_rx,
                 wake_tx: wake_tx.clone(),
                 interval,
+                reconcile_cadence: self.reconcile_cadence,
                 liveness: liveness.register(&name),
                 name,
             };
@@ -1643,7 +1659,9 @@ impl PolicyRunner {
             Entry::Vacant(first) => {
                 let tracked = TrackedStreams::of(&policy.stream_filter());
                 first.insert(
-                    PolicyProgress::load(&self.pool, &name, policy.start_at(), tracked).await?,
+                    PolicyProgress::load(&self.pool, &name, policy.start_at(), tracked)
+                        .await?
+                        .reconciling_every(self.reconcile_cadence),
                 )
             }
         };
@@ -2047,6 +2065,8 @@ struct PolicyWorker {
     /// and nothing else (polling is the correctness baseline).
     wake_tx: Option<broadcast::Sender<()>>,
     interval: Duration,
+    /// How often its Policy runs the full comparison.
+    reconcile_cadence: Duration,
     /// Where this worker publishes what it is doing, shared with its supervisor.
     liveness: LivenessHandle,
     name: String,
@@ -2069,6 +2089,7 @@ impl PolicyWorker {
             mut leader_rx,
             wake_tx,
             interval,
+            reconcile_cadence,
             liveness,
             name,
         } = self;
@@ -2112,7 +2133,7 @@ impl PolicyWorker {
             let tracked = TrackedStreams::of(&policy.stream_filter());
             let mut progress =
                 match PolicyProgress::load(&pool, &name, policy.start_at(), tracked).await {
-                    Ok(progress) => progress,
+                    Ok(progress) => progress.reconciling_every(reconcile_cadence),
                     Err(error) => {
                         tracing::error!(
                             policy = %name,
@@ -2128,7 +2149,9 @@ impl PolicyWorker {
                 };
 
             // A new leader compares the frontier with its places within a few polls, at
-            // its own phase, so the Policies of one runner do not all scan at once.
+            // its own phase, so the Policies of one runner do not all scan at once. That
+            // comparison is also how it finds the writes in flight across the election:
+            // the late-write state it would have found them with lived in the old leader.
             progress.spread_first_reconciliation(&name, interval);
 
             // Where this worker picks up, once per election. A Policy resumes per
@@ -3126,14 +3149,30 @@ async fn drain_policy_once(
     let tracked = TrackedStreams::of(&filter);
     progress.track(pool, &name, &tracked).await?;
 
-    // Three sources: what the last poll could not finish, what the sweep just found, and
-    // — on its own cadence — what the sweep has missed.
-    let mut discovered = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
+    // The sweep and its snapshot are one statement: the snapshot says exactly which
+    // transactions its rows could not see.
+    let sweep = sweep_for_streams(pool, progress.swept_through, read_batch).await?;
+    let mut discovered = sweep.discovered.clone();
+    if remember_open_transactions(&mut progress.late_writes, &sweep.in_progress) {
+        progress.reconcile_now();
+    }
     // After the sweep, not in it: the sweep reads its `LIMIT` of positions whatever streams
     // they name, and `swept_through` passes all of them. Filtering in its SQL would make it
     // search ahead for a matching row, examining rows in proportion to the ones it skips —
     // the cost #258 measured, moved rather than removed.
     discovered.streams = tracked.keep_tracked(pool, discovered.streams).await?;
+    let mut late = lookup_late_writes(
+        pool,
+        &progress.late_writes,
+        &sweep,
+        discovered.swept_through,
+        read_batch,
+    )
+    .await?;
+    late.streams = tracked.keep_tracked(pool, late.streams).await?;
+    if late.force_comparison {
+        progress.reconcile_now();
+    }
     let reconciling = progress.reconcile_is_due();
     let examined = if reconciling {
         streams_behind(
@@ -3163,6 +3202,7 @@ async fn drain_policy_once(
     let mut plan = PollPlan::plan(Nominations {
         carried: progress.unfinished.clone(),
         swept: discovered.streams,
+        late: late.streams,
         examined,
         reconciling,
         read_batch,
@@ -3181,6 +3221,14 @@ async fn drain_policy_once(
 
     // Everything from here to the settle is I/O against what the plan decided, and every
     // way out of it — including a failed statement — goes through the settle below.
+    // The late-write state goes with the sweep it was computed against, so it is taken
+    // before that sweep is written: a poll that fails, or a future dropped, after the
+    // sweep is persisted must not leave the tail of an older sweep behind it — the retry
+    // would search from the new position with the old tail, and a writer between the two
+    // would wait for the reconciliation. Taken earlier than the write it can only cover
+    // more: a retry from the old position re-reads what this tail already covers.
+    progress.late_writes = std::mem::take(&mut late.state);
+
     let drained: Result<usize, replay::Error> = async {
         // The sweep has read this stretch of log whatever the streams in it turn out to
         // owe, and a stream left unfinished is remembered rather than re-swept for.
@@ -4243,23 +4291,339 @@ async fn sweep_for_streams(
     pool: &Pool<Postgres>,
     from: i64,
     limit: u32,
-) -> Result<Discovered, replay::Error> {
+) -> Result<Sweep, replay::Error> {
     let rows = sqlx::query(
-        "SELECT global_position, stream_id FROM events WHERE global_position > $1 \
-         ORDER BY global_position ASC LIMIT $2",
+        "WITH current_snapshot AS MATERIALIZED ( \
+             SELECT pg_current_snapshot() AS snapshot \
+         ), active_ids AS MATERIALIZED ( \
+             SELECT txid::text AS id \
+               FROM current_snapshot, \
+                    LATERAL pg_snapshot_xip(current_snapshot.snapshot) AS active(txid) \
+              LIMIT $3 \
+         ), active AS ( \
+             SELECT COALESCE(array_agg(id), ARRAY[]::text[]) AS ids FROM active_ids \
+         ), swept AS MATERIALIZED ( \
+             SELECT global_position, stream_id FROM events WHERE global_position > $1 \
+              ORDER BY global_position ASC LIMIT $2 \
+         ) \
+         SELECT NULL::bigint AS global_position, NULL::text AS stream_id, \
+                pg_snapshot_xmax(current_snapshot.snapshot)::text AS xmax, active.ids \
+           FROM current_snapshot, active \
+         UNION ALL \
+         SELECT global_position, stream_id, NULL, NULL FROM swept",
     )
     .bind(from)
+    .bind(limit as i64)
+    .bind((UNSEEN_TRANSACTION_CAP + 1) as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    // One row carries the snapshot and every other row one swept event, so the result is
+    // at most `limit + 1` rows and the in-progress ids — at most
+    // `UNSEEN_TRANSACTION_CAP + 1` — are held once, not once per swept row.
+    let snapshot = rows
+        .iter()
+        .find(|row| row.get::<Option<String>, _>("xmax").is_some())
+        .expect("the snapshot row is returned even when the sweep is empty");
+    let xmax = parse_txid(snapshot.get("xmax"))?;
+    let in_progress: Vec<u64> = snapshot
+        .get::<Vec<String>, _>("ids")
+        .into_iter()
+        .map(parse_txid)
+        .collect::<Result<_, _>>()?;
+    let discovered = discovered_from_sweep(
+        from,
+        rows.into_iter()
+            .filter_map(|row| {
+                Some((
+                    row.get::<Option<i64>, _>("global_position")?,
+                    row.get::<Option<String>, _>("stream_id")?,
+                ))
+            })
+            .collect(),
+    );
+
+    Ok(Sweep {
+        discovered,
+        xmax,
+        in_progress,
+    })
+}
+
+/// Parse an `xid8` rendered as text. SQLx does not decode the PostgreSQL type directly.
+fn parse_txid(value: String) -> Result<u64, replay::Error> {
+    value.parse().map_err(|error| {
+        replay::Error::internal("PostgreSQL returned an invalid transaction id")
+            .with_operation("policy_sweep")
+            .with_context("txid", value)
+            .with_context("cause", error)
+    })
+}
+
+/// Keep the snapshot's open ids even if a later query or delivery in this poll fails.
+fn remember_open_transactions(state: &mut LateWriteState, active: &[u64]) -> bool {
+    let active: BTreeSet<u64> = active.iter().copied().collect();
+    let ended: Vec<u64> = state.unseen.difference(&active).copied().collect();
+    for txid in ended {
+        state.pending.entry(txid).or_insert(None);
+    }
+
+    if active.len() > UNSEEN_TRANSACTION_CAP
+        || active.len().saturating_add(state.pending.len()) > UNSEEN_TRANSACTION_CAP
+    {
+        *state = LateWriteState::overflowed();
+        return true;
+    }
+
+    state.unseen = active;
+    false
+}
+
+/// Find ended transactions the sweep could not see, retaining a bounded keyset cursor for
+/// any page that did not fit in this poll.
+async fn lookup_late_writes(
+    pool: &Pool<Postgres>,
+    prior: &LateWriteState,
+    sweep: &Sweep,
+    swept_through: i64,
+    read_batch: u32,
+) -> Result<LatePoll, replay::Error> {
+    let active: HashSet<u64> = sweep.in_progress.iter().copied().collect();
+    let mut state = prior.clone();
+    // Bounded by `read_batch`: every stream pushed comes from a row of a page, and the
+    // pages of one poll share that budget.
+    let mut streams = Vec::new();
+    let mut rows_read = 0u32;
+    let mut force_comparison = false;
+
+    if remember_open_transactions(&mut state, &sweep.in_progress) {
+        return Ok(LatePoll {
+            streams,
+            state,
+            force_comparison: true,
+        });
+    }
+
+    let counter_moved_backwards = state
+        .tail
+        .as_ref()
+        .is_some_and(|tail| sweep.xmax < tail.seen_xmax);
+    if counter_moved_backwards || state.needs_reconciliation {
+        state = LateWriteState {
+            tail: Some(Tail::at(sweep, swept_through)),
+            unseen: active.iter().copied().collect(),
+            needs_reconciliation: active.len() > UNSEEN_TRANSACTION_CAP,
+            ..LateWriteState::default()
+        };
+        force_comparison = true;
+    } else {
+        // The tail and the ended transactions share the batch, and take turns leading it:
+        // were the tail always first, traffic that keeps its page full would leave an
+        // ended transaction to the reconciliation.
+        state.pending_first = !state.pending_first;
+        let order = if state.pending_first {
+            [LookupPart::Pending, LookupPart::Tail]
+        } else {
+            [LookupPart::Tail, LookupPart::Pending]
+        };
+        for part in order {
+            match part {
+                LookupPart::Tail => {
+                    let Some(tail) = state.tail.as_mut() else {
+                        state.tail = Some(Tail::at(sweep, swept_through));
+                        continue;
+                    };
+                    let page = if rows_read < read_batch {
+                        Some(late_tail_page(pool, tail, sweep, read_batch - rows_read).await?)
+                    } else {
+                        None
+                    };
+                    match page {
+                        Some(page) if page.complete => {
+                            rows_read += page.rows.len() as u32;
+                            nominate(&mut streams, page.rows);
+                            *tail = Tail::at(sweep, swept_through);
+                        }
+                        page => {
+                            // The walk resumes from its cursor, but now also owes the ids
+                            // assigned since this sweep — invisible to it, possibly at
+                            // positions it passed. Raising the position bound to this sweep
+                            // covers them; the rows it adds below the cursor's id are ones
+                            // this sweep could see, so it only re-nominates, within the
+                            // same batch.
+                            if let Some(page) = page {
+                                rows_read += page.rows.len() as u32;
+                                nominate(&mut streams, page.rows);
+                                tail.after = page.after;
+                            }
+                            tail.swept_through = swept_through;
+                            tail.seen_xmax = sweep.xmax;
+                        }
+                    }
+                }
+                LookupPart::Pending => {
+                    if rows_read >= read_batch {
+                        continue;
+                    }
+                    // Bounded by `UNSEEN_TRANSACTION_CAP`, which `remember_open_transactions`
+                    // holds `pending` under.
+                    let mut ids: Vec<u64> = state.pending.keys().copied().collect();
+                    if let Some(after) = state.unseen_after {
+                        let split = ids.partition_point(|txid| *txid <= after);
+                        ids.rotate_left(split);
+                    }
+                    let mut last_seen = None;
+                    for txid in ids {
+                        last_seen = Some(txid);
+                        if active.contains(&txid) {
+                            continue;
+                        }
+                        let cursor = state.pending.get(&txid).copied().flatten();
+                        // What is left of the batch now, not when the loop began: every
+                        // page of this poll shares the one budget.
+                        let remaining = read_batch - rows_read;
+                        let page = ended_transaction_page(pool, txid, cursor, remaining).await?;
+                        rows_read += page.rows.len() as u32;
+                        nominate(&mut streams, page.rows);
+                        match page.after {
+                            Some(after) if !page.complete => {
+                                state.pending.insert(txid, Some(after.1));
+                            }
+                            _ => {
+                                state.pending.remove(&txid);
+                            }
+                        }
+                        if rows_read >= read_batch {
+                            break;
+                        }
+                    }
+                    if let Some(last_seen) = last_seen {
+                        state.unseen_after = Some(last_seen);
+                    }
+                }
+            }
+        }
+
+        if state.unseen.len().saturating_add(state.pending.len()) > UNSEEN_TRANSACTION_CAP {
+            state = LateWriteState::overflowed();
+            streams.clear();
+            force_comparison = true;
+        }
+    }
+
+    Ok(LatePoll {
+        streams,
+        state,
+        force_comparison,
+    })
+}
+
+/// Add each row's stream to `streams` once.
+fn nominate(streams: &mut Vec<String>, rows: Vec<LateRow>) {
+    for row in rows {
+        if !streams.contains(&row.stream_id) {
+            streams.push(row.stream_id);
+        }
+    }
+}
+
+struct LatePage {
+    rows: Vec<LateRow>,
+    after: Option<(u64, i64)>,
+    complete: bool,
+}
+
+struct LateRow {
+    stream_id: String,
+    txid: u64,
+    position: i64,
+}
+
+impl LatePage {
+    /// A page of at most `limit` rows, which is complete when it came back short.
+    fn of(rows: Vec<LateRow>, limit: u32) -> Self {
+        Self {
+            after: rows.last().map(|row| (row.txid, row.position)),
+            complete: rows.len() < limit as usize,
+            rows,
+        }
+    }
+}
+
+/// A page of ended ids assigned above the previous snapshot's xmax. Its position bound is
+/// the last sweep that shared that snapshot.
+async fn late_tail_page(
+    pool: &Pool<Postgres>,
+    tail: &Tail,
+    sweep: &Sweep,
+    limit: u32,
+) -> Result<LatePage, replay::Error> {
+    let active: Vec<String> = sweep.in_progress.iter().map(u64::to_string).collect();
+    let rows = sqlx::query(
+        "SELECT stream_id, commit_txid::text AS txid, global_position \
+           FROM events \
+          WHERE commit_txid >= $1::xid8 AND commit_txid < $2::xid8 \
+            AND global_position <= $3 \
+            AND commit_txid::text <> ALL($4::text[]) \
+            AND ($5::text IS NULL OR (commit_txid, global_position) > \
+                 ($5::text::xid8, $6::bigint)) \
+          ORDER BY commit_txid, global_position LIMIT $7",
+    )
+    .bind(tail.xmax.to_string())
+    .bind(sweep.xmax.to_string())
+    .bind(tail.swept_through)
+    .bind(active)
+    .bind(tail.after.map(|(txid, _)| txid.to_string()))
+    .bind(tail.after.map(|(_, position)| position))
     .bind(limit as i64)
     .fetch_all(pool)
     .await
     .map_err(crate::db_error)?;
 
-    Ok(discovered_from_sweep(
-        from,
-        rows.into_iter()
-            .map(|row| (row.get("global_position"), row.get("stream_id")))
-            .collect(),
-    ))
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            Ok(LateRow {
+                stream_id: row.get("stream_id"),
+                txid: parse_txid(row.get("txid"))?,
+                position: row.get("global_position"),
+            })
+        })
+        .collect::<Result<_, replay::Error>>()?;
+    Ok(LatePage::of(rows, limit))
+}
+
+/// A page of one ended transaction's events. The index and LIMIT bound every result.
+async fn ended_transaction_page(
+    pool: &Pool<Postgres>,
+    txid: u64,
+    after: Option<i64>,
+    limit: u32,
+) -> Result<LatePage, replay::Error> {
+    let rows = sqlx::query(
+        "SELECT stream_id, global_position \
+           FROM events \
+          WHERE commit_txid = $1::xid8 \
+            AND ($2::bigint IS NULL OR global_position > $2) \
+          ORDER BY global_position LIMIT $3",
+    )
+    .bind(txid.to_string())
+    .bind(after)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(crate::db_error)?;
+
+    let rows = rows
+        .into_iter()
+        .map(|row| LateRow {
+            stream_id: row.get("stream_id"),
+            txid,
+            position: row.get("global_position"),
+        })
+        .collect();
+    Ok(LatePage::of(rows, limit))
 }
 
 /// The streams a Policy **tracks** — compares, reads and keeps a place for — which its
@@ -4693,7 +5057,86 @@ struct PolicyProgress {
     /// re-checks its carried queue, only when the filter it asked for has changed
     /// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
     tracked: TrackedStreams,
+    /// Transaction ids and per-transaction position cursors the sweep has not yet looked
+    /// up. Bounded by [`UNSEEN_TRANSACTION_CAP`].
+    late_writes: LateWriteState,
 }
+
+/// The most recent sweep's transaction snapshot and the events still to look up.
+///
+/// This state is deliberately leader-local. Losing it costs a full comparison at the next
+/// leadership start, never a delivery.
+#[derive(Clone, Default)]
+struct LateWriteState {
+    unseen: BTreeSet<u64>,
+    pending: BTreeMap<u64, Option<i64>>,
+    tail: Option<Tail>,
+    unseen_after: Option<u64>,
+    needs_reconciliation: bool,
+    /// Whether the ended transactions lead this poll's batch rather than the tail.
+    pending_first: bool,
+}
+
+/// The two halves of the late-write lookup, which take turns leading a poll's batch.
+#[derive(Clone, Copy)]
+enum LookupPart {
+    Tail,
+    Pending,
+}
+
+impl LateWriteState {
+    /// The state after it could no longer be trusted — over the cap, or the transaction
+    /// counter moved backwards: empty, and asking for the reconciliation.
+    fn overflowed() -> Self {
+        Self {
+            needs_reconciliation: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// A bounded keyset walk over transaction ids that were at or above the previous
+/// snapshot's `xmax`.
+#[derive(Clone)]
+struct Tail {
+    /// The walk's lower bound: the `xmax` of the sweep it began after.
+    xmax: u64,
+    /// The newest `xmax` any sweep has shown it, which a later one may not fall below. An
+    /// unfinished walk keeps its lower bound while the counter moves on, so that bound
+    /// alone would miss a reset to anywhere above it.
+    seen_xmax: u64,
+    swept_through: i64,
+    after: Option<(u64, i64)>,
+}
+
+impl Tail {
+    /// The walk the next poll owes after `sweep`, which read through `swept_through`.
+    fn at(sweep: &Sweep, swept_through: i64) -> Self {
+        Self {
+            xmax: sweep.xmax,
+            seen_xmax: sweep.xmax,
+            swept_through,
+            after: None,
+        }
+    }
+}
+
+/// One statement's sweep rows and the transaction snapshot they were read under.
+struct Sweep {
+    discovered: Discovered,
+    xmax: u64,
+    in_progress: Vec<u64>,
+}
+
+/// The late-write candidates and state changes a successfully settled poll may adopt.
+struct LatePoll {
+    streams: Vec<String>,
+    state: LateWriteState,
+    force_comparison: bool,
+}
+
+/// A snapshot's in-progress set is capped in code, including the overflow sentinel.
+const UNSEEN_TRANSACTION_CAP: usize = 4_096;
 
 impl PolicyProgress {
     /// Load the Policy's sweep position, creating its row the first time it runs, and
@@ -4723,6 +5166,7 @@ impl PolicyProgress {
             reconciled_through,
             reconcile: ReconcileSchedule::after_load(resolve_reconcile_cadence()),
             tracked,
+            late_writes: LateWriteState::default(),
         })
     }
 
@@ -4754,6 +5198,12 @@ impl PolicyProgress {
     fn spread_first_reconciliation(&mut self, name: &str, poll_interval: Duration) {
         self.reconcile
             .spread(name, startup_window(poll_interval), Instant::now());
+    }
+
+    /// This progress, comparing once every `cadence`.
+    fn reconciling_every(mut self, cadence: Duration) -> Self {
+        self.reconcile.every = cadence;
+        self
     }
 
     /// Make the next poll pay for the frontier scan whatever the cadence says.
@@ -4830,18 +5280,20 @@ impl ReconcileSchedule {
 
 /// Built-in default for [`resolve_reconcile_cadence`].
 ///
-/// Five seconds is a latency bound, not a correctness one: it is how long a Policy can
-/// take to notice a write that committed below its sweep. Lower it for a deployment that
-/// cares more about that tail than about scanning one row per stream; raise it for one
-/// with millions of streams and no long transactions.
-const DEFAULT_RECONCILE_CADENCE: Duration = Duration::from_secs(5);
+/// Five minutes is a safety net, not the delivery bound: a late write is found on the
+/// first poll after its transaction ends
+/// ([ADR-0030](../../docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). What
+/// is left to the comparison is what that lookup cannot see — a place moved by hand, the
+/// late-write state lost to an overflow — so this bounds those. Lower it for a deployment
+/// that moves places often; raise it for one with millions of streams.
+const DEFAULT_RECONCILE_CADENCE: Duration = Duration::from_secs(300);
 
 /// Environment variable overriding the built-in cadence, in seconds.
 const RECONCILE_CADENCE_ENV_VAR: &str = "REPLAY_POLICY_RECONCILE_SECS";
 
 /// How often a Policy compares every stream's head with its own place.
 ///
-/// Precedence: `REPLAY_POLICY_RECONCILE_SECS` → 5s. `0` and unparseable values fall back
+/// Precedence: `REPLAY_POLICY_RECONCILE_SECS` → 300s. `0` and unparseable values fall back
 /// to the default rather than turning every poll into a full scan.
 fn resolve_reconcile_cadence() -> Duration {
     std::env::var(RECONCILE_CADENCE_ENV_VAR)
@@ -6169,8 +6621,10 @@ mod progress_tests {
     use crate::policy_frontier::rotation_after;
 
     use super::{
-        bootstrap, checkpoint_places, places_of, streams_behind, write_reconciled, Place,
-        PolicyProgress, StartAt, TrackedStreams, STREAMS_BEHIND_OF_TYPES,
+        bootstrap, checkpoint_places, late_tail_page, lookup_late_writes, places_of,
+        streams_behind, sweep_for_streams, write_reconciled, Discovered, LateWriteState, Place,
+        PolicyProgress, StartAt, Sweep, Tail, TrackedStreams, STREAMS_BEHIND_OF_TYPES,
+        UNSEEN_TRANSACTION_CAP,
     };
 
     /// Move the rotation the way a poll that compared `page` and read `read` of it would,
@@ -6259,6 +6713,761 @@ mod progress_tests {
             .await
             .expect("appending must succeed");
         }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_rows_and_transaction_snapshot_share_one_statement_snapshot_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut held = pool.begin().await.expect("starting the held writer");
+        let held_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Held', \
+                 'urn:probe:held', 'Probe', NULL, FALSE)",
+        )
+        .bind(held_id)
+        .fetch_one(&mut *held)
+        .await
+        .expect("the held event must be written");
+        let held_position: i64 =
+            sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+                .bind(held_id)
+                .fetch_one(&mut *held)
+                .await
+                .expect("the held event must have its position");
+        let held_txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(held_id)
+                .fetch_one(&mut *held)
+                .await
+                .expect("the held event must have its transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+
+        let overtaking_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Overtaking', \
+                 'urn:probe:overtaking', 'Probe', NULL, FALSE)",
+        )
+        .bind(overtaking_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the overtaking event must commit");
+        let overtaking_position: i64 =
+            sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+                .bind(overtaking_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the overtaking event must have its position");
+
+        let sweep = sweep_for_streams(&pool, 0, 10)
+            .await
+            .expect("the sweep must return its snapshot");
+
+        assert!(sweep.in_progress.contains(&held_txid));
+        assert!(held_position < overtaking_position);
+        assert!(sweep.discovered.swept_through >= overtaking_position);
+        assert!(
+            !sweep
+                .discovered
+                .streams
+                .contains(&"urn:probe:held".to_string()),
+            "the row is invisible in the same snapshot that reports its writer in progress"
+        );
+        assert!(sweep
+            .discovered
+            .streams
+            .contains(&"urn:probe:overtaking".to_string()));
+
+        held.rollback().await.expect("aborting the held writer");
+    }
+
+    #[tokio::test]
+    async fn an_open_transaction_is_retained_and_looked_up_after_it_ends_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut held = pool.begin().await.expect("starting the held writer");
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Held', \
+                 'urn:probe:held-many-polls', 'Probe', NULL, FALSE)",
+        )
+        .bind(event_id)
+        .fetch_one(&mut *held)
+        .await
+        .expect("the held event must be written");
+        let txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(&mut *held)
+                .await
+                .expect("the held event must have a transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+        let position: i64 = sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&mut *held)
+            .await
+            .expect("the held event must have a position");
+        append_events(&pool, "urn:probe:advance-xmax", 1).await;
+        let mut state = LateWriteState::default();
+
+        for _ in 0..4 {
+            let sweep = sweep_for_streams(&pool, position, 10)
+                .await
+                .expect("a poll must read the held transaction snapshot");
+            assert!(
+                sweep.in_progress.contains(&txid),
+                "transaction {txid} is absent from {:?} at xmax {}",
+                sweep.in_progress,
+                sweep.xmax
+            );
+            let late = lookup_late_writes(&pool, &state, &sweep, position, 10)
+                .await
+                .expect("an open transaction must not be looked up");
+            assert!(late.streams.is_empty());
+            assert_eq!(late.state.unseen.len(), 1);
+            assert!(late.state.unseen.contains(&txid));
+            state = late.state;
+        }
+
+        held.commit().await.expect("committing the held writer");
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the next poll must read the ended transaction");
+        let late = lookup_late_writes(&pool, &state, &sweep, position, 10)
+            .await
+            .expect("the ended transaction must be read");
+        assert_eq!(late.streams, vec!["urn:probe:held-many-polls"]);
+        assert!(!late.state.unseen.contains(&txid));
+        assert!(!late.state.pending.contains_key(&txid));
+
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("a following poll must continue normally");
+        let after = lookup_late_writes(&pool, &late.state, &sweep, position, 10)
+            .await
+            .expect("the completed transaction must be forgotten");
+        assert!(after.streams.is_empty());
+        assert!(after.state.unseen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_tail_finds_an_id_at_the_previous_xmax_below_the_sweep_position_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Tail', \
+                 'urn:probe:tail', 'Probe', NULL, FALSE)",
+        )
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the event must commit");
+        let txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the event must have a transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+        let position: i64 = sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the event must have a position");
+
+        let page = late_tail_page(
+            &pool,
+            &Tail {
+                xmax: txid,
+                seen_xmax: txid,
+                swept_through: position,
+                after: None,
+            },
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: position,
+                },
+                xmax: txid + 1,
+                in_progress: Vec::new(),
+            },
+            10,
+        )
+        .await
+        .expect("the tail query must succeed");
+
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].stream_id, "urn:probe:tail");
+        assert_eq!(page.rows[0].position, position);
+    }
+
+    #[tokio::test]
+    async fn invalid_late_write_state_is_cleared_and_requests_a_full_comparison_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut prior = LateWriteState::default();
+        prior.unseen.insert(8);
+        prior.tail = Some(Tail {
+            xmax: 10,
+            seen_xmax: 10,
+            swept_through: 50,
+            after: Some((9, 45)),
+        });
+        let reset = lookup_late_writes(
+            &pool,
+            &prior,
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: 60,
+                },
+                xmax: 9,
+                in_progress: Vec::new(),
+            },
+            60,
+            10,
+        )
+        .await
+        .expect("a backward counter should not query the old range");
+
+        assert!(reset.force_comparison);
+        assert!(reset.state.unseen.is_empty());
+        assert_eq!(reset.state.tail.as_ref().map(|tail| tail.xmax), Some(9));
+
+        let overflow = lookup_late_writes(
+            &pool,
+            &LateWriteState::default(),
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: 0,
+                },
+                xmax: 20,
+                in_progress: (0..=UNSEEN_TRANSACTION_CAP as u64).collect(),
+            },
+            0,
+            10,
+        )
+        .await
+        .expect("an over-cap snapshot should not query transaction rows");
+
+        assert!(overflow.force_comparison);
+        assert!(overflow.state.unseen.is_empty());
+        assert!(overflow.state.tail.is_none());
+        assert!(overflow.state.needs_reconciliation);
+    }
+
+    /// A counter reset during an unfinished walk is caught against the newest `xmax` the
+    /// walk has seen, not its lower bound: a walk from 10 that has seen 100, then a sweep at
+    /// 90, clears the state and asks for the comparison.
+    #[tokio::test]
+    async fn a_counter_reset_during_an_unfinished_walk_requests_a_comparison_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let prior = LateWriteState {
+            tail: Some(Tail {
+                xmax: 10,
+                seen_xmax: 100,
+                swept_through: 50,
+                after: Some((95, 45)),
+            }),
+            ..LateWriteState::default()
+        };
+
+        let reset = lookup_late_writes(
+            &pool,
+            &prior,
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: 60,
+                },
+                xmax: 90,
+                in_progress: Vec::new(),
+            },
+            60,
+            10,
+        )
+        .await
+        .expect("a reset should not query the old range");
+
+        assert!(reset.force_comparison);
+        assert_eq!(reset.state.tail.as_ref().map(|tail| tail.xmax), Some(90));
+        assert!(reset
+            .state
+            .tail
+            .as_ref()
+            .is_some_and(|tail| tail.after.is_none()));
+    }
+
+    /// Write one event from `writer`, leaving its transaction as the caller holds it, and
+    /// return its commit stamp and position.
+    async fn write_in(writer: &mut sqlx::PgConnection, stream: &str) -> (u64, i64) {
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Probe', $2, 'Probe', \
+             NULL, FALSE)",
+        )
+        .bind(event_id)
+        .bind(stream)
+        .fetch_one(&mut *writer)
+        .await
+        .expect("the event must be written");
+        let (txid, position): (String, i64) =
+            sqlx::query_as("SELECT commit_txid::text, global_position FROM events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(&mut *writer)
+                .await
+                .expect("the event must have its stamp and position");
+        (
+            txid.parse()
+                .expect("a transaction id is an unsigned 64-bit value"),
+            position,
+        )
+    }
+
+    /// Several ended transactions in one poll share the one batch: their pages together
+    /// never read more rows than it allows.
+    #[tokio::test]
+    async fn ended_transactions_share_one_batch_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut first = pool.begin().await.expect("starting the first writer");
+        let mut second = pool.begin().await.expect("starting the second writer");
+        let mut position = i64::MAX;
+        for n in 0..3 {
+            let (_, at) = write_in(&mut first, &format!("urn:probe:first-{n}")).await;
+            position = position.min(at);
+            let (_, at) = write_in(&mut second, &format!("urn:probe:second-{n}")).await;
+            position = position.min(at);
+        }
+        append_events(&pool, "urn:probe:advance-xmax", 1).await;
+        let sweep = sweep_for_streams(&pool, position - 1, 10)
+            .await
+            .expect("the sweep must read its snapshot");
+        let open = lookup_late_writes(&pool, &LateWriteState::default(), &sweep, position, 4)
+            .await
+            .expect("both transactions are remembered");
+        first.commit().await.expect("committing the first writer");
+        second.commit().await.expect("committing the second writer");
+
+        let sweep = sweep_for_streams(&pool, sweep.discovered.swept_through, 10)
+            .await
+            .expect("the next sweep must read its snapshot");
+        let late = lookup_late_writes(&pool, &open.state, &sweep, position, 4)
+            .await
+            .expect("the ended transactions are looked up");
+
+        assert_eq!(
+            late.streams.len(),
+            4,
+            "six rows owed, a batch of four read: {:?}",
+            late.streams
+        );
+    }
+
+    /// The sweep's rows and its snapshot come from one statement, under writers committing
+    /// throughout. Each sweep's rows must be exactly the writes its own snapshot calls
+    /// ended. Were they two statements, a commit landing between them would show a row
+    /// the snapshot calls in progress, or hide one it calls ended.
+    #[tokio::test]
+    async fn under_concurrent_commits_every_sweep_matches_its_own_snapshot_postgres_test() {
+        const WRITERS: usize = 3;
+        const WRITES: usize = 60;
+        let (pool, _container) = start_postgres().await;
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    for n in 0..WRITES {
+                        let mut tx = pool.begin().await.expect("starting a writer");
+                        write_in(&mut tx, &format!("urn:probe:stress-{writer}-{n}")).await;
+                        tokio::task::yield_now().await;
+                        tx.commit().await.expect("committing a writer");
+                    }
+                })
+            })
+            .collect();
+
+        let mut sweeps = 0;
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let sweep = sweep_for_streams(&pool, 0, 10_000)
+                .await
+                .expect("a sweep must read its snapshot");
+            let in_progress: Vec<String> = sweep.in_progress.iter().map(u64::to_string).collect();
+            // Every committed stress write, checked against this sweep's snapshot: ended
+            // (below xmax, not in progress) exactly when the sweep returned its stream.
+            let mismatched: Option<String> = sqlx::query_scalar(
+                "SELECT string_agg(stream_id || '@' || commit_txid::text, ', ') FROM events \
+                  WHERE stream_id LIKE 'urn:probe:stress-%' \
+                    AND (commit_txid < $1::xid8 AND commit_txid::text <> ALL($2::text[])) \
+                        <> (stream_id = ANY($3::text[]))",
+            )
+            .bind(sweep.xmax.to_string())
+            .bind(&in_progress)
+            .bind(&sweep.discovered.streams)
+            .fetch_one(&pool)
+            .await
+            .expect("checking the sweep against its snapshot");
+            assert_eq!(
+                mismatched, None,
+                "sweep {sweeps} disagrees with its own snapshot (xmax {}, in progress {:?})",
+                sweep.xmax, sweep.in_progress
+            );
+            sweeps += 1;
+        }
+        for writer in writers {
+            writer.await.expect("a writer finished");
+        }
+
+        assert!(
+            sweeps > 10,
+            "the sweeps ran while writers committed: {sweeps}"
+        );
+    }
+
+    /// The tail and the ended transactions take turns leading the batch: a tail that
+    /// traffic keeps full, with a batch of one, still leaves an ended transaction its turn.
+    #[tokio::test]
+    async fn a_full_tail_does_not_starve_an_ended_transaction_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut first = None;
+        let mut through = 0;
+        for n in 0..5 {
+            let mut tx = pool.begin().await.expect("starting a traffic writer");
+            let (txid, position) = write_in(&mut tx, &format!("urn:probe:traffic-{n}")).await;
+            tx.commit().await.expect("committing a traffic writer");
+            first.get_or_insert(txid);
+            through = position;
+        }
+        let mut ended = pool.begin().await.expect("starting the ended writer");
+        let (ended_txid, ended_position) = write_in(&mut ended, "urn:probe:ended").await;
+        ended.commit().await.expect("committing the ended writer");
+
+        let mut state = LateWriteState {
+            tail: Some(Tail {
+                xmax: first.expect("traffic was written"),
+                seen_xmax: first.expect("traffic was written"),
+                swept_through: through,
+                after: None,
+            }),
+            pending: [(ended_txid, None)].into(),
+            ..LateWriteState::default()
+        };
+        let mut found = Vec::new();
+        for _ in 0..2 {
+            let sweep = sweep_for_streams(&pool, ended_position, 10)
+                .await
+                .expect("a sweep");
+            let late = lookup_late_writes(&pool, &state, &sweep, ended_position, 1)
+                .await
+                .expect("a lookup");
+            found.extend(late.streams);
+            state = late.state;
+        }
+
+        assert!(
+            found.contains(&"urn:probe:ended".to_string()),
+            "the ended transaction had its turn within two polls: {found:?}"
+        );
+    }
+
+    /// ADR-0030's invariant: a transaction holding a position from `write_event` already
+    /// has its id, so a concurrent snapshot reports it in progress (`xip`) or at or above
+    /// its `xmax` — never as ended.
+    #[tokio::test]
+    async fn a_writer_holding_a_position_already_has_its_id_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut held = pool.begin().await.expect("starting the held writer");
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT pg_current_xact_id_if_assigned()::text")
+                .fetch_one(&mut *held)
+                .await
+                .expect("reading the writer's id");
+        assert_eq!(before, None, "the writer has no id until it writes");
+
+        let (stamp, _) = write_in(&mut held, "urn:probe:invariant").await;
+        let assigned: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
+            .fetch_one(&mut *held)
+            .await
+            .expect("reading the writer's id");
+        assert_eq!(
+            assigned.parse::<u64>().expect("a transaction id"),
+            stamp,
+            "the stamp is the writer's own top-level id"
+        );
+
+        let sweep = sweep_for_streams(&pool, 0, 10)
+            .await
+            .expect("a concurrent sweep must read its snapshot");
+        assert!(
+            sweep.in_progress.contains(&stamp) || stamp >= sweep.xmax,
+            "a writer holding a position is invisible to the snapshot: {stamp} is neither \
+             in {:?} nor at or above xmax {}",
+            sweep.in_progress,
+            sweep.xmax
+        );
+
+        held.rollback().await.expect("aborting the held writer");
+    }
+
+    /// The tail case, staged with real writers. The older transaction takes its id first
+    /// and writes last: the sweep sees its row, while the younger writer — whose id is
+    /// above every one that has ended — is at or above the snapshot's `xmax`, so not in
+    /// its `xip`, and holds a position below the sweep. Only the tail finds it.
+    #[tokio::test]
+    async fn a_writer_above_the_sweeps_xmax_below_its_position_is_found_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut older = pool.begin().await.expect("starting the older writer");
+        sqlx::query("SELECT pg_current_xact_id()")
+            .execute(&mut *older)
+            .await
+            .expect("the older writer takes its id first");
+        let mut younger = pool.begin().await.expect("starting the younger writer");
+        let (younger_txid, younger_position) = write_in(&mut younger, "urn:probe:above").await;
+        let (_, older_position) = write_in(&mut older, "urn:probe:below").await;
+        older.commit().await.expect("committing the older writer");
+
+        let sweep = sweep_for_streams(&pool, 0, 10)
+            .await
+            .expect("the sweep must read its snapshot");
+        assert!(
+            younger_txid >= sweep.xmax && !sweep.in_progress.contains(&younger_txid),
+            "the younger writer {younger_txid} sits at or above xmax {}, outside {:?}",
+            sweep.xmax,
+            sweep.in_progress
+        );
+        assert!(younger_position < older_position);
+        assert!(sweep.discovered.swept_through >= older_position);
+        let first = lookup_late_writes(
+            &pool,
+            &LateWriteState::default(),
+            &sweep,
+            sweep.discovered.swept_through,
+            10,
+        )
+        .await
+        .expect("the first lookup only sets the tail");
+        assert!(first.streams.is_empty());
+
+        younger
+            .commit()
+            .await
+            .expect("committing the younger writer");
+        let next = sweep_for_streams(&pool, sweep.discovered.swept_through, 10)
+            .await
+            .expect("the next sweep must read its snapshot");
+        assert!(
+            !next
+                .discovered
+                .streams
+                .contains(&"urn:probe:above".to_string()),
+            "the sweep has passed the younger writer's position"
+        );
+        let late = lookup_late_writes(
+            &pool,
+            &first.state,
+            &next,
+            next.discovered.swept_through,
+            10,
+        )
+        .await
+        .expect("the tail lookup must succeed");
+
+        assert_eq!(late.streams, vec!["urn:probe:above"]);
+    }
+
+    /// A tail page that does not finish keeps its cursor, and the walk it resumes also
+    /// covers the ids assigned since: a writer above the *next* sweep's `xmax`, at a
+    /// position that sweep passed, is found once the walk completes.
+    #[tokio::test]
+    async fn an_unfinished_tail_still_covers_the_ids_assigned_since_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut older = pool.begin().await.expect("starting the first older writer");
+        sqlx::query("SELECT pg_current_xact_id()")
+            .execute(&mut *older)
+            .await
+            .expect("the older writer takes its id first");
+        let mut younger = pool
+            .begin()
+            .await
+            .expect("starting the first younger writer");
+        write_in(&mut younger, "urn:probe:first-a").await;
+        write_in(&mut younger, "urn:probe:first-b").await;
+        write_in(&mut older, "urn:probe:first-older").await;
+        older
+            .commit()
+            .await
+            .expect("committing the first older writer");
+        let first_sweep = sweep_for_streams(&pool, 0, 10)
+            .await
+            .expect("the first sweep");
+        let first = lookup_late_writes(
+            &pool,
+            &LateWriteState::default(),
+            &first_sweep,
+            first_sweep.discovered.swept_through,
+            1,
+        )
+        .await
+        .expect("the first lookup sets the tail");
+        younger
+            .commit()
+            .await
+            .expect("committing the first younger writer");
+
+        // A second staging, so the second sweep has a writer above *its* xmax.
+        let mut older = pool
+            .begin()
+            .await
+            .expect("starting the second older writer");
+        sqlx::query("SELECT pg_current_xact_id()")
+            .execute(&mut *older)
+            .await
+            .expect("the older writer takes its id first");
+        let mut younger = pool
+            .begin()
+            .await
+            .expect("starting the second younger writer");
+        let (second_txid, _) = write_in(&mut younger, "urn:probe:second").await;
+        write_in(&mut older, "urn:probe:second-older").await;
+        older
+            .commit()
+            .await
+            .expect("committing the second older writer");
+        let second_sweep = sweep_for_streams(&pool, first_sweep.discovered.swept_through, 10)
+            .await
+            .expect("the second sweep");
+        assert!(second_txid >= second_sweep.xmax);
+        // A batch of one: the tail holds two rows, so this page does not finish.
+        let second = lookup_late_writes(
+            &pool,
+            &first.state,
+            &second_sweep,
+            second_sweep.discovered.swept_through,
+            1,
+        )
+        .await
+        .expect("the second lookup reads one tail row");
+        assert_eq!(second.streams.len(), 1);
+        younger
+            .commit()
+            .await
+            .expect("committing the second younger writer");
+
+        let mut state = second.state;
+        let mut found = Vec::new();
+        let mut from = second_sweep.discovered.swept_through;
+        for _ in 0..4 {
+            let sweep = sweep_for_streams(&pool, from, 10)
+                .await
+                .expect("a later sweep");
+            from = sweep.discovered.swept_through;
+            let late = lookup_late_writes(&pool, &state, &sweep, from, 1)
+                .await
+                .expect("a later lookup");
+            found.extend(late.streams);
+            state = late.state;
+        }
+
+        assert!(
+            found.contains(&"urn:probe:second".to_string()),
+            "the writer above the second sweep's xmax is found: {found:?}"
+        );
+    }
+
+    /// An aborted transaction leaves Unseen once it ends, and nominates nothing: it left
+    /// no rows to look up.
+    #[tokio::test]
+    async fn an_aborted_transaction_leaves_unseen_and_nominates_nothing_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut held = pool.begin().await.expect("starting the held writer");
+        let (txid, position) = write_in(&mut held, "urn:probe:aborted").await;
+        append_events(&pool, "urn:probe:advance-xmax", 1).await;
+
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the sweep must read its snapshot");
+        let open = lookup_late_writes(&pool, &LateWriteState::default(), &sweep, position, 10)
+            .await
+            .expect("an open transaction is only remembered");
+        assert!(open.state.unseen.contains(&txid));
+
+        held.rollback().await.expect("aborting the held writer");
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the next sweep must read its snapshot");
+        let ended = lookup_late_writes(&pool, &open.state, &sweep, position, 10)
+            .await
+            .expect("the ended transaction is looked up");
+
+        assert!(ended.streams.is_empty(), "{:?}", ended.streams);
+        assert!(!ended.state.unseen.contains(&txid));
+        assert!(!ended.state.pending.contains_key(&txid));
+    }
+
+    /// A transaction open in another database on the same server shows in every snapshot
+    /// — the counter is the server's — so it is held in Unseen. It nominates nothing, and a
+    /// late write that ends meanwhile is found on the next poll regardless.
+    #[tokio::test]
+    async fn an_open_transaction_in_another_database_neither_nominates_nor_delays_postgres_test() {
+        let (pool, container) = start_postgres().await;
+        sqlx::query("CREATE DATABASE elsewhere")
+            .execute(&pool)
+            .await
+            .expect("creating the other database");
+        let host = container.get_host().await.expect("the container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("the container port");
+        let elsewhere = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!(
+                "postgres://postgres:postgres@{host}:{port}/elsewhere"
+            ))
+            .await
+            .expect("connecting to the other database");
+        let mut foreign = elsewhere
+            .begin()
+            .await
+            .expect("starting the foreign transaction");
+        let foreign_txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT pg_current_xact_id()::text")
+                .fetch_one(&mut *foreign)
+                .await
+                .expect("the foreign transaction takes an id")
+                .parse()
+                .expect("a transaction id");
+
+        let mut held = pool.begin().await.expect("starting the held writer");
+        let (_, position) = write_in(&mut held, "urn:probe:ended").await;
+        append_events(&pool, "urn:probe:advance-xmax", 1).await;
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the sweep must read its snapshot");
+        assert!(
+            sweep.in_progress.contains(&foreign_txid),
+            "the other database's transaction is in this database's snapshot"
+        );
+        let open = lookup_late_writes(&pool, &LateWriteState::default(), &sweep, position, 10)
+            .await
+            .expect("both transactions are remembered");
+
+        held.commit().await.expect("committing the held writer");
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the next sweep must read its snapshot");
+        let late = lookup_late_writes(&pool, &open.state, &sweep, position, 10)
+            .await
+            .expect("the ended transaction is looked up");
+
+        assert_eq!(late.streams, vec!["urn:probe:ended"]);
+        assert!(late.state.unseen.contains(&foreign_txid));
+        assert!(!late.force_comparison);
+
+        foreign
+            .rollback()
+            .await
+            .expect("ending the foreign transaction");
     }
 
     /// What a poll reads before it delivers anything, and what its checkpoints are
@@ -7629,7 +8838,7 @@ mod reconcile_schedule_tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
-    use super::{reconcile_phase, startup_window, ReconcileSchedule};
+    use super::{reconcile_phase, startup_window, ReconcileSchedule, DEFAULT_RECONCILE_CADENCE};
 
     /// The start-up window of a runner polling every five seconds.
     const WINDOW: Duration = Duration::from_secs(15);
@@ -7659,6 +8868,11 @@ mod reconcile_schedule_tests {
             reconcile_phase("billing", WINDOW),
             reconcile_phase("billing", WINDOW)
         );
+    }
+
+    #[test]
+    fn the_default_safety_net_is_five_minutes() {
+        assert_eq!(DEFAULT_RECONCILE_CADENCE, Duration::from_secs(300));
     }
 
     /// The window is a few polls of the runner's interval.
