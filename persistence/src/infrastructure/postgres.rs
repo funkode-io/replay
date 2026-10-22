@@ -955,11 +955,14 @@ impl EventStore for PostgresEventStore {
         after: Option<&Urn>,
         limit: u32,
     ) -> Result<Vec<Urn>, replay::Error> {
-        // `needs_compaction`'s predicate over a keyset page of `streams`. Walked in `id`
-        // order on the primary key, with the type and scope as filters: no index serves a
-        // suffix, and under a non-C collation the primary key's btree cannot serve a
-        // `LIKE` prefix either, so the scan stops after `limit` matches rather than
-        // narrowing to the scope first.
+        // `needs_compaction`'s predicate over a keyset page of `streams`, in `id` order.
+        // `idx_streams_type_id (type, id)` (#272) can serve `type = $1 AND id > $after
+        // ORDER BY id` without reading another type's rows, but the planner chooses
+        // between it and the primary key from its estimates (#277 measured it taking the
+        // primary key for a similar query at scale). The scope is a filter either way: no
+        // index serves a suffix, and under a non-C collation no btree serves a `LIKE`
+        // prefix, so the scan stops after `limit` matches rather than narrowing to the
+        // scope first.
         let mut query: QueryBuilder<Postgres> = QueryBuilder::new(
             "SELECT id FROM streams \
              WHERE version > COALESCE(last_compacted_version, 0) AND type = ",
