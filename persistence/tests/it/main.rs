@@ -23,6 +23,7 @@ mod event_commit_txid;
 mod event_ordering_postgres;
 mod event_stream_seq;
 mod global_position_unique;
+mod inline_projection_catch_up;
 mod inline_projection_chunking;
 mod inline_projection_rebuild_chunking;
 mod integration_tests;
