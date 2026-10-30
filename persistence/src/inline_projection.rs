@@ -35,10 +35,10 @@ pub trait InlineProjection: Send + Sync {
     fn version(&self) -> i32;
 
     /// Events to replay when this projection is first registered or rebuilt after a
-    /// version bump.
+    /// version bump, and to read when it catches up on appends that did not apply it.
     ///
-    /// Returned filter narrows which streams/events the store scans during either
-    /// replay, so unrelated history is not read. Defaults to [`StreamFilter::All`].
+    /// Returned filter narrows which streams/events the store scans during a replay or a
+    /// catch-up, so unrelated history is not read. Defaults to [`StreamFilter::All`].
     ///
     /// Whatever the filter, a replay reads the true log (ADR-0004): archived
     /// originals and the real events appended after a compaction, never compaction
@@ -211,7 +211,7 @@ where
                 .filter(|event| {
                     types
                         .as_ref()
-                        .is_none_or(|types| types.iter().any(|t| *t == event.r#type))
+                        .is_none_or(|types| types.contains(&event.r#type))
                 })
                 .filter_map(|event| {
                     let data = T::Event::deserialize(&event.data).ok()?;

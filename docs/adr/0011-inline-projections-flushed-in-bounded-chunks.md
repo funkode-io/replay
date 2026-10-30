@@ -4,6 +4,8 @@
 **Amends:** ADR-0002 (which had the store call `handle` once per append)
 **Amended by:** [ADR-0018](0018-every-event-read-is-ordered-by-global-position.md) — the
 keyset key below is now `global_position` alone
+**Amended by:** [ADR-0032](0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md) — an
+event committed past the rebuild's cut is applied by the next catch-up
 
 `store_events_stream` pulls its producer one event at a time so a bulk append never has
 to fit in memory — but it retained every appended event as a `serde_json::Value` so the

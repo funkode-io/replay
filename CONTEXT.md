@@ -34,6 +34,10 @@ consistent with the events: the events and the projection write commit together
 or not at all. The projection does not begin or commit the transaction — it only
 contributes writes to a transaction the store owns.
 
+That holds for the appends of a process that registered it. The events of every other
+transaction — a process that had not registered it, or ran another version of it — reach
+it by [Catch-up].
+
 ### Async projection
 
 A projection that updates an **external** system (for example a search index)
@@ -473,6 +477,30 @@ compaction snapshot
 Triggered when a projection's code version is newer than the version recorded in
 the store.
 
+### Catch-up
+
+What an [Inline projection] does about the events of transactions that did not apply it:
+it applies them later, once per projection version, in [Global position] order. Run by
+`build()` at startup, by a background task on a cadence, and on demand. Every append
+records an **applied mark** for each projection it applied, so a catch-up skips those, and
+what is owed is decided by [Commit stamp] against the [Catch-up horizon], never by a
+position, so a [Late write] is owed rather than passed
+([ADR-0032](docs/adr/0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)).
+Distinct from a [Rebuild], which resets the view and replays the whole log; a catch-up
+resets nothing and reads only the gap. A process whose code version differs from the
+stored one never catches up: the view belongs to the other version.
+_Avoid_: reconcile (that is a [Policy feed]'s), backfill, resync, checkpoint.
+
+### Catch-up horizon
+
+`projections.caught_up_below`: the transaction id below which every transaction has been
+accounted for, by applying the projection itself or by a [Catch-up]. Always the `xmin` of
+the snapshot the last catch-up or [Rebuild] read under, so it never passes a transaction
+that was still running. Applied marks above it are what keeps a committed transaction from
+being applied twice; marks below it are deleted when it moves. A row without one — written
+before it existed — is **adopted**: the log is taken as it stands, not replayed.
+_Avoid_: checkpoint, high-water mark, offset.
+
 ### WASM target
 
 `replay` supports WebAssembly. The core `es` crate and the `macros` crate are
@@ -557,5 +585,8 @@ it:
 [Stream scope]: #stream-scope
 [Live projection]: #live-projection
 [Inline projection]: #inline-projection
+[Catch-up]: #catch-up
+[Catch-up horizon]: #catch-up-horizon
+[Late write]: #late-write
 [Async projection]: #async-projection
 [Projection]: #projection

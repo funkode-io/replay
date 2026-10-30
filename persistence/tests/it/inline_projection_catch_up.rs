@@ -208,7 +208,11 @@ async fn restart_at_the_same_version_applies_what_a_process_without_the_projecti
     ring(&old_pod, "t-1", &[3.0, 4.0, 5.0]).await;
     ring(&old_pod, "t-2", &[6.0]).await;
 
-    assert_eq!(view_rows(&pool).await, (2, 2), "only the live appends reached it");
+    assert_eq!(
+        view_rows(&pool).await,
+        (2, 2),
+        "only the live appends reached it"
+    );
 
     let _restarted = store_with_view(&pool, 1).await;
 
@@ -264,8 +268,7 @@ async fn catch_up_applies_only_what_no_process_applied_postgres_test() {
 /// commits after one holding a higher position has been caught up. It must still be
 /// applied, once.
 #[tokio::test]
-async fn a_transaction_committing_after_a_later_one_was_caught_up_is_still_applied_postgres_test(
-) {
+async fn a_transaction_committing_after_a_later_one_was_caught_up_is_still_applied_postgres_test() {
     let (pool, _container) = start_pool().await;
     let new_pod = store_without_task(&pool, 1).await;
 
@@ -318,7 +321,11 @@ async fn a_replay_is_not_applied_again_by_the_catch_up_that_follows_it_postgres_
     ring(&old_pod, "fast", &[2.0, 3.0]).await;
 
     let new_pod = store_without_task(&pool, 1).await;
-    assert_eq!(view_rows(&pool).await, (2, 2), "the first registration replays");
+    assert_eq!(
+        view_rows(&pool).await,
+        (2, 2),
+        "the first registration replays"
+    );
 
     slow.commit().await.unwrap();
 
@@ -449,7 +456,12 @@ impl InlineProjection for AppendsDuringRebuild {
         TillView { version: 1 }.handle(conn, events).await?;
         if !self.appended {
             self.appended = true;
-            ring(&PostgresEventStore::new(self.pool.clone()), "interloper", &[9.0]).await;
+            ring(
+                &PostgresEventStore::new(self.pool.clone()),
+                "interloper",
+                &[9.0],
+            )
+            .await;
         }
         Ok(())
     }
@@ -473,7 +485,11 @@ async fn an_append_committed_during_a_rebuild_is_caught_up_postgres_test() {
         .build()
         .await
         .unwrap();
-    assert_eq!(view_rows(&pool).await, (2, 2), "the rebuild reads its snapshot");
+    assert_eq!(
+        view_rows(&pool).await,
+        (2, 2),
+        "the rebuild reads its snapshot"
+    );
 
     assert_eq!(new_pod.catch_up_projections().await.unwrap(), 1);
     assert_eq!(view_rows(&pool).await, (3, 3));
@@ -530,8 +546,7 @@ async fn void(store: &PostgresEventStore, till: &str) {
 /// registration, the live append and the catch-up all deliver `Rang` and never `Voided`,
 /// although `Voided` is a variant of the projection's event and would deserialize.
 #[tokio::test]
-async fn declared_event_types_narrow_the_replay_the_live_path_and_the_catch_up_postgres_test()
-{
+async fn declared_event_types_narrow_the_replay_the_live_path_and_the_catch_up_postgres_test() {
     let (pool, _container) = start_pool().await;
 
     let old_pod = PostgresEventStore::new(pool.clone());

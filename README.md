@@ -21,7 +21,9 @@ claim. The features that hold it up:
 
 - **13** — every event is stamped with the transaction that wrote it, in the `xid8` type
   PostgreSQL 13 added
-  ([0018](persistence/tests/migrations/0018_event_commit_txid.sql));
+  ([0018](persistence/tests/migrations/0018_event_commit_txid.sql)), and an inline
+  projection's catch-up compares those stamps against `pg_snapshot`s
+  ([0038](persistence/tests/migrations/0038_projection_catch_up.sql));
 - **15** — `NULLS NOT DISTINCT`, which keeps a parked dead letter unique per command
   per reaction over an identity that is nullable for a reaction with no dispatch to
   name ([0030](persistence/tests/migrations/0030_dead_letter_unique_command.sql));
@@ -1632,13 +1634,23 @@ There are two migration concerns:
 1. **Your projection schema**: create the projection table/indexes in your own SQL migrations.
 2. **Replay projection metadata**: ensure the `projections` registry table exists.
 
-The registry table tracks projection `name()` and `version()`:
+The registry table tracks projection `name()` and `version()`, and how far the projection
+has caught up ([below](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it)):
 
 ```sql
 CREATE TABLE IF NOT EXISTS projections (
-    name        TEXT                        NOT NULL PRIMARY KEY,
-    version     INTEGER                     NOT NULL,
-    updated_at  TIMESTAMP WITH TIME ZONE    NOT NULL DEFAULT (now())
+    name             TEXT                        NOT NULL PRIMARY KEY,
+    version          INTEGER                     NOT NULL,
+    updated_at       TIMESTAMP WITH TIME ZONE    NOT NULL DEFAULT (now()),
+    caught_up_below  xid8                                                  -- migration 0038
+);
+
+-- migration 0038
+CREATE TABLE IF NOT EXISTS projection_applied_transactions (
+    projection TEXT    NOT NULL,
+    version    INTEGER NOT NULL,
+    txid       xid8    NOT NULL,
+    PRIMARY KEY (projection, version, txid)
 );
 ```
 
@@ -1713,7 +1725,8 @@ named type, custom `init`, or more involved logic than a single handler closure.
 ### Runtime behavior
 
 - `PostgresEventStore::builder(...).build().await?` runs first-time projection setup and records
-  the current version in the `projections` table.
+  the current version in the `projections` table. At the same version it applies whatever
+  other processes appended without applying the projection (see the next section).
 - On each successful append, the store constructs `PersistedEvent`s from the metadata returned by
   `append_event(...)` and passes them to every registered projection.
 - Projection handlers run inside the **same Postgres transaction** as the event append.
@@ -1741,6 +1754,73 @@ replayed on first registration or a version-drift rebuild: `build()` pages throu
 keyset cursor, inside a single `REPEATABLE READ` transaction, so startup memory scales with
 the chunk while every page still reads one snapshot of the log. See
 [ADR-0011](docs/adr/0011-inline-projections-flushed-in-bounded-chunks.md).
+
+### Rolling deploys: catching up on appends that did not apply it
+
+A projection is applied by the process that appends, and only if that process registered
+it. During a rolling deploy that is not every process: an old pod that has not registered a
+new projection keeps appending events the projection never sees, and an old pod running an
+older *version* of it applies its old logic to the view the new version just rebuilt.
+
+So every append records which projections it applied, and the store **catches up** each
+projection on the events of every other transaction — once per projection version, in
+`global_position` order, whichever process appended them
+([ADR-0032](docs/adr/0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)):
+
+- **at startup**, in `build()`, for a projection whose stored version equals its code
+  version;
+- **on a cadence**, from a background task `build()` starts when a projection is registered;
+- **on demand**, with `store.catch_up_projections().await?`, which returns how many events
+  it read.
+
+| Setting | Store override | Env var | Default |
+|---------|----------------|---------|---------|
+| Interval between background catch-ups | `builder(pool).projection_catch_up_interval(d)` | `REPLAY_PROJECTION_CATCH_UP_SECS` | `60` s; `0` disables the task |
+
+What has been applied is tracked against the transaction that wrote each event (its commit
+stamp), never against a position, so an append that commits after a later one was caught up
+is still caught up. A catch-up that finds nothing to do costs one indexed read. A process
+whose code version differs from the stored one never catches up: the view belongs to the
+other version. The same machinery closes the window a rebuild used to leave
+([#162](https://github.com/funkode-io/replay/issues/162)): an append committed while
+`build()` replays is applied by the next catch-up.
+
+**What a handler must tolerate.** Between processes running this release, each event reaches
+each projection version exactly once. But:
+
+- **Late arrival.** A caught-up event can land after a later event of the same stream was
+  applied live. A handler whose result depends on order should guard on a value its view
+  keeps.
+- **Re-application across versions.** An event an older version applied live during a
+  rollout is applied again by the newer version. Write the view with upserts, so the newer
+  logic wins.
+- **The upgrade to this release.** Processes of earlier releases record nothing, so the
+  events they append after the first upgraded process starts — *with* the projection
+  registered or not — are caught up by the upgraded ones. A handler that is not idempotent,
+  like the running balance above, should take this one upgrade as a stop-then-start deploy.
+  History from before the upgrade is not replayed: the first catch-up adopts the log as it
+  stands, and a version bump is still how a projection repairs history it missed earlier.
+
+**Migrate, then deploy.** Migration 0038 is additive — earlier releases run unchanged against
+it — and this release needs it before its first append or `build()`.
+
+#### Declaring the event types a projection handles
+
+`InlineProjection::event_types()` names the event `type`s a projection handles, as
+`Event::event_type` wrote them. When it returns `Some`, the rebuild replay and the catch-up
+scan read only events of those types, and the live append skips the others before
+deserializing — so the three paths deliver the same events. It defaults to `None`, which
+keeps deserialize-or-skip routing over everything `stream_filter()` admits.
+
+```rust
+fn event_types(&self) -> Option<Vec<String>> {
+    Some(vec!["Deposited".into(), "Withdrawn".into()])
+}
+```
+
+A rebuild over a long, mixed log is where this pays: one downstream rebuild went from ~35 s
+to ~1 s. List every type the projection's `Event` can hold — a type left out never reaches
+`handle`.
 
 Inline projections are Postgres-only. The in-memory store remains useful for tests, but the
 transactional guarantee belongs to the Postgres backend.

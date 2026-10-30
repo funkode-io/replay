@@ -1,6 +1,9 @@
 # Inline projections run atomically inside the append transaction and are store-specific
 
 **Status:** accepted
+**Amended by:** [ADR-0032](0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md) —
+an inline projection now keeps a catch-up horizon, for the events of transactions that
+did not apply it
 
 We add a first kind of persisted read-model projection — the *inline projection* —
 whose write is applied **inside the same transaction that appends the events**,

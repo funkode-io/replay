@@ -427,8 +427,10 @@ async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page
             .push_bind(*horizon)
             .push("::xid8 AND pg_visible_in_snapshot(commit_txid, ")
             .push_bind(query.cut.snapshot.as_str())
-            .push("::pg_snapshot) AND NOT EXISTS (SELECT 1 FROM projection_applied_transactions a \
-                   WHERE a.projection = ")
+            .push(
+                "::pg_snapshot) AND NOT EXISTS (SELECT 1 FROM projection_applied_transactions a \
+                   WHERE a.projection = ",
+            )
             .push_bind(query.name)
             .push(" AND a.version = ")
             .push_bind(query.version)
