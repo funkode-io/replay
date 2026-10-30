@@ -227,3 +227,66 @@ async fn peak_live_bytes_scale_with_the_flush_size_not_the_history_postgres_test
          loading the whole history would cost at least {whole_history}"
     );
 }
+
+/// The same bound on the catch-up (ADR-0032): applying a gap of `EVENTS` events another
+/// process appended must peak near the flush size, not the gap. The gap is read with the
+/// rebuild's pager, so the budget is the rebuild's.
+#[tokio::test]
+async fn peak_live_bytes_of_a_catch_up_scale_with_the_flush_size_not_the_gap_postgres_test() {
+    const EVENTS: usize = 400;
+    const FLUSH: usize = 20;
+
+    let (pool, _container) = start_pool().await;
+
+    let new_pod = replay_persistence::PostgresEventStore::builder(pool.clone())
+        .projection_flush_size(FLUSH)
+        .projection_catch_up_interval(std::time::Duration::ZERO)
+        .register(NoOpProjection)
+        .build()
+        .await
+        .expect("build store");
+
+    // The gap: appended by a process that has not registered the projection.
+    let old_pod = replay_persistence::PostgresEventStore::new(pool.clone());
+    let stream_id = FatUrn(
+        urn::UrnBuilder::new("fat", "catch-up-alloc-1")
+            .build()
+            .unwrap(),
+    );
+    let events = futures::stream::iter((0..EVENTS).map(|i| {
+        Ok(FatEvent::Recorded {
+            blob: format!("{i:0width$}", width = PAYLOAD_BYTES),
+        })
+    }));
+    old_pod
+        .store_events_stream::<FatStream, _, _>(
+            &stream_id,
+            "FatStream".to_string(),
+            replay::Metadata::default(),
+            events,
+            None,
+            |_: &PersistedEvent<FatEvent>| {},
+        )
+        .await
+        .expect("appending the gap must succeed");
+    drop(old_pod);
+
+    reset_peak();
+
+    let read = new_pod
+        .catch_up_projections()
+        .await
+        .expect("catch-up must succeed");
+
+    let peak = peak_live_bytes();
+    assert_eq!(read, EVENTS as u64, "the whole gap is owed");
+
+    let bounded = (FLUSH * PAYLOAD_BYTES * 6) as isize;
+    let whole_gap = (EVENTS * PAYLOAD_BYTES) as isize;
+
+    assert!(
+        peak < bounded,
+        "peak live bytes {peak} must stay near the flush size (budget {bounded}); \
+         loading the whole gap would cost at least {whole_gap}"
+    );
+}
