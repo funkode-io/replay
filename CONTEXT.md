@@ -497,8 +497,10 @@ _Avoid_: reconcile (that is a [Policy feed]'s), backfill, resync, checkpoint.
 accounted for, by applying the projection itself or by a [Catch-up]. Always the `xmin` of
 the snapshot the last catch-up or [Rebuild] read under, so it never passes a transaction
 that was still running. Applied marks above it are what keeps a committed transaction from
-being applied twice; marks below it are deleted when it moves. A row without one — written
-before it existed — is **adopted**: the log is taken as it stands, not replayed.
+being applied twice; marks below it are deleted when it moves. It holds for the version it
+was sealed at only. A row without one for its stored version — written before it existed,
+or rebuilt by a release that does not know it — is **adopted**: the log is taken as it
+stands, not replayed.
 _Avoid_: checkpoint, high-water mark, offset.
 
 ### WASM target

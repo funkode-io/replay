@@ -1642,7 +1642,8 @@ CREATE TABLE IF NOT EXISTS projections (
     name             TEXT                        NOT NULL PRIMARY KEY,
     version          INTEGER                     NOT NULL,
     updated_at       TIMESTAMP WITH TIME ZONE    NOT NULL DEFAULT (now()),
-    caught_up_below  xid8                                                  -- migration 0038
+    caught_up_below  xid8,                                                 -- migration 0038
+    caught_up_version INTEGER                                              -- migration 0038
 );
 
 -- migration 0038
@@ -1779,7 +1780,9 @@ projection on the events of every other transaction — once per projection vers
 
 What has been applied is tracked against the transaction that wrote each event (its commit
 stamp), never against a position, so an append that commits after a later one was caught up
-is still caught up. A catch-up that finds nothing to do costs one indexed read. A process
+is still caught up. A catch-up that finds nothing to do costs an indexed read of the
+transactions since the oldest one still running. While one runs, appends in the same process
+wait for it, as they wait for each other's projection writes. A process
 whose code version differs from the stored one never catches up: the view belongs to the
 other version. The same machinery closes the window a rebuild used to leave
 ([#162](https://github.com/funkode-io/replay/issues/162)): an append committed while
@@ -1809,8 +1812,8 @@ it — and this release needs it before its first append or `build()`.
 `InlineProjection::event_types()` names the event `type`s a projection handles, as
 `Event::event_type` wrote them. When it returns `Some`, the rebuild replay and the catch-up
 scan read only events of those types, and the live append skips the others before
-deserializing — so the three paths deliver the same events. It defaults to `None`, which
-keeps deserialize-or-skip routing over everything `stream_filter()` admits.
+deserializing — so the three paths agree on the types they deliver. It defaults to `None`,
+which keeps deserialize-or-skip routing.
 
 ```rust
 fn event_types(&self) -> Option<Vec<String>> {

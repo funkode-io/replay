@@ -11,8 +11,11 @@
 //!   horizon whose events this version of the projection has already been handed.
 //!
 //! A catch-up reads, under one snapshot, the events above the horizon whose transaction
-//! has no mark, hands them to `handle` a bounded page at a time, marks what it applied,
-//! and moves the horizon to that snapshot's `xmin`.
+//! has no mark, hands them to `handle` a bounded page at a time, and then **seals**: marks
+//! every transaction the snapshot shows as committed at or above its `xmin`, and moves the
+//! horizon to that `xmin`. Marking only once the read is over matters: a mark is visible to
+//! the transaction that wrote it, so a page-by-page mark would hide the rest of a
+//! transaction larger than a page from the very catch-up applying it.
 //!
 //! Transaction ids are `xid8`, which SQLx does not decode: they travel as text and are
 //! cast on the server.
@@ -175,8 +178,9 @@ pub(crate) enum Scope<'a> {
 }
 
 /// Hand `projection` every event `scope` selects, a page of at most `chunk_size` at a time
-/// in `global_position` order, and mark the transactions it applied at or above the cut's
-/// `xmin`. Returns how many events were read.
+/// in `global_position` order. Returns how many events were read.
+///
+/// Marks nothing: the caller [`seal`]s once every page has been read.
 ///
 /// Peak retention is one page: each is loaded, handed over and dropped before the next is
 /// read. The pages are keyset-paged on `global_position` inside the caller's transaction
@@ -238,7 +242,6 @@ pub(crate) async fn apply_pages(
         after = page.last_position;
 
         projection.handle(&mut *conn, &page.events).await?;
-        mark(&mut *conn, &name, version, cut, &page.txids).await?;
         drop(page);
 
         // A short page is the last one: the cursor has passed the final row.
@@ -277,22 +280,10 @@ pub(crate) async fn catch_up(
             .await?
         }
         None => {
-            // A row from before the horizon existed. What was applied to it is unknown, so
-            // the log is taken as it stands: every transaction visible above the cut's
-            // `xmin` is marked rather than replayed, and catching up starts from here.
-            sqlx::query(
-                "INSERT INTO projection_applied_transactions (projection, version, txid) \
-                 SELECT DISTINCT $1, $2, commit_txid FROM events \
-                  WHERE commit_txid >= pg_snapshot_xmin($3::pg_snapshot) \
-                    AND pg_visible_in_snapshot(commit_txid, $3::pg_snapshot) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(&name)
-            .bind(version)
-            .bind(&cut.snapshot)
-            .execute(&mut *conn)
-            .await
-            .map_err(crate::db_error)?;
+            // No horizon for this version: a row from before the horizon existed, or one
+            // an earlier release rebuilt. What was applied to it is unknown, so the log is
+            // taken as it stands — sealing marks every transaction visible above the cut's
+            // `xmin` without replaying it — and catching up starts from here.
             tracing::info!(
                 projection = %name,
                 version,
@@ -306,8 +297,16 @@ pub(crate) async fn catch_up(
     Ok(read)
 }
 
-/// Move `name`'s horizon to the cut's `xmin`, and forget the marks it no longer needs:
-/// those below it, and those of older versions.
+/// Account for everything the cut shows, once every page under it has been applied.
+///
+/// Marks each transaction the cut shows as committed at or above its `xmin` — every one of
+/// them was applied by its own append, by the pages just read, or had nothing this
+/// projection reads — then moves `name`'s horizon to that `xmin` for `version`, and forgets
+/// the marks it no longer needs: those below it, and those of older versions.
+///
+/// The marking is one statement over the transactions since the oldest one still running
+/// when the cut was taken, read from `(commit_txid, global_position)`; nothing of it comes
+/// back to this process.
 pub(crate) async fn seal(
     conn: &mut PgConnection,
     name: &str,
@@ -315,13 +314,34 @@ pub(crate) async fn seal(
     cut: &Cut,
 ) -> Result<(), replay::Error> {
     sqlx::query(
+        "INSERT INTO projection_applied_transactions (projection, version, txid) \
+         SELECT DISTINCT $1, $2, commit_txid FROM events \
+          WHERE commit_txid >= pg_snapshot_xmin($3::pg_snapshot) \
+            AND pg_visible_in_snapshot(commit_txid, $3::pg_snapshot) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(name)
+    .bind(version)
+    .bind(&cut.snapshot)
+    .execute(&mut *conn)
+    .await
+    .map_err(crate::db_error)?;
+
+    // The horizon is only ever the version's own: a release that does not know about it
+    // can change `version` and leave `caught_up_below` behind, and a horizon read for the
+    // wrong version is read as none.
+    sqlx::query(
         "UPDATE projections \
-            SET caught_up_below = GREATEST(COALESCE(caught_up_below, '0'::xid8), \
-                                           pg_snapshot_xmin($2::pg_snapshot)) \
+            SET caught_up_below = CASE WHEN caught_up_version = $3 \
+                                       THEN GREATEST(caught_up_below, \
+                                                     pg_snapshot_xmin($2::pg_snapshot)) \
+                                       ELSE pg_snapshot_xmin($2::pg_snapshot) END, \
+                caught_up_version = $3 \
           WHERE name = $1",
     )
     .bind(name)
     .bind(&cut.snapshot)
+    .bind(version)
     .execute(&mut *conn)
     .await
     .map_err(crate::db_error)?;
@@ -343,8 +363,9 @@ pub(crate) async fn seal(
 
 /// Mark the current transaction as having applied each named projection version.
 ///
-/// Called by the append path, in the append transaction, for the projections whose
-/// `handle` received an event of it. One statement, however many projections.
+/// Called by the append path, in the append transaction, for every projection it
+/// registered — whether or not one of its events matched — so a catch-up never reads an
+/// append it was offered. One statement, however many projections.
 pub(crate) async fn mark_applied_by_append(
     conn: &mut PgConnection,
     names: &[&str],
@@ -358,31 +379,6 @@ pub(crate) async fn mark_applied_by_append(
     )
     .bind(names)
     .bind(versions)
-    .execute(conn)
-    .await
-    .map_err(crate::db_error)?;
-    Ok(())
-}
-
-/// Mark the transactions of one page, at or above the cut's `xmin` — the only ones a later
-/// catch-up could read again. Bounded by the page.
-async fn mark(
-    conn: &mut PgConnection,
-    name: &str,
-    version: i32,
-    cut: &Cut,
-    txids: &[String],
-) -> Result<(), replay::Error> {
-    sqlx::query(
-        "INSERT INTO projection_applied_transactions (projection, version, txid) \
-         SELECT DISTINCT $1, $2, txid::xid8 FROM unnest($3::text[]) AS page(txid) \
-          WHERE txid::xid8 >= pg_snapshot_xmin($4::pg_snapshot) \
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(name)
-    .bind(version)
-    .bind(txids)
-    .bind(&cut.snapshot)
     .execute(conn)
     .await
     .map_err(crate::db_error)?;
@@ -403,15 +399,13 @@ struct PageQuery<'a> {
 struct Page {
     events: Vec<PersistedEvent<Value>>,
     last_position: Option<i64>,
-    /// The page's transaction ids, as text, one per event: bounded by the page.
-    txids: Vec<String>,
 }
 
 /// Load one page of the events `query` selects, in `global_position` order.
 async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page, replay::Error> {
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-         compacted_snapshot, global_position, commit_txid::text AS commit_txid \
+         compacted_snapshot, global_position \
          FROM events WHERE compacted_snapshot = FALSE AND (",
     );
     PostgresEventStore::add_filters(&mut builder, query.filter);
@@ -454,17 +448,14 @@ async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page
 
     let mut last_position = None;
     let mut events = Vec::with_capacity(rows.len());
-    let mut txids = Vec::with_capacity(rows.len());
     for row in rows {
         last_position = Some(row.get::<i64, _>("global_position"));
-        txids.push(row.get::<String, _>("commit_txid"));
         events.push(PersistedEvent::<Value>::try_from(row)?);
     }
 
     Ok(Page {
         events,
         last_position,
-        txids,
     })
 }
 

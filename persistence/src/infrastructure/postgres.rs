@@ -510,8 +510,8 @@ impl PostgresEventStoreBuilder {
         let catch_up_interval =
             catch_up::resolve_catch_up_interval(self.projection_catch_up_interval);
 
-        let registered = if self.projections.is_empty() {
-            Vec::new()
+        let (registered, current) = if self.projections.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
             Self::set_up(&self.pool, self.projections, chunk_size).await?
         };
@@ -523,6 +523,14 @@ impl PostgresEventStoreBuilder {
             stream_lock_wait,
         };
 
+        // Catch up the projections that were already current, each in a READ COMMITTED
+        // transaction of its own. Not in the build transaction: there a view row a live
+        // append of another process also writes would end the build on a serialization
+        // failure — a startup that fails for as long as the rolling deploy keeps writing.
+        for index in current {
+            store.catch_up_one(&store.projections[index], true).await?;
+        }
+
         if !store.projections.is_empty() && !catch_up_interval.is_zero() {
             store.spawn_catch_up_task(catch_up_interval);
         }
@@ -530,13 +538,14 @@ impl PostgresEventStoreBuilder {
         Ok(store)
     }
 
-    /// Lock, then init, rebuild or catch up every projection in one `REPEATABLE READ`
-    /// transaction, on a connection of its own.
+    /// Lock, then init or rebuild every projection that needs it in one `REPEATABLE READ`
+    /// transaction, on a connection of its own. Returns the registry, and the indexes of
+    /// the projections that were already current, which owe a catch-up instead.
     async fn set_up(
         pool: &Pool<Postgres>,
         projections: Vec<Box<ErasedPostgresProjection>>,
         chunk_size: usize,
-    ) -> Result<Vec<RegisteredProjection>, replay::Error> {
+    ) -> Result<(Vec<RegisteredProjection>, Vec<usize>), replay::Error> {
         let names: Vec<String> = projections.iter().map(|p| p.name().to_string()).collect();
 
         // The locks are taken for the session, before the transaction exists: a
@@ -559,7 +568,7 @@ impl PostgresEventStoreBuilder {
         conn: &mut sqlx::PgConnection,
         projections: Vec<Box<ErasedPostgresProjection>>,
         chunk_size: usize,
-    ) -> Result<Vec<RegisteredProjection>, replay::Error> {
+    ) -> Result<(Vec<RegisteredProjection>, Vec<usize>), replay::Error> {
         let mut tx = sqlx::Connection::begin(conn)
             .await
             .map_err(crate::db_error)?;
@@ -575,21 +584,21 @@ impl PostgresEventStoreBuilder {
             .await
             .map_err(crate::db_error)?;
 
-        // The transaction's snapshot: what every projection below is built or caught up
-        // to, and whose `xmin` becomes its horizon.
+        // The transaction's snapshot: what every projection below is built to, and whose
+        // `xmin` becomes its horizon.
         let cut = Cut::current(&mut tx).await?;
 
         let mut registered: Vec<RegisteredProjection> = Vec::with_capacity(projections.len());
+        let mut current: Vec<usize> = Vec::new();
 
         for mut projection in projections {
             let name = projection.name().to_string();
-            let stored: Option<(i32, Option<String>)> = sqlx::query_as(
-                "SELECT version, caught_up_below::text FROM projections WHERE name = $1",
-            )
-            .bind(&name)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(crate::db_error)?;
+            let stored: Option<i32> =
+                sqlx::query_scalar("SELECT version FROM projections WHERE name = $1")
+                    .bind(&name)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(crate::db_error)?;
 
             let code = projection.version();
 
@@ -636,7 +645,7 @@ impl PostgresEventStoreBuilder {
                 // Version drift: the code is newer than the stored view. Reset and rebuild
                 // from history, then record the new version LAST so a crash mid-rebuild
                 // never marks a half-built view as current.
-                Some((stored, _)) if stored < code => {
+                Some(stored) if stored < code => {
                     tracing::info!(
                         projection = %name,
                         stored,
@@ -674,7 +683,7 @@ impl PostgresEventStoreBuilder {
                 }
                 // Stored version is newer than the code: refuse to start. A rolled-back or
                 // older deploy must not run against a view built by newer code.
-                Some((stored, _)) if stored > code => {
+                Some(stored) if stored > code => {
                     return Err(replay::Error::invalid_input(
                         "inline projection stored version is newer than code version",
                     )
@@ -683,31 +692,10 @@ impl PostgresEventStoreBuilder {
                     .with_context("stored_version", stored)
                     .with_context("code_version", code));
                 }
-                // stored == code: no reset and no replay. Apply what transactions that did
-                // not apply this projection appended since its horizon.
-                Some((_, horizon)) => {
-                    let applied = catch_up::catch_up(
-                        &mut tx,
-                        &mut *projection,
-                        chunk_size,
-                        &cut,
-                        horizon.as_deref(),
-                    )
-                    .await?;
-                    if applied > 0 {
-                        tracing::info!(
-                            projection = %name,
-                            version = code,
-                            events = applied,
-                            "inline projection catch-up: applied events appended without it"
-                        );
-                    } else {
-                        tracing::debug!(
-                            projection = %name,
-                            version = code,
-                            "inline projection up to date: no rebuild"
-                        );
-                    }
+                // stored == code: no reset and no replay here. What transactions that did
+                // not apply this projection appended is caught up once the build commits.
+                Some(_) => {
+                    current.push(registered.len());
                 }
             }
 
@@ -720,13 +708,13 @@ impl PostgresEventStoreBuilder {
 
         tx.commit().await.map_err(crate::db_error)?;
 
-        Ok(registered)
+        Ok((registered, current))
     }
 }
 
 impl PostgresEventStore {
     /// Apply the just-appended events to every registered inline projection, inside the
-    /// store's open transaction, and note in `applied` which ones were handed an event.
+    /// store's open transaction.
     ///
     /// Each projection is locked individually and routes the batch by deserialize-or-skip;
     /// any projection error propagates and rolls back the whole append.
@@ -734,40 +722,30 @@ impl PostgresEventStore {
         &self,
         conn: &mut sqlx::PgConnection,
         events: &[PersistedEvent<Value>],
-        applied: &mut [bool],
     ) -> Result<(), replay::Error> {
         if events.is_empty() {
             return Ok(());
         }
 
-        for (registered, applied) in self.projections.iter().zip(applied.iter_mut()) {
+        for registered in self.projections.iter() {
             let mut projection = registered.projection.lock().await;
-            if projection.handle(&mut *conn, events).await? > 0 {
-                *applied = true;
-            }
+            projection.handle(&mut *conn, events).await?;
         }
 
         Ok(())
     }
 
-    /// Record, in the append transaction, which projections it applied, so a catch-up
-    /// does not apply its events again (ADR-0032).
-    async fn mark_applied(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        applied: &[bool],
-    ) -> Result<(), replay::Error> {
+    /// Record, in the append transaction, that it applied every registered projection, so
+    /// a catch-up does not read its events again (ADR-0032). Every one, not only those an
+    /// event matched: each was offered the whole append, and an unmarked append would be
+    /// read again by the next catch-up for nothing.
+    async fn mark_applied(&self, conn: &mut sqlx::PgConnection) -> Result<(), replay::Error> {
         // Bounded by the registry, which `build` fixed: never by the append.
         let (names, versions): (Vec<&str>, Vec<i32>) = self
             .projections
             .iter()
-            .zip(applied)
-            .filter(|(_, applied)| **applied)
-            .map(|(registered, _)| (registered.name.as_str(), registered.version))
+            .map(|registered| (registered.name.as_str(), registered.version))
             .unzip();
-        if names.is_empty() {
-            return Ok(());
-        }
         catch_up::mark_applied_by_append(conn, &names, &versions).await
     }
 
@@ -805,13 +783,6 @@ impl PostgresEventStore {
     ) -> Result<u64, replay::Error> {
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
 
-        // A catch-up writes view rows a live append may also be writing, and holds the
-        // projection's in-process lock while it does: bounding its row-lock waits is what
-        // keeps a wait on such a row from hanging both.
-        crate::lock_wait::bound(&mut tx, self.stream_lock_wait)
-            .await
-            .map_err(crate::db_error)?;
-
         if !catch_up::lock_for_catch_up(&mut tx, &registered.name, wait).await? {
             tracing::debug!(
                 projection = %registered.name,
@@ -820,9 +791,23 @@ impl PostgresEventStore {
             return Ok(0);
         }
 
+        // A catch-up writes view rows a live append may also be writing, and holds the
+        // projection's in-process lock while it does: bounding its row-lock waits is what
+        // keeps a wait on such a row from hanging both. Set after the advisory lock, which
+        // `lock_timeout` would otherwise bound too: a wait for another process's catch-up
+        // or rebuild is a wait for work in progress, not a stranded row.
+        crate::lock_wait::bound(&mut tx, self.stream_lock_wait)
+            .await
+            .map_err(crate::db_error)?;
+
         // Read after the lock, so the snapshot sees whatever the previous holder committed.
+        // The horizon counts only for the version it was sealed at (migration 0038): one
+        // left behind by a release that changed `version` without knowing about it reads
+        // as none, and is adopted.
         let stored: Option<(i32, Option<String>, String)> = sqlx::query_as(
-            "SELECT version, caught_up_below::text, pg_current_snapshot()::text \
+            "SELECT version, \
+                    CASE WHEN caught_up_version = version THEN caught_up_below::text END, \
+                    pg_current_snapshot()::text \
                FROM projections WHERE name = $1",
         )
         .bind(&registered.name)
@@ -952,9 +937,6 @@ impl EventStore for PostgresEventStore {
         let flush_size = self.projection_flush_size;
         let mut appended: Vec<PersistedEvent<Value>> = Vec::new();
         let mut appended_count: usize = 0;
-        // Which projections this append handed an event, so it can mark itself as having
-        // applied them (ADR-0032). One flag per registered projection.
-        let mut applied = vec![false; self.projections.len()];
 
         // Consume the producer one event at a time so a large append (e.g. 160k rows)
         // never has to live fully in memory.
@@ -1056,8 +1038,7 @@ impl EventStore for PostgresEventStore {
                 // aborts the append exactly as an end-of-batch failure would, rolling
                 // back the chunks already applied along with the event rows.
                 if appended.len() >= flush_size {
-                    self.apply_projections(&mut transaction, &appended, &mut applied)
-                        .await?;
+                    self.apply_projections(&mut transaction, &appended).await?;
                     appended.clear();
                 }
             }
@@ -1067,11 +1048,12 @@ impl EventStore for PostgresEventStore {
 
         // Whatever the last chunk left over.
         if has_projections && !appended.is_empty() {
-            self.apply_projections(&mut transaction, &appended, &mut applied)
-                .await?;
+            self.apply_projections(&mut transaction, &appended).await?;
             appended.clear();
         }
-        self.mark_applied(&mut transaction, &applied).await?;
+        if has_projections && appended_count > 0 {
+            self.mark_applied(&mut transaction).await?;
+        }
 
         transaction.commit().await.map_err(crate::db_error)?;
 

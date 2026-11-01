@@ -333,6 +333,39 @@ async fn a_replay_is_not_applied_again_by_the_catch_up_that_follows_it_postgres_
     assert_eq!(view_rows(&pool).await, (3, 3));
 }
 
+/// An append larger than a page, caught up while an unrelated transaction is open — the
+/// normal state of a busy database. The open transaction keeps the append's id above the
+/// horizon, so whatever records it as applied must not hide its later pages from the same
+/// catch-up.
+#[tokio::test]
+async fn an_append_spanning_pages_is_caught_up_whole_while_another_transaction_is_open_postgres_test(
+) {
+    let (pool, _container) = start_pool().await;
+    let new_pod = store_without_task(&pool, 1).await;
+
+    let mut open = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_current_xact_id()")
+        .execute(&mut *open)
+        .await
+        .unwrap();
+
+    // Ten events at a flush size of four: three pages.
+    let old_pod = PostgresEventStore::new(pool.clone());
+    let amounts: Vec<f64> = (0..10).map(f64::from).collect();
+    ring(&old_pod, "t-1", &amounts).await;
+
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), 10);
+    assert_eq!(view_rows(&pool).await, (10, 10));
+
+    // A restart while the transaction is still open owes nothing more.
+    let _restarted = store_without_task(&pool, 1).await;
+    assert_eq!(view_rows(&pool).await, (10, 10));
+
+    open.rollback().await.unwrap();
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), 0);
+    assert_eq!(view_rows(&pool).await, (10, 10));
+}
+
 /// Without anybody calling it, the background task catches the view up.
 #[tokio::test]
 async fn the_background_task_catches_up_on_its_interval_postgres_test() {
@@ -423,6 +456,34 @@ async fn a_row_without_a_horizon_adopts_the_log_and_catches_up_from_there_postgr
     ring(&old_pod, "t-1", &[3.0]).await;
     assert_eq!(new_pod.catch_up_projections().await.unwrap(), 1);
     assert_eq!(view_rows(&pool).await, (1, 1));
+}
+
+/// An earlier release that bumps the version rebuilds the view and changes `version`, but
+/// knows nothing of the horizon and leaves it at the old version's. That horizon says
+/// nothing about the new version, so it is read as none and adopted — not used to apply
+/// again everything the old release's rebuild already applied.
+#[tokio::test]
+async fn a_horizon_left_by_another_version_is_adopted_not_used_postgres_test() {
+    let (pool, _container) = start_pool().await;
+
+    let v1 = store_without_task(&pool, 1).await;
+    ring(&v1, "t-1", &[1.0, 2.0, 3.0]).await;
+    drop(v1);
+
+    // What an earlier release's rebuild to version 2 leaves: the view rebuilt, `version`
+    // moved, and the horizon untouched.
+    sqlx::query("UPDATE projections SET version = 2 WHERE name = 'till_view'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let v2 = store_without_task(&pool, 2).await;
+    assert_eq!(view_rows(&pool).await, (3, 3), "nothing is applied again");
+
+    let old_pod = PostgresEventStore::new(pool.clone());
+    ring(&old_pod, "t-1", &[4.0]).await;
+    assert_eq!(v2.catch_up_projections().await.unwrap(), 1);
+    assert_eq!(view_rows(&pool).await, (4, 4));
 }
 
 /// The view under test, appending an event from another connection the first time it is

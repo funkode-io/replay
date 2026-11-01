@@ -47,14 +47,18 @@ bounds what has to be remembered.**
 - **Applied mark** — a row `(projection, version, txid)` in
   `projection_applied_transactions`, meaning "this transaction's events were applied to
   this version of this projection". The append path writes one, in the append
-  transaction, for each projection whose `handle` received an event in that append. A
-  catch-up and a rebuild write them for the transactions they apply above the horizon.
-  The mark is keyed by version so that an older version's live writes during a rollout
-  never count for the newer one.
+  transaction, for every projection it registered — each was offered the whole append,
+  matched or not, and an unmarked append would be read again by the next catch-up for
+  nothing. A catch-up and a rebuild write them when they seal. The mark is keyed by
+  version so that an older version's live writes during a rollout never count for the
+  newer one.
 - **Catch-up horizon** — `projections.caught_up_below`, an `xid8`: every transaction with
   a lower id has been accounted for. It is the `xmin` of the snapshot the last catch-up or
   rebuild read under, so it never passes a transaction that was still running. Marks below
-  it are no longer needed and are deleted when it moves.
+  it are no longer needed and are deleted when it moves. `caught_up_version` records the
+  version it was sealed at: a release that does not know these columns can rebuild and
+  change `version`, and the horizon it leaves behind says nothing about the new version,
+  so it reads as none.
 
 The transaction id is the event's [Commit stamp], already written on every row and
 indexed by `(commit_txid, global_position)` (migrations 0018, 0019). Ids are compared
@@ -66,29 +70,43 @@ One catch-up of one projection is one transaction:
 
 1. Take the projection's advisory lock (transaction-scoped, keyed by name). A periodic
    catch-up that finds it held skips the round: another process is doing the same work.
+   Only then bound the transaction's row-lock waits (ADR-0022): `lock_timeout` bounds
+   advisory waits too, and waiting for another process's catch-up or rebuild is waiting
+   for work in progress.
 2. Read the registry row and `pg_current_snapshot()` (`S`). If the stored version is not
    this process's code version, stop: a process must never apply its logic to a view
    another version owns.
 3. Page through the events with `commit_txid >= caught_up_below`, visible in `S`, with no
    applied mark for this version, matching the projection's filter — in `global_position`
    order (ADR-0018), compaction snapshots excluded (ADR-0004), at most
-   `projection_flush_size` per page. Hand each page to `handle` and mark the page's
-   transactions at or above `xmin(S)`.
-4. Seal: set `caught_up_below = xmin(S)` and delete the marks below it and the marks of
-   older versions.
+   `projection_flush_size` per page, and hand each page to `handle`. With no horizon for
+   the stored version, read nothing: the log is **adopted** as it stands.
+4. Seal: mark every transaction at or above `xmin(S)` that `S` shows as committed, set
+   `caught_up_below = xmin(S)` for this version, and delete the marks below it and the
+   marks of older versions.
 
 Every transaction below `xmin(S)` had ended when `S` was taken, so its events, if it
 committed, are visible in `S`: either it was marked, or step 3 applied it. Transactions at
-or above `xmin(S)` that `S` already shows as committed were applied and marked in step 3,
-so the next catch-up skips them. Transactions `S` could not see are left for the next one.
-Paging reads under `S` (`pg_visible_in_snapshot`) at `READ COMMITTED`, so a commit
-landing between two pages is never half-read.
+or above `xmin(S)` that `S` shows as committed were marked already, applied in step 3, or
+held nothing the projection reads; step 4 marks them, so the next catch-up skips them.
+Transactions `S` could not see are left for the next one. Paging reads under `S`
+(`pg_visible_in_snapshot`) at `READ COMMITTED`, so a commit landing between two pages is
+never half-read.
+
+The marks are written once the read is over, never page by page: a transaction sees its
+own writes, so a mark written after the first page of a large append would hide the rest
+of it from the catch-up applying it. Sealing is one `INSERT … SELECT` over the events
+since the oldest transaction still running when `S` was taken; nothing of it comes back to
+the process.
 
 ### When it runs
 
-- **At startup**, inside `build()`. A projection whose stored version equals its code
-  version is caught up in the build transaction. A first registration or a version-drift
-  rebuild replays as before and marks what it replayed above the horizon, then seals.
+- **At startup**, in `build()`. A first registration or a version-drift rebuild replays
+  in the build transaction as before, then seals at its snapshot. A projection whose
+  stored version equals its code version is caught up once that transaction commits, in a
+  `READ COMMITTED` transaction of its own: inside the `REPEATABLE READ` build, a view row
+  that a live append of another process also writes would end the build on a
+  serialization failure, for as long as the rolling deploy keeps writing.
   `build()` takes the advisory locks of every projection it registers, as session locks on
   its own connection, **before** its `REPEATABLE READ` transaction takes its snapshot, so
   a rebuild never races a catch-up and never reads a snapshot older than one that
@@ -104,16 +122,17 @@ landing between two pages is never half-read.
 - **On demand**, through `PostgresEventStore::catch_up_projections()`, which waits for the
   lock rather than skipping.
 
-A caught-up projection costs one indexed lookup of the events above its horizon and a
-registry write per round.
+A caught-up projection costs, per round, an indexed read of the events above its horizon
+and the seal, both proportional to the transactions since the oldest one still running.
 
 ### Event types
 
 `InlineProjection::event_types()` lets a projection declare the `type` values it handles.
 When it does, the rebuild replay, the catch-up and the live path all skip events of any
-other type before deserializing them, so the three deliver the same events. Undeclared
-(the default) keeps deserialize-or-skip routing over every event the filter admits
-(ADR-0002).
+other type before deserializing them, so the three agree on the types they deliver.
+Undeclared (the default) keeps deserialize-or-skip routing (ADR-0002). The live path still
+ignores `stream_filter()`, as it always has: that filter narrows what a replay or a
+catch-up reads.
 
 ## Delivery contract
 
@@ -156,9 +175,12 @@ exactly once. What a projection must still tolerate, and the docs say so:
   still applied, by their marks; the horizon moves once it ends. A bulk lane
   ([#288](https://github.com/funkode-io/replay/issues/288)) is not blocked by a catch-up,
   which takes no stream lock.
-- **A catch-up holds the projection's in-process lock while it runs.** Appends from the
-  same process that reach that projection wait for it. The catch-up transaction bounds its
-  row-lock waits by the stream lock wait (ADR-0022), so a wait on a view row cannot hang it.
+- **A catch-up holds the projection's in-process lock while it runs.** Every append in the
+  same process offers its events to every projection, so all of them wait for it. A
+  catch-up that waits on a view row an append of this process holds, while that append
+  waits for the lock, is a deadlock Postgres cannot see; the catch-up's row-lock waits are
+  bounded by the stream lock wait (ADR-0022), which breaks it, and a stream lock wait of
+  zero removes that bound.
 - **Schema.** Migration 0038 adds the column and the table. It is additive: an earlier
   release runs unchanged against it, and its rows read as "no horizon yet".
 - The in-memory store is single-process and test-only; it has nothing to catch up.
