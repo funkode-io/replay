@@ -1809,6 +1809,18 @@ each projection version exactly once. But:
   process *without* the projection that commits while that build runs can be adopted
   without being applied, so quiesce such writers until it has returned.
 
+**After a logical restore** (`pg_dump`/`pg_restore` into another cluster), the restored
+horizons and marks name transaction ids of the old cluster, which the new one may hand out
+again. Before the first append, make every projection adopt the restored log as it stands:
+
+```sql
+UPDATE projections SET caught_up_below = NULL, caught_up_version = NULL;
+TRUNCATE projection_applied_transactions;
+```
+
+A physical restore or a replica promotion keeps the cluster's transaction counter and needs
+nothing.
+
 **Migrate, then deploy.** Migration 0038 is additive — earlier releases run unchanged against
 it — and this release needs it before its first append or `build()`.
 

@@ -201,6 +201,11 @@ exactly once. What a projection must still tolerate, and the docs say so:
   which Postgres cannot see.
 - **Schema.** Migration 0038 adds the column and the table. It is additive: an earlier
   release runs unchanged against it, and its rows read as "no horizon yet".
+- **Transaction ids are cluster-local.** A logical restore into another cluster carries
+  horizons and marks the new cluster's counter can fall below or repeat, so a restore
+  resets them (the README gives the two statements) and the next catch-up adopts the log.
+  A physical restore or promotion keeps the counter. Commit stamps already carry this
+  assumption for the policy feed (ADR-0030).
 - The in-memory store is single-process and test-only; it has nothing to catch up.
 
 [Inline projection]: ../../CONTEXT.md#inline-projection
