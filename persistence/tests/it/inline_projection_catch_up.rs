@@ -640,3 +640,63 @@ async fn declared_event_types_narrow_the_replay_the_live_path_and_the_catch_up_p
     .unwrap();
     assert_eq!(types, vec![("Rang".to_string(), 3)]);
 }
+
+/// The view under test, with a replay filter that admits no till event.
+struct ReplaysNothing;
+
+impl InlineProjection for ReplaysNothing {
+    type Exec = sqlx::PgConnection;
+    type Event = TillEvent;
+
+    fn name(&self) -> &str {
+        "till_view"
+    }
+
+    fn version(&self) -> i32 {
+        1
+    }
+
+    fn stream_filter(&self) -> replay_persistence::StreamFilter {
+        replay_persistence::StreamFilter::ForStreamTypes(vec!["Drawer".to_string()])
+    }
+
+    async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> Result<(), replay::Error> {
+        TillView { version: 1 }.handle(conn, events).await
+    }
+}
+
+/// A catch-up stands in for the live append, and the live append never applies
+/// `stream_filter` — that filter narrows what a replay reads. So an event the live path
+/// would apply is caught up even when the replay filter would not admit it: an
+/// unregistered writer's append must not end up differently from a registered one's.
+#[tokio::test]
+async fn a_catch_up_delivers_what_the_live_path_would_whatever_the_replay_filter_postgres_test() {
+    let (pool, _container) = start_pool().await;
+
+    let new_pod = PostgresEventStore::builder(pool.clone())
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(ReplaysNothing)
+        .build()
+        .await
+        .unwrap();
+    ring(&new_pod, "t-1", &[1.0]).await;
+    assert_eq!(
+        view_rows(&pool).await,
+        (1, 1),
+        "the live path ignores the filter"
+    );
+
+    let old_pod = PostgresEventStore::new(pool.clone());
+    ring(&old_pod, "t-1", &[2.0]).await;
+
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), 1);
+    assert_eq!(view_rows(&pool).await, (2, 2));
+}

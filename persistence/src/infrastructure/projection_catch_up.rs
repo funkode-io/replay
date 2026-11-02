@@ -194,7 +194,13 @@ pub(crate) async fn apply_pages(
 ) -> Result<u64, replay::Error> {
     let name = projection.name().to_string();
     let version = projection.version();
-    let filter = projection.stream_filter();
+    // A replay reads what the projection's filter admits; a catch-up stands in for the
+    // live append, which never applies that filter, so it reads what the live path would
+    // have been offered. Only the declared event types narrow both.
+    let filter = match &scope {
+        Scope::History => projection.stream_filter(),
+        Scope::Gap { .. } => StreamFilter::All,
+    };
     let types = projection.event_types();
 
     // Where the gap can start. Without a lower bound the first page would walk

@@ -783,6 +783,14 @@ impl PostgresEventStore {
     ) -> Result<u64, replay::Error> {
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
 
+        // READ COMMITTED whatever the connection's default: the lock must be taken by a
+        // statement that fixes no snapshot the rest of the catch-up reads, so the
+        // registry row and the cut below are read after whoever held the lock committed.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
+
         if !catch_up::lock_for_catch_up(&mut tx, &registered.name, wait).await? {
             tracing::debug!(
                 projection = %registered.name,
@@ -796,7 +804,16 @@ impl PostgresEventStore {
         // keeps a wait on such a row from hanging both. Set after the advisory lock, which
         // `lock_timeout` would otherwise bound too: a wait for another process's catch-up
         // or rebuild is a wait for work in progress, not a stranded row.
-        crate::lock_wait::bound(&mut tx, self.stream_lock_wait)
+        //
+        // Always a finite bound: a stream lock wait of zero means "wait forever" for the
+        // append, but here half of the wait is this process's own projection lock, which
+        // Postgres cannot see, so nothing else would ever break it.
+        let wait = if self.stream_lock_wait.is_zero() {
+            DEFAULT_STREAM_LOCK_WAIT
+        } else {
+            self.stream_lock_wait
+        };
+        crate::lock_wait::bound(&mut tx, wait)
             .await
             .map_err(crate::db_error)?;
 
