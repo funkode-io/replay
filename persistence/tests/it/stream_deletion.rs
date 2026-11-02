@@ -66,8 +66,7 @@ fn refuse_everything(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
 /// delivered. Deleting the place with the stream is what lets the new one be read from
 /// its first event.
 #[tokio::test]
-async fn a_stream_recreated_under_a_deleted_id_is_delivered_from_its_first_event_postgres_test()
-{
+async fn a_stream_recreated_under_a_deleted_id_is_delivered_from_its_first_event_postgres_test() {
     let harness = PolicyDaemonHarness::start("recreated", |builder, policy| {
         builder.register_policy_fn::<ProbeEvent, _>(
             policy,
@@ -401,8 +400,7 @@ async fn events_of(pool: &PgPool, shelf: &str) -> Vec<uuid::Uuid> {
 /// an append from a process that does not — the applied marks of the deleted stream's
 /// transactions stand in nobody's way.
 #[tokio::test]
-async fn a_stream_recreated_under_a_deleted_id_is_projected_live_and_by_catch_up_postgres_test()
-{
+async fn a_stream_recreated_under_a_deleted_id_is_projected_live_and_by_catch_up_postgres_test() {
     let (pool, _container) = start_pool().await;
     let store = store_with_view(&pool).await;
 
@@ -412,22 +410,29 @@ async fn a_stream_recreated_under_a_deleted_id_is_projected_live_and_by_catch_up
     assert_eq!(view_of(&pool, "front").await.len(), 2);
 
     let deleted = store
-        .delete_streams(&[ShelfUrn::new("front").unwrap().into()], |conn, deleted| {
-            Box::pin(async move {
-                let ids: Vec<String> = deleted.iter().map(Urn::to_string).collect();
-                sqlx::query("DELETE FROM shelf_view WHERE stream_id = ANY($1)")
-                    .bind(&ids)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(replay_persistence::db_error)?;
-                Ok(())
-            })
-        })
+        .delete_streams(
+            &[ShelfUrn::new("front").unwrap().into()],
+            |conn, deleted| {
+                Box::pin(async move {
+                    let ids: Vec<String> = deleted.iter().map(Urn::to_string).collect();
+                    sqlx::query("DELETE FROM shelf_view WHERE stream_id = ANY($1)")
+                        .bind(&ids)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(replay_persistence::db_error)?;
+                    Ok(())
+                })
+            },
+        )
         .await
         .expect("deleting the stream must succeed");
     assert_eq!(deleted.events, 2);
     assert!(view_of(&pool, "front").await.is_empty());
-    assert_eq!(view_of(&pool, "back").await.len(), 1, "another stream is untouched");
+    assert_eq!(
+        view_of(&pool, "back").await.len(),
+        1,
+        "another stream is untouched"
+    );
 
     // Recreated live, through the store that applies the projection.
     stock(&store, "front", "new-1").await;

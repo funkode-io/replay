@@ -1316,6 +1316,18 @@ impl PolicyRunner {
                 },
             )
             .await?;
+            // The event went with its stream while the replay ran (ADR-0033): there is
+            // nothing left to park this command against, and nobody left to retry it.
+            let Some(parked) = parked else {
+                tracing::info!(
+                    policy   = %reaction.policy_name,
+                    event_id = %reaction.event_id,
+                    command  = unclaimed.identity.command_name,
+                    "a retried reaction failed on a command it had not parked, but its \
+                     triggering event has been deleted with its stream; parking nothing"
+                );
+                continue;
+            };
             tracing::warn!(
                 policy    = %reaction.policy_name,
                 event_id  = %reaction.event_id,
@@ -3217,7 +3229,7 @@ async fn drain_policy_once(
     // The places this poll has moved and not yet written. One entry per stream advanced
     // since the last flush, so the batch bounds it. Declared out here because a poll that
     // fails still has to say what it was holding: these places are in memory only.
-    let mut advanced: Vec<(String, i64)> = Vec::new();
+    let mut advanced: Vec<Reached> = Vec::new();
 
     // Everything from here to the settle is I/O against what the plan decided, and every
     // way out of it — including a failed statement — goes through the settle below.
@@ -3279,6 +3291,8 @@ async fn drain_policy_once(
             plan.read(&turn, events.len() as u32);
 
             let mut reached = place;
+            // The position of the event at `reached`, once the poll has read one.
+            let mut reached_position = 0;
             let mut superseded = false;
             for event in events {
                 if let Some(raw) = event.delivered {
@@ -3310,6 +3324,7 @@ async fn drain_policy_once(
                 }
                 // Always track in-memory place.
                 reached = event.stream_seq;
+                reached_position = event.global_position;
                 events_since_checkpoint += 1;
                 // Told as the Policy moves rather than when the poll returns: one poll's
                 // batch is dispatched event by event, each bounded only by the dispatch
@@ -3330,9 +3345,13 @@ async fn drain_policy_once(
                     // Flushed out of `advanced` rather than taken from it: a checkpoint
                     // that fails leaves these places where the poll's failure path can
                     // find them, which is the only record that they moved at all.
-                    advanced.push((stream_id.clone(), reached));
+                    advanced.push(Reached {
+                        stream_id: stream_id.clone(),
+                        seq: reached,
+                        global_position: reached_position,
+                    });
                     let kept = checkpoint_places(pool, &name, &advanced, &observed).await?;
-                    for (stream, seq) in &advanced {
+                    for Reached { stream_id: stream, seq, .. } in &advanced {
                         if let Some(written_by) = kept.get(stream) {
                             observed.insert(
                                 stream.clone(),
@@ -3368,7 +3387,11 @@ async fn drain_policy_once(
 
             plan.delivered(&turn);
             if reached > place {
-                advanced.push((turn.stream_id, reached));
+                advanced.push(Reached {
+                    stream_id: turn.stream_id,
+                    seq: reached,
+                    global_position: reached_position,
+                });
             }
         }
 
@@ -3388,7 +3411,7 @@ async fn drain_policy_once(
     // redelivery.
     let carrying = if drained.is_err() {
         recovering(
-            advanced.into_iter().map(|(stream, _)| stream),
+            advanced.into_iter().map(|reached| reached.stream_id),
             settled.carried,
             read_batch,
         )
@@ -3504,7 +3527,7 @@ impl Delivery<'_> {
                 // null identity columns rather than with a guess.
                 let in_flight = attempt.in_flight.clone();
                 self.park(global_position, raw, attempt).await?;
-                write_dead_letter(
+                let parked = write_dead_letter(
                     self.pool,
                     DeadLetterWrite {
                         policy_name,
@@ -3517,6 +3540,9 @@ impl Delivery<'_> {
                     },
                 )
                 .await?;
+                if parked.is_none() {
+                    parked_nothing(policy_name, raw);
+                }
                 Ok(0)
             }
         }
@@ -3647,7 +3673,7 @@ impl Delivery<'_> {
                 error           = %failure,
                 "policy dispatch failed permanently; writing dead-letter and advancing cursor"
             );
-            write_dead_letter(
+            let parked = write_dead_letter(
                 self.pool,
                 DeadLetterWrite {
                     policy_name: self.policy_name,
@@ -3660,6 +3686,9 @@ impl Delivery<'_> {
                 },
             )
             .await?;
+            if parked.is_none() {
+                parked_nothing(self.policy_name, raw);
+            }
         }
         Ok(())
     }
@@ -3729,6 +3758,17 @@ impl Delivery<'_> {
             }
         }
     }
+}
+
+/// Say why a delivery that failed left no dead letter: its event was deleted with its
+/// stream while the reaction ran (ADR-0033), and a row for it could never be retried.
+fn parked_nothing(policy_name: &str, raw: &PersistedEvent<Value>) {
+    tracing::info!(
+        policy    = %policy_name,
+        event_id  = %raw.id,
+        stream_id = %raw.stream_id,
+        "the triggering event has been deleted with its stream; parking nothing for it"
+    );
 }
 
 /// Read the message out of a caught panic's payload.
@@ -3807,11 +3847,18 @@ enum Parking {
 /// earlier can commit later and would otherwise stamp the recency signal a live
 /// delivery has already moved.
 ///
+/// **Nothing is parked for an event that is gone.** The row is written only while the
+/// triggering event is still in the log, held by a key-share lock until the write commits,
+/// and `None` says it was not. A deletion of the event's stream (ADR-0033) locks every
+/// event of it before it archives the stream's dead letters, so it either waits for this
+/// write and archives the row with the rest, or has already taken the event — and a row
+/// parked after it would be one no retry could ever settle.
+///
 /// [`retry_dead_letter`]: PolicyRunner::retry_dead_letter
 async fn write_dead_letter(
     executor: impl sqlx::PgExecutor<'_>,
     park: DeadLetterWrite<'_>,
-) -> Result<Parked, replay::Error> {
+) -> Result<Option<Parked>, replay::Error> {
     let DeadLetterWrite {
         policy_name,
         global_position,
@@ -3826,7 +3873,8 @@ async fn write_dead_letter(
          (policy_name, global_position, event_id, error_kind, error_message, \
           aggregate_name, target_stream_id, command_name, dispatch_ordinal, \
           last_parked_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp()) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp() \
+           FROM events WHERE id = $3 FOR KEY SHARE \
          ON CONFLICT (policy_name, event_id, aggregate_name, target_stream_id, \
                       command_name, dispatch_ordinal) \
          DO UPDATE SET error_kind = CASE WHEN $10 THEN EXCLUDED.error_kind \
@@ -3851,14 +3899,14 @@ async fn write_dead_letter(
     .bind(identity.map(|i| i.command_name))
     .bind(identity.map(|i| i.ordinal))
     .bind(parking == Parking::Delivery)
-    .fetch_one(executor)
+    .fetch_optional(executor)
     .await
     .map_err(crate::db_error)?;
 
-    Ok(Parked {
+    Ok(row.map(|row| Parked {
         id: row.get("id"),
         conflicted: row.get("conflicted"),
-    })
+    }))
 }
 
 /// What a park wrote.
@@ -4065,8 +4113,13 @@ async fn lock_group(
 /// later page would read that row and settle it from a replay that ran before it
 /// existed, which is the chunked-rebuild problem
 /// (`PostgresEventStoreBuilder::build`) in another table. Postgres requires the
-/// isolation level before the transaction's first query, and the lock is that
-/// query.
+/// isolation level before the transaction's first query.
+///
+/// The triggering event is locked before the group, the order a deletion of its
+/// stream takes them in (ADR-0033): events, then the dead letters it archives.
+/// Locked the other way round, a settlement that parks a command it had not parked
+/// — which locks the event — would deadlock a deletion waiting on the group. An
+/// event that is already gone locks nothing, and its group has gone with it.
 async fn begin_settlement<'a>(
     pool: &'a Pool<Postgres>,
     reaction: &ParkedReaction,
@@ -4077,6 +4130,11 @@ async fn begin_settlement<'a>(
         .await
         .map_err(crate::db_error)?;
 
+    sqlx::query("SELECT 1 FROM events WHERE id = $1 FOR KEY SHARE")
+        .bind(reaction.event_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
     let digest = lock_group(&mut tx, reaction).await?;
     Ok((tx, digest))
 }
@@ -4778,6 +4836,18 @@ const STREAMS_BEHIND_OF_TYPES: &str = "SELECT x.id \
        ORDER BY s.type, s.id LIMIT $3) x \
      ORDER BY x.id LIMIT $3";
 
+/// A place a poll has moved a stream to and not yet written, and the event it reached it
+/// at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Reached {
+    stream_id: String,
+    seq: i64,
+    /// The position of the event at `seq`: what a checkpoint creating the stream's first
+    /// place holds on to, so a place is never written for an event a deletion has taken
+    /// ([`checkpoint_places`]).
+    global_position: i64,
+}
+
 /// A Policy's place in one stream, as a poll read it.
 ///
 /// `written_by` is the transaction that last wrote the row — PostgreSQL's `xmin`, which
@@ -4919,31 +4989,54 @@ struct StreamEvent {
 /// with, so the operator's delete is undone by an insert (funkode-io/replay#236 review).
 /// A place the poll found no row for is only ever inserted, and loses to whoever created
 /// one in the meantime.
+///
+/// And only while the event it was reached at is still in the log, held by a key-share
+/// lock until the insert commits. A deletion of the stream (ADR-0033) locks every event
+/// of it before it deletes the stream's places, so it either waits for this insert and
+/// then deletes the place with the rest, or has already taken the event and this inserts
+/// nothing. Without that, a poll that read the stream before the deletion would write it
+/// a place after it — a place in the stream recreated under that id, whose events start
+/// again at 1 and would be skipped up to it. The event is named by its position, which no
+/// event of a recreated stream can share. Locked in position order, the order a deletion
+/// locks them in, so the two queue rather than deadlock. The row a poll saw needs none of
+/// this: its update matches nothing once a deletion has taken it.
 async fn checkpoint_places(
     pool: &Pool<Postgres>,
     name: &str,
-    places: &[(String, i64)],
+    places: &[Reached],
     observed: &HashMap<String, Place>,
 ) -> Result<HashMap<String, i64>, replay::Error> {
     if places.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let streams: Vec<String> = places.iter().map(|(stream, _)| stream.clone()).collect();
-    let seqs: Vec<i64> = places.iter().map(|(_, seq)| *seq).collect();
+    let streams: Vec<String> = places.iter().map(|r| r.stream_id.clone()).collect();
+    let seqs: Vec<i64> = places.iter().map(|r| r.seq).collect();
+    let positions: Vec<i64> = places.iter().map(|r| r.global_position).collect();
     // A row the poll saw carries the version it saw; a stream it found no row for carries
     // nothing, which is what puts it in the half of the statement that may create one. A
     // place of 0 does not tell you which — a stream at the beginning and a stream with no
     // row are both 0 (funkode-io/replay#231).
     let from: Vec<Option<i64>> = places
         .iter()
-        .map(|(stream, _)| observed.get(stream).and_then(|place| place.written_by))
+        .map(|r| {
+            observed
+                .get(&r.stream_id)
+                .and_then(|place| place.written_by)
+        })
         .collect();
 
     let kept = sqlx::query(
         "WITH incoming AS ( \
-             SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) \
-                       AS i(stream_id, stream_seq, observed)), \
+             SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::bigint[]) \
+                       AS i(stream_id, stream_seq, observed, global_position)), \
+         still_logged AS MATERIALIZED ( \
+             SELECT e.global_position FROM events e \
+               JOIN incoming i ON e.global_position = i.global_position \
+                              AND e.stream_id = i.stream_id \
+              WHERE i.observed IS NULL \
+              ORDER BY e.global_position \
+                FOR KEY SHARE OF e), \
          advanced AS ( \
              UPDATE policy_stream_cursors c \
                 SET stream_seq = i.stream_seq, updated_at = now() \
@@ -4955,7 +5048,7 @@ async fn checkpoint_places(
          created AS ( \
              INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
              SELECT $1, i.stream_id, i.stream_seq FROM incoming i \
-              WHERE i.observed IS NULL \
+               JOIN still_logged l ON l.global_position = i.global_position \
              ON CONFLICT (policy, stream_id) DO NOTHING \
           RETURNING stream_id, xmin::text::bigint AS written_by) \
          SELECT stream_id, written_by FROM advanced \
@@ -4966,6 +5059,7 @@ async fn checkpoint_places(
     .bind(&streams)
     .bind(&seqs)
     .bind(&from)
+    .bind(&positions)
     .fetch_all(pool)
     .await
     .map_err(crate::db_error)?;
@@ -6623,7 +6717,7 @@ mod progress_tests {
     use super::{
         bootstrap, checkpoint_places, late_tail_page, lookup_late_writes, places_of,
         streams_behind, sweep_for_streams, write_reconciled, Discovered, LateWriteState, Place,
-        PolicyProgress, StartAt, Sweep, Tail, TrackedStreams, STREAMS_BEHIND_OF_TYPES,
+        PolicyProgress, Reached, StartAt, Sweep, Tail, TrackedStreams, STREAMS_BEHIND_OF_TYPES,
         UNSEEN_TRANSACTION_CAP,
     };
 
@@ -7582,9 +7676,27 @@ mod progress_tests {
         stream: &str,
         to: i64,
     ) -> HashMap<String, i64> {
-        checkpoint_places(pool, POLICY, &[(stream.to_string(), to)], observed)
+        let reached = reached_at(pool, stream, to).await;
+        checkpoint_places(pool, POLICY, &[reached], observed)
             .await
             .expect("checkpointing must succeed")
+    }
+
+    /// The place `to` in `stream`, as a poll that has just read the event there carries it.
+    async fn reached_at(pool: &PgPool, stream: &str, to: i64) -> Reached {
+        let global_position: i64 = sqlx::query_scalar(
+            "SELECT global_position FROM events WHERE stream_id = $1 AND stream_seq = $2",
+        )
+        .bind(stream)
+        .bind(to)
+        .fetch_one(pool)
+        .await
+        .expect("a poll only reaches a place an event holds");
+        Reached {
+            stream_id: stream.to_string(),
+            seq: to,
+            global_position,
+        }
     }
 
     /// A rotation that has reached the end wraps even on a poll that finds nothing.
@@ -7913,13 +8025,11 @@ mod progress_tests {
             .await
             .expect("the operator's delete must succeed");
 
+        let reached = reached_at(&pool, "urn:probe:a", 15).await;
         let checkpointing = tokio::spawn({
             let pool = pool.clone();
             let observed = observed.clone();
-            async move {
-                checkpoint_places(&pool, POLICY, &[("urn:probe:a".to_string(), 15)], &observed)
-                    .await
-            }
+            async move { checkpoint_places(&pool, POLICY, &[reached], &observed).await }
         });
         await_blocked_by(&pool, operator).await;
         deleting.commit().await.expect("committing must succeed");
@@ -8150,8 +8260,112 @@ mod progress_tests {
         }
     }
 
+    /// Delete `stream` the way [`crate::PostgresEventStore::delete_streams`] does, inside
+    /// `tx`, after its events have been locked: places, events, stream.
+    async fn delete_locked_stream(tx: &mut sqlx::PgConnection, stream: &str) {
+        for statement in [
+            "DELETE FROM policy_stream_cursors WHERE stream_id = $1",
+            "DELETE FROM events WHERE stream_id = $1",
+            "DELETE FROM streams WHERE id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(stream)
+                .execute(&mut *tx)
+                .await
+                .expect("the deletion must succeed");
+        }
+    }
+
+    /// A poll that read a stream before it was deleted does not give the stream recreated
+    /// under its id a place (ADR-0033).
+    ///
+    /// The recreated stream's events start again at 1, so a place left at the old one's
+    /// third event would skip the new one's first three. The checkpoint names the event
+    /// it reached by its position, which no event of the new stream holds.
+    #[tokio::test]
+    async fn a_place_reached_in_a_deleted_stream_is_not_given_to_its_successor_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 3).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, TrackedStreams::Every)
+            .await
+            .expect("loading must succeed");
+
+        // The poll has read the old stream to its end and not checkpointed yet.
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+        let reached = reached_at(&pool, "urn:probe:a", 3).await;
+
+        crate::PostgresEventStore::new(pool.clone())
+            .delete_streams(&["urn:probe:a".parse().unwrap()], |_, _| {
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .expect("deleting the stream must succeed");
+        append_events(&pool, "urn:probe:a", 5).await;
+
+        let kept = checkpoint_places(&pool, POLICY, &[reached], &observed)
+            .await
+            .expect("checkpointing must succeed");
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "the recreated stream is still at its beginning"
+        );
+    }
+
+    /// The same, with the deletion in flight when the checkpoint is made: it has locked the
+    /// stream's events and not yet deleted the places, which is the window in which a place
+    /// written without a lock would be committed after the deletion looked for places.
+    ///
+    /// Forced rather than raced for: the checkpoint is made while the deletion holds the
+    /// events, and the deletion commits while the checkpoint waits for them.
+    #[tokio::test]
+    async fn a_checkpoint_racing_a_deletion_waits_for_it_and_writes_nothing_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 3).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, TrackedStreams::Every)
+            .await
+            .expect("loading must succeed");
+        let observed = observe(&pool, &["urn:probe:a"]).await;
+        let reached = reached_at(&pool, "urn:probe:a", 3).await;
+
+        let mut deleting = pool.begin().await.expect("beginning must succeed");
+        let deletion: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *deleting)
+            .await
+            .expect("the deleting backend must identify itself");
+        sqlx::query(
+            "SELECT count(*) FROM (SELECT 1 FROM events WHERE stream_id = $1 \
+                                    ORDER BY global_position FOR UPDATE) locked",
+        )
+        .bind("urn:probe:a")
+        .execute(&mut *deleting)
+        .await
+        .expect("locking the events must succeed");
+
+        let checkpointing = tokio::spawn({
+            let pool = pool.clone();
+            async move { checkpoint_places(&pool, POLICY, &[reached], &observed).await }
+        });
+        await_blocked_by(&pool, deletion).await;
+        delete_locked_stream(&mut deleting, "urn:probe:a").await;
+        deleting.commit().await.expect("committing must succeed");
+
+        let kept = checkpointing
+            .await
+            .expect("the checkpoint must finish")
+            .expect("checkpointing must succeed");
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        append_events(&pool, "urn:probe:a", 5).await;
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "the recreated stream is still at its beginning"
+        );
+    }
+
     /// Wait until something is queued behind whatever `holder` is holding.
-    async fn await_blocked_by(pool: &PgPool, holder: i32) {
+    pub(super) async fn await_blocked_by(pool: &PgPool, holder: i32) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let blocked: i64 = sqlx::query_scalar(
@@ -8567,14 +8781,90 @@ mod progress_tests {
 mod settlement_tests {
     use sqlx::PgPool;
 
-    use super::progress_tests::start_postgres;
+    use super::progress_tests::{await_blocked_by, start_postgres};
     use super::{
-        begin_settlement, group_digest, load_parked_page, Cqrs, DispatchIdentity, GroupPhase,
-        ParkedReaction, PolicyRunner, Replay, ReplayedDispatch, Settlement,
+        begin_settlement, group_digest, load_parked_page, write_dead_letter, Cqrs, DeadLetterWrite,
+        DispatchIdentity, GroupPhase, ParkedReaction, Parking, PolicyRunner, Replay,
+        ReplayedDispatch, Settlement,
     };
 
     const POLICY: &str = "settlement_under_test";
     const POSITION: i64 = 7;
+
+    /// A delivery that failed on an event its stream's deletion is taking parks nothing
+    /// (ADR-0033): it waits for the deletion, then finds the event gone. A row parked after
+    /// the deletion archived the stream's dead letters would be one no retry could settle,
+    /// and it used to abort the bulk retry of everything its Policy had parked.
+    ///
+    /// Forced rather than raced for: the park is made while the deletion holds the event,
+    /// and the deletion commits while the park waits for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_park_racing_its_streams_deletion_parks_nothing_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Pinged', \
+                 'urn:probe:doomed', 'Probe', NULL, FALSE)",
+        )
+        .bind(event_id)
+        .execute(&pool)
+        .await
+        .expect("the event must be written");
+
+        let mut deleting = pool.begin().await.expect("the deletion must begin");
+        let deletion: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *deleting)
+            .await
+            .expect("the deleting backend must identify itself");
+        sqlx::query("SELECT 1 FROM events WHERE stream_id = 'urn:probe:doomed' FOR UPDATE")
+            .execute(&mut *deleting)
+            .await
+            .expect("locking the events must succeed");
+
+        let parking = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                write_dead_letter(
+                    &pool,
+                    DeadLetterWrite {
+                        policy_name: POLICY,
+                        global_position: POSITION,
+                        event_id,
+                        identity: None,
+                        error_kind: "Invalid Input",
+                        error_message: "refused",
+                        parking: Parking::Delivery,
+                    },
+                )
+                .await
+                .map(|parked| parked.map(|parked| parked.id))
+            })
+        };
+        await_blocked_by(&pool, deletion).await;
+        for statement in [
+            "DELETE FROM policy_dead_letters WHERE event_id = $1",
+            "DELETE FROM events WHERE id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(event_id)
+                .execute(&mut *deleting)
+                .await
+                .expect("the deletion must succeed");
+        }
+        deleting.commit().await.expect("the deletion must commit");
+
+        let parked = parking
+            .await
+            .expect("the parking task must not panic")
+            .expect("parking must not fail");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM policy_dead_letters")
+            .fetch_one(&pool)
+            .await
+            .expect("the dead letters must be countable");
+
+        assert_eq!(parked, None, "nothing is parked for an event that is gone");
+        assert_eq!(rows, 0);
+    }
 
     /// A row parked for `command`, as an old version of the policy would have left
     /// it. No event is involved: these tests are about what the settlement reads,
@@ -8668,10 +8958,21 @@ mod settlement_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_discard_that_wins_the_lock_does_not_swallow_the_replay_postgres_test() {
         let (pool, _container) = start_postgres().await;
+        // A real event this time: the replay parks a command, and nothing is parked for
+        // an event that is not in the log (ADR-0033).
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Pinged', \
+                 'urn:probe:1', 'Probe', NULL, FALSE)",
+        )
+        .bind(event_id)
+        .execute(&pool)
+        .await
+        .expect("the event must be written");
         let reaction = ParkedReaction {
             policy_name: POLICY.to_string(),
             global_position: POSITION,
-            event_id: uuid::Uuid::new_v4(),
+            event_id,
         };
         park(&pool, &reaction, "First").await;
 

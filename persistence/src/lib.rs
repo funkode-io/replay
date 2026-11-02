@@ -62,12 +62,12 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, CompactionOutcome, Cqrs, DeadLetter, DeletedStreams, DeadLetterDiscard, DeadLetterFilter,
-        DeadLetterRetry, DeadLetterRetrySummary, Dispatch, Escalation, EscalationReason, EventSink,
-        EventStore, InMemoryEventStore, InlineProjection, Liveness, NoSink, ObservedEvent,
-        PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
-        PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
-        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, StreamScope,
-        WorkerLiveness, WorkerSupervision,
+        AggregateVersion, CompactionOutcome, Cqrs, DeadLetter, DeadLetterDiscard, DeadLetterFilter,
+        DeadLetterRetry, DeadLetterRetrySummary, DeletedStreams, Dispatch, Escalation,
+        EscalationReason, EventSink, EventStore, InMemoryEventStore, InlineProjection, Liveness,
+        NoSink, ObservedEvent, PersistedEvent, Policy, PolicyCondition, PolicyRunner,
+        PolicyRunnerBuilder, PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore,
+        PostgresEventStore, PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter,
+        StreamScope, WorkerLiveness, WorkerSupervision,
     };
 }
