@@ -823,6 +823,12 @@ impl PostgresEventStore {
     ///
     /// An empty set returns at once without calling `read_models`; a set naming no stream
     /// calls it with an empty slice and deletes nothing.
+    ///
+    /// **Call it only once every process runs this release.** A Policy runner of an earlier
+    /// release does not wait for a deletion, and can write a place or park a dead letter
+    /// for a stream after it; an earlier release's first registration of an inline
+    /// projection does not either, and can write view rows for it. Upgrade, or stop, every
+    /// process that runs Policies or registers inline projections before the first call.
     pub async fn delete_streams<F>(
         &self,
         stream_ids: &[Urn],

@@ -770,3 +770,47 @@ async fn a_deletion_waits_for_a_first_registration_still_building_postgres_test(
         .expect("the deletion must succeed once the build is done");
     assert_eq!(deleted.events, 1);
 }
+
+/// A stream whose first append has not committed has no row the deletion can lock, so it
+/// is not the deletion's: it is not handed to the closure, and its events survive the
+/// deletion whether they commit during it or after it.
+///
+/// Forced rather than raced for: the first append is held open across the whole deletion.
+#[tokio::test]
+async fn a_first_append_in_flight_is_not_deleted_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let store = PostgresEventStore::new(pool.clone());
+    stock(&store, "existing", "old").await;
+
+    let first_append = hold_an_append_open(&pool, "fresh").await;
+    let deleted = store
+        .delete_streams(
+            &[
+                ShelfUrn::new("existing").unwrap().into(),
+                ShelfUrn::new("fresh").unwrap().into(),
+            ],
+            |conn, ids| {
+                assert_eq!(
+                    ids,
+                    &[Urn::from(ShelfUrn::new("existing").unwrap())][..],
+                    "a stream with no committed row is not handed over"
+                );
+                no_read_models(conn, ids)
+            },
+        )
+        .await
+        .expect("the deletion must not wait for an uncommitted stream");
+    first_append
+        .commit()
+        .await
+        .expect("the first append must commit");
+
+    assert_eq!(deleted.streams, 1);
+    assert_eq!(deleted.events, 1);
+    assert!(events_of(&pool, "existing").await.is_empty());
+    assert_eq!(
+        events_of(&pool, "fresh").await.len(),
+        1,
+        "the first append's event survives the deletion"
+    );
+}

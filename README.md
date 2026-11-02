@@ -2318,6 +2318,14 @@ in flight, and for a catch-up or a build of any inline projection, whichever pro
 registered it; those waits, and your closure's, are bounded by the
 [stream lock wait](#stream-lock-wait).
 
+**Upgrade every process before the first deletion.** What keeps a running Policy, a
+catch-up and a build from writing for a deleted stream is in this release, on their side:
+a Policy runner of an earlier release can still write a place or park a dead letter for a
+stream after its deletion, and an earlier release registering an inline projection for the
+first time can still write view rows for it. Do not call `delete_streams` until every
+process that runs a Policy runner or registers an inline projection runs this release, or
+the ones that do not are stopped.
+
 Why a deletion takes what it takes, and what it leaves:
 [ADR-0033](docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md).
 

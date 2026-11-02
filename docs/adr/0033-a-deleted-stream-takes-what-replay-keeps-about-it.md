@@ -87,6 +87,12 @@ with the caller's own read-model deletion inside the same transaction.**
   refused as a conflict and retried, as an initialization error already is.
 - **A poll spanning a deletion *and* a recreation can deliver some of the new stream's
   events twice**, the second time in order, as at-least-once delivery already allows.
+- **Deleting needs every process upgraded first.** The guarantees above are kept by the
+  writers as much as by the deletion: a Policy runner, or a first registration of an
+  inline projection, from an earlier release can still write for a stream after its
+  deletion — a place that skips the recreated stream's events, a dead letter nothing can
+  retry, a view row for nothing. The rollout rule is to call it only once every process
+  that runs Policies or registers inline projections runs this release, or is stopped.
 - The consumer's runbook SQL can be replaced by this call.
 
 [Stream place]: ../../CONTEXT.md#stream-place
