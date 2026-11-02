@@ -1810,13 +1810,20 @@ each projection version exactly once. But:
   without being applied, so quiesce such writers until it has returned.
 
 **After a logical restore** (`pg_dump`/`pg_restore` into another cluster), the restored
-horizons and marks name transaction ids of the old cluster, which the new one may hand out
-again. Before the first append, make every projection adopt the restored log as it stands:
+commit stamps, horizons and marks name transaction ids of the old cluster, which the new
+one may not have reached yet, or may hand out again. Before the first append, give every
+restored event the pre-stamp sentinel (`0`, what events written before migration 0018
+carry, ordering before every real id) and make every projection adopt the restored log as
+it stands:
 
 ```sql
+UPDATE events SET commit_txid = '0'::xid8 WHERE commit_txid <> '0'::xid8;
 UPDATE projections SET caught_up_below = NULL, caught_up_version = NULL;
 TRUNCATE projection_applied_transactions;
 ```
+
+Without the first statement, a restored stamp ahead of the new counter is invisible to the
+adoption snapshot and would be caught up — applied again — once the counter reaches it.
 
 A physical restore or a replica promotion keeps the cluster's transaction counter and needs
 nothing.
