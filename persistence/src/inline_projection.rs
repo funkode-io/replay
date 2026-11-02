@@ -35,10 +35,14 @@ pub trait InlineProjection: Send + Sync {
     fn version(&self) -> i32;
 
     /// Events to replay when this projection is first registered or rebuilt after a
-    /// version bump, and to read when it catches up on appends that did not apply it.
+    /// version bump.
     ///
-    /// Returned filter narrows which streams/events the store scans during a replay or a
-    /// catch-up, so unrelated history is not read. Defaults to [`StreamFilter::All`].
+    /// Returned filter narrows which streams/events the store scans during either
+    /// replay, so unrelated history is not read. Defaults to [`StreamFilter::All`].
+    ///
+    /// The live append does not apply it, and neither does the catch-up that stands in
+    /// for the live append of a process without this projection (ADR-0032); to narrow
+    /// those, declare [`event_types`](Self::event_types).
     ///
     /// Whatever the filter, a replay reads the true log (ADR-0004): archived
     /// originals and the real events appended after a compaction, never compaction

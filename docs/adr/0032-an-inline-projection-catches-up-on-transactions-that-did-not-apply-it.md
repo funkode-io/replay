@@ -77,10 +77,17 @@ One catch-up of one projection is one transaction:
    this process's code version, stop: a process must never apply its logic to a view
    another version owns.
 3. Page through the events with `commit_txid >= caught_up_below`, visible in `S`, with no
-   applied mark for this version, matching the projection's filter — in `global_position`
-   order (ADR-0018), compaction snapshots excluded (ADR-0004), at most
+   applied mark for this version, of the projection's declared event types — in
+   `global_position` order (ADR-0018), compaction snapshots excluded (ADR-0004), at most
    `projection_flush_size` per page, and hand each page to `handle`. With no horizon for
    the stored version, read nothing: the log is **adopted** as it stands.
+
+   Not narrowed by `stream_filter()`: a catch-up stands in for the live append, which has
+   never applied that filter, so it reads what the live path would have been offered. An
+   append from a process without the projection must end up as one from a process with
+   it. Reading the gap through that filter would also let a concurrent compaction move an
+   archived row out of a `WithAggregateVersion` page before it was read, while the seal
+   accounted for its transaction.
 4. Seal: mark every transaction at or above `xmin(S)` that `S` shows as committed, set
    `caught_up_below = xmin(S)` for this version, and delete the marks below it and the
    marks of older versions.
@@ -123,7 +130,10 @@ the process.
   lock rather than skipping.
 
 A caught-up projection costs, per round, an indexed read of the events above its horizon
-and the seal, both proportional to the transactions since the oldest one still running.
+and the seal, both proportional to the events committed since the oldest transaction still
+running when the round began. Under a long transaction that is a rescan, every round, of
+everything committed while it runs; a seal that remembered what it had already marked would
+avoid it, and is left for when a deployment measures it.
 
 ### Event types
 
@@ -131,8 +141,8 @@ and the seal, both proportional to the transactions since the oldest one still r
 When it does, the rebuild replay, the catch-up and the live path all skip events of any
 other type before deserializing them, so the three agree on the types they deliver.
 Undeclared (the default) keeps deserialize-or-skip routing (ADR-0002). The live path still
-ignores `stream_filter()`, as it always has: that filter narrows what a replay or a
-catch-up reads.
+ignores `stream_filter()`, as it always has, and so does the catch-up: that filter narrows
+what a replay reads.
 
 ## Delivery contract
 
@@ -142,14 +152,20 @@ exactly once. What a projection must still tolerate, and the docs say so:
 - **Late arrival.** A caught-up event can land after a later event of the same stream was
   applied live. Handlers that care about order guard on a value the view keeps.
 - **Re-application across versions.** An event an older version applied during a rollout
-  is applied again by the newer version: the newer logic must win, and an upsert lets it.
+  is applied again by the newer version: the newer logic must win. An upsert that sets
+  values lets it; one that accumulates (a running balance) counts the event twice, so a
+  projection whose `handle` is not idempotent should take every version bump as a
+  stop-then-start deploy, as it had to before.
 - **The upgrade to this release.** Processes of an earlier release write no marks, so the
   events they append — with the projection registered or not — are caught up by the first
   processes of this one. A projection whose `handle` is not idempotent should take this
   upgrade as a stop-then-start deploy. A registry row written before this release has no
   horizon; the first catch-up **adopts** the log as it stands, marking every transaction
   visible above `xmin(S)` without applying it, so history before the upgrade is not
-  replayed. A version bump is still how a projection repairs history it missed before.
+  replayed. That includes an append committed by a process without the projection between
+  the first upgraded process starting and its adoption: the guarantee begins at the
+  adoption, so such writers should be quiesced until the first upgraded `build()` has
+  returned. A version bump is still how a projection repairs history it missed before.
 
 ## Considered options
 
@@ -169,18 +185,20 @@ exactly once. What a projection must still tolerate, and the docs say so:
 
 ## Consequences
 
-- **Every append with a matching projection writes one mark per projection.** The table
+- **Every append through a store with projections writes one mark per projection.** The table
   holds marks above the horizon only; each round deletes the rest.
 - **A long transaction holds the horizon back, not the catch-up.** Commits after it are
   still applied, by their marks; the horizon moves once it ends. A bulk lane
-  ([#288](https://github.com/funkode-io/replay/issues/288)) is not blocked by a catch-up,
-  which takes no stream lock.
+  ([#288](https://github.com/funkode-io/replay/issues/288)) is not blocked by another
+  process's catch-up, which takes no stream lock; in the catch-up's own process the next
+  bullet holds.
 - **A catch-up holds the projection's in-process lock while it runs.** Every append in the
   same process offers its events to every projection, so all of them wait for it. A
   catch-up that waits on a view row an append of this process holds, while that append
   waits for the lock, is a deadlock Postgres cannot see; the catch-up's row-lock waits are
-  bounded by the stream lock wait (ADR-0022), which breaks it, and a stream lock wait of
-  zero removes that bound.
+  bounded by the stream lock wait (ADR-0022), which breaks it — by the 30 s default when a
+  consumer sets that wait to zero, since zero cannot mean "forever" for a wait half of
+  which Postgres cannot see.
 - **Schema.** Migration 0038 adds the column and the table. It is additive: an earlier
   release runs unchanged against it, and its rows read as "no horizon yet".
 - The in-memory store is single-process and test-only; it has nothing to catch up.

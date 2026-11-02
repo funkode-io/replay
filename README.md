@@ -1795,14 +1795,19 @@ each projection version exactly once. But:
   applied live. A handler whose result depends on order should guard on a value its view
   keeps.
 - **Re-application across versions.** An event an older version applied live during a
-  rollout is applied again by the newer version. Write the view with upserts, so the newer
-  logic wins.
+  rollout is applied again by the newer version. Write the view with upserts that set
+  values, so the newer logic wins. One that accumulates, like the running balance above,
+  counts that event twice: take every version bump of such a projection as a
+  stop-then-start deploy, as before this release.
 - **The upgrade to this release.** Processes of earlier releases record nothing, so the
   events they append after the first upgraded process starts — *with* the projection
   registered or not — are caught up by the upgraded ones. A handler that is not idempotent,
   like the running balance above, should take this one upgrade as a stop-then-start deploy.
   History from before the upgrade is not replayed: the first catch-up adopts the log as it
   stands, and a version bump is still how a projection repairs history it missed earlier.
+  The guarantee starts at that adoption, in the first upgraded `build()`: an append by a
+  process *without* the projection that commits while that build runs can be adopted
+  without being applied, so quiesce such writers until it has returned.
 
 **Migrate, then deploy.** Migration 0038 is additive — earlier releases run unchanged against
 it — and this release needs it before its first append or `build()`.
