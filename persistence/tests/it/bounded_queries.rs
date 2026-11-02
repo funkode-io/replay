@@ -159,13 +159,14 @@ const REVIEWED: &[Reviewed] = &[
                         id, so a pass over a whole scope holds one chunk at a time.",
     },
     Reviewed {
-        file: "src/infrastructure/postgres.rs",
-        function: "load_replay_chunk",
-        justification: "SQL carries LIMIT $chunk_size, the store's projection_flush_size \
+        file: "src/infrastructure/projection_catch_up.rs",
+        function: "load_page",
+        justification: "SQL carries LIMIT $limit, the store's projection_flush_size \
                         (default 500): one keyset page of an inline projection's history \
-                        replay, handed to the projection before the next is read \
-                        (funkode-io/replay#157). Compaction snapshots are excluded, so a \
-                        rebuild reads the true log once (funkode-io/replay#274).",
+                        replay or catch-up gap, handed to the projection before the next is \
+                        read (funkode-io/replay#157, ADR-0032). Compaction snapshots are \
+                        excluded, so a rebuild reads the true log once \
+                        (funkode-io/replay#274).",
     },
 ];
 
