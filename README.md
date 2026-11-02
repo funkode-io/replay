@@ -2291,15 +2291,22 @@ What goes, for each id:
 - every Policy's [place](#how-a-policy-tracks-where-it-is) in it, so a stream created
   later under the same id is delivered from its first event — left behind, the old place
   would skip the new stream's events up to wherever the Policy had got in the old one;
-- every parked dead letter whose triggering event was one of those events, archived with
-  reason `stream_deleted`: a dead letter whose event is gone can never be retried. A dead
-  letter *addressed to* the stream by an event of another stream stays, since its trigger
-  is still there;
+- every parked dead letter whose triggering event was one of those events, deleted
+  rather than archived: a deletion is a cleanup, and a dead letter whose event is gone
+  can never be retried. Dead letters that had already left the active set stay in the
+  archive as history. A dead letter *addressed to* the stream by an event of another
+  stream stays, since its trigger is still there;
 - whatever your closure deletes. An inline projection cannot see a delete — it is handed
   events, and a deletion is not one — so its rows, and any other read model you keep, are
   yours to delete here. The closure runs before the library's own deletes, so the streams
   and their events can still be read from it; if it returns an error, nothing is
   deleted.
+
+Only streams that exist when the deletion locks them are deleted or handed to the
+closure. An id with no stream is ignored, even if a stream is created under it while the
+deletion runs: the closure never saw that stream, so its events are left whole. An empty
+list returns at once without calling the closure; a non-empty list naming no stream calls
+it with an empty slice.
 
 A stream created again under a deleted id is a new stream: numbered from 1, delivered to
 Policies from its first event, and applied to inline projections — live, or by a
@@ -2311,10 +2318,7 @@ in flight, and for a catch-up or a build of any inline projection, whichever pro
 registered it; those waits, and your closure's, are bounded by the
 [stream lock wait](#stream-lock-wait).
 
-Requires migration
-[0039](persistence/tests/migrations/0039_dead_letter_stream_deleted.sql), which adds the
-`stream_deleted` archive reason; run it before the release that deletes. Why a deletion
-takes what it takes, and what it leaves:
+Why a deletion takes what it takes, and what it leaves:
 [ADR-0033](docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md).
 
 ## Policies
@@ -3281,7 +3285,7 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
     error_kind       TEXT        NOT NULL,
     error_message    TEXT        NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL,   -- when the dead letter was written
-    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded' | 'superseded' | 'stream_deleted'
+    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded' | 'superseded'
     discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     aggregate_name   TEXT,                   -- identity the row carried, kept as-is
     target_stream_id TEXT,
@@ -3299,8 +3303,9 @@ CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy
 
 `superseded` is the third way out, and the only one no operator asked for: the
 duplicate generations the dedupe migration retired when a parked command became
-unique. `stream_deleted` is the fourth: the rows whose triggering event went with its
-stream ([Deleting streams](#deleting-streams)).
+unique. A [stream deletion](#deleting-streams) is the one exit that archives nothing:
+it is a cleanup, and deletes the parked rows whose triggering event went with the
+stream.
 
 #### `A::Error: Into<replay::Error>` migration note
 

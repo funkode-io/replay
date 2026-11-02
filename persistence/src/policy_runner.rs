@@ -1054,7 +1054,7 @@ impl PolicyRunner {
 
         let Some(raw) = load_event_by_id(&self.pool, event_id).await? else {
             // A deletion of the event's stream that committed since the group was read
-            // archived the group with it (ADR-0033): nothing is left to settle, as for a
+            // deleted the group with it (ADR-0033): nothing is left to settle, as for a
             // group discarded meanwhile. A group still parked against an event that is
             // gone is one nothing in this library removed, and is reported.
             if group_digest(&self.pool, &reaction).await?.rows == 0 {
@@ -3857,8 +3857,8 @@ enum Parking {
 /// **Nothing is parked for an event that is gone.** The row is written only while the
 /// triggering event is still in the log, held by a key-share lock until the write commits,
 /// and `None` says it was not. A deletion of the event's stream (ADR-0033) locks every
-/// event of it before it archives the stream's dead letters, so it either waits for this
-/// write and archives the row with the rest, or has already taken the event — and a row
+/// event of it before it deletes the stream's dead letters, so it either waits for this
+/// write and deletes the row with the rest, or has already taken the event — and a row
 /// parked after it would be one no retry could ever settle.
 ///
 /// [`retry_dead_letter`]: PolicyRunner::retry_dead_letter
@@ -4123,7 +4123,7 @@ async fn lock_group(
 /// isolation level before the transaction's first query.
 ///
 /// The triggering event is locked before the group, the order a deletion of its
-/// stream takes them in (ADR-0033): events, then the dead letters it archives.
+/// stream takes them in (ADR-0033): events, then the dead letters it deletes.
 /// Locked the other way round, a settlement that parks a command it had not parked
 /// — which locks the event — would deadlock a deletion waiting on the group. An
 /// event that is already gone locks nothing, and its group has gone with it.
@@ -5494,6 +5494,12 @@ async fn read_sweep(
 /// commits. That is the at-least-once side of the trade: a `Now` Policy may see an event
 /// from just before it started, and never misses one from just after.
 ///
+/// A stream deleted (ADR-0033) under the snapshot this reads fails it as a conflict rather
+/// than seeding a place for the stream later recreated under that id, which would skip the
+/// new stream's events up to the old head. The claim rolls back with it, so the retry —
+/// the daemon's, after an initialization error, or the next manual drain — bootstraps
+/// afresh.
+///
 /// The two reads it takes — where the log ends, and where each stream ends — have to be
 /// one snapshot, which is why this runs in a `REPEATABLE READ` transaction. Read
 /// separately, a write committing between them is seeded as processed while sitting above
@@ -5552,9 +5558,31 @@ async fn bootstrap(
     };
 
     // Only the streams the Policy tracks: a row for any other would be one it never reads
-    // or writes again (ADR-0031). `$2` NULL is every stream. One statement for both, unlike
-    // the reconciliation: this runs once in a Policy's life.
+    // or writes again (ADR-0031). A NULL type array is every stream, in both statements:
+    // unlike the reconciliation, this runs once in a Policy's life.
+    //
+    // Each seeded place is held to the head event it was read at until it commits, every
+    // head locked before any place is written, in position order — the order a deletion
+    // and a checkpoint lock events in. A deletion then either waits and deletes the seeded
+    // place, or has deleted the head since this snapshot, which the server refuses as a
+    // serialization failure. Locking the heads rather than the streams leaves an append
+    // free to move a head meanwhile. Archived events count: an empty compaction archives
+    // the head this snapshot saw without writing a new one. One key-share lock per tracked
+    // stream, once in the Policy's life.
     if matches!(start_at, StartAt::Now) {
+        sqlx::query(
+            "SELECT count(*) FROM ( \
+                 SELECT e.id FROM streams s \
+                   JOIN events e ON e.stream_id = s.id AND e.stream_seq = s.stream_seq \
+                  WHERE s.stream_seq > 0 AND ($1::text[] IS NULL OR s.type = ANY($1)) \
+                  ORDER BY e.global_position FOR KEY SHARE OF e \
+             ) heads",
+        )
+        .bind(tracked.as_column())
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db_error)?;
+
         sqlx::query(
             "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
              SELECT $1, s.id, s.stream_seq FROM streams s \
@@ -8255,6 +8283,91 @@ mod progress_tests {
         );
     }
 
+    /// A Policy started for the first time at `Now` while a stream is being deleted does
+    /// not seed the stream recreated under that id with the old one's head (ADR-0033):
+    /// that place would skip the new stream's first events.
+    #[tokio::test]
+    async fn a_deletion_during_bootstrap_cannot_seed_a_recreated_stream_postgres_test() {
+        assert_bootstrap_rejects_deleted_head(false).await;
+    }
+
+    /// The same when the head the bootstrap saw had been archived by a compaction that
+    /// wrote nothing new: the head is still the event its place is held to.
+    #[tokio::test]
+    async fn an_archived_head_still_guards_bootstrap_against_deletion_postgres_test() {
+        assert_bootstrap_rejects_deleted_head(true).await;
+    }
+
+    async fn assert_bootstrap_rejects_deleted_head(archived: bool) {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 3).await;
+        if archived {
+            // An empty compaction archives every event without advancing stream_seq.
+            sqlx::query("UPDATE events SET aggregate_version = 1")
+                .execute(&pool)
+                .await
+                .expect("the old events must be archived");
+            sqlx::query("UPDATE streams SET version = 0")
+                .execute(&pool)
+                .await
+                .expect("the compacted stream must have no live events");
+        }
+
+        // Pause the real bootstrap after it has claimed its row and fixed its snapshot,
+        // before it can read or lock events. The deleting transaction owns the gate.
+        let mut deleting = pool.begin().await.expect("the deletion must begin");
+        sqlx::query("LOCK TABLE events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *deleting)
+            .await
+            .expect("the bootstrap gate must lock");
+        let bootstrapping = tokio::spawn({
+            let pool = pool.clone();
+            async move { PolicyProgress::load(&pool, POLICY, StartAt::Now, TrackedStreams::Every).await }
+        });
+        await_blocked_on(&pool, "events").await;
+
+        let ids = vec!["urn:probe:a".to_string()];
+        deletion::lock_streams(&mut deleting, &ids)
+            .await
+            .expect("the stream must lock");
+        deletion::lock_events(&mut deleting, &ids)
+            .await
+            .expect("the events must lock");
+        finish_deletion(deleting, &["urn:probe:a"]).await;
+
+        let result = bootstrapping.await.expect("the bootstrap must finish");
+        let Err(error) = result else {
+            panic!("a deleted stream must invalidate the bootstrap snapshot");
+        };
+        assert_eq!(error.kind(), replay::ErrorKind::Conflict, "{error}");
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "a stale place must not survive the failed bootstrap"
+        );
+        assert!(
+            super::read_sweep(&pool, POLICY).await.unwrap().is_none(),
+            "the failed bootstrap must roll back its claim so the worker can retry"
+        );
+
+        // The daemon retries this same load after an initialization error. Its fresh
+        // snapshot sees the deletion, and a stream recreated afterwards starts at zero.
+        PolicyProgress::load(&pool, POLICY, StartAt::Now, TrackedStreams::Every)
+            .await
+            .expect("retrying the bootstrap with a fresh snapshot must succeed");
+        append_events(&pool, "urn:probe:a", 1).await;
+        assert!(
+            places(&pool, &["urn:probe:a"]).await.is_empty(),
+            "the recreated stream must have no inherited place"
+        );
+        assert_eq!(
+            streams_behind(&pool, POLICY, &TrackedStreams::Every, "", 10)
+                .await
+                .unwrap(),
+            vec!["urn:probe:a".to_string()],
+            "the recreated stream's first event must be owed"
+        );
+    }
+
     /// Wait until something is queued behind a lock on `relation`.
     async fn await_blocked_on(pool: &PgPool, relation: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -8309,9 +8422,9 @@ mod progress_tests {
         streams: &[&str],
     ) {
         let ids: Vec<String> = streams.iter().map(|s| (*s).to_string()).collect();
-        deletion::archive_dead_letters(&mut tx, &ids)
+        deletion::delete_dead_letters(&mut tx, &ids)
             .await
-            .expect("archiving the dead letters must succeed");
+            .expect("deleting the dead letters must succeed");
         deletion::delete_places(&mut tx, &ids)
             .await
             .expect("deleting the places must succeed");
@@ -8874,7 +8987,7 @@ mod settlement_tests {
     /// then settles nothing and parks nothing (ADR-0033).
     ///
     /// The settlement locks the triggering event before the group, the order the deletion
-    /// takes them in, so it queues instead of deadlocking it. The deletion archives the
+    /// takes them in, so it queues instead of deadlocking it. The deletion deletes the
     /// group and commits under the settlement's snapshot, which the server refuses as a
     /// conflict; the settlement tries once more against the emptied group, finds the event
     /// gone, and has nothing to park the failure the replay found against.
@@ -8940,11 +9053,10 @@ mod settlement_tests {
             .fetch_one(&pool)
             .await
             .expect("the dead letters must be countable");
-        let archived: Option<String> =
-            sqlx::query_scalar("SELECT string_agg(reason, ', ') FROM discarded_dead_letters")
-                .fetch_one(&pool)
-                .await
-                .expect("the archive must be readable");
+        let archived: i64 = sqlx::query_scalar("SELECT count(*) FROM discarded_dead_letters")
+            .fetch_one(&pool)
+            .await
+            .expect("the archive must be readable");
 
         assert!(
             !settled.any_still_failing,
@@ -8952,15 +9064,14 @@ mod settlement_tests {
         );
         assert_eq!(active, 0, "nothing is parked for an event that is gone");
         assert_eq!(
-            archived.as_deref(),
-            Some("stream_deleted"),
-            "the deletion archived the group; the settlement archived nothing"
+            archived, 0,
+            "the deletion deleted the group; the settlement archived nothing"
         );
     }
 
     /// A delivery that failed on an event its stream's deletion is taking parks nothing
     /// (ADR-0033): it waits for the deletion, then finds the event gone. A row parked after
-    /// the deletion archived the stream's dead letters would be one no retry could settle,
+    /// the deletion deleted the stream's dead letters would be one no retry could settle,
     /// and it used to abort the bulk retry of everything its Policy had parked.
     ///
     /// Forced rather than raced for: the park is made while the deletion holds the event,

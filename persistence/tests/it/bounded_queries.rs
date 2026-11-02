@@ -159,6 +159,13 @@ const REVIEWED: &[Reviewed] = &[
                         id, so a pass over a whole scope holds one chunk at a time.",
     },
     Reviewed {
+        file: "src/infrastructure/stream_deletion.rs",
+        function: "lock_streams",
+        justification: "At most one row per id the caller asked to delete: SQL LIMIT is \
+                        cardinality($1), the length of the caller's own id list, and each \
+                        row is one stream id.",
+    },
+    Reviewed {
         file: "src/infrastructure/projection_catch_up.rs",
         function: "load_page",
         justification: "SQL carries LIMIT $limit, the store's projection_flush_size \

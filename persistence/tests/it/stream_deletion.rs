@@ -6,10 +6,11 @@
 //! what an operator or a consumer can see — what a Policy delivers, what is parked, what a
 //! read model holds — never the statements the deletion ran.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use sqlx::{postgres::PgPoolOptions, PgConnection, PgPool};
+use tokio::sync::Notify;
 use urn::Urn;
 
 use replay_macros::define_aggregate;
@@ -114,10 +115,11 @@ async fn a_stream_recreated_under_a_deleted_id_is_delivered_from_its_first_event
 }
 
 /// A dead letter whose triggering event is gone can never be retried, and used to abort
-/// the bulk retry of everything its Policy had parked. The deletion archives it with its
-/// stream; a dead letter of another stream is left as it was.
+/// the bulk retry of everything its Policy had parked. A deletion is a cleanup, so it
+/// deletes it with its stream, archiving nothing; a dead letter of another stream is left
+/// as it was.
 #[tokio::test]
-async fn the_dead_letters_of_a_deleted_stream_leave_the_active_set_postgres_test() {
+async fn the_dead_letters_of_a_deleted_stream_are_deleted_with_it_postgres_test() {
     let harness = PolicyDaemonHarness::start("parked", |builder, policy| {
         builder.register_policy_fn::<ProbeEvent, _>(
             policy,
@@ -142,15 +144,9 @@ async fn the_dead_letters_of_a_deleted_stream_leave_the_active_set_postgres_test
     assert_eq!(parked.len(), 1, "only the deleted stream's row leaves");
     assert_eq!(parked[0].event_id, kept.event_id);
 
-    let archived = harness.archived_dead_letters().await;
-    assert_eq!(archived.len(), 1);
-    assert_eq!(
-        archived[0].reason, "stream_deleted",
-        "archived, not destroyed, and named for why it left"
-    );
-    assert_ne!(
-        Some(archived[0].dead_letter_id),
-        parked.first().map(|row| row.id)
+    assert!(
+        harness.archived_dead_letters().await.is_empty(),
+        "deleted, not archived: nothing of it is left behind"
     );
 
     // The bulk retry walks what is left without tripping over an event that is gone.
@@ -245,7 +241,13 @@ async fn deleting_streams_that_do_not_exist_deletes_nothing_postgres_test() {
 
     assert_eq!(
         store
-            .delete_streams(&[probe("never-written")], no_read_models)
+            .delete_streams(&[probe("never-written")], |conn, ids| {
+                assert!(
+                    ids.is_empty(),
+                    "the closure only receives streams that exist"
+                );
+                no_read_models(conn, ids)
+            })
             .await
             .expect("an unknown id is not an error"),
         DeletedStreams::default()
@@ -392,6 +394,144 @@ async fn events_of(pool: &PgPool, shelf: &str) -> Vec<uuid::Uuid> {
         .fetch_all(pool)
         .await
         .expect("reading the log must succeed")
+}
+
+fn delete_shelf_view<'c>(
+    conn: &'c mut PgConnection,
+    deleted: &'c [Urn],
+) -> BoxFuture<'c, Result<(), replay::Error>> {
+    Box::pin(async move {
+        let ids: Vec<String> = deleted.iter().map(Urn::to_string).collect();
+        sqlx::query("DELETE FROM shelf_view WHERE stream_id = ANY($1)")
+            .bind(&ids)
+            .execute(conn)
+            .await
+            .map_err(replay_persistence::db_error)?;
+        Ok(())
+    })
+}
+
+/// A stream created under an id the deletion was asked for, but which did not exist when
+/// the deletion locked its streams, is left whole: the caller's read-model deletion never
+/// saw it, so deleting its events would leave its view rows behind.
+#[tokio::test]
+async fn a_stream_created_during_deletion_keeps_its_events_and_view_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let store = store_with_view(&pool).await;
+    stock(&store, "existing", "old").await;
+    let ready = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let deleting = tokio::spawn({
+        let store = store.clone();
+        let ready = Arc::clone(&ready);
+        let resume = Arc::clone(&resume);
+        async move {
+            store
+                .delete_streams(
+                    &[
+                        ShelfUrn::new("existing").unwrap().into(),
+                        ShelfUrn::new("new").unwrap().into(),
+                    ],
+                    |conn, ids| {
+                        Box::pin(async move {
+                            assert_eq!(ids.len(), 1, "only the stream that exists is handed over");
+                            delete_shelf_view(conn, ids).await?;
+                            ready.notify_one();
+                            resume.notified().await;
+                            Ok(())
+                        })
+                    },
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), ready.notified())
+        .await
+        .expect("the read-model deletion must start");
+    stock(&store, "new", "concurrent").await;
+    resume.notify_one();
+    let deleted = deleting.await.unwrap().expect("deletion must succeed");
+    assert_eq!(deleted.streams, 1);
+    assert_eq!(deleted.events, 1);
+    assert!(events_of(&pool, "existing").await.is_empty());
+    assert!(view_of(&pool, "existing").await.is_empty());
+    assert_eq!(events_of(&pool, "new").await.len(), 1);
+    assert_eq!(view_of(&pool, "new").await, events_of(&pool, "new").await);
+}
+
+/// An inline projection whose view has a foreign key to `streams` takes the stream's row
+/// when it writes; a build of it running while a deletion starts must finish first rather
+/// than deadlock against the deletion's lock on that row.
+#[tokio::test]
+async fn a_deletion_waits_for_a_build_with_a_stream_foreign_key_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let store = PostgresEventStore::new(pool.clone());
+    stock(&store, "building", "first").await;
+    sqlx::query(
+        "CREATE TABLE shelf_view (event_id uuid PRIMARY KEY, \
+         stream_id text NOT NULL REFERENCES streams(id))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let ready = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let building = tokio::spawn({
+        let pool = pool.clone();
+        let ready = Arc::clone(&ready);
+        let resume = Arc::clone(&resume);
+        async move {
+            PostgresEventStore::builder(pool)
+                .projection_catch_up_interval(Duration::ZERO)
+                .register_postgres_event_handler::<ShelfEvent, _>(
+                    "shelf_view",
+                    1,
+                    move |conn, events: &[PersistedEvent<ShelfEvent>]| {
+                        let ready = Arc::clone(&ready);
+                        let resume = Arc::clone(&resume);
+                        Box::pin(async move {
+                            ready.notify_one();
+                            resume.notified().await;
+                            for event in events {
+                                sqlx::query(
+                                    "INSERT INTO shelf_view (event_id, stream_id) VALUES ($1, $2)",
+                                )
+                                .bind(event.id)
+                                .bind(event.stream_id.to_string())
+                                .execute(&mut *conn)
+                                .await
+                                .map_err(replay_persistence::db_error)?;
+                            }
+                            Ok(())
+                        })
+                    },
+                )
+                .build()
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), ready.notified())
+        .await
+        .expect("the build must reach the projection");
+    let deleting = tokio::spawn(async move {
+        store
+            .delete_streams(
+                &[ShelfUrn::new("building").unwrap().into()],
+                delete_shelf_view,
+            )
+            .await
+    });
+    await_a_lock_wait(&pool).await;
+    resume.notify_one();
+    let (built, deleted) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(building, deleting)
+    })
+    .await
+    .expect("the build and deletion must finish");
+    built.unwrap().expect("the build must not deadlock");
+    assert_eq!(deleted.unwrap().expect("deletion must succeed").events, 1);
+    assert!(events_of(&pool, "building").await.is_empty());
+    assert!(view_of(&pool, "building").await.is_empty());
 }
 
 /// An inline projection cannot see a delete, so its rows are the caller's to delete, in

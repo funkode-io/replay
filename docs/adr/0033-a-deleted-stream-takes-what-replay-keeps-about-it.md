@@ -32,9 +32,13 @@ ways only Replay can see:
 with the caller's own read-model deletion inside the same transaction.**
 
 - The streams and all their events go, every Policy's place in them goes, and the dead
-  letters their events triggered leave the active set, archived as `stream_deleted`. The
+  letters their events triggered are deleted — not archived: a deletion is a cleanup.
+  Dead letters that had already left the active set stay in the archive as history. The
   caller's read-model deletion runs in the same transaction, and a failure of either half
   undoes both.
+- Only streams that exist when the deletion locks them are deleted and handed to the
+  caller. An id with no stream is ignored, even if a stream is created under it while the
+  deletion runs: the caller never saw it, so it is left whole.
 - A stream recreated under a deleted id is a **new stream**: numbered from 1, delivered
   to Policies from its first event, applied to inline projections like any other.
 - A running Policy, inline-projection catch-up or rebuild never writes for a stream after
@@ -52,8 +56,9 @@ with the caller's own read-model deletion inside the same transaction.**
   on where the old one stopped and no place needs deleting. Then the stream is not
   deleted: its row pins the old type, every Policy behind its head counts it as owed for
   ever, and the catalog delete the consumer asked for does not happen.
-- **Destroy the dead letters** rather than archive them. Every other way out of the
-  active set archives, and a parked failure has never left the schema without a record.
+- **Archive the dead letters** with a reason of their own, as every other way out of the
+  active set does. A deletion is a cleanup of an aggregate that is gone: a record of
+  failures against events that no longer exist is state nobody can act on.
 - **An `InlineProjection` hook** for each registered inline projection to forget streams.
   A default that does nothing leaves rows silently, and a consumer's read models are not
   all inline projections; one closure covers both and cannot be forgotten.
@@ -66,23 +71,25 @@ with the caller's own read-model deletion inside the same transaction.**
 
 ## Consequences
 
-- **Migration 0039** adds the `stream_deleted` archive reason; additive.
+- **No migration.**
 - **A stream place, like a version, can name two events across a deletion.** Anything
   outside Replay that kept one for a deleted stream is the caller's to clear.
 - **A Policy's writes of a first place and of a dead letter now wait for a deletion in
   flight**, and a deletion waits for appends, catch-ups and rebuilds in flight; it gives up
   as `Unavailable` after the stream lock wait.
+- **Inline projections are waited for before any stream is locked.** A read model with a
+  foreign key to `streams` takes a stream's row when it is written, so the other order
+  would deadlock a build or a catch-up against the deletion.
 - **A deletion is an operator's action**, priced as one: it costs in proportion to the
   events it deletes.
-- **Two narrow windows stay open.** A Policy started for the first time at `Now` seeds
-  its places once, unguarded, and can seed one for a stream being deleted. A Policy whose
-  poll spans a deletion *and* a recreation can deliver some of the new stream's events
-  twice, the second time in order. Both are left as at-least-once delivery already allows;
-  the first is undone by a [Cursor move].
+- **A Policy's first start at `Now` fails instead of seeding a place for a stream being
+  deleted** — a place that would skip the recreated stream's first events. The start is
+  refused as a conflict and retried, as an initialization error already is.
+- **A poll spanning a deletion *and* a recreation can deliver some of the new stream's
+  events twice**, the second time in order, as at-least-once delivery already allows.
 - The consumer's runbook SQL can be replaced by this call.
 
 [Stream place]: ../../CONTEXT.md#stream-place
 [Stream lock wait]: ../../CONTEXT.md#stream-lock-wait
 [Dead letter]: ../../CONTEXT.md#dead-letter
 [Inline projection]: ../../CONTEXT.md#inline-projection
-[Cursor move]: ../../CONTEXT.md#cursor-move

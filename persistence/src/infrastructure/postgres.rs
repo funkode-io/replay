@@ -787,13 +787,17 @@ impl PostgresEventStore {
     /// - every Policy's place in them, so a stream recreated under one of these ids is
     ///   delivered from its first event rather than skipped up to where the Policy had got
     ///   in the old one;
-    /// - from the active set, every dead letter parked for one of their events, archived
-    ///   with reason `stream_deleted`: a dead letter whose event is gone can never be
-    ///   retried. A dead letter *addressed to* one of these streams by an event of another
+    /// - every dead letter parked for one of their events, deleted rather than archived: a
+    ///   deletion is a cleanup, and a dead letter whose event is gone can never be retried.
+    ///   The archive of dead letters that already left the active set is not touched. A
+    ///   dead letter *addressed to* one of these streams by an event of another
     ///   is left, since its trigger is still there.
     ///
-    /// Before any of that it runs `read_models` on the same connection, with the ids, while
-    /// the streams and their events can still be read, so a read model keyed by something
+    /// Only streams that exist when the deletion locks them are deleted: an id that names no
+    /// stream locks nothing, so a stream created under it while the deletion runs is left
+    /// whole. Before any of the deletes it runs `read_models` on the same connection, with
+    /// the ids it locked, in the order they were asked for, while the streams and their
+    /// events can still be read, so a read model keyed by something
     /// in them can find its rows. An inline projection cannot see a delete — it is handed
     /// events, and a deletion is not one — so its rows, and any other read model the caller
     /// keeps, are the caller's to delete there. An `Err` from it, or from any step, rolls
@@ -817,8 +821,8 @@ impl PostgresEventStore {
     /// moves past them
     /// ([ADR-0033](https://github.com/funkode-io/replay/blob/main/docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md)).
     ///
-    /// An id that names no stream deletes nothing, and an empty set returns at once
-    /// without calling `read_models`. Requires migration 0039.
+    /// An empty set returns at once without calling `read_models`; a set naming no stream
+    /// calls it with an empty slice and deletes nothing.
     pub async fn delete_streams<F>(
         &self,
         stream_ids: &[Urn],
@@ -861,20 +865,30 @@ impl PostgresEventStore {
             .await
             .map_err(failed)?;
 
-        // Streams, then their events, then the inline projections, then the rows the steps
-        // below write: no other writer of these rows takes two of them in the other order,
-        // so a deletion queues rather than deadlocks (ADR-0033).
-        deletion::lock_streams(&mut tx, &ids)
+        // The inline projections, then the streams, then their events, then the rows the
+        // steps below write: no other writer of these rows takes two of them in the other
+        // order, so a deletion queues rather than deadlocks (ADR-0033). The projections
+        // come first because a build or a catch-up can take a stream row too, through a
+        // read model's foreign key to `streams`.
+        catch_up::lock_every_registered(&mut tx).await?;
+        let mut locked = deletion::lock_streams(&mut tx, &ids)
             .await
             .map_err(lock_failed)?;
+        // From here on only what was locked: sized by the caller's set, like `ids`.
+        locked.sort_unstable();
+        let ids = locked;
+        let deleting: Vec<Urn> = stream_ids
+            .iter()
+            .filter(|id| ids.binary_search(&id.to_string()).is_ok())
+            .cloned()
+            .collect();
         deletion::lock_events(&mut tx, &ids)
             .await
             .map_err(lock_failed)?;
-        catch_up::lock_every_registered(&mut tx).await?;
 
-        read_models(&mut tx, stream_ids).await?;
+        read_models(&mut tx, &deleting).await?;
 
-        let dead_letters = deletion::archive_dead_letters(&mut tx, &ids)
+        let dead_letters = deletion::delete_dead_letters(&mut tx, &ids)
             .await
             .map_err(failed)?;
         let places = deletion::delete_places(&mut tx, &ids)
