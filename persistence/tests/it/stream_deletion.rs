@@ -9,6 +9,7 @@
 use std::{sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
+use futures::{StreamExt, TryStreamExt};
 use sqlx::{postgres::PgPoolOptions, PgConnection, PgPool};
 use tokio::sync::Notify;
 use urn::Urn;
@@ -16,7 +17,7 @@ use urn::Urn;
 use replay_macros::define_aggregate;
 use replay_persistence::{
     DeletedStreams, Dispatch, EventStore, ObservedEvent, PersistedEvent, PolicySettings,
-    PostgresEventStore, StartAt,
+    PostgresEventStore, StartAt, StreamScope,
 };
 
 use crate::common;
@@ -377,6 +378,146 @@ async fn stock(store: &PostgresEventStore, shelf: &str, sku: &str) {
         )
         .await
         .expect("append must succeed");
+}
+
+#[tokio::test]
+async fn stream_ids_list_every_type_in_a_scope_and_resume_after_deletion_postgres_test() {
+    let (pool, _server) = start_pool().await;
+    let store = PostgresEventStore::builder(pool).build().await.unwrap();
+    stock(&store, "one@catalog:acme", "sku").await;
+    stock(&store, "nested@user:alice@catalog:acme", "sku").await;
+    stock(&store, "other@catalog:acme-eu", "sku").await;
+    stock(&store, "unscoped", "sku").await;
+    store
+        .store_events::<Probe>(
+            &ProbeUrn::new("one@catalog:acme").unwrap(),
+            "Probe".to_string(),
+            replay::Metadata::default(),
+            &[ProbeEvent::Pinged { tag: "ping".into() }],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let scope = StreamScope::within(&"urn:catalog:acme".parse::<Urn>().unwrap());
+    let first: Vec<Urn> = store
+        .stream_ids(scope.clone(), None)
+        .take(1)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(first, vec![probe("one@catalog:acme")]);
+    store.delete_streams(&first, no_read_models).await.unwrap();
+    let remaining: Vec<Urn> = store
+        .stream_ids(scope.clone(), first.last().cloned())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining,
+        vec![
+            ShelfUrn::new("nested@user:alice@catalog:acme")
+                .unwrap()
+                .to_urn()
+                .clone(),
+            ShelfUrn::new("one@catalog:acme").unwrap().to_urn().clone(),
+        ]
+    );
+    store
+        .delete_streams(&remaining, no_read_models)
+        .await
+        .unwrap();
+    assert!(store
+        .stream_ids(scope, None)
+        .boxed()
+        .try_next()
+        .await
+        .unwrap()
+        .is_none());
+    let survivors: Vec<Urn> = store
+        .stream_ids(StreamScope::All, None)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(survivors.len(), 2);
+}
+
+#[tokio::test]
+async fn stream_ids_match_literal_suffixes_and_prefixes_postgres_test() {
+    let (pool, _server) = start_pool().await;
+    let store = PostgresEventStore::builder(pool).build().await.unwrap();
+    for name in [
+        "literal@catalog:a%25_b",
+        "percent-wildcard@catalog:axyz25_b",
+        "underscore-wildcard@catalog:a%25xb",
+        "longer@catalog:a%25_b-extra",
+        "case@catalog:A%25_b",
+    ] {
+        stock(&store, name, "sku").await;
+    }
+    let ids: Vec<Urn> = store
+        .stream_ids(StreamScope::Suffix("@catalog:a%25_b".into()), None)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        ids,
+        vec![ShelfUrn::new("literal@catalog:a%25_b")
+            .unwrap()
+            .to_urn()
+            .clone()]
+    );
+    let prefixed: Vec<Urn> = store
+        .stream_ids(StreamScope::Prefix("urn:shelf:literal".into()), None)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(prefixed, ids);
+    assert!(store
+        .stream_ids(StreamScope::Suffix(r"@catalog:a\_b".into()), None)
+        .boxed()
+        .try_next()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn stream_ids_cross_chunks_without_holding_a_connection_postgres_test() {
+    let (pool, _server) = start_pool().await;
+    let single = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let store = PostgresEventStore::builder(single).build().await.unwrap();
+    // More than two internal chunks, with a partial final chunk.
+    for n in 0..513 {
+        stock(&store, &format!("{n:04}@catalog:bulk"), "sku").await;
+    }
+    let ids = store.stream_ids(StreamScope::Suffix("@catalog:bulk".into()), None);
+    futures::pin_mut!(ids);
+    for n in 0..513 {
+        let id = ids.try_next().await.unwrap().expect("every id is listed");
+        assert_eq!(
+            id,
+            ShelfUrn::new(format!("{n:04}@catalog:bulk"))
+                .unwrap()
+                .to_urn()
+                .clone()
+        );
+        // Deleting while the listing lives must work even with a one-connection pool.
+        store.delete_streams(&[id], no_read_models).await.unwrap();
+    }
+    assert!(ids.try_next().await.unwrap().is_none());
+    assert!(store
+        .stream_ids(StreamScope::All, None)
+        .boxed()
+        .try_next()
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// The view rows of `shelf`, as the event ids they were written for.

@@ -152,6 +152,13 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/infrastructure/postgres.rs",
+        function: "stream_ids",
+        justification: "SQL LIMIT is CHUNK_SIZE (256 ids). The keyset loop consumes \
+                        each chunk before fetching the next and releases the connection \
+                        before yielding, regardless of the number of matching streams.",
+    },
+    Reviewed {
+        file: "src/infrastructure/postgres.rs",
         function: "streams_needing_compaction_page",
         justification: "SQL carries LIMIT $limit, the caller's page size; one id per row. \
                         `Cqrs::streams_needing_compaction` calls it with \

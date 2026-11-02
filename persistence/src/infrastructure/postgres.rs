@@ -714,6 +714,59 @@ impl PostgresEventStoreBuilder {
 }
 
 impl PostgresEventStore {
+    /// List existing stream ids of every type within `scope`, in PostgreSQL's id
+    /// order, strictly after `after` (`None` starts at the beginning).
+    ///
+    /// Use [`crate::StreamScope::within`] to find all streams under a scoped URN,
+    /// including nested scopes, without needing a read model for every stream type.
+    /// Matching is literal and case-sensitive, including `%`, `_` and `\`.
+    /// Unlike the compaction listing, this includes unchanged and compacted streams.
+    ///
+    /// Reads use short keyset queries of at most 256 ids, releasing the connection
+    /// before yielding. Callers choose a page with `.take(n)` and resume with the last
+    /// id they received, even if that id has since been deleted.
+    ///
+    /// This is not a snapshot or an atomic scope deletion: concurrent inserts behind
+    /// the cursor may be missed, and ids already read may be deleted. Coordinate
+    /// writers when using this listing with [`Self::delete_streams`] for a hard delete.
+    pub fn stream_ids(
+        &self,
+        scope: crate::StreamScope,
+        after: Option<Urn>,
+    ) -> impl futures::Stream<Item = Result<Urn, replay::Error>> + Send + '_ {
+        async_stream::try_stream! {
+            const CHUNK_SIZE: usize = 256;
+            let mut cursor = after.map(|id| id.to_string());
+            loop {
+                let mut query: QueryBuilder<Postgres> =
+                    QueryBuilder::new("SELECT id FROM streams WHERE TRUE");
+                if let Some(after) = &cursor {
+                    query.push(" AND id > ").push_bind(after);
+                }
+                if let Some(pattern) = scope.like_pattern() {
+                    query.push(" AND id LIKE ").push_bind(pattern).push(" ESCAPE '\\'");
+                }
+                query.push(" ORDER BY id LIMIT ").push_bind(CHUNK_SIZE as i64);
+                // Bounded by CHUNK_SIZE; no connection or snapshot lives across a yield.
+                let ids: Vec<String> = query.build_query_scalar()
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|error| crate::db_error(error)
+                        .with_operation("stream_ids")
+                        .with_context("scope", format!("{scope:?}")))?;
+                let last_chunk = ids.len() < CHUNK_SIZE;
+                let next_cursor = ids.last().cloned();
+                for id in ids {
+                    yield crate::error::stored_stream_id(&id, "stream_ids")?;
+                }
+                if last_chunk {
+                    break;
+                }
+                cursor = next_cursor;
+            }
+        }
+    }
+
     /// Apply the just-appended events to every registered inline projection, inside the
     /// store's open transaction.
     ///

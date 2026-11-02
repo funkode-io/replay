@@ -2,14 +2,16 @@ use urn::Urn;
 
 /// Which streams a stream-level read covers, by **stream id** alone.
 ///
-/// Used by [`Cqrs::streams_needing_compaction`](crate::Cqrs::streams_needing_compaction)
+/// Used by [`PostgresEventStore::stream_ids`](crate::PostgresEventStore::stream_ids)
+/// to list streams across all types, and by
+/// [`Cqrs::streams_needing_compaction`](crate::Cqrs::streams_needing_compaction)
 /// (and the store seam behind it,
 /// [`EventStore::streams_needing_compaction_page`](crate::EventStore::streams_needing_compaction_page))
 /// to narrow a compaction pass to, for example, every stream of one tenant. It is deliberately
 /// not a [`StreamFilter`](crate::StreamFilter): that filter's variants select *events*
 /// (by metadata, `created`, `aggregate_version`, ...) and have no meaning for a row of
 /// the `streams` table, which carries only an id, a type and its versions. The aggregate
-/// type is given separately, by the reader.
+/// type, when restricted, is given separately by the reader.
 ///
 /// Matching is on the id's text as stored (`Urn::to_string`), case-sensitive. `%`, `_`
 /// and `\` in a prefix or suffix are matched literally, never as wildcards.
