@@ -762,7 +762,7 @@ impl PostgresEventStore {
     /// ([ADR-0032](https://github.com/funkode-io/replay/blob/main/docs/adr/0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)).
     ///
     /// The background task started by `build` calls the same thing on a cadence
-    /// ([`projection_catch_up_interval`](PostgresEventStoreBuilder::projection_catch_up_interval)),
+    /// (`PostgresEventStoreBuilder::projection_catch_up_interval`),
     /// skipping a projection another process is already catching up; call this when you
     /// need the views current now, or when that task is disabled.
     ///
