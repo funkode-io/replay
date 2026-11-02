@@ -40,6 +40,14 @@ pub(crate) type ErasedPostgresProjection = dyn ErasedInlineProjection<Exec = PgC
 /// not exclude each other. The value spells `RPJC`.
 const PROJECTION_LOCK_CLASS: i32 = 0x5250_4A43;
 
+/// The advisory lock on the registry as a whole: `(REGISTRY_LOCK_CLASS, 0)`. A class of its
+/// own so no projection's `hashtext` can land on it. The value spells `RPJR`.
+///
+/// `build()` holds it shared while it builds, and a deletion of streams takes it
+/// exclusively: a projection registered for the first time has no registry row for the
+/// deletion to find and lock by name until its build commits (ADR-0033).
+const REGISTRY_LOCK_CLASS: i32 = 0x5250_4A52;
+
 /// Built-in default for how often the background task catches every projection up.
 pub(crate) const DEFAULT_CATCH_UP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -81,11 +89,20 @@ pub(crate) fn catch_up_interval_or_default(
 /// snapshot. The caller owns releasing them: it unlocks on success and closes the
 /// connection on every path.
 ///
-/// Name order, so two processes building overlapping sets cannot deadlock.
+/// Name order, so two processes building overlapping sets cannot deadlock — byte order,
+/// which is what [`lock_every_registered`] asks the database for. The registry lock is
+/// taken shared first, so builds run side by side and a deletion of streams waits for
+/// them all.
 pub(crate) async fn lock_for_build(
     conn: &mut PgConnection,
     names: &[String],
 ) -> Result<(), replay::Error> {
+    sqlx::query("SELECT pg_advisory_lock_shared($1, 0)")
+        .bind(REGISTRY_LOCK_CLASS)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| crate::db_error(e).with_operation("locking the inline projection registry"))?;
+
     let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
     names.sort_unstable();
     names.dedup();
@@ -137,18 +154,29 @@ pub(crate) async fn lock_for_catch_up(
         .map_err(|e| lock_error(e, name))
 }
 
-/// Take, for the current transaction, the lock of every inline projection the registry
-/// holds a row for — registered in this process or in any other — in name order, waiting
-/// for each.
+/// Take, for the current transaction, the registry lock exclusively and then the lock of
+/// every inline projection the registry holds a row for — registered in this process or
+/// in any other — in name order, waiting for each.
 ///
 /// What a deletion of streams takes (ADR-0033): a catch-up or a rebuild that read their
 /// events before the deletion would otherwise write rows for them after the caller has
-/// deleted its own. Name order, the order `build()` takes its locks in. One statement,
-/// returning one row however many projections there are.
+/// deleted its own. The registry lock covers a first registration, whose row does not
+/// exist until its build commits; the names are read after it is taken, so they include
+/// every build it waited for, and are locked for the catch-ups.
+///
+/// Byte order (`COLLATE "C"`), the order `build()` sorts its names in: under the
+/// database's own collation two names can sort the other way round, and a deletion and a
+/// build would deadlock. One statement for the names, returning one row however many
+/// there are; the ordered subquery feeds the aggregate, which takes the locks in its order.
 pub(crate) async fn lock_every_registered(conn: &mut PgConnection) -> Result<(), replay::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, 0)")
+        .bind(REGISTRY_LOCK_CLASS)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| crate::db_error(e).with_operation("locking the inline projection registry"))?;
     sqlx::query(
         "SELECT count(pg_advisory_xact_lock($1, hashtext(name))) \
-           FROM (SELECT name FROM projections ORDER BY name) registered",
+           FROM (SELECT name FROM projections ORDER BY name COLLATE \"C\") registered",
     )
     .bind(PROJECTION_LOCK_CLASS)
     .execute(conn)

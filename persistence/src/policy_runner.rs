@@ -5010,8 +5010,12 @@ struct StreamEvent {
 /// The events are locked before any place, and in position order — the order a deletion
 /// takes them in, events first and places after — so a checkpoint and a deletion queue
 /// rather than deadlock. Every row both halves of the statement read comes through
-/// `incoming`, which cannot produce one until `still_logged` has taken its locks: an update
-/// of one stream's place cannot get ahead of a wait for another stream's event.
+/// `incoming`, which cannot produce one until `still_logged` has taken its locks: its
+/// filter is an uncorrelated subquery, which PostgreSQL runs once, before the first row,
+/// so an update of one stream's place cannot get ahead of a wait for another stream's
+/// event. That rests on how the executor runs such a filter rather than on anything the
+/// SQL promises, so `a_checkpoint_of_two_streams_racing_their_deletion_does_not_deadlock`
+/// pins it.
 async fn checkpoint_places(
     pool: &Pool<Postgres>,
     name: &str,
@@ -8275,9 +8279,11 @@ mod progress_tests {
         }
     }
 
-    /// A deletion of `streams` that has taken its locks and stopped there, as
+    /// A deletion of `streams` that has taken its row locks and stopped there, as
     /// [`crate::PostgresEventStore::delete_streams`] takes them: the open transaction and
-    /// the backend holding it. [`finish_deletion`] runs the rest.
+    /// the backend holding it. [`finish_deletion`] runs the rest. Only the steps a Policy's
+    /// writes meet: not the isolation level, the lock wait or the inline projection locks,
+    /// which nothing here contends for.
     pub(super) async fn begin_deletion(
         pool: &PgPool,
         streams: &[&str],
@@ -8863,6 +8869,94 @@ mod settlement_tests {
 
     const POLICY: &str = "settlement_under_test";
     const POSITION: i64 = 7;
+
+    /// A retry settling a reaction whose stream is being deleted waits for the deletion,
+    /// then settles nothing and parks nothing (ADR-0033).
+    ///
+    /// The settlement locks the triggering event before the group, the order the deletion
+    /// takes them in, so it queues instead of deadlocking it. The deletion archives the
+    /// group and commits under the settlement's snapshot, which the server refuses as a
+    /// conflict; the settlement tries once more against the emptied group, finds the event
+    /// gone, and has nothing to park the failure the replay found against.
+    ///
+    /// Forced rather than raced for: the settlement starts while the deletion holds the
+    /// event, and the deletion commits while the settlement waits for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_settlement_racing_its_streams_deletion_settles_nothing_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let event_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Pinged', \
+                 'urn:probe:doomed', 'Probe', NULL, FALSE)",
+        )
+        .bind(event_id)
+        .execute(&pool)
+        .await
+        .expect("the event must be written");
+        let reaction = ParkedReaction {
+            policy_name: POLICY.to_string(),
+            global_position: POSITION,
+            event_id,
+        };
+        park(&pool, &reaction, "First").await;
+
+        let runner =
+            PolicyRunner::builder(Cqrs::new(crate::PostgresEventStore::new(pool.clone()))).build();
+        let before = group_digest(&pool, &reaction)
+            .await
+            .expect("the digest must be readable");
+        // What the replay found: the parked command resolved, and one it never parked
+        // failing — the one row a settlement inserts.
+        let replay = Replay::Ran(vec![ReplayedDispatch {
+            identity: DispatchIdentity {
+                aggregate_name: "Probe",
+                target_stream_id: "urn:probe:2".to_string(),
+                command_name: "Second",
+                ordinal: 0,
+            },
+            outcome: Some(Settlement {
+                error_kind: "Unavailable".to_string(),
+                error_message: "the command the replay found failing".to_string(),
+            }),
+            claimed: false,
+        }]);
+
+        let (deleting, deletion) = begin_deletion(&pool, &["urn:probe:doomed"]).await;
+        let settling = {
+            let reaction = ParkedReaction {
+                policy_name: reaction.policy_name.clone(),
+                ..reaction
+            };
+            tokio::spawn(async move { runner.settle(&reaction, before, replay, None).await })
+        };
+        await_blocked_by(&pool, deletion).await;
+        finish_deletion(deleting, &["urn:probe:doomed"]).await;
+
+        let settled = settling
+            .await
+            .expect("the settling task must not panic")
+            .expect("a settlement that lost its group to a deletion must still return");
+        let active: i64 = sqlx::query_scalar("SELECT count(*) FROM policy_dead_letters")
+            .fetch_one(&pool)
+            .await
+            .expect("the dead letters must be countable");
+        let archived: Option<String> =
+            sqlx::query_scalar("SELECT string_agg(reason, ', ') FROM discarded_dead_letters")
+                .fetch_one(&pool)
+                .await
+                .expect("the archive must be readable");
+
+        assert!(
+            !settled.any_still_failing,
+            "nothing is left that could fail"
+        );
+        assert_eq!(active, 0, "nothing is parked for an event that is gone");
+        assert_eq!(
+            archived.as_deref(),
+            Some("stream_deleted"),
+            "the deletion archived the group; the settlement archived nothing"
+        );
+    }
 
     /// A delivery that failed on an event its stream's deletion is taking parks nothing
     /// (ADR-0033): it waits for the deletion, then finds the event gone. A row parked after

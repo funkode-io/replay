@@ -2307,7 +2307,7 @@ Policies from its first event, and applied to inline projections — live, or by
 other. Running Policies need not be stopped: a Policy never writes a place or parks a
 dead letter for an event a deletion has taken, though a reaction already running when the
 deletion starts runs to its end. The deletion waits for an append to the stream that is
-in flight, and for a catch-up or a rebuild of any inline projection, whichever process
+in flight, and for a catch-up or a build of any inline projection, whichever process
 registered it; those waits, and your closure's, are bounded by the
 [stream lock wait](#stream-lock-wait).
 

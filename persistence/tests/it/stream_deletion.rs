@@ -588,3 +588,45 @@ async fn a_deletion_waits_for_a_catch_up_registered_in_another_process_postgres_
         .expect("the deletion must succeed once the catch-up is done");
     assert_eq!(deleted.events, 1);
 }
+
+/// The advisory-lock class of the inline projection registry as a whole — `RPJR`.
+const REGISTRY_LOCK_CLASS: i32 = 0x5250_4A52;
+
+/// An inline projection being registered for the first time has no registry row yet for
+/// the deletion to find, but its build replays the log, deleted streams included: the
+/// deletion waits for it as a whole, so the build's rows are there for the caller to
+/// delete.
+#[tokio::test]
+async fn a_deletion_waits_for_a_first_registration_still_building_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let store = PostgresEventStore::new(pool.clone());
+    stock(&store, "new-view", "first").await;
+
+    // A build in another process, holding the registry as `build()` does.
+    let mut building = pool.acquire().await.expect("the build must connect");
+    sqlx::query("SELECT pg_advisory_lock_shared($1, 0)")
+        .bind(REGISTRY_LOCK_CLASS)
+        .execute(&mut *building)
+        .await
+        .expect("the build must take the registry");
+
+    let deleting = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .delete_streams(&[ShelfUrn::new("new-view").unwrap().into()], no_read_models)
+                .await
+        }
+    });
+    await_a_lock_wait(&pool).await;
+    sqlx::query("SELECT pg_advisory_unlock_all()")
+        .execute(&mut *building)
+        .await
+        .expect("the build must release the registry");
+
+    let deleted = deleting
+        .await
+        .expect("the deletion must not panic")
+        .expect("the deletion must succeed once the build is done");
+    assert_eq!(deleted.events, 1);
+}

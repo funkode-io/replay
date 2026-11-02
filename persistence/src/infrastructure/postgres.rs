@@ -804,7 +804,8 @@ impl PostgresEventStore {
     /// append that starts after it waits and then creates the stream anew. A running Policy
     /// writes no place and parks no dead letter for an event the deletion has taken. It
     /// takes the lock of every inline projection in the registry, whichever process
-    /// registered it, so a catch-up or a rebuild never writes rows for these events after
+    /// registered it, and waits for every `build` in progress, a first registration
+    /// included, so a catch-up or a rebuild never writes rows for these events after
     /// `read_models` has deleted them. Every lock wait of the transaction — `read_models`'
     /// own statements included — is bounded by the
     /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait), and one that runs
