@@ -792,18 +792,21 @@ impl PostgresEventStore {
     ///   retried. A dead letter *addressed to* one of these streams by an event of another
     ///   is left, since its trigger is still there.
     ///
-    /// Then it runs `read_models` on the same connection, with the ids, and commits only
-    /// if that returns `Ok`. An inline projection cannot see a delete — it is handed
-    /// events, and a deletion is not one — so its rows, and any other read model the
-    /// caller keeps, are the caller's to delete here. An `Err` from it, or from any step,
-    /// rolls the whole deletion back and is returned. A caller with no read model passes a
-    /// closure that returns `Ok(())`.
+    /// Before any of that it runs `read_models` on the same connection, with the ids, while
+    /// the streams and their events can still be read, so a read model keyed by something
+    /// in them can find its rows. An inline projection cannot see a delete — it is handed
+    /// events, and a deletion is not one — so its rows, and any other read model the caller
+    /// keeps, are the caller's to delete there. An `Err` from it, or from any step, rolls
+    /// the whole deletion back and is returned. A caller with no read model passes a closure
+    /// that returns `Ok(())`.
     ///
     /// The deletion waits for an append to one of these streams that is in flight, and an
-    /// append that starts after it waits and then creates the stream anew. It takes the
-    /// advisory lock of every inline projection this store registered, so a catch-up or a
-    /// rebuild of one never writes rows for these events after `read_models` has deleted
-    /// them. Its row-lock and advisory-lock waits are bounded by the
+    /// append that starts after it waits and then creates the stream anew. A running Policy
+    /// writes no place and parks no dead letter for an event the deletion has taken. It
+    /// takes the lock of every inline projection in the registry, whichever process
+    /// registered it, so a catch-up or a rebuild never writes rows for these events after
+    /// `read_models` has deleted them. Every lock wait of the transaction — `read_models`'
+    /// own statements included — is bounded by the
     /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait), and one that runs
     /// out is [`replay::ErrorKind::Unavailable`], to be retried.
     ///
@@ -832,13 +835,17 @@ impl PostgresEventStore {
         if stream_ids.is_empty() {
             return Ok(DeletedStreams::default());
         }
-        // Sized by the caller's set, not by the data: what the statements below bind.
+        // Both sized by the caller's set, not by the data: what the statements below bind,
+        // and how a failure names it.
         let ids: Vec<String> = stream_ids.iter().map(Urn::to_string).collect();
+        let named = ids.join(",");
         let failed = |error: sqlx::Error| {
             crate::db_error(error)
                 .with_operation(OPERATION)
-                .with_context("stream_ids", ids.join(","))
+                .with_context("stream_ids", named.clone())
         };
+        let lock_failed =
+            |error| stream_lock_error(error, &named, self.stream_lock_wait, OPERATION);
 
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
 
@@ -853,29 +860,18 @@ impl PostgresEventStore {
             .await
             .map_err(failed)?;
 
-        // Streams first, then their events, then the projections: the order no other
-        // writer of these rows takes them in reverse, so a deletion waits rather than
-        // deadlocks (ADR-0033).
+        // Streams, then their events, then the inline projections, then the rows the steps
+        // below write: no other writer of these rows takes two of them in the other order,
+        // so a deletion queues rather than deadlocks (ADR-0033).
         deletion::lock_streams(&mut tx, &ids)
             .await
-            .map_err(|error| {
-                stream_lock_error(error, &ids.join(","), self.stream_lock_wait, OPERATION)
-            })?;
+            .map_err(lock_failed)?;
         deletion::lock_events(&mut tx, &ids)
             .await
-            .map_err(|error| {
-                stream_lock_error(error, &ids.join(","), self.stream_lock_wait, OPERATION)
-            })?;
-        let mut names: Vec<&str> = self
-            .projections
-            .iter()
-            .map(|registered| registered.name.as_str())
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        for name in names {
-            catch_up::lock_for_catch_up(&mut tx, name, true).await?;
-        }
+            .map_err(lock_failed)?;
+        catch_up::lock_every_registered(&mut tx).await?;
+
+        read_models(&mut tx, stream_ids).await?;
 
         let dead_letters = deletion::archive_dead_letters(&mut tx, &ids)
             .await
@@ -886,8 +882,6 @@ impl PostgresEventStore {
         let (events, streams) = deletion::delete_events_and_streams(&mut tx, &ids)
             .await
             .map_err(failed)?;
-
-        read_models(&mut tx, stream_ids).await?;
 
         tx.commit().await.map_err(failed)?;
 

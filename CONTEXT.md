@@ -294,9 +294,11 @@ _Avoid_: deadline, SLA, watchdog, timeout (unqualified).
 ### Stream lock wait
 
 How long a transaction of this library waits for a stream's row before the server
-abandons it — one value for both transactions that take that row, the append and
-`compact`, defaulting to 30s and disabled by zero
-([ADR-0022](docs/adr/0022-a-stream-lock-wait-is-bounded-on-the-server.md)). It
+abandons it — one value for every transaction that takes that row, the append,
+`compact` and a [Stream deletion] (which it bounds for every lock it waits on),
+defaulting to 30s and disabled by zero
+([ADR-0022](docs/adr/0022-a-stream-lock-wait-is-bounded-on-the-server.md),
+[ADR-0033](docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md)). It
 bounds *this* library's waiting, not the holder: a wait that runs out is
 `Unavailable` and retryable, and a spike of them names a long holder rather than a
 broken append. Distinct from the [Dispatch timeout], which is a client-side bound

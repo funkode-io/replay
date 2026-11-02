@@ -2297,7 +2297,9 @@ What goes, for each id:
   is still there;
 - whatever your closure deletes. An inline projection cannot see a delete — it is handed
   events, and a deletion is not one — so its rows, and any other read model you keep, are
-  yours to delete here. If the closure returns an error, nothing is deleted.
+  yours to delete here. The closure runs before the library's own deletes, so the streams
+  and their events can still be read from it; if it returns an error, nothing is
+  deleted.
 
 A stream created again under a deleted id is a new stream: numbered from 1, delivered to
 Policies from its first event, and applied to inline projections — live, or by a
@@ -2305,8 +2307,9 @@ Policies from its first event, and applied to inline projections — live, or by
 other. Running Policies need not be stopped: a Policy never writes a place or parks a
 dead letter for an event a deletion has taken, though a reaction already running when the
 deletion starts runs to its end. The deletion waits for an append to the stream that is
-in flight, and for a catch-up or a rebuild of an inline projection the store registered;
-those waits are bounded by the [stream lock wait](#stream-lock-wait).
+in flight, and for a catch-up or a rebuild of any inline projection, whichever process
+registered it; those waits, and your closure's, are bounded by the
+[stream lock wait](#stream-lock-wait).
 
 Requires migration
 [0039](persistence/tests/migrations/0039_dead_letter_stream_deleted.sql), which adds the

@@ -455,3 +455,136 @@ async fn a_stream_recreated_under_a_deleted_id_is_projected_live_and_by_catch_up
     );
     assert_eq!(view_of(&pool, "front").await.len(), 2);
 }
+
+// ── Waiting for writers in flight ──────────────────────────────────────────────
+
+/// Start an append to `shelf` and hold it open: it has taken the stream's row and
+/// written its event, and nobody else can see either until it ends.
+async fn hold_an_append_open(
+    pool: &PgPool,
+    shelf: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.expect("the append must begin");
+    sqlx::query(
+        "SELECT id FROM write_event(gen_random_uuid(), '{\"Stocked\":{\"sku\":\"held\"}}'::jsonb, \
+             '{}'::jsonb, 'Stocked', $1, 'Shelf', NULL, FALSE)",
+    )
+    .bind(ShelfUrn::new(shelf).unwrap().to_urn().to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("the held event must be written");
+    tx
+}
+
+/// Wait until some backend is queued on a lock, read off `pg_stat_activity` rather than
+/// slept for, so a busy machine delays the test instead of failing it.
+async fn await_a_lock_wait(pool: &PgPool) {
+    common::wait::wait_for_count(
+        pool,
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+        1,
+        Duration::from_secs(10),
+        "the deletion to queue behind the writer holding what it needs",
+    )
+    .await;
+}
+
+/// An append in flight when the deletion starts is not left behind: the deletion waits
+/// for it, then deletes its event with the rest.
+#[tokio::test]
+async fn a_deletion_waits_for_an_append_in_flight_and_takes_its_event_too_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let store = PostgresEventStore::new(pool.clone());
+    stock(&store, "busy", "first").await;
+
+    let held = hold_an_append_open(&pool, "busy").await;
+    let deleting = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .delete_streams(&[ShelfUrn::new("busy").unwrap().into()], no_read_models)
+                .await
+        }
+    });
+    await_a_lock_wait(&pool).await;
+    held.commit().await.expect("the append must commit");
+
+    let deleted = deleting
+        .await
+        .expect("the deletion must not panic")
+        .expect("the deletion must succeed once the append is done");
+    assert_eq!(
+        deleted.events, 2,
+        "the append it waited for is deleted with the rest"
+    );
+    assert!(events_of(&pool, "busy").await.is_empty());
+}
+
+/// A deletion stuck behind an append for longer than the stream lock wait gives up as
+/// `Unavailable` — temporary, to be retried — and deletes nothing.
+#[tokio::test]
+async fn a_deletion_that_waits_past_the_stream_lock_wait_is_unavailable_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let store = PostgresEventStore::builder(pool.clone())
+        .stream_lock_wait(Duration::from_millis(200))
+        .build()
+        .await
+        .expect("building the store must succeed");
+    stock(&store, "stuck", "first").await;
+
+    let held = hold_an_append_open(&pool, "stuck").await;
+    let refused = store
+        .delete_streams(&[ShelfUrn::new("stuck").unwrap().into()], no_read_models)
+        .await
+        .expect_err("a deletion cannot take a stream an append holds");
+    held.rollback().await.expect("the append must roll back");
+
+    assert_eq!(refused.kind(), replay::ErrorKind::Unavailable, "{refused}");
+    assert_eq!(
+        events_of(&pool, "stuck").await.len(),
+        1,
+        "nothing was deleted"
+    );
+}
+
+/// The advisory-lock class an inline projection's catch-up and rebuild lock in — `RPJC`,
+/// as the store spells it.
+const PROJECTION_LOCK_CLASS: i32 = 0x5250_4A43;
+
+/// A catch-up of an inline projection running in another process — one the deleting
+/// store never registered — finishes before the deletion reads on, so it cannot write
+/// rows for the deleted events after the caller has deleted its own.
+#[tokio::test]
+async fn a_deletion_waits_for_a_catch_up_registered_in_another_process_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let with_view = store_with_view(&pool).await;
+    stock(&with_view, "shared", "first").await;
+
+    // The other process's catch-up, holding the projection's lock as one does.
+    let mut catching_up = pool.begin().await.expect("the catch-up must begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext('shelf_view'))")
+        .bind(PROJECTION_LOCK_CLASS)
+        .execute(&mut *catching_up)
+        .await
+        .expect("the catch-up must take its lock");
+
+    let deleting = tokio::spawn({
+        let store = PostgresEventStore::new(pool.clone());
+        async move {
+            store
+                .delete_streams(&[ShelfUrn::new("shared").unwrap().into()], no_read_models)
+                .await
+        }
+    });
+    await_a_lock_wait(&pool).await;
+    catching_up
+        .commit()
+        .await
+        .expect("the catch-up must commit");
+
+    let deleted = deleting
+        .await
+        .expect("the deletion must not panic")
+        .expect("the deletion must succeed once the catch-up is done");
+    assert_eq!(deleted.events, 1);
+}

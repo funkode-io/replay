@@ -1052,14 +1052,21 @@ impl PolicyRunner {
                 .with_context("policy", policy_name)
             })?;
 
-        let raw = load_event_by_id(&self.pool, event_id)
-            .await?
-            .ok_or_else(|| {
-                replay::Error::not_found("triggering event for dead letter no longer exists")
-                    .with_operation(operation)
-                    .with_context("policy", policy_name)
-                    .with_context("event_id", event_id)
-            })?;
+        let Some(raw) = load_event_by_id(&self.pool, event_id).await? else {
+            // A deletion of the event's stream that committed since the group was read
+            // archived the group with it (ADR-0033): nothing is left to settle, as for a
+            // group discarded meanwhile. A group still parked against an event that is
+            // gone is one nothing in this library removed, and is reported.
+            if group_digest(&self.pool, &reaction).await?.rows == 0 {
+                return Ok(ReactionSettlement::default());
+            }
+            return Err(replay::Error::not_found(
+                "triggering event for dead letter no longer exists",
+            )
+            .with_operation(operation)
+            .with_context("policy", policy_name)
+            .with_context("event_id", event_id));
+        };
 
         // Reproduce and execute every dispatch the reaction now yields, carrying
         // on past a failure exactly as the forward drain does: stopping at the
@@ -4997,9 +5004,14 @@ struct StreamEvent {
 /// nothing. Without that, a poll that read the stream before the deletion would write it
 /// a place after it — a place in the stream recreated under that id, whose events start
 /// again at 1 and would be skipped up to it. The event is named by its position, which no
-/// event of a recreated stream can share. Locked in position order, the order a deletion
-/// locks them in, so the two queue rather than deadlock. The row a poll saw needs none of
-/// this: its update matches nothing once a deletion has taken it.
+/// event of a recreated stream can share. The row a poll saw needs none of this: its
+/// update matches nothing once a deletion has taken it.
+///
+/// The events are locked before any place, and in position order — the order a deletion
+/// takes them in, events first and places after — so a checkpoint and a deletion queue
+/// rather than deadlock. Every row both halves of the statement read comes through
+/// `incoming`, which cannot produce one until `still_logged` has taken its locks: an update
+/// of one stream's place cannot get ahead of a wait for another stream's event.
 async fn checkpoint_places(
     pool: &Pool<Postgres>,
     name: &str,
@@ -5027,16 +5039,18 @@ async fn checkpoint_places(
         .collect();
 
     let kept = sqlx::query(
-        "WITH incoming AS ( \
+        "WITH given AS ( \
              SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::bigint[]) \
-                       AS i(stream_id, stream_seq, observed, global_position)), \
+                       AS g(stream_id, stream_seq, observed, global_position)), \
          still_logged AS MATERIALIZED ( \
              SELECT e.global_position FROM events e \
-               JOIN incoming i ON e.global_position = i.global_position \
-                              AND e.stream_id = i.stream_id \
-              WHERE i.observed IS NULL \
+               JOIN given g ON e.global_position = g.global_position \
+                           AND e.stream_id = g.stream_id \
+              WHERE g.observed IS NULL \
               ORDER BY e.global_position \
                 FOR KEY SHARE OF e), \
+         incoming AS MATERIALIZED ( \
+             SELECT * FROM given WHERE (SELECT count(*) FROM still_logged) >= 0), \
          advanced AS ( \
              UPDATE policy_stream_cursors c \
                 SET stream_seq = i.stream_seq, updated_at = now() \
@@ -6712,6 +6726,7 @@ mod progress_tests {
     use testcontainers_modules::postgres;
     use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 
+    use crate::infrastructure::stream_deletion as deletion;
     use crate::policy_frontier::rotation_after;
 
     use super::{
@@ -8260,20 +8275,44 @@ mod progress_tests {
         }
     }
 
-    /// Delete `stream` the way [`crate::PostgresEventStore::delete_streams`] does, inside
-    /// `tx`, after its events have been locked: places, events, stream.
-    async fn delete_locked_stream(tx: &mut sqlx::PgConnection, stream: &str) {
-        for statement in [
-            "DELETE FROM policy_stream_cursors WHERE stream_id = $1",
-            "DELETE FROM events WHERE stream_id = $1",
-            "DELETE FROM streams WHERE id = $1",
-        ] {
-            sqlx::query(statement)
-                .bind(stream)
-                .execute(&mut *tx)
-                .await
-                .expect("the deletion must succeed");
-        }
+    /// A deletion of `streams` that has taken its locks and stopped there, as
+    /// [`crate::PostgresEventStore::delete_streams`] takes them: the open transaction and
+    /// the backend holding it. [`finish_deletion`] runs the rest.
+    pub(super) async fn begin_deletion(
+        pool: &PgPool,
+        streams: &[&str],
+    ) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+        let ids: Vec<String> = streams.iter().map(|s| (*s).to_string()).collect();
+        let mut tx = pool.begin().await.expect("the deletion must begin");
+        let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the deleting backend must identify itself");
+        deletion::lock_streams(&mut tx, &ids)
+            .await
+            .expect("locking the streams must succeed");
+        deletion::lock_events(&mut tx, &ids)
+            .await
+            .expect("locking the events must succeed");
+        (tx, backend)
+    }
+
+    /// The rest of a deletion [`begin_deletion`] started, committed.
+    pub(super) async fn finish_deletion(
+        mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+        streams: &[&str],
+    ) {
+        let ids: Vec<String> = streams.iter().map(|s| (*s).to_string()).collect();
+        deletion::archive_dead_letters(&mut tx, &ids)
+            .await
+            .expect("archiving the dead letters must succeed");
+        deletion::delete_places(&mut tx, &ids)
+            .await
+            .expect("deleting the places must succeed");
+        deletion::delete_events_and_streams(&mut tx, &ids)
+            .await
+            .expect("deleting the streams must succeed");
+        tx.commit().await.expect("the deletion must commit");
     }
 
     /// A poll that read a stream before it was deleted does not give the stream recreated
@@ -8329,27 +8368,14 @@ mod progress_tests {
         let observed = observe(&pool, &["urn:probe:a"]).await;
         let reached = reached_at(&pool, "urn:probe:a", 3).await;
 
-        let mut deleting = pool.begin().await.expect("beginning must succeed");
-        let deletion: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *deleting)
-            .await
-            .expect("the deleting backend must identify itself");
-        sqlx::query(
-            "SELECT count(*) FROM (SELECT 1 FROM events WHERE stream_id = $1 \
-                                    ORDER BY global_position FOR UPDATE) locked",
-        )
-        .bind("urn:probe:a")
-        .execute(&mut *deleting)
-        .await
-        .expect("locking the events must succeed");
+        let (deleting, deletion) = begin_deletion(&pool, &["urn:probe:a"]).await;
 
         let checkpointing = tokio::spawn({
             let pool = pool.clone();
             async move { checkpoint_places(&pool, POLICY, &[reached], &observed).await }
         });
         await_blocked_by(&pool, deletion).await;
-        delete_locked_stream(&mut deleting, "urn:probe:a").await;
-        deleting.commit().await.expect("committing must succeed");
+        finish_deletion(deleting, &["urn:probe:a"]).await;
 
         let kept = checkpointing
             .await
@@ -8361,6 +8387,51 @@ mod progress_tests {
         assert!(
             places(&pool, &["urn:probe:a"]).await.is_empty(),
             "the recreated stream is still at its beginning"
+        );
+    }
+
+    /// A checkpoint whose batch holds a place it is updating and a place it is creating,
+    /// both in streams one deletion is taking, queues behind the deletion instead of
+    /// deadlocking it.
+    ///
+    /// The deletion holds the events and is about to delete the places; the checkpoint
+    /// must wait for the new stream's event before it locks the old stream's place, or each
+    /// waits for the other. Forced rather than raced for, like the test above.
+    #[tokio::test]
+    async fn a_checkpoint_of_two_streams_racing_their_deletion_does_not_deadlock_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_events(&pool, "urn:probe:a", 3).await;
+        append_events(&pool, "urn:probe:b", 3).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, TrackedStreams::Every)
+            .await
+            .expect("loading must succeed");
+        // `a` has a place to update, `b` none yet.
+        checkpoint(&pool, "urn:probe:a", 2).await;
+        let observed = observe(&pool, &["urn:probe:a", "urn:probe:b"]).await;
+        let batch = [
+            reached_at(&pool, "urn:probe:a", 3).await,
+            reached_at(&pool, "urn:probe:b", 3).await,
+        ];
+
+        let (deleting, deletion) = begin_deletion(&pool, &["urn:probe:a", "urn:probe:b"]).await;
+        let checkpointing = tokio::spawn({
+            let pool = pool.clone();
+            async move { checkpoint_places(&pool, POLICY, &batch, &observed).await }
+        });
+        await_blocked_by(&pool, deletion).await;
+        finish_deletion(deleting, &["urn:probe:a", "urn:probe:b"]).await;
+
+        let kept = checkpointing
+            .await
+            .expect("the checkpoint must finish")
+            .expect("checkpointing must succeed, not lose a deadlock");
+
+        assert!(kept.is_empty(), "the poll is told its view went stale");
+        assert!(
+            places(&pool, &["urn:probe:a", "urn:probe:b"])
+                .await
+                .is_empty(),
+            "both streams went with their places"
         );
     }
 
@@ -8781,7 +8852,9 @@ mod progress_tests {
 mod settlement_tests {
     use sqlx::PgPool;
 
-    use super::progress_tests::{await_blocked_by, start_postgres};
+    use super::progress_tests::{
+        await_blocked_by, begin_deletion, finish_deletion, start_postgres,
+    };
     use super::{
         begin_settlement, group_digest, load_parked_page, write_dead_letter, Cqrs, DeadLetterWrite,
         DispatchIdentity, GroupPhase, ParkedReaction, Parking, PolicyRunner, Replay,
@@ -8811,15 +8884,7 @@ mod settlement_tests {
         .await
         .expect("the event must be written");
 
-        let mut deleting = pool.begin().await.expect("the deletion must begin");
-        let deletion: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *deleting)
-            .await
-            .expect("the deleting backend must identify itself");
-        sqlx::query("SELECT 1 FROM events WHERE stream_id = 'urn:probe:doomed' FOR UPDATE")
-            .execute(&mut *deleting)
-            .await
-            .expect("locking the events must succeed");
+        let (deleting, deletion) = begin_deletion(&pool, &["urn:probe:doomed"]).await;
 
         let parking = {
             let pool = pool.clone();
@@ -8841,17 +8906,7 @@ mod settlement_tests {
             })
         };
         await_blocked_by(&pool, deletion).await;
-        for statement in [
-            "DELETE FROM policy_dead_letters WHERE event_id = $1",
-            "DELETE FROM events WHERE id = $1",
-        ] {
-            sqlx::query(statement)
-                .bind(event_id)
-                .execute(&mut *deleting)
-                .await
-                .expect("the deletion must succeed");
-        }
-        deleting.commit().await.expect("the deletion must commit");
+        finish_deletion(deleting, &["urn:probe:doomed"]).await;
 
         let parked = parking
             .await

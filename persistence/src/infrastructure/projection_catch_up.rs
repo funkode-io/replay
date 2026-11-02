@@ -137,6 +137,26 @@ pub(crate) async fn lock_for_catch_up(
         .map_err(|e| lock_error(e, name))
 }
 
+/// Take, for the current transaction, the lock of every inline projection the registry
+/// holds a row for — registered in this process or in any other — in name order, waiting
+/// for each.
+///
+/// What a deletion of streams takes (ADR-0033): a catch-up or a rebuild that read their
+/// events before the deletion would otherwise write rows for them after the caller has
+/// deleted its own. Name order, the order `build()` takes its locks in. One statement,
+/// returning one row however many projections there are.
+pub(crate) async fn lock_every_registered(conn: &mut PgConnection) -> Result<(), replay::Error> {
+    sqlx::query(
+        "SELECT count(pg_advisory_xact_lock($1, hashtext(name))) \
+           FROM (SELECT name FROM projections ORDER BY name) registered",
+    )
+    .bind(PROJECTION_LOCK_CLASS)
+    .execute(conn)
+    .await
+    .map_err(|e| crate::db_error(e).with_operation("locking every inline projection"))?;
+    Ok(())
+}
+
 fn lock_error(error: sqlx::Error, name: &str) -> replay::Error {
     crate::db_error(error)
         .with_operation("locking an inline projection for catch-up")
