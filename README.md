@@ -1825,6 +1825,10 @@ TRUNCATE projection_applied_transactions;
 Without the first statement, a restored stamp ahead of the new counter is invisible to the
 adoption snapshot and would be caught up — applied again — once the counter reaches it.
 
+Adoption applies nothing, so a gap the backup still held is not caught up after the restore.
+Take the backup with writers quiesced and after a `catch_up_projections()` has returned, or
+bump the version of each projection after the restore so `build()` rebuilds it.
+
 A physical restore or a replica promotion keeps the cluster's transaction counter and needs
 nothing.
 
