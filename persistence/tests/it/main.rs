@@ -42,4 +42,5 @@ mod policy_timeout;
 mod policy_tracks_stream_types;
 mod single_target_policy;
 mod stream_creation_race;
+mod stream_deletion;
 mod stream_lock_wait;

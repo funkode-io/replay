@@ -569,6 +569,17 @@ impl PolicyDaemonHarness {
         &self.policy_name
     }
 
+    /// A store over the daemon's database, for the operations an operator runs
+    /// against it out of band — deleting a stream, for one.
+    pub fn store(&self) -> PostgresEventStore {
+        PostgresEventStore::new(self.pool.clone())
+    }
+
+    /// The daemon's database, for a test that keeps a read model of its own beside it.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Append a `Pinged` event for the policy to react to.
     ///
     /// The daemon is already running, so by the time the append returns the

@@ -20,7 +20,9 @@ pub use aggregate_version::AggregateVersion;
 pub use cqrs::Cqrs;
 pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;
-pub use infrastructure::{InMemoryEventStore, PostgresEventStore, PostgresInlineProjection};
+pub use infrastructure::{
+    DeletedStreams, InMemoryEventStore, PostgresEventStore, PostgresInlineProjection,
+};
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
 // The rule itself lives in the core crate (ADR-0027); re-exported here permanently so a
@@ -60,7 +62,7 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, CompactionOutcome, Cqrs, DeadLetter, DeadLetterDiscard, DeadLetterFilter,
+        AggregateVersion, CompactionOutcome, Cqrs, DeadLetter, DeletedStreams, DeadLetterDiscard, DeadLetterFilter,
         DeadLetterRetry, DeadLetterRetrySummary, Dispatch, Escalation, EscalationReason, EventSink,
         EventStore, InMemoryEventStore, InlineProjection, Liveness, NoSink, ObservedEvent,
         PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,

@@ -16,6 +16,7 @@ use urn::Urn;
 use uuid::Uuid;
 
 use super::projection_catch_up::{self as catch_up, Cut, ErasedPostgresProjection, Scope};
+use super::stream_deletion::{self as deletion, DeletedStreams};
 use crate::inline_projection::InlineProjection;
 use crate::{CompactionOutcome, EventSink, EventStore, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event, Metadata, ObservedEvent};
@@ -773,6 +774,137 @@ impl PostgresEventStore {
             read += self.catch_up_one(registered, true).await?;
         }
         Ok(read)
+    }
+
+    /// Delete `stream_ids` for good, with everything this library keeps about them, and
+    /// let the caller delete its own read-model rows in the same transaction.
+    ///
+    /// For a stream that is to be gone rather than merely closed — a catalog entry
+    /// hard-deleted, whose id may be taken again by a stream created later under the same
+    /// name. In one transaction, it deletes:
+    ///
+    /// - the streams and every one of their events, archived compaction versions included;
+    /// - every Policy's place in them, so a stream recreated under one of these ids is
+    ///   delivered from its first event rather than skipped up to where the Policy had got
+    ///   in the old one;
+    /// - from the active set, every dead letter parked for one of their events, archived
+    ///   with reason `stream_deleted`: a dead letter whose event is gone can never be
+    ///   retried. A dead letter *addressed to* one of these streams by an event of another
+    ///   is left, since its trigger is still there.
+    ///
+    /// Then it runs `read_models` on the same connection, with the ids, and commits only
+    /// if that returns `Ok`. An inline projection cannot see a delete — it is handed
+    /// events, and a deletion is not one — so its rows, and any other read model the
+    /// caller keeps, are the caller's to delete here. An `Err` from it, or from any step,
+    /// rolls the whole deletion back and is returned. A caller with no read model passes a
+    /// closure that returns `Ok(())`.
+    ///
+    /// The deletion waits for an append to one of these streams that is in flight, and an
+    /// append that starts after it waits and then creates the stream anew. It takes the
+    /// advisory lock of every inline projection this store registered, so a catch-up or a
+    /// rebuild of one never writes rows for these events after `read_models` has deleted
+    /// them. Its row-lock and advisory-lock waits are bounded by the
+    /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait), and one that runs
+    /// out is [`replay::ErrorKind::Unavailable`], to be retried.
+    ///
+    /// Nothing that refers to these streams by the transactions that wrote them is touched:
+    /// a transaction id is never reused, so an inline projection's applied marks for them
+    /// match nothing a recreated stream writes, and are cleared as its catch-up horizon
+    /// moves past them
+    /// ([ADR-0033](https://github.com/funkode-io/replay/blob/main/docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md)).
+    ///
+    /// An id that names no stream deletes nothing, and an empty set returns at once
+    /// without calling `read_models`. Requires migration 0039.
+    pub async fn delete_streams<F>(
+        &self,
+        stream_ids: &[Urn],
+        read_models: F,
+    ) -> Result<DeletedStreams, replay::Error>
+    where
+        F: for<'c> FnOnce(
+                &'c mut sqlx::PgConnection,
+                &'c [Urn],
+            ) -> BoxFuture<'c, Result<(), replay::Error>>
+            + Send,
+    {
+        const OPERATION: &str = "delete_streams";
+
+        if stream_ids.is_empty() {
+            return Ok(DeletedStreams::default());
+        }
+        // Sized by the caller's set, not by the data: what the statements below bind.
+        let ids: Vec<String> = stream_ids.iter().map(Urn::to_string).collect();
+        let failed = |error: sqlx::Error| {
+            crate::db_error(error)
+                .with_operation(OPERATION)
+                .with_context("stream_ids", ids.join(","))
+        };
+
+        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+
+        // READ COMMITTED whatever the connection's default: each statement below must read
+        // what committed while the one before it waited, or a place or a dead letter written
+        // during a wait would survive the deletion.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *tx)
+            .await
+            .map_err(failed)?;
+        crate::lock_wait::bound(&mut tx, self.stream_lock_wait)
+            .await
+            .map_err(failed)?;
+
+        // Streams first, then their events, then the projections: the order no other
+        // writer of these rows takes them in reverse, so a deletion waits rather than
+        // deadlocks (ADR-0033).
+        deletion::lock_streams(&mut tx, &ids)
+            .await
+            .map_err(|error| {
+                stream_lock_error(error, &ids.join(","), self.stream_lock_wait, OPERATION)
+            })?;
+        deletion::lock_events(&mut tx, &ids)
+            .await
+            .map_err(|error| {
+                stream_lock_error(error, &ids.join(","), self.stream_lock_wait, OPERATION)
+            })?;
+        let mut names: Vec<&str> = self
+            .projections
+            .iter()
+            .map(|registered| registered.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            catch_up::lock_for_catch_up(&mut tx, name, true).await?;
+        }
+
+        let dead_letters = deletion::archive_dead_letters(&mut tx, &ids)
+            .await
+            .map_err(failed)?;
+        let places = deletion::delete_places(&mut tx, &ids)
+            .await
+            .map_err(failed)?;
+        let (events, streams) = deletion::delete_events_and_streams(&mut tx, &ids)
+            .await
+            .map_err(failed)?;
+
+        read_models(&mut tx, stream_ids).await?;
+
+        tx.commit().await.map_err(failed)?;
+
+        let deleted = DeletedStreams {
+            streams,
+            events,
+            places,
+            dead_letters,
+        };
+        tracing::info!(
+            streams = deleted.streams,
+            events = deleted.events,
+            places = deleted.places,
+            dead_letters = deleted.dead_letters,
+            "deleted streams with their places and dead letters"
+        );
+        Ok(deleted)
     }
 
     /// One catch-up of one projection, in a transaction of its own.
