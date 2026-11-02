@@ -93,7 +93,10 @@ _Avoid_: offset, sequence number, event time.
 The place an event holds in its own stream: `stream_seq`, assigned by `write_event` from
 a counter on the `streams` row and never reset
 ([0027](persistence/tests/migrations/0027_event_stream_seq.sql)). Contiguous, unique per
-stream, and permanent — unlike a stream `version`, which compaction restarts at 1 so
+stream, and permanent for the life of the stream — a [Stream deletion] ends it, and a
+stream created again under the same id is numbered from 1
+([ADR-0033](docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md)) — unlike
+a stream `version`, which compaction restarts at 1 so
 hydration reads `1..N`, making `(stream_id, version)` name two different events over time
 ([ADR-0023](docs/adr/0023-a-stream-is-numbered-twice.md)). Permanence is the library's to
 keep, as it is for [Global position], and unlike a [Cursor move]
@@ -215,8 +218,9 @@ The _controlling_ act of an operator judging a [Dead letter]'s reaction
 permanently unrecoverable and retiring the record from the active set
 **without** re-executing it. The record is archived rather than destroyed, so
 the failure history is never lost. The only way a row leaves the active set for
-good on purpose: a failed [Retry] always leaves it retryable, because what makes
-another attempt worth making is a change outside the library.
+good on purpose, short of a [Stream deletion] taking its triggering event: a
+failed [Retry] always leaves it retryable, because what makes another attempt
+worth making is a change outside the library.
 The counterpart to [Retry]; together they are
 the controlling actions over a Policy's failures that [Policy status] only
 observes.
@@ -235,6 +239,18 @@ reads its places fresh every poll rather than holding them between polls
 [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
 _Avoid_: reset, seek, rewind (as a name for the act; a rewind is one direction of
 it).
+
+### Stream deletion
+
+The _controlling_ act of removing streams for good, with everything the library keeps
+about them: their events, every [Policy]'s [Stream place] in them, and — archived, not
+destroyed — the [Dead letter]s their events triggered. The caller's own read-model rows,
+an [Inline projection]'s included, are deleted in the same transaction, because an inline
+projection is handed events and a deletion is not one. A stream created later under a
+deleted id is a new stream, numbered and delivered from its first event. Distinct from
+compaction, which keeps a stream and shortens it
+([ADR-0033](docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md)).
+_Avoid_: purge, tombstone, hard delete (as the name for the act).
 
 ### Policy status
 
@@ -566,6 +582,8 @@ it:
 [Retry]: #retry
 [Discard]: #discard
 [Cursor move]: #cursor-move
+[Stream deletion]: #stream-deletion
+[Stream place]: #stream-place
 [Rebuild]: #rebuild
 [Policy status]: #policy-status
 [Blocked policy]: #blocked-policy

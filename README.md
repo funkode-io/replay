@@ -2258,6 +2258,62 @@ time and no database snapshot between them; a caller that pages across requests 
 `.take(n)` and resumes with `after` set to the last id it saw
 ([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)).
 
+## Deleting streams
+
+Compaction keeps a stream and shortens it. When a stream must be **gone** — a catalog
+entry hard-deleted, say, whose id is a name slug that a later entry of the same name
+will take again — `PostgresEventStore::delete_streams` deletes it with everything the
+library keeps about it, in one transaction, and lets you delete your own read-model rows
+in that same transaction:
+
+```rust,ignore
+use urn::Urn;
+
+let deleted = store
+    .delete_streams(&[brand_id.into()], |conn, ids| {
+        Box::pin(async move {
+            let ids: Vec<String> = ids.iter().map(Urn::to_string).collect();
+            sqlx::query("DELETE FROM brand_view WHERE stream_id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *conn)
+                .await
+                .map_err(replay_persistence::db_error)?;
+            Ok(())
+        })
+    })
+    .await?;
+println!("deleted {} event(s), {} dead letter(s)", deleted.events, deleted.dead_letters);
+```
+
+What goes, for each id:
+
+- the stream and all of its events, the archived versions of a compacted stream included;
+- every Policy's [place](#how-a-policy-tracks-where-it-is) in it, so a stream created
+  later under the same id is delivered from its first event — left behind, the old place
+  would skip the new stream's events up to wherever the Policy had got in the old one;
+- every parked dead letter whose triggering event was one of those events, archived with
+  reason `stream_deleted`: a dead letter whose event is gone can never be retried. A dead
+  letter *addressed to* the stream by an event of another stream stays, since its trigger
+  is still there;
+- whatever your closure deletes. An inline projection cannot see a delete — it is handed
+  events, and a deletion is not one — so its rows, and any other read model you keep, are
+  yours to delete here. If the closure returns an error, nothing is deleted.
+
+A stream created again under a deleted id is a new stream: numbered from 1, delivered to
+Policies from its first event, and applied to inline projections — live, or by a
+[catch-up](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it) — like any
+other. Running Policies need not be stopped: a Policy never writes a place or parks a
+dead letter for an event a deletion has taken, though a reaction already running when the
+deletion starts runs to its end. The deletion waits for an append to the stream that is
+in flight, and for a catch-up or a rebuild of an inline projection the store registered;
+those waits are bounded by the [stream lock wait](#stream-lock-wait).
+
+Requires migration
+[0039](persistence/tests/migrations/0039_dead_letter_stream_deleted.sql), which adds the
+`stream_deleted` archive reason; run it before the release that deletes. Why a deletion
+takes what it takes, and what it leaves:
+[ADR-0033](docs/adr/0033-a-deleted-stream-takes-what-replay-keeps-about-it.md).
+
 ## Policies
 
 A `Policy` is a checkpointed background subscriber that **reacts to events by
@@ -3222,7 +3278,7 @@ CREATE TABLE IF NOT EXISTS discarded_dead_letters (
     error_kind       TEXT        NOT NULL,
     error_message    TEXT        NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL,   -- when the dead letter was written
-    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded' | 'superseded'
+    reason           TEXT        NOT NULL,   -- 'retried' | 'discarded' | 'superseded' | 'stream_deleted'
     discarded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     aggregate_name   TEXT,                   -- identity the row carried, kept as-is
     target_stream_id TEXT,
@@ -3240,7 +3296,8 @@ CREATE INDEX IF NOT EXISTS idx_discarded_dead_letters_policy
 
 `superseded` is the third way out, and the only one no operator asked for: the
 duplicate generations the dedupe migration retired when a parked command became
-unique.
+unique. `stream_deleted` is the fourth: the rows whose triggering event went with its
+stream ([Deleting streams](#deleting-streams)).
 
 #### `A::Error: Into<replay::Error>` migration note
 
