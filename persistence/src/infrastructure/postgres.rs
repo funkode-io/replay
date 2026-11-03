@@ -714,8 +714,8 @@ impl PostgresEventStoreBuilder {
 }
 
 impl PostgresEventStore {
-    /// List existing stream ids of every type within `scope`, in PostgreSQL's id
-    /// order, strictly after `after` (`None` starts at the beginning).
+    /// List existing stream ids of every type within `scope`, ordered by the
+    /// `streams.id` collation, strictly after `after` (`None` starts at the beginning).
     ///
     /// Use [`crate::StreamScope::within`] to find all streams under a scoped URN,
     /// including nested scopes, without needing a read model for every stream type.
@@ -725,6 +725,9 @@ impl PostgresEventStore {
     /// Reads use short keyset queries of at most 256 ids, releasing the connection
     /// before yielding. Callers choose a page with `.take(n)` and resume with the last
     /// id they received, even if that id has since been deleted.
+    /// No current index serves a suffix filter (nor a `LIKE` prefix under a non-C
+    /// collation). Each query scans forward from the cursor until 256 matches or
+    /// the end: the chunk bounds returned ids, not rows examined for a sparse scope.
     ///
     /// This is not a snapshot or an atomic scope deletion: concurrent inserts behind
     /// the cursor may be missed, and ids already read may be deleted. Coordinate
@@ -733,7 +736,8 @@ impl PostgresEventStore {
         &self,
         scope: crate::StreamScope,
         after: Option<Urn>,
-    ) -> impl futures::Stream<Item = Result<Urn, replay::Error>> + Send + '_ {
+    ) -> impl futures::Stream<Item = Result<Urn, replay::Error>> + Send + 'static {
+        let pool = self.pool.clone();
         async_stream::try_stream! {
             const CHUNK_SIZE: usize = 256;
             let mut cursor = after.map(|id| id.to_string());
@@ -749,7 +753,7 @@ impl PostgresEventStore {
                 query.push(" ORDER BY id LIMIT ").push_bind(CHUNK_SIZE as i64);
                 // Bounded by CHUNK_SIZE; no connection or snapshot lives across a yield.
                 let ids: Vec<String> = query.build_query_scalar()
-                    .fetch_all(&self.pool)
+                    .fetch_all(&pool)
                     .await
                     .map_err(|error| crate::db_error(error)
                         .with_operation("stream_ids")

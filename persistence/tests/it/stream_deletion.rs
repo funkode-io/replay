@@ -455,10 +455,10 @@ async fn stream_ids_match_literal_suffixes_and_prefixes_postgres_test() {
     ] {
         stock(&store, name, "sku").await;
     }
-    let ids: Vec<Urn> = store
-        .stream_ids(StreamScope::Suffix("@catalog:a%25_b".into()), None)
-        .try_collect()
+    let listing = store.stream_ids(StreamScope::Suffix("@catalog:a%25_b".into()), None);
+    let ids: Vec<Urn> = tokio::spawn(async move { listing.try_collect().await })
         .await
+        .unwrap()
         .unwrap();
     assert_eq!(
         ids,
@@ -474,7 +474,7 @@ async fn stream_ids_match_literal_suffixes_and_prefixes_postgres_test() {
         .unwrap();
     assert_eq!(prefixed, ids);
     assert!(store
-        .stream_ids(StreamScope::Suffix(r"@catalog:a\_b".into()), None)
+        .stream_ids(StreamScope::Suffix(r"@catalog:\a%25_b".into()), None)
         .boxed()
         .try_next()
         .await
