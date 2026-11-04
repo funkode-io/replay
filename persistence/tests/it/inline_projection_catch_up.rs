@@ -916,7 +916,35 @@ async fn a_catch_up_reads_from_its_horizon_when_the_gap_is_most_of_the_log_postg
     for _ in 0..99 {
         assert_eq!(new_pod.catch_up_projections().await.unwrap(), 0);
     }
+    let (horizon, marked): (String, bool) = sqlx::query_as(
+        "SELECT caught_up_below::text, EXISTS ( \
+             SELECT 1 FROM projection_applied_transactions \
+              WHERE projection = 'till_view' AND version = 1) \
+           FROM projections WHERE name = 'till_view'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(marked, "the held horizon must retain applied marks");
     held.rollback().await.unwrap();
+
+    // A NULL gap start must still seal and retire marks once the horizon can move.
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), 0);
+    let (advanced, marked): (bool, bool) = sqlx::query_as(
+        "SELECT caught_up_below > $1::xid8, EXISTS ( \
+             SELECT 1 FROM projection_applied_transactions \
+              WHERE projection = 'till_view' AND version = 1) \
+           FROM projections WHERE name = 'till_view'",
+    )
+    .bind(&horizon)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(advanced, "an empty catch-up must advance the horizon");
+    assert!(
+        !marked,
+        "an empty catch-up must prune marks below its horizon"
+    );
 
     let read = event_reads_since(&pool, new_pod, measured, before).await;
     assert!(

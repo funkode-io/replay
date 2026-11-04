@@ -306,21 +306,12 @@ pub(crate) async fn apply_pages(
 /// is most of the log may be cheaper to scan — and never walks `global_position`'s own
 /// index from the start of the log (funkode-io/replay#306):
 ///
-/// - **Fenced.** A bare `MIN(global_position) … WHERE commit_txid >= $1` lets the planner
-///   walk `global_position` from the start of the log and stop at the first row above the
-///   horizon. It does so with a generic plan, and with the real horizon whenever the rows
-///   above it are a large share of the log; either way it reads everything below the
-///   horizon, every round. `OFFSET 0` keeps the range read a subquery the `MIN` cannot be
-///   turned into that walk through.
-/// - **Unnamed.** Planned with the horizon every time rather than generically after five
-///   executions on one connection.
-/// - **Owed rows only.** A long transaction holds the horizon back, and every round reads
-///   what committed above it. Those rows are marked, so a round that owes nothing stops
-///   here instead of walking each of them in the pages. The predicate is the page query's
-///   own, less the filters on the row itself (event types, compaction snapshots), so it
-///   can only start lower than the first row a page returns, never higher; keep the two
-///   in step. A compaction's transaction has no mark until a seal writes one, so it wakes
-///   the pages for the one round that does.
+/// Keep `OFFSET 0`: without the fence, even a custom plan can walk the position index
+/// from the start (#306). `persistent(false)` plans the range with the current horizon.
+///
+/// This predicate must include every row `load_page` can return; extra rows are safe.
+/// Excluding marked transactions avoids paging them again under a held-back horizon.
+/// A `None` result skips pages, but the caller must still seal (ADR-0032).
 async fn gap_start(
     conn: &mut PgConnection,
     name: &str,
