@@ -16,6 +16,7 @@
 mod common;
 
 mod bounded_queries;
+mod command_middleware;
 mod created_filter_index;
 mod dead_letter_listing;
 mod dead_letter_unique_command;

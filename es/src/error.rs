@@ -23,6 +23,9 @@ pub enum ErrorKind {
     Forbidden,
     /// Too many requests, rate limit exceeded. Safe to retry after delay.
     RateLimited,
+    /// Not now: a command middleware stopped the command, and the same command may
+    /// succeed later (maintenance mode, for one). Not a failure. Safe to retry later.
+    Busy,
 }
 
 impl fmt::Display for ErrorKind {
@@ -37,6 +40,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Conflict => "Conflict",
             ErrorKind::Unavailable => "Unavailable",
             ErrorKind::BusinessRuleViolation => "Business Rule Violation",
+            ErrorKind::Busy => "Busy",
         };
         write!(f, "{}", s)
     }
@@ -54,6 +58,7 @@ impl fmt::Debug for ErrorKind {
             ErrorKind::Conflict => "\u{2694}\u{FE0F} Conflict",
             ErrorKind::Unavailable => "\u{26A0}\u{FE0F} Unavailable",
             ErrorKind::BusinessRuleViolation => "\u{1F4CB} Business Rule Violation",
+            ErrorKind::Busy => "\u{23F3} Busy",
         };
         write!(f, "{}", s)
     }
@@ -207,6 +212,15 @@ impl Error {
     #[track_caller]
     pub fn business_rule_violation(message: impl Into<String>) -> Self {
         Self::permanent(ErrorKind::BusinessRuleViolation, message)
+    }
+
+    /// Create a "busy" error: not now, the same command may succeed later.
+    ///
+    /// What a command middleware's `Busy` answer reaches the caller as, carrying the
+    /// middleware's reason as its message. Temporary, so it is safe to retry later.
+    #[track_caller]
+    pub fn busy(reason: impl Into<String>) -> Self {
+        Self::temporary(ErrorKind::Busy, reason)
     }
 
     #[track_caller]
@@ -434,6 +448,7 @@ impl fmt::Debug for Error {
             (ErrorKind::BusinessRuleViolation, _) => {
                 Some("💡 Review business logic and request parameters")
             }
+            (ErrorKind::Busy, _) => Some("💡 Not now: try the same command again later"),
             _ => None,
         };
 
@@ -710,6 +725,30 @@ mod tests {
         assert!(format!("{:?}", ErrorKind::InvalidInput).contains("❌"));
         assert!(format!("{:?}", ErrorKind::Conflict).contains("⚔"));
         assert!(format!("{:?}", ErrorKind::Unavailable).contains("⚠"));
+    }
+
+    #[test]
+    fn a_busy_error_is_temporary_and_carries_its_reason() {
+        let err = Error::busy("maintenance in progress");
+
+        assert_eq!(err.kind(), ErrorKind::Busy);
+        assert_eq!(err.status(), ErrorStatus::Temporary);
+        assert!(err.is_temporary());
+        assert_eq!(format!("{}", err), "maintenance in progress");
+    }
+
+    #[test]
+    fn a_busy_kind_displays_plainly_and_debugs_with_its_emoji() {
+        assert_eq!(format!("{}", ErrorKind::Busy), "Busy");
+        assert_eq!(format!("{:?}", ErrorKind::Busy), "⏳ Busy");
+    }
+
+    #[test]
+    fn a_busy_error_hints_to_try_again_later() {
+        let debug = format!("{:?}", Error::busy("maintenance in progress"));
+
+        assert!(debug.contains("⏳ Busy maintenance in progress"));
+        assert!(debug.contains("💡 Not now: try the same command again later"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod aggregate_version;
+mod command_middleware;
 mod cqrs;
 mod error;
 mod filters;
@@ -17,6 +18,7 @@ mod store;
 mod stream_scope;
 
 pub use aggregate_version::AggregateVersion;
+pub use command_middleware::{Causation, CommandContext, CommandMiddleware, Next, Outcome};
 pub use cqrs::Cqrs;
 pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;
@@ -62,12 +64,13 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, CompactionOutcome, Cqrs, DeadLetter, DeadLetterDiscard, DeadLetterFilter,
-        DeadLetterRetry, DeadLetterRetrySummary, DeletedStreams, Dispatch, Escalation,
-        EscalationReason, EventSink, EventStore, InMemoryEventStore, InlineProjection, Liveness,
-        NoSink, ObservedEvent, PersistedEvent, Policy, PolicyCondition, PolicyRunner,
-        PolicyRunnerBuilder, PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore,
-        PostgresEventStore, PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter,
-        StreamScope, WorkerLiveness, WorkerSupervision,
+        AggregateVersion, CommandContext, CommandMiddleware, CompactionOutcome, Cqrs, DeadLetter,
+        DeadLetterDiscard, DeadLetterFilter, DeadLetterRetry, DeadLetterRetrySummary,
+        DeletedStreams, Dispatch, Escalation, EscalationReason, EventSink, EventStore,
+        InMemoryEventStore, InlineProjection, Liveness, Next, NoSink, ObservedEvent,
+        PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
+        PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
+        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, StreamScope,
+        WorkerLiveness, WorkerSupervision,
     };
 }

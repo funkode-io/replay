@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Pool, Postgres, QueryBuilder, Row};
 use tokio::sync::{broadcast, watch};
@@ -29,6 +28,7 @@ use tokio::task::JoinHandle;
 
 use replay::{Aggregate, Dispatch, Metadata, ObservedEvent, Policy};
 
+use crate::command_middleware::Causation;
 use crate::policy::{
     AggregateClosurePolicy, ClosurePolicy, PolicySettings, RegisteredPolicy, StartAt,
 };
@@ -5672,45 +5672,24 @@ async fn write_reconciled(
     Ok(())
 }
 
-/// Typed representation of the `causation` block stamped in event metadata by
-/// every policy reaction.  Using a struct instead of manual `Value` navigation
-/// ensures the write (serialization) and read (deserialization) paths stay in sync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CausationInfo {
-    policy: String,
-    event_id: String,
-    stream_id: String,
-    global_position: i64,
-    /// How many policy hops deep this event is.  Root events (from normal
-    /// `append`) carry no causation block and are treated as depth 0.
-    #[serde(default)]
-    depth: u32,
-}
-
-/// Top-level metadata payload written by the runner for each policy-issued command.
-#[derive(Debug, Serialize)]
-struct CausationPayload {
-    causation: CausationInfo,
-}
-
 /// Causation metadata stamped on every command a policy issues.
 ///
 /// Records which policy reacted and which event triggered it, and increments the
 /// causation depth so the runner can detect runaway event→command→event cascades.
+/// Written and read through one type, [`Causation`], so the two cannot drift apart.
 fn causation_metadata(
     policy_name: &str,
     global_position: i64,
     raw: &PersistedEvent<Value>,
 ) -> Metadata {
-    Metadata::new(CausationPayload {
-        causation: CausationInfo {
-            policy: policy_name.to_string(),
-            event_id: raw.id.to_string(),
-            stream_id: raw.stream_id.to_string(),
-            global_position,
-            depth: event_causation_depth(raw) + 1,
-        },
-    })
+    Causation {
+        policy: policy_name.to_string(),
+        event_id: raw.id.to_string(),
+        stream_id: raw.stream_id.to_string(),
+        global_position,
+        depth: event_causation_depth(raw) + 1,
+    }
+    .into_metadata()
 }
 
 /// Extract the causation depth from an event's metadata.
@@ -5723,12 +5702,8 @@ fn event_causation_depth(raw: &PersistedEvent<Value>) -> u32 {
 }
 
 /// Deserialize the `causation` block from an event's metadata, if present.
-fn parse_causation_info(raw: &PersistedEvent<Value>) -> Option<CausationInfo> {
-    raw.metadata
-        .to_json()
-        .get("causation")
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
+fn parse_causation_info(raw: &PersistedEvent<Value>) -> Option<Causation> {
+    Causation::from_metadata(&raw.metadata)
 }
 
 /// Built-in default maximum causation depth (circuit-breaker for loops).

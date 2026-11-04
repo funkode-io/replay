@@ -6,15 +6,29 @@ use replay::{Aggregate, Event};
 use urn::Urn;
 
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
+use crate::{CommandContext, CommandMiddleware, Next};
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
 const DEFAULT_COMPACTION_CHUNK_SIZE: u32 = 100;
 
-#[derive(Clone)]
 pub struct Cqrs<ES: EventStore> {
     store: Arc<ES>,
     /// How many stream ids [`Cqrs::streams_needing_compaction`] reads per store query.
     compaction_chunk_size: u32,
+    /// The command middleware chain, in registration order. Shared by every clone, and
+    /// bounded by how many middlewares the consumer registers, not by any data.
+    middlewares: Arc<[Arc<dyn CommandMiddleware>]>,
+}
+
+/// A clone shares the store and the middleware chain, so it needs no `ES: Clone`.
+impl<ES: EventStore> Clone for Cqrs<ES> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            compaction_chunk_size: self.compaction_chunk_size,
+            middlewares: Arc::clone(&self.middlewares),
+        }
+    }
 }
 
 impl<ES: EventStore> Cqrs<ES> {
@@ -22,7 +36,21 @@ impl<ES: EventStore> Cqrs<ES> {
         Self {
             store: Arc::new(event_store),
             compaction_chunk_size: DEFAULT_COMPACTION_CHUNK_SIZE,
+            middlewares: Arc::new([]),
         }
+    }
+
+    /// Register a command middleware, after every one registered before it.
+    ///
+    /// Every command [`execute`](Self::execute) runs — an application's call and a
+    /// Policy dispatch alike — passes through each middleware in registration order
+    /// (ADR-0035). Clones of this `Cqrs` made afterwards share the chain. A `Cqrs` with
+    /// no middleware behaves as if the feature did not exist.
+    pub fn with_middleware<M: CommandMiddleware + 'static>(mut self, middleware: M) -> Self {
+        let mut chain = self.middlewares.to_vec();
+        chain.push(Arc::new(middleware));
+        self.middlewares = chain.into();
+        self
     }
 
     /// Cap how many stream ids [`streams_needing_compaction`](Self::streams_needing_compaction)
@@ -94,6 +122,15 @@ impl<ES: EventStore> Cqrs<ES> {
             .await
     }
 
+    /// Run `command` against the aggregate at `id` and append the events it produces.
+    ///
+    /// Each registered [command middleware](Self::with_middleware) runs its `before`
+    /// first, in registration order. The first that does not answer
+    /// [`Next::Continue`] stops the command — nothing is loaded, handled or appended,
+    /// and later middlewares do not run: [`Next::Busy`] reaches the caller as a
+    /// `replay::Error` of kind [`Busy`](replay::ErrorKind::Busy) carrying its reason,
+    /// [`Next::Error`] as the error it carries. Metadata a middleware adds is carried by
+    /// the appended events.
     pub async fn execute<A: Aggregate>(
         &self,
         id: &A::StreamId,
@@ -106,6 +143,27 @@ impl<ES: EventStore> Cqrs<ES> {
         A::Event: 'static,
         A::Error: 'static,
     {
+        let metadata = if self.middlewares.is_empty() {
+            metadata
+        } else {
+            let mut command = CommandContext::new::<A>(id, metadata);
+            for middleware in self.middlewares.iter() {
+                match middleware.before(&mut command).await {
+                    Next::Continue => {}
+                    Next::Busy(reason) => {
+                        return Err(A::Error::from(
+                            replay::Error::busy(reason)
+                                .with_operation("execute")
+                                .with_context("stream_id", command.stream_id())
+                                .with_context("command", command.command_type()),
+                        ))
+                    }
+                    Next::Error(error) => return Err(A::Error::from(error)),
+                }
+            }
+            command.metadata().clone()
+        };
+
         // Always load the latest (current) event stream for command handling.
         let mut aggregate = self
             .fetch_aggregate_at::<A>(id, AggregateVersion::Latest, expected_version, None)
