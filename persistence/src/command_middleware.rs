@@ -184,20 +184,35 @@ impl CommandContext {
     }
 
     /// Replace the command's metadata.
-    pub fn set_metadata(&mut self, metadata: replay::Metadata) {
+    ///
+    /// The `causation` key is the Policy runner's, and bounds how deep one event may
+    /// cascade: the replacement must carry it exactly as the command arrived with it, or
+    /// not at all when it arrived without one. Fails with
+    /// [`InvalidInput`](replay::ErrorKind::InvalidInput), leaving the metadata as it was,
+    /// when it does not.
+    pub fn set_metadata(&mut self, metadata: replay::Metadata) -> Result<(), replay::Error> {
+        if metadata.as_json().get(CAUSATION_KEY) != self.metadata.as_json().get(CAUSATION_KEY) {
+            return Err(causation_is_reserved("set_metadata"));
+        }
         self.metadata = metadata;
+        Ok(())
     }
 
     /// Add `key` to the command's metadata, replacing any value it had.
     ///
     /// Metadata that is `null` (the default) becomes an object holding `key`. Fails with
-    /// [`InvalidInput`](replay::ErrorKind::InvalidInput) when the metadata is another
+    /// [`InvalidInput`](replay::ErrorKind::InvalidInput), leaving the metadata as it was,
+    /// when `key` is `causation` (the Policy runner's), when the metadata is another
     /// non-object value, or when `value` does not serialize to JSON.
     pub fn insert_metadata(
         &mut self,
         key: impl Into<String>,
         value: impl Serialize,
     ) -> Result<(), replay::Error> {
+        let key = key.into();
+        if key == CAUSATION_KEY {
+            return Err(causation_is_reserved("insert_metadata"));
+        }
         let value = serde_json::to_value(value).map_err(|e| {
             replay::Error::invalid_input("command metadata value does not serialize to JSON")
                 .with_operation("insert_metadata")
@@ -214,7 +229,7 @@ impl CommandContext {
                 .with_operation("insert_metadata"));
             }
         };
-        object.insert(key.into(), value);
+        object.insert(key, value);
         self.metadata = replay::Metadata::from_json(Value::Object(object));
         Ok(())
     }
@@ -236,6 +251,15 @@ pub struct Causation {
 
 /// The metadata key the runner stamps a [`Causation`] under.
 const CAUSATION_KEY: &str = "causation";
+
+/// Why a middleware may not change the `causation` key: the runner reads the depth it
+/// carries to stop a cyclic Policy, so erasing it would reset that depth to zero.
+fn causation_is_reserved(operation: &'static str) -> replay::Error {
+    replay::Error::invalid_input(
+        "command metadata key `causation` is the Policy runner's and a middleware cannot change it",
+    )
+    .with_operation(operation)
+}
 
 impl Causation {
     /// The causation stamped in `metadata`, if any.
@@ -586,13 +610,7 @@ mod tests {
             Cqrs::new(InMemoryEventStore::new())
                 .with_middleware(answering("probe", &log, || Next::Continue));
         // The metadata the Policy runner stamps on every command it dispatches.
-        let stamped = Causation {
-            policy: "notifier".to_string(),
-            event_id: "e-1".to_string(),
-            stream_id: "urn:account:42".to_string(),
-            global_position: 7,
-            depth: 1,
-        };
+        let stamped = stamped();
 
         for metadata in [Metadata::default(), stamped.clone().into_metadata()] {
             cqrs.execute::<Counter>(&counter(), metadata, Add(1), &Handled::default(), None)
@@ -652,6 +670,76 @@ mod tests {
         let events = appended(&cqrs).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].metadata.to_json(), json!({ "tenant": "acme" }));
+    }
+
+    /// Tries to erase and to overwrite the Policy runner's causation stamp, ignores the
+    /// refusals, and lets the command go on.
+    struct TampersWithCausation;
+
+    impl CommandMiddleware for TampersWithCausation {
+        fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+            Box::pin(async move {
+                let erased = context.set_metadata(Metadata::new(json!({ "user": "mallory" })));
+                let overwritten = context.insert_metadata("causation", json!({ "depth": 0 }));
+                assert_eq!(erased.unwrap_err().kind(), ErrorKind::InvalidInput);
+                assert_eq!(overwritten.unwrap_err().kind(), ErrorKind::InvalidInput);
+                Next::Continue
+            })
+        }
+    }
+
+    fn stamped() -> Causation {
+        Causation {
+            policy: "notifier".to_string(),
+            event_id: "e-1".to_string(),
+            stream_id: "urn:account:42".to_string(),
+            global_position: 7,
+            depth: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_middleware_cannot_change_the_causation_a_policy_command_carries() {
+        let cqrs = Cqrs::new(InMemoryEventStore::new()).with_middleware(TampersWithCausation);
+
+        cqrs.execute::<Counter>(
+            &counter(),
+            stamped().into_metadata(),
+            Add(1),
+            &Handled::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let events = appended(&cqrs).await;
+        assert_eq!(events[0].metadata, stamped().into_metadata());
+    }
+
+    #[test]
+    fn metadata_may_be_replaced_when_the_causation_is_kept() {
+        let mut context = CommandContext::new::<Counter>(&counter(), stamped().into_metadata());
+        let mut kept = stamped().into_metadata().to_json();
+        kept["user"] = json!("alice");
+
+        context
+            .set_metadata(Metadata::from_json(kept.clone()))
+            .unwrap();
+
+        assert_eq!(context.metadata().to_json(), kept);
+    }
+
+    #[test]
+    fn an_application_command_cannot_be_given_a_causation() {
+        let mut context = CommandContext::new::<Counter>(&counter(), Metadata::default());
+
+        let set = context.set_metadata(stamped().into_metadata());
+        let inserted = context.insert_metadata("causation", stamped());
+
+        assert_eq!(set.unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(inserted.unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(context.metadata(), &Metadata::default());
+        assert_eq!(context.causation(), None);
     }
 
     #[test]

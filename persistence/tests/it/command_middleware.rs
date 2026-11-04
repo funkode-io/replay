@@ -39,6 +39,24 @@ impl CommandMiddleware for RecordsCausation {
     }
 }
 
+/// Tries to erase and to overwrite the causation stamp through both metadata APIs,
+/// ignores the refusals, and lets the command go on.
+struct TampersWithCausation;
+
+impl CommandMiddleware for TampersWithCausation {
+    fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            if context.causation().is_some() {
+                assert!(context.set_metadata(Metadata::default()).is_err());
+                assert!(context
+                    .insert_metadata("causation", serde_json::json!({ "depth": 0 }))
+                    .is_err());
+            }
+            Next::Continue
+        })
+    }
+}
+
 #[tokio::test]
 async fn a_policy_command_shows_its_causation_and_an_application_command_none_postgres_test() {
     let container = start_postgres_server().await;
@@ -66,7 +84,9 @@ async fn a_policy_command_shows_its_causation_and_an_application_command_none_po
         .expect("migrations must succeed");
 
     let seen = RecordsCausation::default();
-    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone())).with_middleware(seen.clone());
+    let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()))
+        .with_middleware(seen.clone())
+        .with_middleware(TampersWithCausation);
     let policy = "middleware_sees_causation";
     let runner = PolicyRunner::builder(cqrs.clone())
         .register_services::<Probe>(())
@@ -116,4 +136,15 @@ async fn a_policy_command_shows_its_causation_and_an_application_command_none_po
     assert_eq!(causation.stream_id(), "urn:probe:hello");
     assert_eq!(causation.global_position(), ping_position);
     assert_eq!(causation.depth(), 1);
+
+    // The stamp the runner reads to bound a cascade survived the middleware that tried
+    // to erase it.
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT metadata FROM events WHERE stream_id = $1")
+            .bind("urn:probe:hello-echo")
+            .fetch_one(&pool)
+            .await
+            .expect("the Policy's command appended an event");
+    assert_eq!(stored["causation"]["policy"], serde_json::json!(policy));
+    assert_eq!(stored["causation"]["depth"], serde_json::json!(1));
 }
