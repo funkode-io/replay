@@ -62,8 +62,8 @@ pub(crate) struct Nominations {
     /// What the late-write lookup found, which leads the poll because it may not be
     /// nominated again.
     pub(crate) late: Vec<String>,
-    /// The bounded stream-id window the reconciliation compared, including streams that
-    /// were already caught up.
+    /// Rotation order: a cadence window including caught-up streams, or only the
+    /// candidates retained by a full comparison.
     pub(crate) page: Vec<String>,
     /// The limit that distinguishes a complete scan page from the end of the key range.
     pub(crate) page_limit: u32,
@@ -95,8 +95,8 @@ const RECOVERED: usize = 2;
 pub(crate) struct PollPlan {
     /// The candidates, in read order.
     streams: Vec<String>,
-    /// The bounded stream-id window the reconciliation compared, kept whole: the rotation
-    /// moves through this order, which is stream id order, not the order the poll read in.
+    /// The comparison's rotation order, which may wrap at the saved cursor. Full
+    /// comparisons retain only candidates; cadence windows include caught-up streams.
     page: Vec<String>,
     page_limit: u32,
     /// The streams in `page` that owe events to the Policy.
@@ -934,7 +934,7 @@ mod settling_tests {
         assert_eq!(settled.rotation, Some("urn:probe:a".to_string()));
         assert!(
             !settled.carried.contains(&"urn:probe:b".to_string()),
-            "the capped candidate is not hidden behind the new rotation"
+            "the behind stream that got no slot is not carried"
         );
     }
 
@@ -1201,6 +1201,7 @@ mod liveness_simulation {
         seed: u64,
         streams: Vec<Stream>,
         read_batch: u32,
+        scan_window: u32,
         polls_per_cadence: u32,
         /// The log, as the sweep reads it: one entry per event of a stream it can see.
         log: Vec<usize>,
@@ -1233,6 +1234,7 @@ mod liveness_simulation {
                 seed,
                 streams: Vec::new(),
                 read_batch,
+                scan_window: 1 + (seed % 7) as u32,
                 polls_per_cadence,
                 log: Vec::new(),
                 late: Vec::new(),
@@ -1315,7 +1317,7 @@ mod liveness_simulation {
                 .iter()
                 .filter(|stream| stream.id > self.rotation)
                 .map(|stream| stream.id.clone())
-                .take(self.read_batch as usize)
+                .take(self.scan_window as usize)
                 .collect()
         }
 
@@ -1363,7 +1365,7 @@ mod liveness_simulation {
                 swept: swept.clone(),
                 late: late.clone(),
                 page,
-                page_limit: self.read_batch,
+                page_limit: self.scan_window,
                 examined,
                 reconciling,
                 read_batch: self.read_batch,
@@ -1377,7 +1379,7 @@ mod liveness_simulation {
             }
             if reconciling {
                 // A full page with behind streams after it means the rotation spans pages.
-                if page_len == self.read_batch as usize
+                if page_len == self.scan_window as usize
                     && self.streams.iter().any(|stream| {
                         stream.head > stream.place && stream.id.as_str() > page_last.as_str()
                     })
@@ -1454,17 +1456,14 @@ mod liveness_simulation {
         /// compare each against [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md):
         ///
         /// ```text
-        /// cadences ≤ ceil(tracked streams / streams read per cadence) + 1
+        /// cadences ≤ ceil(tracked streams / window) + streams behind + 1
         /// ```
         ///
-        /// Taken at its floor, which is the guarantee the ADR gives rather than its best
-        /// case: the reconciliation leads the poll it runs on, so **one** tracked stream
-        /// is read per cadence at worst, and the division is by one. The numerator is all
-        /// tracked streams because the bounded query advances through caught-up streams
-        /// too. The ADR's `+ 1` is the cadence a finished pass spends wrapping on an empty
-        /// page.
+        /// The worst case spends one cadence per caught-up window or behind stream,
+        /// plus the empty page that wraps the rotation.
         fn account(&mut self) -> Result<(), String> {
-            let stream_count = self.streams.len() as u32;
+            let windows = (self.streams.len() as u32).div_ceil(self.scan_window);
+            let behind = self.streams.iter().filter(|s| s.head > s.place).count() as u32;
             let mut starved: Vec<String> = Vec::new();
 
             for stream in &mut self.streams {
@@ -1472,16 +1471,14 @@ mod liveness_simulation {
                     stream.waited = 0;
                 } else {
                     stream.waited += 1;
-                    let bound = stream_count + 1;
+                    let bound = windows + behind + 1;
                     if stream.waited > bound {
                         starved.push(format!(
-                            "{} (owed {}, unread for {} cadences, bound {bound} = at most \
-                             {} tracked streams, read one a cadence, plus the cadence a \
-                             pass ends on)",
+                            "{} (owed {}, unread for {} cadences, bound {bound} = {windows} \
+                             caught-up windows + {behind} behind streams + wrap)",
                             stream.id,
                             stream.head - stream.place,
                             stream.waited,
-                            stream_count,
                         ));
                     }
                 }
@@ -1494,9 +1491,9 @@ mod liveness_simulation {
 
             Err(format!(
                 "a stream the Policy is behind on went unread for longer than ADR-0026's \
-                 bound, ceil(tracked streams / streams read per cadence) + 1:\n  \
+                 bound, ceil(tracked streams / window) + streams behind + 1:\n  \
                  starved: {}\n  \
-                 seed: {}\n  streams: {} ({} quiet, {} busy)\n  read_batch: {}\n  \
+                 seed: {}\n  streams: {} ({} quiet, {} busy)\n  read_batch: {}\n  scan_window: {}\n  \
                  polls per cadence: {}\n  schedule:\n    {}",
                 starved.join("\n           "),
                 self.seed,
@@ -1504,6 +1501,7 @@ mod liveness_simulation {
                 self.streams.iter().filter(|s| s.quiet).count(),
                 self.streams.iter().filter(|s| s.busy).count(),
                 self.read_batch,
+                self.scan_window,
                 self.polls_per_cadence,
                 self.transcript.join("\n    "),
             ))

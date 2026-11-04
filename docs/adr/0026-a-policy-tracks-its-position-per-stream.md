@@ -57,12 +57,14 @@ columns and no index can answer it. Two paths, with different costs and differen
   It advances `swept_through` to the last position it *read*, deliberately passing
   positions it never saw, which is what stops it waiting for anything.
 - **The reconciliation, as a safety net.** `streams.stream_seq > COALESCE(cursor, 0)` —
-  one bounded keyset window of `RECONCILIATION_SCAN_SIZE` (10,000) stream rows per cadence,
-  default every 300 seconds (`REPLAY_POLICY_RECONCILE_SECS`). Late writes are normally
+  one bounded keyset window per cadence, sized by `PolicyRunnerBuilder::reconcile_window`
+  (default 10,000), every 300 seconds by default (`REPLAY_POLICY_RECONCILE_SECS`). Late writes are normally
   found by their commit stamp (ADR-0030). A worker that has just started or been elected
   first compares **within three poll intervals**, at a per-Policy phase (`reconcile_phase`,
   funkode-io/replay#269, #273); startup and manual comparisons walk bounded pages until a
-  candidate batch or the end of the tracked streams.
+  candidate batch or a complete pass, wrapping once at the saved rotation. When nothing
+  is behind, this costs roughly `ceil(tracked streams / window)` statements plus boundary
+  probes inside one poll; delivery waits until the comparison finishes.
 
 The sweep is allowed to be wrong because it decides nothing. It nominates; what a stream
 is owed is read from that stream's own sequence, which has no holes.
@@ -79,7 +81,7 @@ is owed is read from that stream's own sequence, which has no holes.
   safety-net comparison.
 
   ```text
-  cadences ≤ ceil(tracked streams / streams read per cadence) + 1
+  cadences ≤ ceil(tracked streams / scan window) + streams behind + 1
   ```
 
   The count starts at the first safety-net comparison after an election, which comes up
@@ -107,7 +109,7 @@ is owed is read from that stream's own sequence, which has no holes.
   The floor is asserted rather than argued: `liveness_simulation` in
   `persistence/src/policy_frontier.rs` replays sixty-four schedules against the poll's own
   decision and fails if a behind stream goes unread for longer than this bound, taken at
-  one read per cadence and over the Policy's tracked streams (funkode-io/replay#243).
+  one read per cadence, with an independently varied scan window (funkode-io/replay#243).
 - **There is no hole to detect, so the machinery that detected holes is gone**:
   `burned_position.rs` and its `pg_locks` probe, `policy_feed.rs` and its gap truncation,
   `policy_blocked.rs` and its rate gate, `PolicyCondition::Blocked`, and the cursor's
@@ -123,8 +125,8 @@ is owed is read from that stream's own sequence, which has no holes.
   database with millions of them (of the types it tracks, since
   [ADR-0031](0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 - **A reconciliation statement compares a bounded window, not every tracked stream.**
-  Each cadence reads at most `RECONCILIATION_SCAN_SIZE` (10,000) streams, while a full pass
-  still costs the number of streams the Policy tracks. A frontier table — a row per
+  Each cadence compares at most `reconcile_window` (default 10,000) streams, while a full
+  pass still costs the number of streams the Policy tracks. A frontier table — a row per
   `(policy, stream)` written on append and deleted when caught up — would make each pass
   proportional to work instead, and was rejected for now because keeping it small means
   the *write* path has to know the set of deployed policies, so an append's cost would

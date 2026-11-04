@@ -66,12 +66,12 @@ const REVIEWED: &[Reviewed] = &[
     Reviewed {
         file: "src/policy_runner.rs",
         function: "reconciliation_page",
-        justification: "A cadence reads at most RECONCILIATION_SCAN_SIZE stream rows for \
-                        every tracked stream, then joins places only for that bounded \
+        justification: "A cadence reads at most reconcile_window stream rows for \
+                        every tracked stream, then probes places only for that bounded \
                         window. A ForStreamTypes(types) Policy reads at most \
-                        types x RECONCILIATION_SCAN_SIZE rows through idx_streams_type_id, \
+                        types x reconcile_window rows through idx_streams_type_id, \
                         with no rows of untracked types (ADR-0031); its outer window and \
-                        cursor joins are capped at RECONCILIATION_SCAN_SIZE. A forced \
+                        cursor probes are capped at reconcile_window. A forced \
                         startup or manual comparison walks the same bounded pages and \
                         retains at most read_batch_size behind ids. The persisted rotation \
                         advances only through caught-up or read candidates, so it costs a \

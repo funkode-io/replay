@@ -14,6 +14,7 @@ use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -151,6 +152,7 @@ pub struct PolicyRunnerBuilder {
     supervision: WorkerSupervision,
     on_escalation: EscalationHook,
     reconcile_cadence: Duration,
+    reconcile_window: NonZeroU32,
 }
 
 impl PolicyRunnerBuilder {
@@ -228,13 +230,21 @@ impl PolicyRunnerBuilder {
         self
     }
 
-    /// Replace how often each Policy runs the full comparison, its safety net
+    /// Replace how often each Policy compares one reconciliation window
     /// (`REPLAY_POLICY_RECONCILE_SECS`, else 300 s).
     ///
     /// [`Duration::ZERO`] compares on every poll. That is for tests: a test that moves a
     /// place by hand is then answered on the next poll instead of waiting out a cadence.
     pub fn reconcile_every(mut self, cadence: Duration) -> Self {
         self.reconcile_cadence = cadence;
+        self
+    }
+
+    /// Maximum stream rows per reconciliation statement. Defaults to 10,000.
+    /// Typed policies scan up to this many rows per tracked type before merging the window.
+    /// Larger windows shorten safety-net recovery at the cost of more work per cadence.
+    pub fn reconcile_window(mut self, window: NonZeroU32) -> Self {
+        self.reconcile_window = window;
         self
     }
 
@@ -437,6 +447,7 @@ impl PolicyRunnerBuilder {
             supervision: self.supervision,
             on_escalation: self.on_escalation,
             reconcile_cadence: self.reconcile_cadence,
+            reconcile_window: self.reconcile_window,
             drained: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -507,8 +518,9 @@ pub struct PolicyRunner {
     supervision: WorkerSupervision,
     /// What the consumer does about a worker this runner has given up on.
     on_escalation: EscalationHook,
-    /// How often each Policy runs the full comparison.
+    /// How often each Policy compares one window.
     reconcile_cadence: Duration,
+    reconcile_window: NonZeroU32,
     /// Where each policy's search had got to at the end of the last [`Self::drain`].
     ///
     /// A daemon worker keeps this for its leadership term; a manual drain has no term, so
@@ -885,6 +897,7 @@ impl PolicyRunner {
             supervision: WorkerSupervision::default(),
             on_escalation: exit_the_process(),
             reconcile_cadence: resolve_reconcile_cadence(),
+            reconcile_window: DEFAULT_RECONCILE_WINDOW,
         }
     }
 
@@ -902,9 +915,9 @@ impl PolicyRunner {
     /// full comparison's rotation carries on rather than restarting. A fresh runner starts
     /// the search afresh — from what is stored, never from the beginning.
     ///
-    /// Unlike a daemon's poll, this one always compares every stream's head with the
-    /// policy's places rather than doing it on a cadence, so a place moved by hand is
-    /// found by the very next call.
+    /// Always compares, wrapping once from the saved rotation until a candidate batch
+    /// or a complete pass. A caught-up pass costs roughly `ceil(tracked / window)`
+    /// statements plus boundary probes before delivery starts.
     ///
     /// Returns how many dispatches **committed** across all policies — a progress
     /// signal, not an audit. A delivery that fails does not contribute its
@@ -1603,6 +1616,7 @@ impl PolicyRunner {
                 wake_tx: wake_tx.clone(),
                 interval,
                 reconcile_cadence: self.reconcile_cadence,
+                reconcile_window: self.reconcile_window,
                 liveness: liveness.register(&name),
                 name,
             };
@@ -1680,15 +1694,13 @@ impl PolicyRunner {
                 first.insert(
                     PolicyProgress::load(&self.pool, &name, policy.start_at(), tracked)
                         .await?
-                        .reconciling_every(self.reconcile_cadence),
+                        .reconciling_every(self.reconcile_cadence)
+                        .with_reconcile_window(self.reconcile_window),
                 )
             }
         };
 
-        // A manual drain always pays for the frontier scan, whatever the cadence says. The
-        // cadence bounds what a daemon's tight polling loop spends on a scan it mostly
-        // does not need; a call made by hand is one poll and has to be a whole one — an
-        // operator who moves a place and drains expects that drain to find it.
+        // Manual drains must find rewound places even when the safety cadence is not due.
         progress.reconcile_fully_now();
 
         let max_depth = resolve_max_depth(policy.settings());
@@ -2084,8 +2096,9 @@ struct PolicyWorker {
     /// and nothing else (polling is the correctness baseline).
     wake_tx: Option<broadcast::Sender<()>>,
     interval: Duration,
-    /// How often its Policy runs the full comparison.
+    /// How often its Policy compares one window.
     reconcile_cadence: Duration,
+    reconcile_window: NonZeroU32,
     /// Where this worker publishes what it is doing, shared with its supervisor.
     liveness: LivenessHandle,
     name: String,
@@ -2109,6 +2122,7 @@ impl PolicyWorker {
             wake_tx,
             interval,
             reconcile_cadence,
+            reconcile_window,
             liveness,
             name,
         } = self;
@@ -2152,7 +2166,9 @@ impl PolicyWorker {
             let tracked = TrackedStreams::of(&policy.stream_filter());
             let mut progress =
                 match PolicyProgress::load(&pool, &name, policy.start_at(), tracked).await {
-                    Ok(progress) => progress.reconciling_every(reconcile_cadence),
+                    Ok(progress) => progress
+                        .reconciling_every(reconcile_cadence)
+                        .with_reconcile_window(reconcile_window),
                     Err(error) => {
                         tracing::error!(
                             policy = %name,
@@ -3199,7 +3215,7 @@ async fn drain_policy_once(
             &name,
             &tracked,
             &progress.reconciled_through,
-            RECONCILIATION_SCAN_SIZE,
+            progress.reconcile_window.get(),
             read_batch,
             progress.full_reconciliation,
         )
@@ -4766,23 +4782,9 @@ impl TrackedStreams {
     }
 }
 
-/// The bounded stream window this Policy compares after `after`.
-///
-/// This is the correctness half: it finds what the sweep missed, which is any write that
-/// committed below a position the sweep had already passed. No index answers a comparison
-/// between two tables' columns, so each statement compares a bounded stream window; a full
-/// pass still visits every tracked stream over successive cadences. That is why it runs on
-/// a cadence and the sweep runs on every poll (ADR-0026).
-///
-/// What it compares is what the Policy **tracks**: every stream, or — for a Policy whose
-/// filter is [`StreamFilter::ForStreamTypes`] — the streams of those types, found through
-/// `idx_streams_type_id`, one walk per type, without reading a row of any other type
-/// ([ADR-0031](https://github.com/funkode-io/replay/blob/main/docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
-/// A stream it does not track is never behind, because it is never owed anything.
-///
-/// On a cadence it reads one bounded stream window after the last id safely passed. A new
-/// or explicitly forced comparison streams bounded windows until it finds one candidate
-/// batch or reaches the end, preserving the startup and manual-drain comparison.
+/// Cadences compare one window; startup and forced comparisons wrap once, stopping at a
+/// candidate batch. A caught-up full pass costs roughly `ceil(tracked / window)` statements
+/// (plus boundary probes); delivery waits for that pass to finish.
 async fn reconciliation_page(
     pool: &Pool<Postgres>,
     name: &str,
@@ -4792,16 +4794,14 @@ async fn reconciliation_page(
     candidate_limit: u32,
     full_scan: bool,
 ) -> Result<ReconciliationPage, replay::Error> {
-    if full_scan && candidate_limit == 0 {
+    if scan_limit == 0 || (full_scan && candidate_limit == 0) {
         return Ok(ReconciliationPage::default());
     }
 
     let mut cursor = after.to_string();
-    let mut behind = Vec::with_capacity(if full_scan {
-        candidate_limit as usize
-    } else {
-        scan_limit as usize
-    });
+    let mut wrapped = false;
+    // Bounded by candidate_limit in full mode, scan_limit otherwise.
+    let mut behind = Vec::new();
 
     loop {
         // Two statements rather than one `$4 IS NULL OR type = ANY($4)`: the planner
@@ -4811,18 +4811,26 @@ async fn reconciliation_page(
             TrackedStreams::Every => sqlx::query(RECONCILIATION_PAGE)
                 .bind(name)
                 .bind(&cursor)
-                .bind(scan_limit as i64),
+                .bind(scan_limit as i64)
+                .bind(after),
             TrackedStreams::OfTypes(types) => sqlx::query(RECONCILIATION_PAGE_OF_TYPES)
                 .bind(name)
                 .bind(&cursor)
                 .bind(scan_limit as i64)
-                .bind(types),
+                .bind(types)
+                .bind(after),
         };
         let rows = query.fetch_all(pool).await.map_err(crate::db_error)?;
         let mut scanned = Vec::with_capacity(rows.len());
 
+        let page_len = rows.len();
+        let mut reached_start = false;
         for row in rows {
             let id: String = row.get("id");
+            if wrapped && row.get("past_start") {
+                reached_start = true;
+                break;
+            }
             if row.get("behind") {
                 behind.push(id.clone());
             }
@@ -4844,7 +4852,12 @@ async fn reconciliation_page(
                 rotation_limit: scan_limit,
             });
         }
-        if scanned.len() < scan_limit as usize {
+        if reached_start || page_len < scan_limit as usize {
+            if !wrapped && !after.is_empty() {
+                cursor.clear();
+                wrapped = true;
+                continue;
+            }
             return Ok(ReconciliationPage {
                 scanned: behind.clone(),
                 behind,
@@ -4852,9 +4865,6 @@ async fn reconciliation_page(
             });
         }
 
-        // A full comparison streams bounded pages and retains only the first candidate
-        // batch. Once that batch is found, the ordinary poll planner and rotation take
-        // over; if no batch is found, keep scanning until the keyset reaches the end.
         cursor = scanned
             .last()
             .cloned()
@@ -4863,13 +4873,14 @@ async fn reconciliation_page(
 }
 
 /// The maximum stream rows compared by one reconciliation statement.
-const RECONCILIATION_SCAN_SIZE: u32 = 10_000;
+const DEFAULT_RECONCILE_WINDOW: NonZeroU32 = NonZeroU32::new(10_000).unwrap();
 
-/// The bounded keyset window compared by [`reconciliation_page`] for every tracked stream.
+/// A join let PostgreSQL scan every cursor for the policy (#299). The scalar subquery
+/// keeps cursor reads to one primary-key probe per window row.
 const RECONCILIATION_PAGE: &str =
-    "SELECT s.id, s.stream_seq > COALESCE(c.stream_seq, 0) AS behind \
+    "SELECT s.id, s.id > $4 AS past_start, s.stream_seq > COALESCE((SELECT c.stream_seq \
+       FROM policy_stream_cursors c WHERE c.policy = $1 AND c.stream_id = s.id), 0) AS behind \
      FROM (SELECT id, stream_seq FROM streams WHERE id > $2 ORDER BY id LIMIT $3) s \
-     LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = s.id \
      ORDER BY s.id";
 
 /// [`reconciliation_page`] for a Policy that tracks the stream types in `$4`: one bounded walk
@@ -4888,20 +4899,21 @@ const RECONCILIATION_PAGE: &str =
 /// lookups happen only for the resulting `$3` rows. `DISTINCT` keeps a type listed twice
 /// from returning its streams twice.
 const RECONCILIATION_PAGE_OF_TYPES: &str =
-    "SELECT x.id, x.stream_seq > COALESCE(c.stream_seq, 0) AS behind \
+    "SELECT x.id, x.id > $5 AS past_start, x.stream_seq > COALESCE((SELECT c.stream_seq \
+       FROM policy_stream_cursors c WHERE c.policy = $1 AND c.stream_id = x.id), 0) AS behind \
      FROM (SELECT s.id, s.stream_seq \
        FROM (SELECT DISTINCT type FROM unnest($4::text[]) AS u(type)) t \
-       CROSS JOIN LATERAL (SELECT s.id, s.type, s.stream_seq FROM streams s \
+       CROSS JOIN LATERAL (SELECT s.id, s.stream_seq FROM streams s \
          WHERE (s.type, s.id) > (t.type, $2) AND s.type <= t.type \
          ORDER BY s.type, s.id LIMIT $3) s \
        ORDER BY s.id LIMIT $3) x \
-     LEFT JOIN policy_stream_cursors c ON c.policy = $1 AND c.stream_id = x.id \
      ORDER BY x.id";
 
 /// The bounded stream window compared by a Policy's reconciliation.
 #[derive(Default)]
 struct ReconciliationPage {
-    /// The bounded stream window, or the behind candidates retained by a full comparison.
+    /// Rotation order: the cadence window, or a full comparison's retained candidates.
+    /// Full mode omits caught-up ids so memory stays bounded across pages.
     scanned: Vec<String>,
     /// The streams in `scanned` whose head is beyond the Policy's place.
     behind: Vec<String>,
@@ -5230,6 +5242,7 @@ struct PolicyProgress {
     /// A newly loaded or explicitly forced reconciliation scans bounded keyset pages
     /// until it finds one candidate batch or reaches the end of the tracked streams.
     full_reconciliation: bool,
+    reconcile_window: NonZeroU32,
     /// When the frontier is next compared with the places.
     reconcile: ReconcileSchedule,
     /// The streams this Policy tracks, as this worker last recorded them in
@@ -5346,6 +5359,7 @@ impl PolicyProgress {
             reconciled_through,
             reconcile: ReconcileSchedule::after_load(resolve_reconcile_cadence()),
             full_reconciliation: true,
+            reconcile_window: DEFAULT_RECONCILE_WINDOW,
             tracked,
             late_writes: LateWriteState::default(),
         })
@@ -5384,6 +5398,11 @@ impl PolicyProgress {
     /// This progress, comparing once every `cadence`.
     fn reconciling_every(mut self, cadence: Duration) -> Self {
         self.reconcile.every = cadence;
+        self
+    }
+
+    fn with_reconcile_window(mut self, window: NonZeroU32) -> Self {
+        self.reconcile_window = window;
         self
     }
 
@@ -8907,6 +8926,186 @@ mod progress_tests {
         );
     }
 
+    #[tokio::test]
+    async fn reconciliation_windows_bound_cursor_probes_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append_interleaved_streams(&pool, &INTERLEAVED_TYPES, 4_096).await;
+        for policy in ["other-a", "other-b", POLICY, "other-c"] {
+            sqlx::query(
+                "INSERT INTO policy_stream_cursors (policy, stream_id, stream_seq) \
+                 SELECT $1, id, stream_seq FROM streams",
+            )
+            .bind(policy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("ANALYZE streams, policy_stream_cursors")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for statement in [RECONCILIATION_PAGE, RECONCILIATION_PAGE_OF_TYPES] {
+            let sql = format!("EXPLAIN (ANALYZE, FORMAT JSON) {statement}");
+            let mut query = sqlx::query_scalar::<_, serde_json::Value>(sqlx::AssertSqlSafe(sql))
+                .bind(POLICY)
+                .bind("")
+                .bind(256_i64);
+            if statement == RECONCILIATION_PAGE_OF_TYPES {
+                query = query.bind(INTERLEAVED_TYPES.to_vec());
+            }
+            let plan = query.bind("").fetch_one(&pool).await.unwrap();
+            let places = rows_examined(&plan[0]["Plan"], "policy_stream_cursors");
+            assert!(
+                places > 0.0 && places <= 256.0,
+                "examined {places} cursors for a 256-stream window\n{plan:#}"
+            );
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Appended {}
+
+    impl replay::Event for Appended {
+        fn event_type(&self) -> String {
+            "Appended".into()
+        }
+    }
+
+    fn reconciliation_runner(pool: &PgPool) -> super::PolicyRunner {
+        super::PolicyRunner::builder(crate::Cqrs::new(crate::PostgresEventStore::new(
+            pool.clone(),
+        )))
+        .reconcile_every(std::time::Duration::ZERO)
+        .reconcile_window(std::num::NonZeroU32::new(2).unwrap())
+        .register_policy_fn::<Appended, _>(
+            POLICY,
+            crate::PolicySettings::new()
+                .starting_at(StartAt::Now)
+                .with_read_batch_size(1)
+                .with_checkpoint_batch_size(1),
+            |_| vec![],
+        )
+        .build()
+    }
+
+    async fn cadence_poll(runner: &super::PolicyRunner, progress: &mut PolicyProgress) -> usize {
+        super::drain_policy_once(
+            &runner.cqrs,
+            &runner.pool,
+            &runner.executors,
+            &runner.policies[0],
+            progress,
+            10,
+            &mut super::Reporting { narration: None },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconciliation_cadence_advances_one_window_after_full_load_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        for index in 1..=6 {
+            append_events(&pool, &format!("urn:probe:{index}"), 1).await;
+        }
+        let runner = reconciliation_runner(&pool);
+        assert_eq!(runner.drain().await.unwrap(), 0);
+        let mut drained = runner.drained.lock().await;
+        let progress = drained.get_mut(POLICY).unwrap();
+        for expected in ["urn:probe:2", "urn:probe:4", "urn:probe:6", ""] {
+            assert_eq!(cadence_poll(&runner, progress).await, 0);
+            assert_eq!(progress.reconciled_through, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_startup_and_manual_drain_find_sparse_work_and_wrap_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        for index in 1..=6 {
+            append_events(&pool, &format!("urn:probe:{index}"), 1).await;
+        }
+        let runner = reconciliation_runner(&pool);
+        assert_eq!(runner.drain().await.unwrap(), 0);
+        // Rewind places behind the sweep so only reconciliation can nominate them.
+        sqlx::query("UPDATE policy_stream_cursors SET stream_seq = 0 WHERE policy = $1 AND stream_id = 'urn:probe:6'")
+            .bind(POLICY).execute(&pool).await.unwrap();
+        let mut progress = PolicyProgress::load(&pool, POLICY, StartAt::Now, TrackedStreams::Every)
+            .await
+            .unwrap()
+            .reconciling_every(runner.reconcile_cadence)
+            .with_reconcile_window(runner.reconcile_window);
+        assert_eq!(cadence_poll(&runner, &mut progress).await, 0);
+        assert_eq!(places(&pool, &["urn:probe:6"]).await["urn:probe:6"], 1);
+        assert_eq!(progress.reconciled_through, "urn:probe:6");
+        runner.drained.lock().await.insert(POLICY.into(), progress);
+
+        sqlx::query("UPDATE policy_stream_cursors SET stream_seq = 0 WHERE policy = $1 AND stream_id = 'urn:probe:1'")
+            .bind(POLICY).execute(&pool).await.unwrap();
+        assert_eq!(runner.drain().await.unwrap(), 0);
+        assert_eq!(places(&pool, &["urn:probe:1"]).await["urn:probe:1"], 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_full_wrap_retains_candidates_once_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        for index in 1..=6 {
+            append_events(&pool, &format!("urn:probe:{index}"), 1).await;
+        }
+        for tracked in [TrackedStreams::Every, probes_only()] {
+            let page = reconciliation_page(&pool, POLICY, &tracked, "urn:probe:4", 2, 10, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                page.behind,
+                [
+                    "urn:probe:5",
+                    "urn:probe:6",
+                    "urn:probe:1",
+                    "urn:probe:2",
+                    "urn:probe:3",
+                    "urn:probe:4"
+                ]
+            );
+            let empty = reconciliation_page(&pool, POLICY, &tracked, "", 0, 10, true)
+                .await
+                .unwrap();
+            assert!(empty.behind.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_wrap_uses_database_collation_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        sqlx::query("CREATE COLLATION reconciliation_order (provider = icu, locale = 'en')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE streams ALTER COLUMN id TYPE TEXT COLLATE reconciliation_order")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for suffix in ["a", "B", "c", "D", "e", "F"] {
+            append_events(&pool, &format!("urn:probe:{suffix}"), 1).await;
+        }
+        let after = "urn:probe:D";
+        let expected: Vec<String> = sqlx::query_scalar(
+            "SELECT COALESCE(array_agg(id ORDER BY id) FILTER (WHERE id > $1), ARRAY[]::text[]) \
+                 || COALESCE(array_agg(id ORDER BY id) FILTER (WHERE id <= $1), ARRAY[]::text[]) \
+             FROM streams",
+        )
+        .bind(after)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for tracked in [TrackedStreams::Every, probes_only()] {
+            let page = reconciliation_page(&pool, POLICY, &tracked, after, 2, 10, true)
+                .await
+                .unwrap();
+            assert_eq!(page.behind, expected);
+        }
+    }
+
     /// A forced comparison continues through bounded keyset pages to find sparse work
     /// beyond the first window without holding all scanned ids in memory.
     #[tokio::test]
@@ -9112,6 +9311,7 @@ mod progress_tests {
             .bind(POLICY)
             .bind("")
             .bind(10_i64)
+            .bind("")
             .fetch_one(pool)
             .await
             .expect("explaining must succeed"),
@@ -9122,6 +9322,7 @@ mod progress_tests {
             .bind("")
             .bind(10_i64)
             .bind(tracked.as_column())
+            .bind("")
             .fetch_one(pool)
             .await
             .expect("explaining must succeed"),

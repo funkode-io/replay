@@ -38,9 +38,9 @@ are the streams whose `streams.type` is in `types`, and every path honours that 
   index on `streams (type, id)` per tracked type (migration 0036, which supersedes 0005's
   index on `type` alone; migration 0037 drops that one once its replacement exists). Each
   walk is a range of that index, `(s.type, s.id) > ($type, $rotation) AND s.type <= $type`,
-  ordered by `(type, id)` and stopped at `RECONCILIATION_SCAN_SIZE`; the walks are merged
+  ordered by `(type, id)` and stopped at `reconcile_window`; the walks are merged
   in id order under the same limit. Its cost per statement is bounded by
-  `types × RECONCILIATION_SCAN_SIZE`, it reads no row of another type, and cursor lookups
+  `types × reconcile_window`, it reads no row of another type, and cursor lookups
   happen only for the merged window. The rotation rules of ADR-0026 are unchanged: it
   rotates through the tracked streams, passes caught-up streams it compared, and moves
   through behind streams only after the poll reads them.

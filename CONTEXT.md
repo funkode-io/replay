@@ -119,8 +119,10 @@ late-write lookup every poll finds those by their [Commit stamp] once their tran
 ends ([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A
 reconciliation compares a bounded window of stream heads with the Policy's places: one
 window on its slow safety cadence, and bounded keyset pages at leader start or on a manual
-drain until it finds a candidate batch or reaches the end. None of these paths decides what
-is owed; they nominate streams. The sweep and the reconciliation resume where the last one
+drain until it finds a candidate batch or completes a pass, wrapping at the saved rotation.
+A caught-up full comparison costs roughly `ceil(tracked streams / window)` statements plus
+boundary probes in one poll, delaying delivery until it finishes. None of these paths
+decides what is owed; they nominate streams. The sweep and the reconciliation resume where the last one
 stopped, so "bounded" costs a rotation rather than a stream nobody looks at.
 
 Which streams a poll reads, in what order, how far its event budget gets and where that
