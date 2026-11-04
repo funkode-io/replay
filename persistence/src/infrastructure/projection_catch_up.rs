@@ -254,12 +254,18 @@ pub(crate) async fn apply_pages(
     // Where the gap can start. Without a lower bound the first page would walk
     // `global_position` from the beginning of the log to find the recent events above the
     // horizon; `(commit_txid, global_position)` answers this from the horizon's range.
+    //
+    // Unnamed, so it is planned with the horizon every time (funkode-io/replay#306). A
+    // statement cached on the connection is planned generically after five executions, and
+    // the generic plan for `MIN` walks `global_position` from the start of the log until a
+    // row passes the filter: the whole log when nothing is owed.
     let mut after: Option<i64> = match &scope {
         Scope::History => None,
         Scope::Gap { horizon } => {
             let first: Option<i64> = sqlx::query_scalar(
                 "SELECT MIN(global_position) FROM events WHERE commit_txid >= $1::xid8",
             )
+            .persistent(false)
             .bind(*horizon)
             .fetch_one(&mut *conn)
             .await

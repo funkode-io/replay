@@ -700,3 +700,113 @@ async fn a_catch_up_delivers_what_the_live_path_would_whatever_the_replay_filter
     assert_eq!(new_pod.catch_up_projections().await.unwrap(), 1);
     assert_eq!(view_rows(&pool).await, (2, 2));
 }
+
+/// Index tuples read so far through `global_position`'s unique index, as the statistics
+/// collector has them.
+async fn global_position_index_reads(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT idx_tup_read FROM pg_stat_user_indexes \
+          WHERE indexrelname = 'idx_events_global_position_unique'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("reading the index statistics must succeed")
+}
+
+/// funkode-io/replay#306: a catch-up's starting point must stay a read from the horizon
+/// however many times the catch-up has run on one connection. A statement cached on the
+/// connection is planned generically after its fifth execution, and a generic
+/// `MIN(global_position) … WHERE commit_txid >= $1` walks `global_position` from the start
+/// of the log — all of it when nothing is owed, which is every round of a periodic task
+/// with nothing to do.
+///
+/// A hundred catch-ups on one connection over a log of a few thousand events, the last
+/// ninety-nine owing nothing: together they must read fewer tuples of the
+/// `global_position` index than two walks of the log — the one that applies what an old
+/// pod wrote, and slack.
+#[tokio::test]
+async fn a_catch_up_reads_from_its_horizon_on_its_hundredth_run_on_one_connection_postgres_test() {
+    const LOGGED: i64 = 4_000;
+    let (pool, _container) = start_pool().await;
+
+    // One connection, so every catch-up runs on the one whose statements are cached;
+    // named, so the test can tell when it has gone and flushed its statistics.
+    let options = (*pool.connect_options())
+        .clone()
+        .application_name("catch-up-under-test");
+    let measured = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connecting the measured pool must succeed");
+    let new_pod = PostgresEventStore::builder(measured.clone())
+        .projection_flush_size(500)
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(TillView { version: 1 })
+        .build()
+        .await
+        .expect("build store with the view");
+
+    // An old pod's history, in one append the view has not seen.
+    sqlx::query(
+        "SELECT count(*) FROM ( \
+             SELECT append_event(gen_random_uuid(), '{\"Rang\": {\"amount\": 1.0}}'::jsonb, \
+                                 '{}'::jsonb, 'Rang', 'urn:till:t-' || (g % 40), 'Till', NULL) \
+               FROM generate_series(1, $1) g) appended",
+    )
+    .bind(LOGGED)
+    .execute(&pool)
+    .await
+    .expect("seeding the log must succeed");
+    sqlx::query("ANALYZE events")
+        .execute(&pool)
+        .await
+        .expect("analyzing the log must succeed");
+    let before = global_position_index_reads(&pool).await;
+
+    assert_eq!(
+        new_pod.catch_up_projections().await.unwrap(),
+        LOGGED as u64,
+        "the first catch-up applies the old pod's append"
+    );
+    for _ in 0..99 {
+        assert_eq!(new_pod.catch_up_projections().await.unwrap(), 0);
+    }
+
+    // A backend reports its statistics when it exits: close the measured connection, wait
+    // until it has gone, then for the counter to settle.
+    drop(new_pod);
+    measured.close().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let alive: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = 'catch-up-under-test'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if alive == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the connection must close"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut read = global_position_index_reads(&pool).await - before;
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let settled = global_position_index_reads(&pool).await - before;
+        if settled == read {
+            break;
+        }
+        read = settled;
+    }
+
+    assert!(
+        read < 2 * LOGGED,
+        "a hundred catch-ups read {read} tuples of the global_position index over a log of \
+         {LOGGED}: the starting point walked the log"
+    );
+}
