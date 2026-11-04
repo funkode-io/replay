@@ -183,6 +183,19 @@ impl CommandContext {
         self.causation.as_ref()
     }
 
+    /// Whether this is still the command `arrived` describes: the same aggregate, stream
+    /// and command, carrying the same `causation` key. Only the rest of the metadata may
+    /// differ.
+    pub(crate) fn is_the_command(&self, arrived: &CommandContext) -> bool {
+        self.aggregate_type == arrived.aggregate_type
+            && self.stream_type == arrived.stream_type
+            && self.stream_id == arrived.stream_id
+            && self.command_type == arrived.command_type
+            && self.causation == arrived.causation
+            && self.metadata.as_json().get(CAUSATION_KEY)
+                == arrived.metadata.as_json().get(CAUSATION_KEY)
+    }
+
     /// Replace the command's metadata.
     ///
     /// The `causation` key is the Policy runner's, and bounds how deep one event may
@@ -714,6 +727,49 @@ mod tests {
 
         let events = appended(&cqrs).await;
         assert_eq!(events[0].metadata, stamped().into_metadata());
+    }
+
+    /// Replaces the whole context with a fresh one: an application's command to another
+    /// stream, without the causation the command arrived with.
+    struct ReplacesTheContext;
+
+    impl CommandMiddleware for ReplacesTheContext {
+        fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+            Box::pin(async move {
+                let elsewhere = CounterUrn(UrnBuilder::new("counter", "2").build().unwrap());
+                *context = CommandContext::new::<Counter>(&elsewhere, Metadata::default());
+                Next::Continue
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_middleware_that_replaces_the_whole_context_fails_the_command() {
+        let log = Log::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(ReplacesTheContext)
+            .with_middleware(answering("later", &log, || Next::Continue));
+        let handled = Handled::default();
+
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                stamped().into_metadata(),
+                Add(1),
+                &handled,
+                None,
+            )
+            .await
+            .err()
+            .expect("a replaced context stops the command");
+
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert!(
+            ran(&log).is_empty(),
+            "a later middleware saw the replaced context"
+        );
+        assert!(!handled.0.load(Ordering::SeqCst), "the handler ran");
+        assert!(appended(&cqrs).await.is_empty());
     }
 
     #[test]

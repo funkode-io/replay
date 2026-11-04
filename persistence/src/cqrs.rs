@@ -130,7 +130,9 @@ impl<ES: EventStore> Cqrs<ES> {
     /// and later middlewares do not run: [`Next::Busy`] reaches the caller as a
     /// `replay::Error` of kind [`Busy`](replay::ErrorKind::Busy) carrying its reason,
     /// [`Next::Error`] as the error it carries. Metadata a middleware adds is carried by
-    /// the appended events.
+    /// the appended events. A middleware that continues after changing the command's
+    /// identity or its `causation` (by replacing the context whole) fails the command with
+    /// an [`Internal`](replay::ErrorKind::Internal) error.
     pub async fn execute<A: Aggregate>(
         &self,
         id: &A::StreamId,
@@ -147,8 +149,21 @@ impl<ES: EventStore> Cqrs<ES> {
             metadata
         } else {
             let mut command = CommandContext::new::<A>(id, metadata);
+            // What no middleware may change: `before` takes the context mutably, so one
+            // could replace it whole and slip past the metadata methods' own checks.
+            let arrived = command.clone();
             for middleware in self.middlewares.iter() {
                 match middleware.before(&mut command).await {
+                    Next::Continue if !command.is_the_command(&arrived) => {
+                        return Err(A::Error::from(
+                            replay::Error::internal(
+                                "a command middleware changed the command's identity or causation",
+                            )
+                            .with_operation("execute")
+                            .with_context("stream_id", arrived.stream_id())
+                            .with_context("command", arrived.command_type()),
+                        ));
+                    }
                     Next::Continue => {}
                     Next::Busy(reason) => {
                         return Err(A::Error::from(
