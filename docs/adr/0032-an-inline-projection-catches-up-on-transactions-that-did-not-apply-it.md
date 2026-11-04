@@ -9,10 +9,7 @@ inline projection "is never behind the log, so no checkpoint or catch-up positio
 stored". Replaces the caveat [ADR-0011](0011-inline-projections-flushed-in-bounded-chunks.md)
 records about a rebuild missing appends committed past its cut
 ([#162](https://github.com/funkode-io/replay/issues/162)). Decides
-[#289](https://github.com/funkode-io/replay/issues/289). Amended by
-[#306](https://github.com/funkode-io/replay/issues/306): the catch-up reads its gap in
-commit-stamp order rather than `global_position` order, and promises order per stream only
-(step 3, the delivery contract and *Paging the gap* below).
+[#289](https://github.com/funkode-io/replay/issues/289).
 
 ## Context
 
@@ -81,10 +78,9 @@ One catch-up of one projection is one transaction:
    another version owns.
 3. Page through the events with `commit_txid >= caught_up_below`, visible in `S`, with no
    applied mark for this version, of the projection's declared event types — in
-   commit-stamp order, `(commit_txid, global_position)`, from the horizon (see *Paging the
-   gap*), compaction snapshots excluded (ADR-0004), at most `projection_flush_size` per
-   page, and hand each page to `handle`. With no horizon for the stored version, read
-   nothing: the log is **adopted** as it stands.
+   `global_position` order (ADR-0018), compaction snapshots excluded (ADR-0004), at most
+   `projection_flush_size` per page, and hand each page to `handle`. With no horizon for
+   the stored version, read nothing: the log is **adopted** as it stands.
 
    Not narrowed by `stream_filter()`: a catch-up stands in for the live append, which has
    never applied that filter, so it reads what the live path would have been offered. An
@@ -109,33 +105,6 @@ own writes, so a mark written after the first page of a large append would hide 
 of it from the catch-up applying it. Sealing is one `INSERT … SELECT` over the events
 since the oldest transaction still running when `S` was taken; nothing of it comes back to
 the process.
-
-### Paging the gap
-
-The gap is read in the order of `idx_events_commit_txid_position`: by commit stamp, then by
-`global_position` within one transaction. Each page is a range read of that index from the
-horizon, or from the last row of the page before; nothing looks up where the gap starts
-and nothing walks `global_position` on its own index.
-
-The order this promises is **per stream, and nothing across streams**. A stream's appends
-take their transaction ids when they take the stream's row (`write_event`, ADR-0030), so
-its commit stamps rise with its `stream_seq`, and within one transaction its positions do.
-Between two streams the order is whatever the stamps give, which is not the order their
-events were written in: a transaction that took its id before another wrote to an unrelated
-stream sorts first however late its own writes. `global_position` breaks ties inside one
-transaction only, because it is the index's second column and unique; it says nothing
-across transactions here.
-
-The first release paged in `global_position` order and found its start with
-`SELECT MIN(global_position) FROM events WHERE commit_txid >= $horizon`. Cached on a
-connection, that statement was planned generically after its fifth execution, and the
-generic plan walked `global_position` from the start of the log until a row passed the
-filter: every row of the log on every round that owed nothing. On a consumer's 544k-event
-log it read 15 TB in 30 hours and held the volume at its baseline throughput (#306). A
-global order was also never something the catch-up could give: a caught-up event already
-lands after later events of its own stream applied live (*Delivery contract*). Pages of the
-gap are therefore planned for each execution (unnamed statements), and ordered by the stamp
-the horizon is already expressed in.
 
 ### When it runs
 
@@ -182,8 +151,6 @@ exactly once. What a projection must still tolerate, and the docs say so:
 
 - **Late arrival.** A caught-up event can land after a later event of the same stream was
   applied live. Handlers that care about order guard on a value the view keeps.
-- **Order per stream only.** Caught-up events reach `handle` in each stream's own order
-  and in no promised order across streams (*Paging the gap*).
 - **Re-application across versions.** An event an older version applied during a rollout
   is applied again by the newer version: the newer logic must win. An upsert that sets
   values lets it; one that accumulates (a running balance) counts the event twice, so a
@@ -212,18 +179,6 @@ exactly once. What a projection must still tolerate, and the docs say so:
 - **Catch up the appended stream first, on the live path.** Would keep per-stream order,
   but costs a read of the stream's history per append and needs the catch-up to take stream
   locks to avoid applying an event twice.
-- **Page the gap in `global_position` order from `MIN(global_position)` above the
-  horizon.** The first release did. It needs a lookup no index answers from the horizon
-  once the plan is generic, and it implies an order across streams the catch-up cannot
-  keep anyway (#306).
-- **Page the gap by `(commit_txid, stream_id, stream_seq)`**, so that `global_position`
-  is not even a tie-break. Exactly the per-stream order wanted, but no index has that key:
-  on `(commit_txid, global_position)` every page inside a large transaction re-reads and
-  re-sorts the whole transaction, and the planner scans `events` once that transaction is a
-  large share of it — quadratic in an unmarked import. A new index would fix that at the
-  price of a consumer migration, a large `CREATE INDEX CONCURRENTLY` on `events` and one
-  more index entry per append, for a key that within one transaction orders each stream
-  exactly as `global_position` already does.
 - **Declare event types on `Event` and derive them.** Gives filtering for free, but widens
   the core `es` and `macros` crates for a persistence concern; an opt-in on
   `InlineProjection` is enough for #289.

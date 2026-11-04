@@ -215,40 +215,24 @@ impl Cut {
     }
 }
 
-/// Which events [`apply_pages`] reads, and in what order.
+/// Which events [`apply_pages`] reads.
 pub(crate) enum Scope<'a> {
-    /// Everything the projection's filter admits — a rebuild or a first registration — in
-    /// `global_position` order (ADR-0018). The caller's transaction must read the cut's
-    /// snapshot (`REPEATABLE READ`).
+    /// Everything the projection's filter admits — a rebuild or a first registration. The
+    /// caller's transaction must read the cut's snapshot (`REPEATABLE READ`).
     History,
     /// Only the events a catch-up owes: above `horizon`, visible in the cut, and not
-    /// marked for this version — in commit-stamp order, `(commit_txid, global_position)`,
-    /// read from the horizon's range of that index (ADR-0032, funkode-io/replay#306).
-    ///
-    /// The order promised is per stream only. A stream's appends take their ids when they
-    /// take its row, so its commit stamps rise with its `stream_seq`, and within one
-    /// transaction its positions do. Across streams the order is whatever the stamps give;
-    /// nothing reads `global_position` to find where the gap starts, and nothing walks it.
+    /// marked for this version.
     Gap { horizon: &'a str },
 }
 
-/// Where the next page starts: after the last row of the page before, in the scope's
-/// order.
-enum After {
-    /// A [`Scope::History`] page's last `global_position`.
-    Position(i64),
-    /// A [`Scope::Gap`] page's last `(commit_txid, global_position)`, the stamp as text.
-    Stamped(String, i64),
-}
-
 /// Hand `projection` every event `scope` selects, a page of at most `chunk_size` at a time
-/// in the scope's order. Returns how many events were read.
+/// in `global_position` order. Returns how many events were read.
 ///
 /// Marks nothing: the caller [`seal`]s once every page has been read.
 ///
 /// Peak retention is one page: each is loaded, handed over and dropped before the next is
-/// read. The pages are keyset-paged inside the caller's transaction (ADR-0011), because
-/// `handle` writes on the same connection a row stream would hold.
+/// read. The pages are keyset-paged on `global_position` inside the caller's transaction
+/// (ADR-0011), because `handle` writes on the same connection a row stream would hold.
 pub(crate) async fn apply_pages(
     conn: &mut PgConnection,
     projection: &mut ErasedPostgresProjection,
@@ -267,10 +251,35 @@ pub(crate) async fn apply_pages(
     };
     let types = projection.event_types();
 
-    let mut after: Option<After> = None;
+    // Where the gap can start. Without a lower bound the first page would walk
+    // `global_position` from the beginning of the log to find the recent events above the
+    // horizon; `(commit_txid, global_position)` answers this from the horizon's range.
+    //
+    // Unnamed, so it is planned with the horizon every time (funkode-io/replay#306). A
+    // statement cached on the connection is planned generically after five executions, and
+    // the generic plan for `MIN` walks `global_position` from the start of the log until a
+    // row passes the filter: the whole log when nothing is owed.
+    let mut after: Option<i64> = match &scope {
+        Scope::History => None,
+        Scope::Gap { horizon } => {
+            let first: Option<i64> = sqlx::query_scalar(
+                "SELECT MIN(global_position) FROM events WHERE commit_txid >= $1::xid8",
+            )
+            .persistent(false)
+            .bind(*horizon)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(crate::db_error)?;
+            match first {
+                Some(first) => Some(first - 1),
+                None => return Ok(0),
+            }
+        }
+    };
+
     let mut read = 0u64;
     loop {
-        let Page { events, last } = load_page(
+        let page = load_page(
             &mut *conn,
             PageQuery {
                 name: &name,
@@ -285,15 +294,15 @@ pub(crate) async fn apply_pages(
         )
         .await?;
 
-        if events.is_empty() {
+        if page.events.is_empty() {
             break;
         }
-        let fetched = events.len();
+        let fetched = page.events.len();
         read += fetched as u64;
-        after = last;
+        after = page.last_position;
 
-        projection.handle(&mut *conn, &events).await?;
-        drop(events);
+        projection.handle(&mut *conn, &page.events).await?;
+        drop(page);
 
         // A short page is the last one: the cursor has passed the final row.
         if fetched < chunk_size {
@@ -443,21 +452,20 @@ struct PageQuery<'a> {
     types: Option<&'a [String]>,
     cut: &'a Cut,
     scope: &'a Scope<'a>,
-    after: Option<After>,
+    after: Option<i64>,
     limit: usize,
 }
 
 struct Page {
     events: Vec<PersistedEvent<Value>>,
-    last: Option<After>,
+    last_position: Option<i64>,
 }
 
-/// Load one page of the events `query` selects, in its scope's order.
+/// Load one page of the events `query` selects, in `global_position` order.
 async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page, replay::Error> {
-    let gap = matches!(query.scope, Scope::Gap { .. });
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-         compacted_snapshot, global_position, commit_txid::text AS commit_stamp \
+         compacted_snapshot, global_position \
          FROM events WHERE compacted_snapshot = FALSE AND (",
     );
     PostgresEventStore::add_filters(&mut builder, query.filter);
@@ -483,56 +491,32 @@ async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page
             .push(" AND a.txid = events.commit_txid)");
     }
 
-    match query.after {
-        Some(After::Position(position)) => {
-            builder.push(" AND global_position > ").push_bind(position);
-        }
-        Some(After::Stamped(txid, position)) => {
-            builder
-                .push(" AND (commit_txid, global_position) > (")
-                .push_bind(txid)
-                .push("::xid8, ")
-                .push_bind(position)
-                .push(")");
-        }
-        None => {}
+    if let Some(after) = query.after {
+        builder.push(" AND global_position > ").push_bind(after);
     }
 
     builder
-        .push(if gap {
-            " ORDER BY commit_txid ASC, global_position ASC LIMIT "
-        } else {
-            " ORDER BY global_position ASC LIMIT "
-        })
+        .push(" ORDER BY global_position ASC LIMIT ")
         // Saturating rather than `as`: a wrapped cast would send a negative LIMIT.
         .push_bind(i64::try_from(query.limit).unwrap_or(i64::MAX));
 
-    // A gap page is unnamed, so it is planned with its horizon and cursor every time rather
-    // than generically after five executions on one connection (funkode-io/replay#306): the
-    // generic plan of the `MIN` lookup this replaced walked the whole log. Its order is the
-    // index's, and both kinds of plan read `(commit_txid, global_position)` from the
-    // cursor; planning it with the real values is what keeps a plan from being chosen
-    // blind to how short that range is.
     let rows = builder
         .build()
-        .persistent(!gap)
         .fetch_all(&mut *conn)
         .await
         .map_err(crate::db_error)?;
 
-    let mut last = None;
+    let mut last_position = None;
     let mut events = Vec::with_capacity(rows.len());
     for row in rows {
-        let position = row.get::<i64, _>("global_position");
-        last = Some(if gap {
-            After::Stamped(row.get::<String, _>("commit_stamp"), position)
-        } else {
-            After::Position(position)
-        });
+        last_position = Some(row.get::<i64, _>("global_position"));
         events.push(PersistedEvent::<Value>::try_from(row)?);
     }
 
-    Ok(Page { events, last })
+    Ok(Page {
+        events,
+        last_position,
+    })
 }
 
 #[cfg(test)]

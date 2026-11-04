@@ -1,10 +1,6 @@
 # Every event read is ordered by `global_position`
 
 **Status:** accepted, narrowed by [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md): a Policy's feed is no longer one of the reads this ADR governs. It reads one stream at a time, ordered by that stream's own sequence. Hydration, projections and every other read still order by `global_position`.
-Narrowed again by [ADR-0032](0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)
-([#306](https://github.com/funkode-io/replay/issues/306)): an inline projection's catch-up
-reads its gap in commit-stamp order, `(commit_txid, global_position)`, and promises order
-per stream only. A rebuild still replays in `global_position` order.
 
 **Amends** [ADR-0011](0011-inline-projections-flushed-in-bounded-chunks.md)'s keyset
 decision: the rebuild cursor's `(created, version, id)` key, and the index behind it.
