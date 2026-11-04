@@ -713,6 +713,87 @@ async fn global_position_index_reads(pool: &PgPool) -> i64 {
     .expect("reading the index statistics must succeed")
 }
 
+/// The application name of the one connection a measured store runs on.
+const MEASURED: &str = "catch-up-under-test";
+
+/// A store with the view registered, on a pool of one connection: every catch-up runs on
+/// the connection whose statements are cached, and the connection is named so a test can
+/// tell when it has gone and reported its statistics.
+async fn measured_store(pool: &PgPool) -> (PostgresEventStore, PgPool) {
+    let options = (*pool.connect_options()).clone().application_name(MEASURED);
+    let measured = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connecting the measured pool must succeed");
+    let store = PostgresEventStore::builder(measured.clone())
+        .projection_flush_size(500)
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(TillView { version: 1 })
+        .build()
+        .await
+        .expect("build store with the view");
+    (store, measured)
+}
+
+/// Append `count` events over forty tills in one transaction, as an old pod without the
+/// view would, and refresh the planner's statistics.
+async fn seed_old_pod_history(pool: &PgPool, count: i64) {
+    sqlx::query(
+        "SELECT count(*) FROM ( \
+             SELECT append_event(gen_random_uuid(), '{\"Rang\": {\"amount\": 1.0}}'::jsonb, \
+                                 '{}'::jsonb, 'Rang', 'urn:till:t-' || (g % 40), 'Till', NULL) \
+               FROM generate_series(1, $1) g) appended",
+    )
+    .bind(count)
+    .execute(pool)
+    .await
+    .expect("seeding the log must succeed");
+    sqlx::query("ANALYZE events")
+        .execute(pool)
+        .await
+        .expect("analyzing the log must succeed");
+}
+
+/// Close the measured store and return how many tuples of the `global_position` index it
+/// read since `before`. A backend reports its statistics when it exits: wait until it has
+/// gone, then for the counter to settle.
+async fn global_position_index_reads_since(
+    pool: &PgPool,
+    store: PostgresEventStore,
+    measured: PgPool,
+    before: i64,
+) -> i64 {
+    drop(store);
+    measured.close().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let alive: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1")
+                .bind(MEASURED)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        if alive == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the connection must close"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut read = global_position_index_reads(pool).await - before;
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let settled = global_position_index_reads(pool).await - before;
+        if settled == read {
+            return read;
+        }
+        read = settled;
+    }
+}
+
 /// funkode-io/replay#306: a catch-up's starting point must stay a read from the horizon
 /// however many times the catch-up has run on one connection. A statement cached on the
 /// connection is planned generically after its fifth execution, and a generic
@@ -728,40 +809,8 @@ async fn global_position_index_reads(pool: &PgPool) -> i64 {
 async fn a_catch_up_reads_from_its_horizon_on_its_hundredth_run_on_one_connection_postgres_test() {
     const LOGGED: i64 = 4_000;
     let (pool, _container) = start_pool().await;
-
-    // One connection, so every catch-up runs on the one whose statements are cached;
-    // named, so the test can tell when it has gone and flushed its statistics.
-    let options = (*pool.connect_options())
-        .clone()
-        .application_name("catch-up-under-test");
-    let measured = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .expect("connecting the measured pool must succeed");
-    let new_pod = PostgresEventStore::builder(measured.clone())
-        .projection_flush_size(500)
-        .projection_catch_up_interval(Duration::ZERO)
-        .register(TillView { version: 1 })
-        .build()
-        .await
-        .expect("build store with the view");
-
-    // An old pod's history, in one append the view has not seen.
-    sqlx::query(
-        "SELECT count(*) FROM ( \
-             SELECT append_event(gen_random_uuid(), '{\"Rang\": {\"amount\": 1.0}}'::jsonb, \
-                                 '{}'::jsonb, 'Rang', 'urn:till:t-' || (g % 40), 'Till', NULL) \
-               FROM generate_series(1, $1) g) appended",
-    )
-    .bind(LOGGED)
-    .execute(&pool)
-    .await
-    .expect("seeding the log must succeed");
-    sqlx::query("ANALYZE events")
-        .execute(&pool)
-        .await
-        .expect("analyzing the log must succeed");
+    let (new_pod, measured) = measured_store(&pool).await;
+    seed_old_pod_history(&pool, LOGGED).await;
     let before = global_position_index_reads(&pool).await;
 
     assert_eq!(
@@ -773,40 +822,180 @@ async fn a_catch_up_reads_from_its_horizon_on_its_hundredth_run_on_one_connectio
         assert_eq!(new_pod.catch_up_projections().await.unwrap(), 0);
     }
 
-    // A backend reports its statistics when it exits: close the measured connection, wait
-    // until it has gone, then for the counter to settle.
-    drop(new_pod);
-    measured.close().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let alive: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = 'catch-up-under-test'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        if alive == 0 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the connection must close"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let mut read = global_position_index_reads(&pool).await - before;
-    loop {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let settled = global_position_index_reads(&pool).await - before;
-        if settled == read {
-            break;
-        }
-        read = settled;
-    }
-
+    let read = global_position_index_reads_since(&pool, new_pod, measured, before).await;
     assert!(
         read < 2 * LOGGED,
         "a hundred catch-ups read {read} tuples of the global_position index over a log of \
          {LOGGED}: the starting point walked the log"
+    );
+}
+
+/// funkode-io/replay#306: a catch-up pages its gap by commit stamp from its horizon, on
+/// `(commit_txid, global_position)`, and never through `global_position`'s own index —
+/// neither to find where the gap starts nor to walk it. An old pod's append of a few
+/// thousand events, caught up over several pages, reads none of that index.
+#[tokio::test]
+async fn a_catch_up_pages_its_gap_without_walking_global_position_postgres_test() {
+    const LOGGED: i64 = 4_000;
+    let (pool, _container) = start_pool().await;
+    let (new_pod, measured) = measured_store(&pool).await;
+    seed_old_pod_history(&pool, LOGGED).await;
+    let before = global_position_index_reads(&pool).await;
+
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), LOGGED as u64);
+    assert_eq!(view_rows(&pool).await, (LOGGED, LOGGED));
+    for _ in 0..9 {
+        assert_eq!(new_pod.catch_up_projections().await.unwrap(), 0);
+    }
+
+    assert_eq!(
+        global_position_index_reads_since(&pool, new_pod, measured, before).await,
+        0,
+        "the catch-up read the global_position index"
+    );
+}
+
+/// The view under test, recording the order `handle` was handed events in.
+struct HandOrder;
+
+impl InlineProjection for HandOrder {
+    type Exec = sqlx::PgConnection;
+    type Event = TillEvent;
+
+    fn name(&self) -> &str {
+        "till_hand_order"
+    }
+
+    fn version(&self) -> i32 {
+        1
+    }
+
+    async fn init(&mut self, conn: &mut Self::Exec) -> Result<(), replay::Error> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS till_hand_order ( \
+                 handed    bigserial PRIMARY KEY, \
+                 stream_id text   NOT NULL, \
+                 version   bigint NOT NULL \
+             )",
+        )
+        .execute(conn)
+        .await
+        .map_err(replay_persistence::db_error)?;
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        conn: &mut Self::Exec,
+        events: &[PersistedEvent<Self::Event>],
+    ) -> Result<(), replay::Error> {
+        for event in events {
+            sqlx::query("INSERT INTO till_hand_order (stream_id, version) VALUES ($1, $2)")
+                .bind(event.stream_id.to_string())
+                .bind(event.version)
+                .execute(&mut *conn)
+                .await
+                .map_err(replay_persistence::db_error)?;
+        }
+        Ok(())
+    }
+}
+
+/// Append one `Rang` to `till` on an open transaction, as an old pod's append in flight.
+async fn ring_in(tx: &mut sqlx::PgConnection, till: &str) {
+    let stream: urn::Urn = TillUrn::new(till).unwrap().into();
+    sqlx::query("SELECT id FROM append_event($1, $2, '{}', 'Rang', $3, 'Till', NULL)")
+        .bind(uuid::Uuid::new_v4())
+        .bind(serde_json::json!({ "Rang": { "amount": 1.0 } }))
+        .bind(stream.to_string())
+        .execute(tx)
+        .await
+        .unwrap();
+}
+
+/// funkode-io/replay#306, ADR-0032: a catch-up promises order within a stream and nothing
+/// across streams. A gap of four old-pod transactions over two tills, one of them holding
+/// its first position while the other till's append commits, caught up over pages of four:
+/// each till's events reach `handle` in its own order, every one of them once.
+#[tokio::test]
+async fn a_catch_up_hands_each_stream_its_events_in_stream_order_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let new_pod = PostgresEventStore::builder(pool.clone())
+        .projection_flush_size(4)
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(HandOrder)
+        .build()
+        .await
+        .expect("build store with the view");
+    let old_pod = PostgresEventStore::new(pool.clone());
+
+    let mut held = pool.begin().await.unwrap();
+    ring_in(&mut held, "a").await;
+    ring(&old_pod, "b", &[1.0, 2.0, 3.0]).await;
+    ring_in(&mut held, "a").await;
+    ring_in(&mut held, "a").await;
+    held.commit().await.unwrap();
+    ring(&old_pod, "a", &[4.0, 5.0, 6.0]).await;
+    ring(&old_pod, "b", &[7.0, 8.0]).await;
+
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), 11);
+
+    for (till, expected) in [
+        ("a", (1..=6).collect::<Vec<i64>>()),
+        ("b", (1..=5).collect()),
+    ] {
+        let stream: urn::Urn = TillUrn::new(till).unwrap().into();
+        let handed: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM till_hand_order WHERE stream_id = $1 ORDER BY handed",
+        )
+        .bind(stream.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            handed, expected,
+            "till {till} is handed its events in order"
+        );
+    }
+}
+
+/// What a catch-up's per-stream order rests on: an append takes its transaction id when it
+/// takes its stream's row, so appends queued on one stream are stamped in the order they
+/// write it. Many concurrent appends to one till: ordered by the till's own sequence,
+/// their commit stamps never go down.
+#[tokio::test]
+async fn appends_queued_on_one_stream_are_stamped_in_stream_order_postgres_test() {
+    let (pool, _container) = start_pool().await;
+    let store = PostgresEventStore::new(pool.clone());
+
+    let appends: Vec<_> = (0..24)
+        .map(|amount| {
+            let store = store.clone();
+            tokio::spawn(async move { ring(&store, "busy", &[f64::from(amount)]).await })
+        })
+        .collect();
+    for append in appends {
+        append.await.unwrap();
+    }
+
+    let out_of_order: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ( \
+             SELECT commit_txid < lag(commit_txid) OVER (ORDER BY stream_seq) AS went_down \
+               FROM events WHERE stream_id = $1) seq \
+          WHERE went_down",
+    )
+    .bind(
+        TillUrn::new("busy")
+            .map(urn::Urn::from)
+            .unwrap()
+            .to_string(),
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_count(&pool).await, 24);
+    assert_eq!(
+        out_of_order, 0,
+        "a later place in the stream has an earlier stamp"
     );
 }

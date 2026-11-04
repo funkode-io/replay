@@ -341,8 +341,10 @@ sentinel `0`, which orders before every real id. The [Policy feed] no longer ord
 ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)), but it is
 load-bearing again: the late-write lookup finds a [Late write] by the stamp of a
 transaction the sweep could not see
-([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)), so the column,
-its index and the top-level transaction id every insert stamps must stay. It is also an
+([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)), and an inline
+projection's [Catch-up] reads its gap in stamp order from its horizon
+([ADR-0032](docs/adr/0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)),
+so the column, its index and the top-level transaction id every insert stamps must stay. It is also an
 operator's diagnostic: which write wrote this row, and what else that write wrote.
 _Avoid_: commit id, transaction number, xmin, sequence.
 
@@ -500,7 +502,8 @@ the store.
 ### Catch-up
 
 What an [Inline projection] does about the events of transactions that did not apply it:
-it applies them later, once per projection version, in [Global position] order. Run by
+it applies them later, once per projection version, in [Commit stamp] order — each
+stream's events in its own order, no order promised across streams. Run by
 `build()` at startup, by a background task on a cadence, and on demand. Every append
 records an **applied mark** for each projection it applied, so a catch-up skips those, and
 what is owed is decided by [Commit stamp] against the [Catch-up horizon], never by a
