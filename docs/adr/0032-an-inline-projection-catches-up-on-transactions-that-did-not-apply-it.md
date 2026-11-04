@@ -116,13 +116,11 @@ The pages walk `global_position` from the lowest position the catch-up owes: abo
 horizon, visible in `S`, unmarked. Finding it must cost a read of the range above the
 horizon, on every round, however long the connection has been running the statement.
 
-The first release looked it up with `SELECT MIN(global_position) FROM events WHERE
-commit_txid >= $horizon`, cached on the connection. After five executions Postgres planned
-it generically, and the generic plan walks `global_position` from the start of the log until
-a row passes the filter: the whole log on every round that owes nothing. On a consumer's
-544k-event log that read 15 TB in 30 hours and held the database's volume at its baseline
-throughput (#306). Planned with the real horizon, the same `MIN` still becomes that walk
-once the rows above the horizon are a large share of the log.
+The first release looked it up with a bare `MIN(global_position)` above the horizon, cached
+on the connection. Planned generically, as a cached statement is after five executions, or
+with the real horizon once the rows above it are a large share of the log, that `MIN`
+becomes a walk of `global_position` from the start of the log: the whole log on every round
+that owes nothing. On a consumer's log it was a third of the database's disk reads (#306).
 
 So the lookup reads the horizon's range of `(commit_txid, global_position)` in a fenced
 subquery, which no plan can turn into a walk of `global_position`; it is planned with the

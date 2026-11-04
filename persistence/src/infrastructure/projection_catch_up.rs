@@ -301,10 +301,10 @@ pub(crate) async fn apply_pages(
 /// visible in the cut, without an applied mark. `None` when nothing is owed.
 ///
 /// The pages walk `global_position` from here, so without it the first page would walk
-/// from the beginning of the log to find the recent events above the horizon. It is read
-/// from the horizon's range of `(commit_txid, global_position)` — index only, the marks
-/// joined from their primary key — and whatever the plan, it never walks
-/// `global_position`'s own index (funkode-io/replay#306):
+/// from the beginning of the log to find the recent events above the horizon. It reads
+/// the horizon's range — `(commit_txid, global_position)` covers it, though a range that
+/// is most of the log may be cheaper to scan — and never walks `global_position`'s own
+/// index from the start of the log (funkode-io/replay#306):
 ///
 /// - **Fenced.** A bare `MIN(global_position) … WHERE commit_txid >= $1` lets the planner
 ///   walk `global_position` from the start of the log and stop at the first row above the
@@ -316,7 +316,11 @@ pub(crate) async fn apply_pages(
 ///   executions on one connection.
 /// - **Owed rows only.** A long transaction holds the horizon back, and every round reads
 ///   what committed above it. Those rows are marked, so a round that owes nothing stops
-///   here instead of walking each of them in the pages.
+///   here instead of walking each of them in the pages. The predicate is the page query's
+///   own, less the filters on the row itself (event types, compaction snapshots), so it
+///   can only start lower than the first row a page returns, never higher; keep the two
+///   in step. A compaction's transaction has no mark until a seal writes one, so it wakes
+///   the pages for the one round that does.
 async fn gap_start(
     conn: &mut PgConnection,
     name: &str,
@@ -533,8 +537,12 @@ async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page
         // Saturating rather than `as`: a wrapped cast would send a negative LIMIT.
         .push_bind(i64::try_from(query.limit).unwrap_or(i64::MAX));
 
+    // A gap page is unnamed too, so it is planned with its horizon and cursor rather than
+    // generically: under a held-back horizon a generic plan could read the whole range above
+    // it for every page. A rebuild's pages have no horizon and stay cached.
     let rows = builder
         .build()
+        .persistent(!matches!(query.scope, Scope::Gap { .. }))
         .fetch_all(&mut *conn)
         .await
         .map_err(crate::db_error)?;

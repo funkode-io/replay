@@ -809,7 +809,8 @@ async fn event_reads(pool: &PgPool) -> EventReads {
 }
 
 /// Close the measured store and return how it read `events` since `before`, once its
-/// connection has reported and the counters have settled.
+/// connection has reported. Every other connection that reads `events` in these tests has
+/// reported before `before` was taken.
 async fn event_reads_since(
     pool: &PgPool,
     store: PostgresEventStore,
@@ -817,18 +818,10 @@ async fn event_reads_since(
     before: EventReads,
 ) -> EventReads {
     close_and_report(pool, store, measured, MEASURED).await;
-    let since = |now: EventReads| EventReads {
+    let now = event_reads(pool).await;
+    EventReads {
         by_position: now.by_position - before.by_position,
         scanned: now.scanned - before.scanned,
-    };
-    let mut read = since(event_reads(pool).await);
-    loop {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let settled = since(event_reads(pool).await);
-        if settled == read {
-            return read;
-        }
-        read = settled;
     }
 }
 
@@ -839,10 +832,11 @@ async fn event_reads_since(
 /// of the log — all of it when nothing is owed, which is every round of a periodic task
 /// with nothing to do.
 ///
-/// A hundred catch-ups on one connection over a log of a few thousand events, the last
-/// ninety-nine owing nothing: together they read the `global_position` index once, to
-/// apply what an old pod wrote, and the table at most once — the first round's range is
-/// all of it.
+/// A hundred catch-ups on one connection over a log of a few thousand events. The first
+/// applies the log; of the ninety-nine after it, every other one owes an old pod's single
+/// event, so the pages run warm too, and the rest owe nothing. Together they read the
+/// `global_position` index for what they apply and no more, and scan the table only in the
+/// first round, whose range is all of it — by its starting point and its seal at most.
 #[tokio::test]
 async fn a_catch_up_reads_from_its_horizon_on_its_hundredth_run_on_one_connection_postgres_test() {
     const LOGGED: i64 = 4_000;
@@ -856,19 +850,27 @@ async fn a_catch_up_reads_from_its_horizon_on_its_hundredth_run_on_one_connectio
         LOGGED as u64,
         "the first catch-up applies the old pod's append"
     );
-    for _ in 0..99 {
-        assert_eq!(new_pod.catch_up_projections().await.unwrap(), 0);
+    let old_pod = PostgresEventStore::new(pool.clone());
+    for round in 0..99 {
+        let owed = if round % 2 == 0 {
+            ring(&old_pod, "t-late", &[1.0]).await;
+            1
+        } else {
+            0
+        };
+        assert_eq!(new_pod.catch_up_projections().await.unwrap(), owed);
     }
 
     let read = event_reads_since(&pool, new_pod, measured, before).await;
     assert!(
         read.by_position <= LOGGED + LOGGED / 10,
-        "a hundred catch-ups read {} tuples of the global_position index over a log of \
-         {LOGGED}: the starting point walked the log",
-        read.by_position
+        "a hundred catch-ups read {} tuples of the global_position index applying {} \
+         events: a starting point or a page walked the log",
+        read.by_position,
+        LOGGED + 50
     );
     assert!(
-        read.scanned <= LOGGED,
+        read.scanned <= 2 * LOGGED,
         "a hundred catch-ups scanned {} rows of a log of {LOGGED}: more than the round that \
          applied it",
         read.scanned
