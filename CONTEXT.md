@@ -500,7 +500,8 @@ the store.
 ### Catch-up
 
 What an [Inline projection] does about the events of transactions that did not apply it:
-it applies them later, once per projection version, in [Global position] order. Run by
+it applies them later, once per projection version: each stream's events in that stream's
+order, by [Global position], and no order promised across streams. Run by
 `build()` at startup, by a background task on a cadence, and on demand. Every append
 records an **applied mark** for each projection it applied, so a catch-up skips those, and
 what is owed is decided by [Commit stamp] against the [Catch-up horizon], never by a

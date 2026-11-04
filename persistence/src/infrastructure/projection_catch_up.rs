@@ -251,26 +251,10 @@ pub(crate) async fn apply_pages(
     };
     let types = projection.event_types();
 
-    // Where the gap can start. Without a lower bound the first page would walk
-    // `global_position` from the beginning of the log to find the recent events above the
-    // horizon; `(commit_txid, global_position)` answers this from the horizon's range.
-    //
-    // Unnamed, so it is planned with the horizon every time (funkode-io/replay#306). A
-    // statement cached on the connection is planned generically after five executions, and
-    // the generic plan for `MIN` walks `global_position` from the start of the log until a
-    // row passes the filter: the whole log when nothing is owed.
     let mut after: Option<i64> = match &scope {
         Scope::History => None,
         Scope::Gap { horizon } => {
-            let first: Option<i64> = sqlx::query_scalar(
-                "SELECT MIN(global_position) FROM events WHERE commit_txid >= $1::xid8",
-            )
-            .persistent(false)
-            .bind(*horizon)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(crate::db_error)?;
-            match first {
+            match gap_start(&mut *conn, &name, version, cut, horizon).await? {
                 Some(first) => Some(first - 1),
                 None => return Ok(0),
             }
@@ -311,6 +295,52 @@ pub(crate) async fn apply_pages(
     }
 
     Ok(read)
+}
+
+/// The lowest `global_position` a catch-up owes `name` at `version`: above `horizon`,
+/// visible in the cut, without an applied mark. `None` when nothing is owed.
+///
+/// The pages walk `global_position` from here, so without it the first page would walk
+/// from the beginning of the log to find the recent events above the horizon. It is read
+/// from the horizon's range of `(commit_txid, global_position)` — index only, the marks
+/// joined from their primary key — and whatever the plan, it never walks
+/// `global_position`'s own index (funkode-io/replay#306):
+///
+/// - **Fenced.** A bare `MIN(global_position) … WHERE commit_txid >= $1` lets the planner
+///   walk `global_position` from the start of the log and stop at the first row above the
+///   horizon. It does so with a generic plan, and with the real horizon whenever the rows
+///   above it are a large share of the log; either way it reads everything below the
+///   horizon, every round. `OFFSET 0` keeps the range read a subquery the `MIN` cannot be
+///   turned into that walk through.
+/// - **Unnamed.** Planned with the horizon every time rather than generically after five
+///   executions on one connection.
+/// - **Owed rows only.** A long transaction holds the horizon back, and every round reads
+///   what committed above it. Those rows are marked, so a round that owes nothing stops
+///   here instead of walking each of them in the pages.
+async fn gap_start(
+    conn: &mut PgConnection,
+    name: &str,
+    version: i32,
+    cut: &Cut,
+    horizon: &str,
+) -> Result<Option<i64>, replay::Error> {
+    sqlx::query_scalar(
+        "SELECT MIN(gap.global_position) \
+           FROM (SELECT global_position, commit_txid FROM events \
+                  WHERE commit_txid >= $1::xid8 OFFSET 0) gap \
+          WHERE pg_visible_in_snapshot(gap.commit_txid, $2::pg_snapshot) \
+            AND NOT EXISTS (SELECT 1 FROM projection_applied_transactions a \
+                             WHERE a.projection = $3 AND a.version = $4 \
+                               AND a.txid = gap.commit_txid)",
+    )
+    .persistent(false)
+    .bind(horizon)
+    .bind(cut.snapshot.as_str())
+    .bind(name)
+    .bind(version)
+    .fetch_one(conn)
+    .await
+    .map_err(crate::db_error)
 }
 
 /// Catch `projection` up on the gap above `horizon`, or adopt the log when it has no
@@ -380,6 +410,9 @@ pub(crate) async fn seal(
             AND pg_visible_in_snapshot(commit_txid, $3::pg_snapshot) \
          ON CONFLICT DO NOTHING",
     )
+    // Unnamed, like the gap's starting point: a generic plan of this range read is planned
+    // blind to the horizon, and nothing would stop it scanning `events` (funkode-io/replay#306).
+    .persistent(false)
     .bind(name)
     .bind(version)
     .bind(&cut.snapshot)
