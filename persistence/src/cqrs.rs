@@ -6,15 +6,29 @@ use replay::{Aggregate, Event};
 use urn::Urn;
 
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
+use crate::{CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome};
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
 const DEFAULT_COMPACTION_CHUNK_SIZE: u32 = 100;
 
-#[derive(Clone)]
 pub struct Cqrs<ES: EventStore> {
     store: Arc<ES>,
     /// How many stream ids [`Cqrs::streams_needing_compaction`] reads per store query.
     compaction_chunk_size: u32,
+    /// The command middleware chain, in registration order. Shared by every clone, and
+    /// bounded by how many middlewares the consumer registers, not by any data.
+    middlewares: Arc<[Arc<dyn CommandMiddleware>]>,
+}
+
+/// A clone shares the store and the middleware chain, so it needs no `ES: Clone`.
+impl<ES: EventStore> Clone for Cqrs<ES> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            compaction_chunk_size: self.compaction_chunk_size,
+            middlewares: Arc::clone(&self.middlewares),
+        }
+    }
 }
 
 impl<ES: EventStore> Cqrs<ES> {
@@ -22,7 +36,21 @@ impl<ES: EventStore> Cqrs<ES> {
         Self {
             store: Arc::new(event_store),
             compaction_chunk_size: DEFAULT_COMPACTION_CHUNK_SIZE,
+            middlewares: Arc::new([]),
         }
+    }
+
+    /// Register a command middleware, after every one registered before it.
+    ///
+    /// Every command [`execute`](Self::execute) runs — an application's call and a
+    /// Policy dispatch alike — passes through each middleware in registration order
+    /// (ADR-0035). Clones of this `Cqrs` made afterwards share the chain. A `Cqrs` with
+    /// no middleware behaves as if the feature did not exist.
+    pub fn with_middleware<M: CommandMiddleware + 'static>(mut self, middleware: M) -> Self {
+        let mut chain = self.middlewares.to_vec();
+        chain.push(Arc::new(middleware));
+        self.middlewares = chain.into();
+        self
     }
 
     /// Cap how many stream ids [`streams_needing_compaction`](Self::streams_needing_compaction)
@@ -94,7 +122,91 @@ impl<ES: EventStore> Cqrs<ES> {
             .await
     }
 
+    /// Run `command` against the aggregate at `id` and append the events it produces.
+    ///
+    /// Each registered [command middleware](Self::with_middleware) runs its `before`
+    /// first, in registration order. The first that does not answer
+    /// [`Next::Continue`] stops the command — nothing is loaded, handled or appended,
+    /// and later middlewares do not run: [`Next::Busy`] reaches the caller as a
+    /// `replay::Error` of kind [`Busy`](replay::ErrorKind::Busy) carrying its reason,
+    /// [`Next::Error`] as the error it carries. Metadata a middleware adds is carried by
+    /// the appended events; a middleware can change nothing else about the command.
+    ///
+    /// Once the command has finished, each middleware whose `before` answered `Continue`
+    /// runs its `after`, in reverse registration order, with the [`Outcome`]: committed,
+    /// busy with the reason, or failed with the error this call returns. A middleware that
+    /// stopped the command, and every one after it, runs no `after`. `after` only
+    /// observes: what it does never changes what this call returns.
     pub async fn execute<A: Aggregate>(
+        &self,
+        id: &A::StreamId,
+        metadata: replay::Metadata,
+        command: A::Command,
+        services: &A::Services,
+        expected_version: Option<i64>,
+    ) -> Result<A, A::Error>
+    where
+        A::Event: 'static,
+        A::Error: 'static,
+    {
+        if self.middlewares.is_empty() {
+            return self
+                .run::<A>(id, metadata, command, services, expected_version)
+                .await;
+        }
+
+        let mut context = CommandContext::new::<A>(id, metadata);
+        // How many middlewares answered `Continue`: the ones whose `after` runs.
+        let mut continued = 0;
+        // The reason a middleware gave when it answered `Busy`.
+        let mut busy = None;
+
+        let result = 'command: {
+            for middleware in self.middlewares.iter() {
+                // The handle lets `before` change the metadata, through its checked
+                // setters, and nothing else: the command's identity and causation stay
+                // as they arrived.
+                match middleware
+                    .before(CommandContextMut::new(&mut context))
+                    .await
+                {
+                    Next::Continue => continued += 1,
+                    Next::Busy(reason) => {
+                        let error = replay::Error::busy(reason.clone())
+                            .with_operation("execute")
+                            .with_context("stream_id", context.stream_id())
+                            .with_context("command", context.command_type());
+                        busy = Some(reason);
+                        break 'command Err(A::Error::from(error));
+                    }
+                    Next::Error(error) => break 'command Err(A::Error::from(error)),
+                }
+            }
+            self.run::<A>(
+                id,
+                context.metadata().clone(),
+                command,
+                services,
+                expected_version,
+            )
+            .await
+        };
+
+        let outcome = match (&result, &busy) {
+            (Ok(_), _) => Outcome::Committed,
+            (Err(_), Some(reason)) => Outcome::Busy(reason),
+            (Err(error), None) => Outcome::Failed(error),
+        };
+        for middleware in self.middlewares[..continued].iter().rev() {
+            middleware.after(&context, &outcome).await;
+        }
+
+        result
+    }
+
+    /// Load the aggregate, handle `command` and append what it produces, with no
+    /// middleware: what [`execute`](Self::execute) runs once every `before` continued.
+    async fn run<A: Aggregate>(
         &self,
         id: &A::StreamId,
         metadata: replay::Metadata,

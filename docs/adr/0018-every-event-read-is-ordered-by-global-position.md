@@ -2,6 +2,11 @@
 
 **Status:** accepted, narrowed by [ADR-0026](0026-a-policy-tracks-its-position-per-stream.md): a Policy's feed is no longer one of the reads this ADR governs. It reads one stream at a time, ordered by that stream's own sequence. Hydration, projections and every other read still order by `global_position`.
 
+An inline projection's catch-up still pages in `global_position` order, for the order it
+keeps within each stream, and promises nothing across streams
+([ADR-0032](0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md),
+[#306](https://github.com/funkode-io/replay/issues/306)).
+
 **Amends** [ADR-0011](0011-inline-projections-flushed-in-bounded-chunks.md)'s keyset
 decision: the rebuild cursor's `(created, version, id)` key, and the index behind it.
 
@@ -61,7 +66,11 @@ the rule that change established and finishes applying it.
   [#171](https://github.com/funkode-io/replay/issues/171) moves the feed onto it. It
   answers a different question from this one: a point-in-time read of a committed stream
   needs relative order, not a visibility watermark — and it costs a backfill and a cursor
-  format change, which this rule does not.
+  format change, which this rule does not. It is not a stream's order either: a
+  transaction can take its id before it takes a stream's row, so under concurrent appends
+  a later place in a stream can carry a lower stamp
+  ([ADR-0032](0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md),
+  [#306](https://github.com/funkode-io/replay/issues/306)).
 
 ## Consequences
 

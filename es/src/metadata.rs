@@ -35,6 +35,12 @@ impl Metadata {
         (*self.value).clone()
     }
 
+    /// Borrow the JSON document, for reading a key without the copy
+    /// [`to_json`](Self::to_json) makes.
+    pub fn as_json(&self) -> &Value {
+        &self.value
+    }
+
     /// Check if one metadata matches another.
     ///
     /// If passed metadata has different type of current metadata, returns false

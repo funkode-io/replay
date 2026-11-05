@@ -153,6 +153,40 @@ no metadata in `handle`. The chain of causation is what bounds how deep one even
 cascade into further reactions.
 _Avoid_: trigger, cause, origin.
 
+### Command middleware
+
+Code a consumer registers once to run around every command: before the command
+runs, which may stop it or add to its metadata; just before its append commits,
+which may roll the append back; and after it has finished, which only observes.
+Each of the first two answers continue, [Busy], or an error. Middleware runs in the
+order it was registered, on every command — an application's and a [Policy]'s alike,
+the latter told apart by its [Causation] — and on nothing that is not a command: a
+direct append, a compaction, a [Stream deletion], a [Rebuild] or a [Catch-up]. It is
+not a [Projection] and the registry knows nothing of it
+([ADR-0035](docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)).
+_Avoid_: interceptor, hook, filter, guard, plugin.
+
+### Commit gate
+
+The point in an append where the store asks the [Command middleware] whether to
+commit, after the events and every [Inline projection] write are in place. Anything
+but continue rolls the append back. Once a gate has let an append through, a flag
+set afterwards cannot be missed: the store makes waiting for every such append
+possible, so switching a rule on and then waiting leaves no append that checked the
+old rule still to commit
+([ADR-0035](docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)).
+_Avoid_: pre-commit hook, commit check.
+
+### Busy
+
+The answer "not now": the command is neither wrong nor failed and may succeed
+later, unchanged — maintenance mode is the case that named it. A caller sees it as
+its own kind of error. The [Policy runner] holds a busy command, retrying it for as
+long as it stays busy, and never parks it as a [Dead letter]
+([ADR-0036](docs/adr/0036-a-busy-command-is-held-not-dead-lettered.md)). A refusal
+that will never succeed is an error, not Busy.
+_Avoid_: unavailable, paused, deferred, refused.
+
 ### Dead letter
 
 A recorded failure of a [Policy] reaction that could not be completed — a
@@ -502,7 +536,8 @@ the store.
 ### Catch-up
 
 What an [Inline projection] does about the events of transactions that did not apply it:
-it applies them later, once per projection version, in [Global position] order. Run by
+it applies them later, once per projection version: each stream's events in that stream's
+order, by [Global position], and no order promised across streams. Run by
 `build()` at startup, by a background task on a cadence, and on demand. Every append
 records an **applied mark** for each projection it applied, so a catch-up skips those, and
 what is owed is decided by [Commit stamp] against the [Catch-up horizon], never by a
@@ -616,3 +651,6 @@ it:
 [Late write]: #late-write
 [Async projection]: #async-projection
 [Projection]: #projection
+[Command middleware]: #command-middleware
+[Commit gate]: #commit-gate
+[Busy]: #busy

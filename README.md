@@ -1764,8 +1764,8 @@ new projection keeps appending events the projection never sees, and an old pod 
 older *version* of it applies its old logic to the view the new version just rebuilt.
 
 So every append records which projections it applied, and the store **catches up** each
-projection on the events of every other transaction — once per projection version, in
-`global_position` order, whichever process appended them
+projection on the events of every other transaction — once per projection version,
+whichever process appended them, each stream's events in that stream's order
 ([ADR-0032](docs/adr/0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)):
 
 - **at startup**, in `build()`, for a projection whose stored version equals its code
@@ -1794,6 +1794,9 @@ each projection version exactly once. But:
 - **Late arrival.** A caught-up event can land after a later event of the same stream was
   applied live. A handler whose result depends on order should guard on a value its view
   keeps.
+- **No order across streams.** The events a catch-up applies reach `handle` in each
+  stream's own order, and in no promised order between streams. A handler that combines
+  events of several streams must not depend on which stream's events arrive first.
 - **Re-application across versions.** An event an older version applied live during a
   rollout is applied again by the newer version. Write the view with upserts that set
   values, so the newer logic wins. One that accumulates, like the running balance above,
