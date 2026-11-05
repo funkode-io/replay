@@ -101,10 +101,14 @@ pub trait CommandMiddleware: Send + Sync {
         Box::pin(ready(Next::Continue))
     }
 
-    /// Runs once the command has finished, whatever its outcome. It cannot change it.
+    /// Runs once the command has finished, whatever its outcome. It cannot change it: it
+    /// is the hook for auditing and metrics.
     ///
-    /// Not yet called: `Cqrs` runs it in a later release
-    /// ([#314](https://github.com/funkode-io/replay/issues/314)).
+    /// It runs in reverse registration order, and only for the middlewares whose
+    /// [`before`](CommandMiddleware::before) answered [`Next::Continue`], so the hooks
+    /// nest as web middleware does: a middleware that stopped the command, and every one
+    /// registered after it, runs no `after`. The context carries the metadata the
+    /// appended events carry, with what every `before` added.
     fn after<'a>(
         &'a self,
         context: &'a CommandContext,
@@ -407,6 +411,9 @@ mod tests {
             services: &Self::Services,
         ) -> Result<Vec<Self::Event>, Self::Error> {
             services.0.store(true, Ordering::SeqCst);
+            if command.0 < 0 {
+                return Err(replay::Error::invalid_input("cannot add a negative amount"));
+            }
             Ok(vec![CounterEvent::Added { amount: command.0 }])
         }
     }
@@ -770,6 +777,335 @@ mod tests {
         );
         assert!(!handled.0.load(Ordering::SeqCst), "the handler ran");
         assert!(appended(&cqrs).await.is_empty());
+    }
+
+    /// What each middleware saw in `after`, in the order they ran: its name, the outcome
+    /// as text, and the context.
+    type Afters = Arc<Mutex<Vec<(&'static str, String, CommandContext)>>>;
+
+    /// Answers `before` as it was built to, and records what its `after` sees.
+    struct Observing {
+        name: &'static str,
+        answer: fn() -> Next,
+        afters: Afters,
+    }
+
+    impl CommandMiddleware for Observing {
+        fn before<'a>(&'a self, _: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+            Box::pin(ready((self.answer)()))
+        }
+
+        fn after<'a>(
+            &'a self,
+            context: &'a CommandContext,
+            outcome: &'a Outcome<'a>,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                let outcome = match outcome {
+                    Outcome::Committed => "committed".to_string(),
+                    Outcome::Busy(reason) => format!("busy: {reason}"),
+                    Outcome::Failed(error) => format!("failed: {error}"),
+                };
+                self.afters
+                    .lock()
+                    .unwrap()
+                    .push((self.name, outcome, context.clone()));
+            })
+        }
+    }
+
+    fn observing(name: &'static str, afters: &Afters, answer: fn() -> Next) -> Observing {
+        Observing {
+            name,
+            answer,
+            afters: afters.clone(),
+        }
+    }
+
+    /// Who ran `after`, in order, and the outcome each saw.
+    fn observed(afters: &Afters) -> Vec<(&'static str, String)> {
+        afters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, outcome, _)| (*name, outcome.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn after_sees_a_committed_command_in_reverse_registration_order() {
+        let afters = Afters::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(AddsTheUser)
+            .with_middleware(observing("first", &afters, || Next::Continue))
+            .with_middleware(observing("second", &afters, || Next::Continue))
+            .with_middleware(observing("third", &afters, || Next::Continue));
+
+        cqrs.execute::<Counter>(
+            &counter(),
+            Metadata::default(),
+            Add(1),
+            &Handled::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            observed(&afters),
+            vec![
+                ("third", "committed".to_string()),
+                ("second", "committed".to_string()),
+                ("first", "committed".to_string()),
+            ]
+        );
+        let afters = afters.lock().unwrap();
+        let context = &afters[0].2;
+        assert_eq!(context.stream_id(), &Urn::from(counter()));
+        assert_eq!(context.metadata().to_json(), json!({ "user": "alice" }));
+    }
+
+    #[tokio::test]
+    async fn after_runs_only_for_the_middlewares_before_one_that_answered_busy() {
+        let afters = Afters::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(observing("first", &afters, || Next::Continue))
+            .with_middleware(observing("second", &afters, || Next::Continue))
+            .with_middleware(observing("maintenance", &afters, || {
+                Next::Busy("maintenance in progress".to_string())
+            }))
+            .with_middleware(observing("later", &afters, || Next::Continue));
+
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                None,
+            )
+            .await
+            .err()
+            .expect("a busy middleware stops the command");
+
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert_eq!(
+            observed(&afters),
+            vec![
+                ("second", "busy: maintenance in progress".to_string()),
+                ("first", "busy: maintenance in progress".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn after_runs_only_for_the_middlewares_before_one_that_answered_an_error() {
+        let afters = Afters::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(observing("first", &afters, || Next::Continue))
+            .with_middleware(observing("auth", &afters, || {
+                Next::Error(replay::Error::permanent(
+                    ErrorKind::Forbidden,
+                    "alice may not add",
+                ))
+            }))
+            .with_middleware(observing("later", &afters, || Next::Continue));
+
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                None,
+            )
+            .await
+            .err()
+            .expect("a refusing middleware stops the command");
+
+        assert_eq!(error.kind(), ErrorKind::Forbidden);
+        assert_eq!(
+            observed(&afters),
+            vec![("first", format!("failed: {error}"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn when_the_first_middleware_stops_the_command_no_after_runs() {
+        let afters = Afters::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(observing("maintenance", &afters, || {
+                Next::Busy("not now".to_string())
+            }))
+            .with_middleware(observing("later", &afters, || Next::Continue));
+
+        let result = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                None,
+            )
+            .await;
+
+        assert_eq!(result.err().map(|e| e.kind()), Some(ErrorKind::Busy));
+        assert!(observed(&afters).is_empty());
+    }
+
+    #[tokio::test]
+    async fn after_sees_a_command_that_failed_in_its_handler_as_failed_with_that_error() {
+        let afters = Afters::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(observing("first", &afters, || Next::Continue))
+            .with_middleware(observing("second", &afters, || Next::Continue));
+
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(-1),
+                &Handled::default(),
+                None,
+            )
+            .await
+            .err()
+            .expect("the handler refuses a negative amount");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "cannot add a negative amount");
+        let failed = format!("failed: {error}");
+        assert_eq!(
+            observed(&afters),
+            vec![("second", failed.clone()), ("first", failed)]
+        );
+        assert!(appended(&cqrs).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn after_sees_a_command_that_failed_in_the_store_as_failed_with_that_error() {
+        let afters = Afters::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new()).with_middleware(observing(
+            "audit",
+            &afters,
+            || Next::Continue,
+        ));
+
+        // The stream is empty, so expecting it at version 5 conflicts in the store.
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                Some(5),
+            )
+            .await
+            .err()
+            .expect("a stale expected version conflicts");
+
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(
+            observed(&afters),
+            vec![("audit", format!("failed: {error}"))]
+        );
+        assert!(appended(&cqrs).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_middleware_that_replaces_the_context_runs_no_after_and_earlier_ones_see_the_command()
+    {
+        let afters = Afters::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(observing("first", &afters, || Next::Continue))
+            .with_middleware(ReplacesTheContext)
+            .with_middleware(observing("later", &afters, || Next::Continue));
+
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                None,
+            )
+            .await
+            .err()
+            .expect("a replaced context stops the command");
+
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert_eq!(
+            observed(&afters),
+            vec![("first", format!("failed: {error}"))]
+        );
+        assert_eq!(
+            afters.lock().unwrap()[0].2.stream_id(),
+            &Urn::from(counter())
+        );
+    }
+
+    /// Its `after` does everything it can to the outcome it sees: it only gets to read it.
+    struct BusyAfter(Arc<Mutex<u32>>);
+
+    impl CommandMiddleware for BusyAfter {
+        fn after<'a>(
+            &'a self,
+            _: &'a CommandContext,
+            outcome: &'a Outcome<'a>,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                if !matches!(outcome, Outcome::Committed) {
+                    *self.0.lock().unwrap() += 1;
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_after_does_changes_what_execute_returns() {
+        let failures = Arc::new(Mutex::new(0));
+        let plain = Cqrs::new(InMemoryEventStore::new());
+        let observed =
+            Cqrs::new(InMemoryEventStore::new()).with_middleware(BusyAfter(failures.clone()));
+
+        for (amount, expected_version) in [(2, None), (-1, None), (1, Some(5))] {
+            let without = plain
+                .execute::<Counter>(
+                    &counter(),
+                    Metadata::default(),
+                    Add(amount),
+                    &Handled::default(),
+                    expected_version,
+                )
+                .await;
+            let with = observed
+                .execute::<Counter>(
+                    &counter(),
+                    Metadata::default(),
+                    Add(amount),
+                    &Handled::default(),
+                    expected_version,
+                )
+                .await;
+
+            match (without, with) {
+                (Ok(without), Ok(with)) => assert_eq!(without.total, with.total),
+                (Err(without), Err(with)) => {
+                    assert_eq!(without.kind(), with.kind());
+                    assert_eq!(without.to_string(), with.to_string());
+                    assert_eq!(without.operation(), with.operation());
+                    assert_eq!(without.context(), with.context());
+                }
+                (without, with) => panic!(
+                    "after changed the result: {:?} became {:?}",
+                    without.map(|a| a.total),
+                    with.map(|a| a.total)
+                ),
+            }
+        }
+        assert_eq!(*failures.lock().unwrap(), 2, "after saw both failures");
+        assert_eq!(appended(&observed).await.len(), 1);
     }
 
     #[test]
