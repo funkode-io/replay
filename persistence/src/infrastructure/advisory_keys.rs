@@ -8,14 +8,16 @@
 //! - **one-key**, `hashtext(policy name)`: a Policy's leadership, held for the session by
 //!   the [Policy runner](crate::PolicyRunner)'s lock-manager connection (ADR-0008). It is
 //!   the only one-key lock Replay takes;
-//! - **two-key**, `(class, key)`, with a class of Replay's own for each purpose, spelled as
-//!   four ASCII letters so a lock seen in `pg_locks.classid` names itself:
+//! - **two-key**, `(class, key)`, with a class of Replay's own for each purpose. The
+//!   classes defined here are spelled as four ASCII letters so a lock seen in
+//!   `pg_locks.classid` names itself; the bulk lane's claim lock hashes a name instead:
 //!
 //! | Class | Value         | Second key                 | What it guards |
 //! |-------|---------------|----------------------------|----------------|
 //! | `RPJC` | `0x5250_4A43` | `hashtext(projection name)` | an inline projection's catch-up and build |
 //! | `RPJR` | `0x5250_4A52` | `0`                         | the inline projection registry as a whole |
 //! | `RCGT` | `0x5243_4754` | `0`                         | the commit gate: appends in flight past it |
+//! | `hashtext('replay.bulk_claim')` | `0x59C2_65A4` | `hashtext(policy name)` | one bulk-lane claim at a time per Policy (`policy_runner/bulk_lane.rs`) |
 //!
 //! A class must differ from every other class here; the second key only separates locks
 //! within one class.
@@ -46,6 +48,12 @@ pub(crate) const REGISTRY_LOCK_CLASS: i32 = 0x5250_4A52;
 /// its gate before the call began has committed or rolled back (ADR-0035).
 pub(crate) const COMMIT_GATE_LOCK_CLASS: i32 = 0x5243_4754;
 
+/// The class the bulk lane's claim lock is taken in, as the server computes
+/// `hashtext('replay.bulk_claim')` — the query spells the name, so this value is the
+/// reference the other classes are checked against, and an integration test pins it.
+#[cfg(test)]
+const BULK_CLAIM_LOCK_CLASS: i32 = 0x59C2_65A4;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +73,7 @@ mod tests {
             PROJECTION_LOCK_CLASS,
             REGISTRY_LOCK_CLASS,
             COMMIT_GATE_LOCK_CLASS,
+            BULK_CLAIM_LOCK_CLASS,
         ];
         for (i, a) in classes.iter().enumerate() {
             for b in &classes[i + 1..] {
