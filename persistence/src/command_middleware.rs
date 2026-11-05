@@ -1044,6 +1044,69 @@ mod tests {
         );
     }
 
+    /// Replaces the whole context with one for another stream, then gives the answer it
+    /// was built with.
+    struct ReplacesTheContextAndAnswers(fn() -> Next);
+
+    impl CommandMiddleware for ReplacesTheContextAndAnswers {
+        fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+            Box::pin(async move {
+                let elsewhere = CounterUrn(UrnBuilder::new("counter", "2").build().unwrap());
+                *context = CommandContext::new::<Counter>(&elsewhere, Metadata::default());
+                (self.0)()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_middleware_that_replaces_the_context_and_stops_the_command_leaves_it_as_it_arrived()
+    {
+        let answers: [fn() -> Next; 2] = [
+            || Next::Busy("not now".to_string()),
+            || {
+                Next::Error(replay::Error::permanent(
+                    ErrorKind::Forbidden,
+                    "alice may not add",
+                ))
+            },
+        ];
+        for answer in answers {
+            let afters = Afters::default();
+            let cqrs = Cqrs::new(InMemoryEventStore::new())
+                .with_middleware(observing("first", &afters, || Next::Continue))
+                .with_middleware(ReplacesTheContextAndAnswers(answer));
+
+            let error = cqrs
+                .execute::<Counter>(
+                    &counter(),
+                    stamped().into_metadata(),
+                    Add(1),
+                    &Handled::default(),
+                    None,
+                )
+                .await
+                .err()
+                .expect("the middleware stops the command");
+
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::Busy | ErrorKind::Forbidden
+            ));
+            if error.kind() == ErrorKind::Busy {
+                assert_eq!(error.to_string(), "not now");
+                assert!(error
+                    .context()
+                    .contains(&("stream_id", Urn::from(counter()).to_string())));
+            } else {
+                assert_eq!(error.to_string(), "alice may not add");
+            }
+            let afters = afters.lock().unwrap();
+            assert_eq!(afters.len(), 1);
+            assert_eq!(afters[0].2.stream_id(), &Urn::from(counter()));
+            assert_eq!(afters[0].2.causation(), Some(&stamped()));
+        }
+    }
+
     /// Its `after` does everything it can to the outcome it sees: it only gets to read it.
     struct BusyAfter(Arc<Mutex<u32>>);
 

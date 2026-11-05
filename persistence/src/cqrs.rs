@@ -168,17 +168,22 @@ impl<ES: EventStore> Cqrs<ES> {
 
         let result = 'command: {
             for middleware in self.middlewares.iter() {
-                match middleware.before(&mut context).await {
-                    Next::Continue if !context.is_the_command(&arrived) => {
+                let answer = middleware.before(&mut context).await;
+                // A middleware that replaced the context whole, whatever it answers: the
+                // middlewares that ran before it, and the error the caller gets, name the
+                // command as it arrived, not the replacement.
+                let replaced = !context.is_the_command(&arrived);
+                if replaced {
+                    context = arrived.clone();
+                }
+                match answer {
+                    Next::Continue if replaced => {
                         let error = replay::Error::internal(
                             "a command middleware changed the command's identity or causation",
                         )
                         .with_operation("execute")
-                        .with_context("stream_id", arrived.stream_id())
-                        .with_context("command", arrived.command_type());
-                        // The middlewares that ran before it see the command as it was
-                        // meant to be, not the replacement.
-                        context = arrived;
+                        .with_context("stream_id", context.stream_id())
+                        .with_context("command", context.command_type());
                         break 'command Err(A::Error::from(error));
                     }
                     Next::Continue => continued += 1,
