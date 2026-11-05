@@ -183,8 +183,8 @@ impl PolicyStatusStore {
 
     /// Return one [`PolicyStatus`] for every policy that has a `policy_cursors` row —
     /// the online lane's — or a `policy_bulk_registrations` row — the bulk lane's. A
-    /// Policy on both lanes is listed once, with both views. A registered-but-never-run
-    /// policy (no row) does not appear.
+    /// Policy on both lanes is listed once, with both views. A Policy with neither row —
+    /// registered on a runner that has never started it — does not appear.
     ///
     /// The result is produced by a **single** SQL read: a per-policy `LATERAL` over
     /// `streams` against that policy's places, a per-policy `LATERAL` aggregate over
@@ -244,14 +244,14 @@ impl PolicyStatusStore {
                     -- the first is a one-time filter that skips the scan entirely for a
                     -- Policy that tracks some types, and the second is an index scan on
                     -- `idx_streams_type_id` that never reads a row of another type. A
-                    -- Policy with no online row tracks nothing on the online lane: the
-                    -- first branch is filtered on the row being there, and the second
-                    -- compares against a NULL array, which matches nothing.
+                    -- Policy with no online row — only on the bulk lane — tracks nothing
+                    -- on the online lane, so both branches are filtered on the row being
+                    -- there, a one-time filter that skips their scans.
                     SELECT id, stream_seq FROM streams
                      WHERE pc.name IS NOT NULL AND pc.tracked_stream_types IS NULL
                     UNION ALL
                     SELECT id, stream_seq FROM streams
-                     WHERE type = ANY(pc.tracked_stream_types)
+                     WHERE pc.name IS NOT NULL AND type = ANY(pc.tracked_stream_types)
                 ) s
                 LEFT JOIN policy_stream_cursors c
                        ON c.policy = p.name AND c.stream_id = s.id
@@ -266,10 +266,11 @@ impl PolicyStatusStore {
             ) dl ON TRUE
             LEFT JOIN LATERAL (
                 -- No row, so NULL, for a Policy that is not on the bulk lane, rather than
-                -- 0: "no queue" and "an empty queue" are different answers.
+                -- 0: "no queue" and "an empty queue" are different answers. The same test
+                -- in the WHERE is a one-time filter, so such a Policy reads no work rows.
                 SELECT COUNT(*) AS bulk_pending
                 FROM policy_bulk_work w
-                WHERE w.policy = p.name
+                WHERE br.policy IS NOT NULL AND w.policy = p.name
                 HAVING br.policy IS NOT NULL
             ) bw ON TRUE
             ORDER BY p.name
