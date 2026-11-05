@@ -36,6 +36,8 @@ pub(crate) struct MiddlewareGate {
     /// `None` when no middleware is registered: the gate always continues.
     context: Option<Arc<CommandContext>>,
     busy: Arc<std::sync::OnceLock<String>>,
+    /// Set when a middleware did not continue: the gate's answer is the outcome.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MiddlewareGate {
@@ -45,6 +47,7 @@ impl MiddlewareGate {
             middlewares: Arc::new([]),
             context: None,
             busy: Arc::default(),
+            stopped: Arc::default(),
         }
     }
 }
@@ -59,9 +62,15 @@ impl CommitGate for MiddlewareGate {
                 Next::Continue => {}
                 Next::Busy(reason) => {
                     let _ = self.busy.set(reason.clone());
+                    self.stopped
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     return Next::Busy(reason);
                 }
-                stop => return stop,
+                stop => {
+                    self.stopped
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return stop;
+                }
             }
         }
         Next::Continue
@@ -272,6 +281,7 @@ impl<ES: EventStore> Cqrs<ES> {
                 // The context `before` left, owned by the gate so the append can hold it.
                 context: Some(Arc::new(context.clone())),
                 busy: Arc::default(),
+                stopped: Arc::default(),
             };
             let gate_busy = Arc::clone(&gate.busy);
             let result = command(context.metadata().clone(), gate).await;
@@ -319,6 +329,7 @@ impl<ES: EventStore> Cqrs<ES> {
             services,
             expected_version,
             gate,
+            &mut false,
         )
         .await?;
 
@@ -326,7 +337,9 @@ impl<ES: EventStore> Cqrs<ES> {
     }
 
     /// Handle `command` on the loaded `aggregate` and append what it produces behind
-    /// `gate`, folding each persisted event back into it.
+    /// `gate`, folding each persisted event back into it. `wrote` turns true once the
+    /// first event is written, whether or not the append then commits.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_and_append<A: Aggregate>(
         &self,
         aggregate: &mut A,
@@ -335,6 +348,7 @@ impl<ES: EventStore> Cqrs<ES> {
         services: &A::Services,
         expected_version: Option<i64>,
         gate: MiddlewareGate,
+        wrote: &mut bool,
     ) -> Result<Option<(i64, i64, uuid::Uuid)>, A::Error>
     where
         A::Event: 'static,
@@ -366,6 +380,7 @@ impl<ES: EventStore> Cqrs<ES> {
                 event_stream,
                 expected_version,
                 |event: &PersistedEvent<A::Event>| {
+                    *wrote = true;
                     let count = appended.map_or(1, |(_, n, _)| n + 1);
                     appended = Some((event.version, count, event.id));
                     aggregate.apply(event.data.clone())
@@ -625,6 +640,8 @@ impl Cqrs<PostgresEventStore> {
                 _ => self.fetch_loaded::<A>(id).await?,
             };
             let expected = expected_version.or(Some(loaded.head.version));
+            let gate_stopped = Arc::clone(&gate.stopped);
+            let mut wrote = false;
             let appended = self
                 .handle_and_append::<A>(
                     &mut loaded.aggregate,
@@ -633,13 +650,17 @@ impl Cqrs<PostgresEventStore> {
                     services,
                     expected,
                     gate,
+                    &mut wrote,
                 )
                 .await;
-            // An outcome that appended nothing — a refusal, a no-op, any failure — met no
-            // version check, so it is only as good as the state it was decided on. Read the
-            // head again: a stream that moved while the handler decided makes the outcome a
-            // `Conflict`, and the caller retries on a fresh load.
-            if !matches!(appended, Ok(Some(_))) {
+            // A decision that wrote nothing — a refusal, a no-op, a handler's failure — met
+            // no version check, so it is only as good as the state it was decided on. Read
+            // the head again: a stream that moved while the handler decided makes the
+            // outcome a `Conflict`, and the caller retries on a fresh load. A decision that
+            // wrote was checked at its first event; and a commit gate that stopped the
+            // command has the last word, so a `Busy` there stays `Busy`.
+            let stopped_at_gate = gate_stopped.load(std::sync::atomic::Ordering::SeqCst);
+            if !wrote && !stopped_at_gate {
                 let now = self.head_of::<A>(id).await?;
                 if now != loaded.head {
                     return Err(A::Error::from(

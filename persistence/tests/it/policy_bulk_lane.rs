@@ -26,7 +26,7 @@ use common::policy_harness::{
 };
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    CommandContextMut, CommandMiddleware, Dispatch, Lanes, Next, ObservedEvent,
+    CommandContext, CommandContextMut, CommandMiddleware, Dispatch, Lanes, Next, ObservedEvent,
     PolicyRunnerBuilder, PolicySettings, StartAt, StreamFilter,
 };
 
@@ -434,6 +434,7 @@ define_aggregate! {
         commands: {
             Count { tag: String },
             CountIfOpen { tag: String },
+            Touch {},
         },
         events: {
             Counted { tag: String },
@@ -483,6 +484,9 @@ impl replay::Aggregate for Tally {
             TallyCommand::CountIfOpen { .. } => Err(replay::Error::business_rule_violation(
                 "the tally is not open",
             )),
+            // A decision to do nothing: an append of no events, which still meets the
+            // commit gate.
+            TallyCommand::Touch => Ok(vec![]),
         }
     }
 }
@@ -985,6 +989,102 @@ async fn a_refusal_raced_by_a_write_is_retried_postgres_test() {
             (harness.all_bulk_work().await == 0).then_some(())
         })
         .await;
+    assert_eq!(harness.parked_row_count().await, 0, "nothing was parked");
+
+    harness.shutdown().await;
+}
+
+/// Arms [`OPEN_WHILE_DECIDING`] for the second Tally command and answers `Busy` at that
+/// command's commit gate, once.
+#[derive(Clone, Default)]
+struct BusyAtGateWhileMoved {
+    pool: Arc<OnceLock<PgPool>>,
+    tally_commands: Arc<AtomicUsize>,
+    busy_at_next_gate: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CommandMiddleware for BusyAtGateWhileMoved {
+    fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            if context.stream_type() == "Tally"
+                && context.causation().is_some()
+                && self.tally_commands.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                *OPEN_WHILE_DECIDING
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(self.pool.get().expect("the pool is set").clone());
+                self.busy_at_next_gate.store(true, Ordering::SeqCst);
+            }
+            Next::Continue
+        })
+    }
+
+    fn before_commit<'a>(&'a self, _context: &'a CommandContext) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            if self.busy_at_next_gate.swap(false, Ordering::SeqCst) {
+                Next::Busy("held at the gate".to_string())
+            } else {
+                Next::Continue
+            }
+        })
+    }
+}
+
+/// t-0 counts, t-2 does nothing; the rest count.
+fn count_but_touch_t2(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
+    count_alternately(event)
+        .into_iter()
+        .map(|dispatch| {
+            let tally = dispatch.target_stream_id().clone();
+            let (_, command) = dispatch
+                .into_parts::<Tally>()
+                .unwrap_or_else(|_| panic!("count_alternately dispatches to a Tally"));
+            let command = match command {
+                TallyCommand::Count { tag } if tag == "t-2" => TallyCommand::Touch,
+                other => other,
+            };
+            Dispatch::to::<Tally>(tally.try_into().expect("a tally URN"), command)
+        })
+        .collect()
+}
+
+/// A `Busy` at the commit gate stays `Busy` when the stream also moved while the command
+/// was decided: the batch is abandoned and claimed again — so `t-0`, which committed
+/// before it, is delivered again (at-least-once) — rather than the command being settled
+/// in the batch as a conflict.
+#[tokio::test]
+async fn a_busy_gate_abandons_the_batch_even_when_the_stream_moved_postgres_test() {
+    let _counting = count_tally_loads().await;
+    let middleware = BusyAtGateWhileMoved::default();
+    let pool = Arc::clone(&middleware.pool);
+    let harness = PolicyDaemonHarness::start_with_middleware(
+        "busy_gate_moved",
+        middleware,
+        |builder, policy| {
+            builder
+                .register_services::<Tally>(())
+                .register_policy_fn::<ProbeEvent, _>(policy, bulk(), count_but_touch_t2)
+        },
+    )
+    .await;
+    pool.set(harness.pool().clone())
+        .expect("the pool is set once");
+    harness.await_bulk_registration(harness.policy_name()).await;
+
+    harness.bulk_import("busy-moved", &tags("t", 4)).await;
+
+    harness
+        .observe("every queue to be drained", || async {
+            (harness.all_bulk_work().await == 0).then_some(())
+        })
+        .await;
+    assert_eq!(
+        counted(&harness, "even").await,
+        ["t-0", "opened", "t-0"],
+        "the abandoned batch is claimed again from its first event"
+    );
+    assert_eq!(counted(&harness, "odd").await, ["t-1", "t-3"]);
     assert_eq!(harness.parked_row_count().await, 0, "nothing was parked");
 
     harness.shutdown().await;
