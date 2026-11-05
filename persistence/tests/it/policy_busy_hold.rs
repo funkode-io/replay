@@ -18,7 +18,7 @@ use common::policy_harness::{
     DeadLetter, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
 };
 use replay_persistence::{
-    CommandContext, CommandMiddleware, DeadLetterRetry, Dispatch, Liveness, Next, ObservedEvent,
+    CommandContextMut, CommandMiddleware, DeadLetterRetry, Dispatch, Liveness, Next, ObservedEvent,
     PolicySettings, StartAt,
 };
 
@@ -68,7 +68,7 @@ impl Gate {
 }
 
 impl CommandMiddleware for Gate {
-    fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+    fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
         Box::pin(async move {
             if context.causation().is_none() || !context.stream_id().as_str().ends_with("-echo") {
                 return Next::Continue;
@@ -443,7 +443,7 @@ impl TwoGates {
 }
 
 impl CommandMiddleware for TwoGates {
-    fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+    fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
         Box::pin(async move {
             let stream = context.stream_id().as_str().to_string();
             let gate = if stream.ends_with("-first") {
@@ -678,7 +678,7 @@ struct DiscardsWhileBusy {
 }
 
 impl CommandMiddleware for DiscardsWhileBusy {
-    fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+    fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
         Box::pin(async move {
             if context.causation().is_none() {
                 return Next::Continue;
