@@ -29,15 +29,20 @@ const PAST_THE_RETRY_BUDGET: usize = 6;
 const CONTINUE: u8 = 0;
 const BUSY: u8 = 1;
 const REFUSE: u8 = 2;
+/// Let the command through, but only after longer than any test waits: a dispatch
+/// still in flight when the test acts.
+const HANG: u8 = 3;
 
 /// Maintenance mode for a Policy's commands: what it answers is switched from the test.
 ///
-/// Only commands carrying a Causation are its business, so the harness's own pings —
-/// an application's commands — always go through.
+/// Only a Policy's commands to an `-echo` stream are its business: the harness's own
+/// pings — an application's commands — always go through, and so does a sibling
+/// command a reaction sends anywhere else.
 #[derive(Clone)]
 struct Gate {
     answer: Arc<AtomicU8>,
     busy_answers: Arc<AtomicUsize>,
+    hangs: Arc<AtomicUsize>,
 }
 
 impl Gate {
@@ -45,7 +50,12 @@ impl Gate {
         Self {
             answer: Arc::new(AtomicU8::new(answer)),
             busy_answers: Arc::new(AtomicUsize::new(0)),
+            hangs: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn hangs(&self) -> usize {
+        self.hangs.load(Ordering::SeqCst)
     }
 
     fn answer(&self, answer: u8) {
@@ -60,7 +70,7 @@ impl Gate {
 impl CommandMiddleware for Gate {
     fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
         Box::pin(async move {
-            if context.causation().is_none() {
+            if context.causation().is_none() || !context.stream_id().as_str().ends_with("-echo") {
                 return Next::Continue;
             }
             match self.answer.load(Ordering::SeqCst) {
@@ -69,6 +79,11 @@ impl CommandMiddleware for Gate {
                     Next::Busy("maintenance in progress".to_string())
                 }
                 REFUSE => Next::Error(replay::Error::invalid_input("refused by the gate")),
+                HANG => {
+                    self.hangs.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    Next::Continue
+                }
                 _ => Next::Continue,
             }
         })
@@ -86,12 +101,40 @@ fn echo(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
     }
 }
 
+/// Flake into a `-flake` stream first, then echo: a reaction whose first command
+/// always fails retryably and whose second the gate decides.
+fn flake_then_echo(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
+    match &event.data {
+        ProbeEvent::Pinged { tag } => vec![
+            Dispatch::to::<Probe>(
+                ProbeUrn::new(format!("{tag}-flake")).unwrap(),
+                ProbeCommand::Flake {
+                    reason: "the downstream is down".to_string(),
+                },
+            ),
+            Dispatch::to::<Probe>(
+                ProbeUrn::new(format!("{tag}-echo")).unwrap(),
+                ProbeCommand::Echo { tag: tag.clone() },
+            ),
+        ],
+        _ => vec![],
+    }
+}
+
 async fn start(label: &str, gate: &Gate) -> PolicyDaemonHarness {
-    PolicyDaemonHarness::start_with_middleware(label, gate.clone(), |builder, policy| {
+    start_reacting(label, gate, echo).await
+}
+
+async fn start_reacting(
+    label: &str,
+    gate: &Gate,
+    reaction: fn(&ObservedEvent<ProbeEvent>) -> Vec<Dispatch>,
+) -> PolicyDaemonHarness {
+    PolicyDaemonHarness::start_with_middleware(label, gate.clone(), move |builder, policy| {
         builder.register_policy_fn::<ProbeEvent, _>(
             policy,
             PolicySettings::new().starting_at(StartAt::Beginning),
-            echo,
+            reaction,
         )
     })
     .await
@@ -221,6 +264,98 @@ async fn a_held_policy_shuts_down_without_waiting_for_the_middleware_postgres_te
         .await_dispatch_caused_by(pinged.global_position)
         .await;
     assert_eq!(dispatched.event_type, "Echoed");
+
+    harness.shutdown().await;
+}
+
+/// A hold lets go of a dispatch still in flight when the worker is told to stop, as
+/// it lets go of a backoff: waiting for the dispatch would let a worker that is no
+/// longer leading advance the event, or park it.
+#[tokio::test]
+async fn a_held_policy_shuts_down_without_waiting_for_a_dispatch_in_flight_postgres_test() {
+    let gate = Gate::answering(BUSY);
+    let mut harness = start("busy_in_flight", &gate).await;
+
+    let pinged = harness.ping("subject-1", "hello").await;
+    harness
+        .observe("the command held", || async {
+            (gate.busy_answers() >= 1).then_some(())
+        })
+        .await;
+    gate.answer(HANG);
+    harness
+        .observe("a held attempt in flight", || async {
+            (gate.hangs() >= 1).then_some(())
+        })
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(5), harness.stop())
+        .await
+        .expect("a held worker lets go of the dispatch in flight when asked to stop");
+    assert_eq!(harness.dead_letters().await.len(), 0);
+    assert!(!harness.has_passed(pinged.global_position).await);
+    assert_eq!(harness.dispatches().await.len(), 0);
+
+    gate.answer(CONTINUE);
+    harness.resume();
+    harness.await_passed(pinged.global_position).await;
+
+    harness.shutdown().await;
+}
+
+/// A sibling that fails retryably before the held command is reached does not end
+/// the hold: it is still one hold, entered once, until the held command answers — and
+/// then the sibling is settled by the ordinary rules, parked once.
+#[tokio::test]
+#[traced_test]
+async fn a_failing_sibling_does_not_end_the_hold_postgres_test() {
+    let gate = Gate::answering(BUSY);
+    let harness = start_reacting("busy_sibling", &gate, flake_then_echo).await;
+    let policy = harness.policy_name().to_string();
+
+    let pinged = harness.ping("subject-1", "hello").await;
+    // Each busy answer is preceded by the sibling spending a whole retry budget, so
+    // three of them are three times round that loop.
+    harness
+        .observe("the held command busy three times", || async {
+            (gate.busy_answers() >= 3).then_some(())
+        })
+        .await;
+
+    assert_eq!(harness.dead_letters().await.len(), 0);
+    logs_assert(|lines: &[&str]| {
+        let entered = hold_records(lines, &policy, "entered");
+        let left = hold_records(lines, &policy, "left");
+        if entered.len() != 1 || !left.is_empty() {
+            return Err(format!(
+                "expected one hold still open, got {entered:#?} entering and {left:#?} leaving"
+            ));
+        }
+        Ok(())
+    });
+
+    gate.answer(CONTINUE);
+    harness.await_passed(pinged.global_position).await;
+    let parked = harness.await_dead_letters(1).await;
+    assert_eq!(parked.len(), 1, "the sibling is parked once");
+    assert_eq!(
+        parked[0].target_stream_id.as_deref(),
+        Some("urn:probe:hello-flake")
+    );
+    let dispatched = harness
+        .await_dispatch_caused_by(pinged.global_position)
+        .await;
+    assert_eq!(dispatched.event_type, "Echoed");
+    logs_assert(|lines: &[&str]| {
+        let entered = hold_records(lines, &policy, "entered");
+        let left = hold_records(lines, &policy, "left");
+        if entered.len() != 1 || left.len() != 1 {
+            return Err(format!(
+                "expected one hold entered and left, got {entered:#?} and {left:#?}"
+            ));
+        }
+        Ok(())
+    });
 
     harness.shutdown().await;
 }

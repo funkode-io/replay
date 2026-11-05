@@ -2577,6 +2577,8 @@ struct Hold {
     since: Instant,
     /// Busy attempts so far, which is what the backoff doubles on.
     busy_attempts: u32,
+    /// The dispatch that was busy: the hold ends when it answers anything else.
+    dispatch: DispatchIdentity,
 }
 
 /// Returns `true` for errors whose cause may be transient and worth retrying.
@@ -2678,6 +2680,15 @@ struct DispatchIdentity {
 }
 
 impl DispatchIdentity {
+    /// Whether `other` is the same dispatch of the same reaction: its place in the
+    /// vector, and the command and instance it names.
+    fn is(&self, other: &DispatchIdentity) -> bool {
+        self.ordinal == other.ordinal
+            && self.aggregate_name == other.aggregate_name
+            && self.target_stream_id == other.target_stream_id
+            && self.command_name == other.command_name
+    }
+
     fn of(ordinal: usize, dispatch: &Dispatch) -> Self {
         Self {
             aggregate_name: dispatch.aggregate_name(),
@@ -3740,11 +3751,12 @@ impl Delivery<'_> {
     /// this event. The reaction is tried again after a backoff that doubles up to
     /// [`HOLD_MAX_BACKOFF`], for as long as it stays busy; busy attempts spend nothing
     /// of the retry budget and park nothing. The first attempt that is anything else
-    /// ends the hold and is settled by the rows above with a fresh budget. The hold is
-    /// narrated as an edge, once on entering and once on leaving. Only the worker
-    /// being asked to stop leading cuts it short ([`StandDown`]): the delivery then
-    /// fails, nothing is parked or advanced, and the next leader delivers the event
-    /// again.
+    /// ends the hold and is settled by the rows above with a fresh budget; a sibling
+    /// that fails retryably before the held command is reached leaves the hold open.
+    /// The hold is narrated as an edge, once on entering and once on leaving. Only
+    /// the worker being asked to stop leading cuts it short ([`StandDown`]), at any
+    /// point of it — a backoff or a dispatch in flight: the delivery then fails,
+    /// nothing is parked or advanced, and the next leader delivers the event again.
     ///
     /// **Re-react safety**: on retry the policy's `react` is called again for the
     /// same event.  `react` is pure, and the same event yields the same dispatches —
@@ -3766,14 +3778,36 @@ impl Delivery<'_> {
             let mut executed = 0usize;
             let mut need_retry = false;
             let mut busy = None;
+            // Whether the dispatch the hold is on came back with anything but busy.
+            let mut held_dispatch_answered = false;
 
             for (ordinal, dispatch) in dispatches.into_iter().enumerate() {
                 let identity = DispatchIdentity::of(ordinal, &dispatch);
                 pending.dispatching(identity.clone());
-                let outcome = self
-                    .execute_dispatch_within(global_position, raw, dispatch)
-                    .await;
+                let running = self.execute_dispatch_within(global_position, raw, dispatch);
+                // Inside a hold, a dispatch is raced against the worker standing down
+                // as the backoff is: a stand-down that waited for the dispatch could
+                // still advance the event, or park it, for a worker no longer leading.
+                // Cutting the dispatch loose is what its timeout already does
+                // (ADR-0018).
+                let outcome = match &hold {
+                    Some(held) => tokio::select! {
+                        outcome = running => outcome,
+                        _ = self.stand_down.signalled() => {
+                            return Err(self.abandon_hold(raw, global_position, held));
+                        }
+                    },
+                    None => running.await,
+                };
                 pending.returned();
+
+                if !matches!(&outcome, Err(failure) if failure.busy())
+                    && hold
+                        .as_ref()
+                        .is_some_and(|held| held.dispatch.is(&identity))
+                {
+                    held_dispatch_answered = true;
+                }
 
                 match outcome {
                     Ok(()) => {
@@ -3836,6 +3870,7 @@ impl Delivery<'_> {
                     Hold {
                         since: Instant::now(),
                         busy_attempts: 0,
+                        dispatch: identity,
                     }
                 });
                 let backoff = hold_backoff(held.busy_attempts);
@@ -3843,21 +3878,7 @@ impl Delivery<'_> {
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = self.stand_down.signalled() => {
-                        tracing::info!(
-                            policy          = %policy_name,
-                            event_id        = %raw.id,
-                            global_position,
-                            busy_attempts   = held.busy_attempts,
-                            held_ms         = held.since.elapsed().as_millis(),
-                            hold            = "abandoned",
-                            "policy stopped leading while holding a busy command; \
-                             the event is delivered again by whoever leads next"
-                        );
-                        return Err(replay::Error::unavailable(
-                            "policy stopped leading while holding a busy command",
-                        )
-                        .with_operation("policy_drain")
-                        .with_context("policy", policy_name));
+                        return Err(self.abandon_hold(raw, global_position, held));
                     }
                 }
                 // A fresh budget for whatever the reaction meets once it runs.
@@ -3865,16 +3886,23 @@ impl Delivery<'_> {
                 continue;
             }
 
-            if let Some(held) = hold.take() {
-                tracing::info!(
-                    policy          = %policy_name,
-                    event_id        = %raw.id,
-                    global_position,
-                    busy_attempts   = held.busy_attempts,
-                    held_ms         = held.since.elapsed().as_millis(),
-                    hold            = "left",
-                    "policy dispatch is no longer busy; the hold is over"
-                );
+            // The hold is over when the command it is on answers, or when the delivery
+            // settles without reaching it again. A sibling that fails retryably before
+            // the held command is reached leaves the hold open: closing it there would
+            // reopen it on the next busy answer, narrating a hold that never ended and
+            // restarting its backoff.
+            if held_dispatch_answered || !need_retry {
+                if let Some(held) = hold.take() {
+                    tracing::info!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        global_position,
+                        busy_attempts   = held.busy_attempts,
+                        held_ms         = held.since.elapsed().as_millis(),
+                        hold            = "left",
+                        "policy dispatch is no longer busy; the hold is over"
+                    );
+                }
             }
 
             if !need_retry {
@@ -3884,9 +3912,41 @@ impl Delivery<'_> {
 
             // Exponential back-off: 100 ms, 200 ms, 400 ms, …
             let backoff = Duration::from_millis(100 * (1u64 << attempt.min(5)));
-            tokio::time::sleep(backoff).await;
+            match &hold {
+                Some(held) => tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = self.stand_down.signalled() => {
+                        return Err(self.abandon_hold(raw, global_position, held));
+                    }
+                },
+                None => tokio::time::sleep(backoff).await,
+            }
             attempt += 1;
         }
+    }
+
+    /// Let go of a hold because the worker is to stop leading, saying so, and return
+    /// the error that ends the poll: nothing is parked or advanced, and whoever leads
+    /// next delivers the event again.
+    fn abandon_hold(
+        &self,
+        raw: &PersistedEvent<Value>,
+        global_position: i64,
+        held: &Hold,
+    ) -> replay::Error {
+        tracing::info!(
+            policy          = %self.policy_name,
+            event_id        = %raw.id,
+            global_position,
+            busy_attempts   = held.busy_attempts,
+            held_ms         = held.since.elapsed().as_millis(),
+            hold            = "abandoned",
+            "policy stopped leading while holding a busy command; \
+             the event is delivered again by whoever leads next"
+        );
+        replay::Error::unavailable("policy stopped leading while holding a busy command")
+            .with_operation("policy_drain")
+            .with_context("policy", self.policy_name)
     }
 
     /// Write a dead letter for everything an attempt failed on, each row naming
