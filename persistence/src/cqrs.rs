@@ -30,7 +30,9 @@ struct StreamHead {
 /// `before_commit`, in registration order, on the context `before` left; the first that
 /// does not continue has the last word, and a `Busy` reason is kept for `after`
 /// (ADR-0035). Owned, so a command's append can carry it into the store whatever the path
-/// — online, bulk, or a bulk worker's grouped dispatch.
+/// — online, bulk, or a bulk worker's grouped dispatch. A clone shares the context and
+/// what the gate answered, so a bulk append asks one clone per segment.
+#[derive(Clone)]
 pub(crate) struct MiddlewareGate {
     middlewares: Arc<[Arc<dyn CommandMiddleware>]>,
     /// `None` when no middleware is registered: the gate always continues.
@@ -552,8 +554,26 @@ impl Cqrs<PostgresEventStore> {
     ///   in the append's own transaction. Its worker claims that work in batches, calls
     ///   the same `react` on each event, dispatches and deletes it.
     ///
-    /// The events are appended in one transaction, so the call is all or nothing. A
-    /// Policy registered after it commits never receives it.
+    /// The events are committed in **segments** of
+    /// `bulk_segment_size` events, set on [`PostgresEventStore::builder`](crate::PostgresEventStore::builder)
+    /// (`REPLAY_BULK_SEGMENT_SIZE`, default 1000), each segment one transaction holding its
+    /// events, their inline-projection rows and their bulk work. The handler's stream is
+    /// consumed as it is written, so peak memory is the segment, whatever the size of the
+    /// bulk; and because each segment ends, a bulk never holds back an online Policy or a
+    /// projection catch-up for longer than one segment takes to write. Every middleware's
+    /// `before_commit` is asked before each segment commits.
+    ///
+    /// **The call is not all or nothing.** A failure — the handler's stream returning an
+    /// error, a write, an inline projection or a middleware stopping the commit — rolls
+    /// back the segment it is in and is returned; the segments before it stay committed,
+    /// with their work queued, which is the outcome the domain would have had issuing them
+    /// as separate commands. A rerun must therefore be idempotent at the command, as any
+    /// command must; and if consumers need to know a bulk is complete, the aggregate
+    /// records that with an ordinary event once this returns. The expected version is
+    /// checked against the stream's head before the first segment only: another writer
+    /// may append to the stream between segments.
+    ///
+    /// A Policy registered after a segment commits never receives that segment.
     pub async fn execute_bulk<A: Aggregate>(
         &self,
         id: &A::StreamId,

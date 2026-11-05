@@ -48,13 +48,43 @@ fn resolve_projection_flush_size(store_override: Option<usize>) -> usize {
 /// The precedence itself, over values rather than the process environment, so it is
 /// testable without mutating global state.
 fn resolve_flush_size(store_override: Option<usize>, env: Option<String>) -> usize {
+    resolve_event_count(store_override, env, DEFAULT_PROJECTION_FLUSH_SIZE)
+}
+
+/// Per-store override → env var → `default`, for a count of events; below 1 is clamped
+/// to 1, so whatever it bounds always makes progress.
+fn resolve_event_count(
+    store_override: Option<usize>,
+    env: Option<String>,
+    default: usize,
+) -> usize {
     if let Some(n) = store_override {
         return n.max(1);
     }
     if let Some(n) = env.and_then(|s| s.parse::<usize>().ok()) {
         return n.max(1);
     }
-    DEFAULT_PROJECTION_FLUSH_SIZE
+    default
+}
+
+/// Built-in default for how many events a bulk append commits per segment.
+const DEFAULT_BULK_SEGMENT_SIZE: usize = 1_000;
+/// Environment variable that overrides the bulk segment size.
+const BULK_SEGMENT_SIZE_ENV_VAR: &str = "REPLAY_BULK_SEGMENT_SIZE";
+
+/// Resolve how many events a bulk append commits per segment.
+///
+/// Precedence: per-store override → `REPLAY_BULK_SEGMENT_SIZE` env var → default 1000.
+fn resolve_bulk_segment_size(store_override: Option<usize>) -> usize {
+    bulk_segment_size_or_default(
+        store_override,
+        std::env::var(BULK_SEGMENT_SIZE_ENV_VAR).ok(),
+    )
+}
+
+/// The precedence itself, over values rather than the process environment.
+fn bulk_segment_size_or_default(store_override: Option<usize>, env: Option<String>) -> usize {
+    resolve_event_count(store_override, env, DEFAULT_BULK_SEGMENT_SIZE)
 }
 
 /// Built-in default for how long a transaction of this library waits for a stream's
@@ -190,6 +220,9 @@ pub struct PostgresEventStore {
     /// server abandons it. [`Duration::ZERO`] waits forever; see
     /// [`resolve_stream_lock_wait`].
     stream_lock_wait: Duration,
+    /// How many events a bulk append commits per transaction; see
+    /// [`resolve_bulk_segment_size`].
+    bulk_segment_size: usize,
 }
 
 impl PostgresEventStore {
@@ -199,6 +232,7 @@ impl PostgresEventStore {
             projections: Arc::new(Vec::new()),
             projection_flush_size: resolve_projection_flush_size(None),
             stream_lock_wait: resolve_stream_lock_wait(None),
+            bulk_segment_size: resolve_bulk_segment_size(None),
         }
     }
 
@@ -213,6 +247,7 @@ impl PostgresEventStore {
             projection_flush_size: None,
             stream_lock_wait: None,
             projection_catch_up_interval: None,
+            bulk_segment_size: None,
         }
     }
 
@@ -368,6 +403,7 @@ pub struct PostgresEventStoreBuilder {
     projection_flush_size: Option<usize>,
     stream_lock_wait: Option<Duration>,
     projection_catch_up_interval: Option<Duration>,
+    bulk_segment_size: Option<usize>,
 }
 
 impl PostgresEventStoreBuilder {
@@ -381,6 +417,23 @@ impl PostgresEventStoreBuilder {
     /// registration or version drift: it is paged through in chunks of this many events.
     pub fn projection_flush_size(mut self, events: usize) -> Self {
         self.projection_flush_size = Some(events);
+        self
+    }
+
+    /// Cap how many events a bulk append commits per transaction
+    /// ([ADR-0034](https://github.com/funkode-io/replay/blob/main/docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+    ///
+    /// [`Cqrs::execute_bulk`](crate::Cqrs::execute_bulk) commits its events in segments of
+    /// this many, each one transaction holding the segment's events, their inline-projection
+    /// rows and their bulk work. A segment is what a bulk holds at once: what it retains in
+    /// memory, how long it holds the stream row and the commit stamp every online consumer
+    /// and projection catch-up waits behind, and what a failure rolls back.
+    ///
+    /// Overrides the `REPLAY_BULK_SEGMENT_SIZE` env var and the built-in default of 1000.
+    /// Values below 1 are clamped to 1. An online append is one transaction whatever this
+    /// is set to.
+    pub fn bulk_segment_size(mut self, events: usize) -> Self {
+        self.bulk_segment_size = Some(events);
         self
     }
 
@@ -522,6 +575,7 @@ impl PostgresEventStoreBuilder {
             projections: Arc::new(registered),
             projection_flush_size: chunk_size,
             stream_lock_wait,
+            bulk_segment_size: resolve_bulk_segment_size(self.bulk_segment_size),
         };
 
         // Catch up the projections that were already current, each in a READ COMMITTED
@@ -1085,6 +1139,7 @@ impl PostgresEventStore {
         let pool = self.pool.clone();
         let projection_flush_size = self.projection_flush_size;
         let stream_lock_wait = self.stream_lock_wait;
+        let bulk_segment_size = self.bulk_segment_size;
 
         tokio::spawn(async move {
             let mut ticker =
@@ -1103,6 +1158,7 @@ impl PostgresEventStore {
                     projections,
                     projection_flush_size,
                     stream_lock_wait,
+                    bulk_segment_size,
                 };
                 for registered in store.projections.iter() {
                     if let Err(error) = store.catch_up_one(registered, false).await {
@@ -1128,11 +1184,267 @@ pub(crate) enum AppendLane {
     Bulk,
 }
 
+/// What one append carries from event to event and from transaction to transaction: an
+/// online append's one transaction, or each of a bulk append's segments in turn.
+///
+/// It holds no event beyond the inline-projection buffer, which is flushed every
+/// `projection_flush_size` events and at every commit, so what it retains is bounded by
+/// the smaller of that size and the segment, never by the append.
+struct Appender<'s, E, Sink> {
+    store: &'s PostgresEventStore,
+    stream_id: Urn,
+    stream_type: String,
+    metadata: Metadata,
+    /// Metadata is constant for the whole append, so its JSON is built once rather than
+    /// once per event; each event then shares the document behind the cheap `Metadata`
+    /// handle.
+    metadata_json: Value,
+    /// The caller's expected version, checked against the stream head on the append's
+    /// first event only.
+    expected_version: Option<i64>,
+    is_first: bool,
+    lane: AppendLane,
+    sink: Sink,
+    /// The events of the open transaction not yet handed to the inline projections.
+    /// Populated only when projections are registered, and bounded by
+    /// `projection_flush_size`.
+    pending: Vec<PersistedEvent<Value>>,
+    /// How many events the open transaction has written.
+    written: usize,
+    _event: std::marker::PhantomData<fn(E)>,
+}
+
+impl<'s, E, Sink> Appender<'s, E, Sink>
+where
+    E: Event,
+    Sink: EventSink<E> + Send,
+{
+    fn new(
+        store: &'s PostgresEventStore,
+        stream_id: Urn,
+        stream_type: String,
+        metadata: Metadata,
+        expected_version: Option<i64>,
+        sink: Sink,
+        lane: AppendLane,
+    ) -> Self {
+        let metadata_json = metadata.to_json();
+        Self {
+            store,
+            stream_id,
+            stream_type,
+            metadata,
+            metadata_json,
+            expected_version,
+            is_first: true,
+            lane,
+            sink,
+            pending: Vec::new(),
+            written: 0,
+            _event: std::marker::PhantomData,
+        }
+    }
+
+    /// Write one event in `conn`'s transaction, hand it to the sink, and flush the
+    /// projection buffer once it holds `projection_flush_size` events.
+    async fn write(
+        &mut self,
+        conn: &mut sqlx::PgConnection,
+        event: E,
+    ) -> Result<(), replay::Error> {
+        let event_type = event.event_type().clone();
+        let event_data = serde_json::to_value(&event).map_err(crate::ser_error)?;
+        let id = Uuid::new_v4();
+
+        // Optimistic concurrency is checked once, on the append's first event. The
+        // caller's expected version is matched against the stream head inside
+        // `append_event`, whose `SELECT ... FOR UPDATE` locks the stream row for the rest
+        // of the transaction. Every later event passes a NULL expected version: the
+        // version has been incremented since — under the lock in the same transaction,
+        // or by the append's own earlier segments — so re-checking it against the
+        // original expectation would spuriously conflict.
+        let expected = if self.is_first {
+            self.expected_version
+        } else {
+            None
+        };
+
+        // The online lane keeps the statement every release before lanes used; the bulk
+        // lane names its lane to the writer that `append_event` delegates to.
+        let statement = match self.lane {
+            AppendLane::Online => {
+                "SELECT id, version, created FROM append_event($1, $2, $3, $4, $5, $6, $7)"
+            }
+            AppendLane::Bulk => {
+                "SELECT id, version, created \
+                   FROM write_event($1, $2, $3, $4, $5, $6, $7, FALSE, 'bulk')"
+            }
+        };
+        let row = sqlx::query(statement)
+            .bind(id)
+            .bind(&event_data)
+            .bind(&self.metadata_json)
+            .bind(&event_type)
+            .bind(self.stream_id.to_string())
+            .bind(&self.stream_type)
+            .bind(expected)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| {
+                stream_lock_error(
+                    error,
+                    self.stream_id.as_ref(),
+                    self.store.stream_lock_wait,
+                    "store_events",
+                )
+            })?;
+
+        // No row means an optimistic-concurrency mismatch in `append_event` (only
+        // possible on the first event). Surface it as a concurrency_error and let the
+        // transaction roll back so no partial append commits.
+        let Some(row) = row else {
+            let actual_version: i64 =
+                sqlx::query_scalar("SELECT version FROM streams WHERE id = $1")
+                    .bind(self.stream_id.to_string())
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(crate::db_error)?
+                    .unwrap_or(0);
+
+            return Err(crate::concurrency_error(
+                self.stream_id.clone(),
+                self.expected_version.unwrap_or(actual_version),
+                actual_version,
+            ));
+        };
+
+        self.is_first = false;
+        self.written += 1;
+
+        let persisted_id: Uuid = row.get("id");
+        let version: i64 = row.get("version");
+        let created: chrono::DateTime<Utc> = row.get("created");
+
+        // Notify the sink as each event is appended (inside the transaction) so a
+        // consumer can fold events as they stream, without the store retaining the
+        // whole batch. The sink is an infallible observer and cannot abort the txn.
+        self.sink.on_event(&PersistedEvent {
+            id: persisted_id,
+            r#type: event_type.clone(),
+            version,
+            aggregate_version: None,
+            compacted_snapshot: false,
+            observed: ObservedEvent {
+                data: event,
+                stream_id: self.stream_id.clone(),
+                metadata: self.metadata.clone(),
+                created,
+            },
+        });
+
+        if !self.store.projections.is_empty() {
+            self.pending.push(PersistedEvent {
+                id: persisted_id,
+                r#type: event_type,
+                version,
+                aggregate_version: None,
+                compacted_snapshot: false,
+                observed: ObservedEvent {
+                    data: event_data,
+                    stream_id: self.stream_id.clone(),
+                    metadata: self.metadata.clone(),
+                    created,
+                },
+            });
+
+            // Flush on the same transaction, then drop the events. A failure here
+            // aborts the transaction exactly as a failure at its end would, rolling
+            // back the chunks already applied along with the event rows.
+            if self.pending.len() >= self.store.projection_flush_size {
+                self.store.apply_projections(conn, &self.pending).await?;
+                self.pending.clear();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Finish the open transaction: the projections' last chunk and their applied
+    /// mark, the bulk work its events owe, the commit gate, the commit, and a NOTIFY.
+    async fn commit<Gate: CommitGate>(
+        &mut self,
+        mut transaction: sqlx::Transaction<'static, Postgres>,
+        gate: Gate,
+    ) -> Result<(), replay::Error> {
+        let written = std::mem::take(&mut self.written);
+        if !self.pending.is_empty() {
+            self.store
+                .apply_projections(&mut transaction, &self.pending)
+                .await?;
+            self.pending.clear();
+        }
+        if written > 0 && !self.store.projections.is_empty() {
+            self.store.mark_applied(&mut transaction).await?;
+        }
+        if written > 0 && self.lane == AppendLane::Bulk {
+            PostgresEventStore::queue_bulk_work(&mut transaction, &self.stream_type).await?;
+        }
+
+        // The commit gate (ADR-0035): last, after every insert and inline projection
+        // write, so it has the final word. Returning early drops the transaction, which
+        // rolls it back, projection writes included.
+        // A middleware's error is returned as it is, so it is not decorated here.
+        gate.check().await.into_result()?;
+
+        transaction.commit().await.map_err(crate::db_error)?;
+
+        // Best-effort NOTIFY: wake any waiting policy tasks immediately so they react
+        // without waiting for the next poll interval. Errors are silently swallowed —
+        // polling remains the correctness baseline and a missed notification is caught
+        // on the next interval.
+        if written > 0 {
+            let _ = sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(crate::REPLAY_NOTIFY_CHANNEL)
+                .bind(&self.stream_type)
+                .execute(&self.store.pool)
+                .await;
+        }
+
+        Ok(())
+    }
+}
+
 impl PostgresEventStore {
-    /// [`EventStore::store_events_stream`] on the **bulk lane**: the same append, every
-    /// event stamped `lane = 'bulk'`, and — in the same transaction, before it commits —
-    /// one row of `policy_bulk_work` per event for each Policy registered on the bulk lane
-    /// that tracks this stream's type (ADR-0034).
+    /// Open a transaction for the append, its wait for the stream row bounded.
+    ///
+    /// The first write takes the stream row with `SELECT ... FOR UPDATE` and holds it for
+    /// the rest of the transaction. Bounding the wait here is what lets an abandoned
+    /// append end on the server and hand its connection back, instead of holding one for
+    /// as long as the blocker lasts (funkode-io/replay#205).
+    async fn begin_append(&self) -> Result<sqlx::Transaction<'static, Postgres>, replay::Error> {
+        let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
+        crate::lock_wait::bound(&mut transaction, self.stream_lock_wait)
+            .await
+            .map_err(crate::db_error)?;
+        Ok(transaction)
+    }
+
+    /// [`EventStore::store_events_stream`] on the **bulk lane**, committed in **segments**
+    /// (ADR-0034).
+    ///
+    /// Every event is stamped `lane = 'bulk'`. The append commits every
+    /// [`bulk_segment_size`](PostgresEventStoreBuilder::bulk_segment_size) events, each
+    /// segment one transaction holding its events, their inline-projection rows, its
+    /// applied mark and — before it commits — one row of `policy_bulk_work` per event for
+    /// each Policy registered on the bulk lane that tracks this stream's type. `gate` is
+    /// asked once per segment, before that segment commits.
+    ///
+    /// A segment's transaction opens when its first event arrives, so a producer that
+    /// waits between segments holds no transaction, no stream row and no commit stamp
+    /// while it waits. A failure — the producer's, a write's, a projection's, the gate's
+    /// — rolls back the segment it is in and is returned; earlier segments stand, as if
+    /// the domain had issued them as separate commands. Optimistic concurrency is
+    /// checked on the first event only.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn store_bulk_events_stream<S, ES, Sink, Gate>(
         &self,
@@ -1148,19 +1460,48 @@ impl PostgresEventStore {
         S: replay::EventStream,
         ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
         Sink: EventSink<S::Event> + Send,
-        Gate: CommitGate,
+        Gate: CommitGate + Clone,
     {
-        self.append_on_lane::<S, ES, Sink, Gate>(
-            stream_id,
+        let mut appender = Appender::new(
+            self,
+            stream_id.clone().into(),
             stream_type,
             metadata,
-            domain_events,
             expected_version,
             sink,
-            gate,
             AppendLane::Bulk,
-        )
-        .await
+        );
+        let mut domain_events = std::pin::pin!(domain_events.into_stream());
+
+        let mut appended_any = false;
+        while let Some(first) = domain_events.try_next().await? {
+            appended_any = true;
+            let mut transaction = self.begin_append().await?;
+            appender.write(&mut transaction, first).await?;
+
+            let mut ended = false;
+            while appender.written < self.bulk_segment_size {
+                match domain_events.try_next().await? {
+                    Some(event) => appender.write(&mut transaction, event).await?,
+                    None => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+
+            appender.commit(transaction, gate.clone()).await?;
+            if ended {
+                return Ok(());
+            }
+        }
+
+        // A bulk that produced nothing writes nothing, but its gate is still asked, as
+        // an online append that writes nothing asks it.
+        if !appended_any {
+            gate.check().await.into_result()?;
+        }
+        Ok(())
     }
 
     /// Queue this transaction's bulk-lane events for every Policy registered on the bulk
@@ -1189,202 +1530,6 @@ impl PostgresEventStore {
         .map_err(crate::db_error)?;
         Ok(())
     }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn append_on_lane<S, ES, Sink, Gate>(
-        &self,
-        stream_id: &S::StreamId,
-        stream_type: String,
-        metadata: replay::Metadata,
-        domain_events: ES,
-        expected_version: Option<i64>,
-        mut sink: Sink,
-        gate: Gate,
-        lane: AppendLane,
-    ) -> Result<(), replay::Error>
-    where
-        S: replay::EventStream,
-        ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
-        Sink: EventSink<S::Event> + Send,
-        Gate: CommitGate,
-    {
-        let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
-        let stream_id: Urn = stream_id.clone().into();
-
-        // `append_event` takes the stream row with `SELECT ... FOR UPDATE` and holds it
-        // for the rest of this transaction. Bounding the wait here is what lets an
-        // abandoned append end on the server and hand its connection back, instead of
-        // holding one for as long as the blocker lasts (funkode-io/replay#205).
-        crate::lock_wait::bound(&mut transaction, self.stream_lock_wait)
-            .await
-            .map_err(crate::db_error)?;
-
-        // Metadata is constant for the whole append, so its JSON is built once here
-        // rather than once per event; each event then shares the document behind the
-        // cheap `Metadata` handle.
-        let metadata_json = metadata.to_json();
-
-        // Track the appended events so registered inline projections can be applied
-        // inside this same transaction. The buffer is populated *only* when projections
-        // are registered — bulk producers without projections stream straight through —
-        // and is flushed every `projection_flush_size` events, so peak retention is
-        // O(flush size) rather than O(append size).
-        let has_projections = !self.projections.is_empty();
-        let flush_size = self.projection_flush_size;
-        let mut appended: Vec<PersistedEvent<Value>> = Vec::new();
-        let mut appended_count: usize = 0;
-
-        // Consume the producer one event at a time so a large append (e.g. 160k rows)
-        // never has to live fully in memory.
-        let mut domain_events = std::pin::pin!(domain_events.into_stream());
-
-        let mut is_first = true;
-        while let Some(event) = domain_events.try_next().await? {
-            let event_type = event.event_type().clone();
-            let event_data = serde_json::to_value(&event).map_err(crate::ser_error)?;
-            let id = Uuid::new_v4();
-
-            // Optimistic concurrency is checked once, on the first append only. The caller's
-            // expected version is matched against the stream head inside `append_event`,
-            // whose `SELECT ... FOR UPDATE` locks the stream row for the rest of the
-            // transaction. Subsequent appends pass a NULL expected version: the version has
-            // been incremented under the lock we already hold, so re-checking it against the
-            // original expectation would spuriously conflict.
-            let expected = if is_first { expected_version } else { None };
-
-            // The online lane keeps the statement every release before lanes used; the
-            // bulk lane names its lane to the writer that `append_event` delegates to.
-            let statement = match lane {
-                AppendLane::Online => {
-                    "SELECT id, version, created FROM append_event($1, $2, $3, $4, $5, $6, $7)"
-                }
-                AppendLane::Bulk => {
-                    "SELECT id, version, created \
-                       FROM write_event($1, $2, $3, $4, $5, $6, $7, FALSE, 'bulk')"
-                }
-            };
-            let row = sqlx::query(statement)
-                .bind(id)
-                .bind(&event_data)
-                .bind(&metadata_json)
-                .bind(&event_type)
-                .bind(stream_id.to_string())
-                .bind(&stream_type)
-                .bind(expected)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|error| {
-                    stream_lock_error(
-                        error,
-                        stream_id.as_ref(),
-                        self.stream_lock_wait,
-                        "store_events",
-                    )
-                })?;
-
-            // No row means an optimistic-concurrency mismatch in `append_event` (only
-            // possible on the first append). Surface it as a concurrency_error and let the
-            // transaction roll back so no partial append commits.
-            let Some(row) = row else {
-                let actual_version: i64 =
-                    sqlx::query_scalar("SELECT version FROM streams WHERE id = $1")
-                        .bind(stream_id.to_string())
-                        .fetch_optional(&mut *transaction)
-                        .await
-                        .map_err(crate::db_error)?
-                        .unwrap_or(0);
-
-                return Err(crate::concurrency_error(
-                    stream_id.clone(),
-                    expected_version.unwrap_or(actual_version),
-                    actual_version,
-                ));
-            };
-
-            is_first = false;
-
-            let persisted_id: Uuid = row.get("id");
-            let version: i64 = row.get("version");
-            let created: chrono::DateTime<Utc> = row.get("created");
-
-            // Notify the sink as each event is appended (inside the transaction) so a
-            // consumer can fold events as they stream, without the store retaining the
-            // whole batch. The sink is an infallible observer and cannot abort the txn.
-            sink.on_event(&PersistedEvent {
-                id: persisted_id,
-                r#type: event_type.clone(),
-                version,
-                aggregate_version: None,
-                compacted_snapshot: false,
-                observed: ObservedEvent {
-                    data: event,
-                    stream_id: stream_id.clone(),
-                    metadata: metadata.clone(),
-                    created,
-                },
-            });
-
-            if has_projections {
-                appended.push(PersistedEvent {
-                    id: persisted_id,
-                    r#type: event_type,
-                    version,
-                    aggregate_version: None,
-                    compacted_snapshot: false,
-                    observed: ObservedEvent {
-                        data: event_data,
-                        stream_id: stream_id.clone(),
-                        metadata: metadata.clone(),
-                        created,
-                    },
-                });
-
-                // Flush on the same transaction, then drop the events. A failure here
-                // aborts the append exactly as an end-of-batch failure would, rolling
-                // back the chunks already applied along with the event rows.
-                if appended.len() >= flush_size {
-                    self.apply_projections(&mut transaction, &appended).await?;
-                    appended.clear();
-                }
-            }
-
-            appended_count += 1;
-        }
-
-        // Whatever the last chunk left over.
-        if has_projections && !appended.is_empty() {
-            self.apply_projections(&mut transaction, &appended).await?;
-            appended.clear();
-        }
-        if has_projections && appended_count > 0 {
-            self.mark_applied(&mut transaction).await?;
-        }
-        if lane == AppendLane::Bulk && appended_count > 0 {
-            Self::queue_bulk_work(&mut transaction, &stream_type).await?;
-        }
-
-        // The commit gate (ADR-0035): last, after every insert and inline projection
-        // write, so it has the final word. Returning early drops the transaction, which
-        // rolls the whole append back, projection writes included.
-        // A middleware's error is returned as it is, so it is not decorated here.
-        gate.check().await.into_result()?;
-
-        transaction.commit().await.map_err(crate::db_error)?;
-
-        // Best-effort NOTIFY: wake any waiting policy tasks immediately so they
-        // react without waiting for the next poll interval.  Errors are silently
-        // swallowed — polling remains the correctness baseline and a missed
-        // notification is caught on the next interval.
-        if appended_count > 0 {
-            let _ = sqlx::query("SELECT pg_notify($1, $2)")
-                .bind(crate::REPLAY_NOTIFY_CHANNEL)
-                .bind(&stream_type)
-                .execute(&self.pool)
-                .await;
-        }
-
-        Ok(())
-    }
 }
 
 impl EventStore for PostgresEventStore {
@@ -1404,17 +1549,25 @@ impl EventStore for PostgresEventStore {
         Sink: EventSink<S::Event> + Send,
         Gate: CommitGate,
     {
-        self.append_on_lane::<S, ES, Sink, Gate>(
-            stream_id,
+        // One transaction for the whole append, however many events the producer
+        // yields: the producer is consumed one event at a time, so a large append (e.g.
+        // 160k rows) never has to live fully in memory, and it commits or rolls back
+        // as one.
+        let mut appender = Appender::new(
+            self,
+            stream_id.clone().into(),
             stream_type,
             metadata,
-            domain_events,
             expected_version,
             sink,
-            gate,
             AppendLane::Online,
-        )
-        .await
+        );
+        let mut transaction = self.begin_append().await?;
+        let mut domain_events = std::pin::pin!(domain_events.into_stream());
+        while let Some(event) = domain_events.try_next().await? {
+            appender.write(&mut transaction, event).await?;
+        }
+        appender.commit(transaction, gate).await
     }
 
     fn stream_events<E: Event>(
@@ -1663,6 +1816,7 @@ impl Clone for PostgresEventStore {
             projections: self.projections.clone(),
             projection_flush_size: self.projection_flush_size,
             stream_lock_wait: self.stream_lock_wait,
+            bulk_segment_size: self.bulk_segment_size,
         }
     }
 }
@@ -1723,9 +1877,36 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        resolve_flush_size, stream_lock_wait_or_default, DEFAULT_PROJECTION_FLUSH_SIZE,
-        DEFAULT_STREAM_LOCK_WAIT,
+        bulk_segment_size_or_default, resolve_flush_size, stream_lock_wait_or_default,
+        DEFAULT_BULK_SEGMENT_SIZE, DEFAULT_PROJECTION_FLUSH_SIZE, DEFAULT_STREAM_LOCK_WAIT,
     };
+
+    #[test]
+    fn the_bulk_segment_size_falls_back_to_the_built_in_default() {
+        assert_eq!(
+            bulk_segment_size_or_default(None, None),
+            DEFAULT_BULK_SEGMENT_SIZE
+        );
+        assert_eq!(
+            bulk_segment_size_or_default(None, Some("not-a-number".into())),
+            DEFAULT_BULK_SEGMENT_SIZE
+        );
+    }
+
+    #[test]
+    fn the_bulk_segment_size_reads_the_env_var_and_a_store_override_beats_it() {
+        assert_eq!(bulk_segment_size_or_default(None, Some("250".into())), 250);
+        assert_eq!(
+            bulk_segment_size_or_default(Some(40), Some("250".into())),
+            40
+        );
+    }
+
+    #[test]
+    fn a_zero_bulk_segment_size_is_clamped_to_one_so_a_segment_always_holds_an_event() {
+        assert_eq!(bulk_segment_size_or_default(Some(0), None), 1);
+        assert_eq!(bulk_segment_size_or_default(None, Some("0".into())), 1);
+    }
 
     #[test]
     fn flush_size_falls_back_to_the_built_in_default() {

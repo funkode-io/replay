@@ -32,6 +32,7 @@ mod integration_tests;
 mod policy_backlog;
 mod policy_bulk_lane;
 mod policy_bulk_lane_failures;
+mod policy_bulk_segments;
 mod policy_busy_hold;
 mod policy_cursor_backfill;
 mod policy_daemon;

@@ -2937,6 +2937,21 @@ value you choose is the longest honest hold, and in this library that is `compac
 it is O(stream length), so a stream long enough to take more than the wait will
 fail the appends queued behind it.
 
+### Bulk segment size
+
+`Cqrs::execute_bulk` commits its events in segments, each one transaction holding the
+segment's events, their inline-projection rows and their bulk work. The segment bounds
+what a bulk holds at once — memory, the stream row, and the commit stamp every online
+Policy and projection catch-up waits behind — and what a failure rolls back: a failure
+mid-bulk leaves the segments before it committed and returns the error
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+
+| Setting | Store override | Env var | Default |
+|---------|----------------|---------|---------|
+| Events a bulk append commits per segment | `builder(pool).bulk_segment_size(n)` | `REPLAY_BULK_SEGMENT_SIZE` | `1000` |
+
+Values below 1 are clamped to 1. An online append is one transaction whatever this is.
+
 ### Failure handling
 
 When a dispatch fails the runner classifies the error and responds accordingly:
