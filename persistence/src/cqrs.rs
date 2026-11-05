@@ -6,7 +6,7 @@ use replay::{Aggregate, Event};
 use urn::Urn;
 
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
-use crate::{CommandContext, CommandMiddleware, Next};
+use crate::{CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome};
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
 const DEFAULT_COMPACTION_CHUNK_SIZE: u32 = 100;
@@ -130,14 +130,18 @@ impl<ES: EventStore> Cqrs<ES> {
     /// and later middlewares do not run: [`Next::Busy`] reaches the caller as a
     /// `replay::Error` of kind [`Busy`](replay::ErrorKind::Busy) carrying its reason,
     /// [`Next::Error`] as the error it carries. Metadata a middleware adds is carried by
-    /// the appended events. A middleware that continues after changing the command's
-    /// identity or its `causation` (by replacing the context whole) fails the command with
-    /// an [`Internal`](replay::ErrorKind::Internal) error.
+    /// the appended events; a middleware can change nothing else about the command.
     ///
     /// Each middleware's `before_commit` then runs at the append's commit gate, in
     /// registration order, after the events and every inline projection write are in
     /// place: the first that does not continue rolls the whole append back and reaches the
     /// caller the same way.
+    ///
+    /// Once the command has finished, each middleware whose `before` answered `Continue`
+    /// runs its `after`, in reverse registration order, with the [`Outcome`]: committed,
+    /// busy with the reason, or failed with the error this call returns. A middleware that
+    /// stopped the command, and every one after it, runs no `after`. `after` only
+    /// observes: what it does never changes what this call returns.
     pub async fn execute<A: Aggregate>(
         &self,
         id: &A::StreamId,
@@ -150,42 +154,86 @@ impl<ES: EventStore> Cqrs<ES> {
         A::Event: 'static,
         A::Error: 'static,
     {
-        // The context `before` left, for the commit gate; `None` without middleware.
-        let (context, metadata) = if self.middlewares.is_empty() {
-            (None, metadata)
-        } else {
-            let mut command = CommandContext::new::<A>(id, metadata);
-            // What no middleware may change: `before` takes the context mutably, so one
-            // could replace it whole and slip past the metadata methods' own checks.
-            let arrived = command.clone();
+        if self.middlewares.is_empty() {
+            return self
+                .run::<A>(id, metadata, command, services, expected_version, None)
+                .await;
+        }
+
+        let mut context = CommandContext::new::<A>(id, metadata);
+        // How many middlewares answered `Continue`: the ones whose `after` runs.
+        let mut continued = 0;
+        // The reason a middleware gave when it answered `Busy`, in `before` or at the gate.
+        let mut busy = None;
+        let gate_busy = std::sync::OnceLock::new();
+
+        let result = 'command: {
             for middleware in self.middlewares.iter() {
-                match middleware.before(&mut command).await {
-                    Next::Continue if !command.is_the_command(&arrived) => {
-                        return Err(A::Error::from(
-                            replay::Error::internal(
-                                "a command middleware changed the command's identity or causation",
-                            )
-                            .with_operation("execute")
-                            .with_context("stream_id", arrived.stream_id())
-                            .with_context("command", arrived.command_type()),
-                        ));
-                    }
-                    Next::Continue => {}
+                // The handle lets `before` change the metadata, through its checked
+                // setters, and nothing else: the command's identity and causation stay
+                // as they arrived.
+                match middleware
+                    .before(CommandContextMut::new(&mut context))
+                    .await
+                {
+                    Next::Continue => continued += 1,
                     Next::Busy(reason) => {
-                        return Err(A::Error::from(
-                            replay::Error::busy(reason)
-                                .with_operation("execute")
-                                .with_context("stream_id", command.stream_id())
-                                .with_context("command", command.command_type()),
-                        ))
+                        let error = replay::Error::busy(reason.clone())
+                            .with_operation("execute")
+                            .with_context("stream_id", context.stream_id())
+                            .with_context("command", context.command_type());
+                        busy = Some(reason);
+                        break 'command Err(A::Error::from(error));
                     }
-                    Next::Error(error) => return Err(A::Error::from(error)),
+                    Next::Error(error) => break 'command Err(A::Error::from(error)),
                 }
             }
-            let metadata = command.metadata().clone();
-            (Some(command), metadata)
+            let result = self
+                .run::<A>(
+                    id,
+                    context.metadata().clone(),
+                    command,
+                    services,
+                    expected_version,
+                    Some((&context, &gate_busy)),
+                )
+                .await;
+            // A `Busy` at the commit gate is as busy as one in `before`.
+            busy = busy.or_else(|| gate_busy.into_inner());
+            result
         };
 
+        let outcome = match (&result, &busy) {
+            (Ok(_), _) => Outcome::Committed,
+            (Err(_), Some(reason)) => Outcome::Busy(reason),
+            (Err(error), None) => Outcome::Failed(error),
+        };
+        for middleware in self.middlewares[..continued].iter().rev() {
+            middleware.after(&context, &outcome).await;
+        }
+
+        result
+    }
+
+    /// Load the aggregate, handle `command` and append what it produces: what
+    /// [`execute`](Self::execute) runs once every `before` continued.
+    ///
+    /// With `gate`, the append's commit gate runs every middleware's `before_commit` on the
+    /// context `before` left, and records the reason of a `Busy` answer; without it, the
+    /// gate always continues.
+    async fn run<A: Aggregate>(
+        &self,
+        id: &A::StreamId,
+        metadata: replay::Metadata,
+        command: A::Command,
+        services: &A::Services,
+        expected_version: Option<i64>,
+        gate: Option<(&CommandContext, &std::sync::OnceLock<String>)>,
+    ) -> Result<A, A::Error>
+    where
+        A::Event: 'static,
+        A::Error: 'static,
+    {
         // Always load the latest (current) event stream for command handling.
         let mut aggregate = self
             .fetch_aggregate_at::<A>(id, AggregateVersion::Latest, expected_version, None)
@@ -209,12 +257,16 @@ impl<ES: EventStore> Cqrs<ES> {
         // first that does not continue has the last word.
         let middlewares = &self.middlewares;
         let gate = || async move {
-            let Some(context) = context.as_ref() else {
+            let Some((context, busy)) = gate else {
                 return Next::Continue;
             };
             for middleware in middlewares.iter() {
                 match middleware.before_commit(context).await {
                     Next::Continue => {}
+                    Next::Busy(reason) => {
+                        let _ = busy.set(reason.clone());
+                        return Next::Busy(reason);
+                    }
                     stop => return stop,
                 }
             }

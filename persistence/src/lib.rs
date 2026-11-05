@@ -18,7 +18,9 @@ mod store;
 mod stream_scope;
 
 pub use aggregate_version::AggregateVersion;
-pub use command_middleware::{Causation, CommandContext, CommandMiddleware, Next, Outcome};
+pub use command_middleware::{
+    Causation, CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome,
+};
 pub use cqrs::Cqrs;
 pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;
