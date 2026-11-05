@@ -28,25 +28,11 @@ use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
 use crate::inline_projection::ErasedInlineProjection;
 use crate::{PersistedEvent, StreamFilter};
 
+use super::advisory_keys::{PROJECTION_LOCK_CLASS, REGISTRY_LOCK_CLASS};
 use super::postgres::PostgresEventStore;
 
 /// A type-erased Postgres inline projection, as the store holds it.
 pub(crate) type ErasedPostgresProjection = dyn ErasedInlineProjection<Exec = PgConnection>;
-
-/// The advisory-lock class every projection lock is taken in.
-///
-/// The two-key form keeps these locks apart from the policy runner's, which use the
-/// one-key form over `hashtext(policy name)`: a Policy and a projection sharing a name must
-/// not exclude each other. The value spells `RPJC`.
-const PROJECTION_LOCK_CLASS: i32 = 0x5250_4A43;
-
-/// The advisory lock on the registry as a whole: `(REGISTRY_LOCK_CLASS, 0)`. A class of its
-/// own so no projection's `hashtext` can land on it. The value spells `RPJR`.
-///
-/// `build()` holds it shared while it builds, and a deletion of streams takes it
-/// exclusively: a projection registered for the first time has no registry row for the
-/// deletion to find and lock by name until its build commits (ADR-0033).
-const REGISTRY_LOCK_CLASS: i32 = 0x5250_4A52;
 
 /// Built-in default for how often the background task catches every projection up.
 pub(crate) const DEFAULT_CATCH_UP_INTERVAL: Duration = Duration::from_secs(60);

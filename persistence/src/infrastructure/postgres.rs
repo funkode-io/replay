@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use urn::Urn;
 use uuid::Uuid;
 
+use super::advisory_keys::COMMIT_GATE_LOCK_CLASS;
 use super::projection_catch_up::{self as catch_up, Cut, ErasedPostgresProjection, Scope};
 use super::stream_deletion::{self as deletion, DeletedStreams};
 use crate::inline_projection::InlineProjection;
@@ -116,6 +117,22 @@ fn stream_lock_error(
         "waited {limit}ms for the stream row lock without getting it"
     ))
     .with_operation(operation)
+    .with_context("stream_id", stream_id)
+    .with_context("stream_lock_wait_ms", limit)
+}
+
+/// What an append returns when the commit gate's lock was not free within the stream lock
+/// wait: an [`await_in_flight_commits`](PostgresEventStore::await_in_flight_commits) was
+/// waiting for, or holding, it the whole time.
+fn commit_gate_lock_error(error: sqlx::Error, stream_id: &str, wait: Duration) -> replay::Error {
+    if !crate::lock_wait::is_lock_not_available(&error) {
+        return crate::db_error(error);
+    }
+    let limit = crate::lock_wait::limit_ms(wait);
+    replay::Error::unavailable(format!(
+        "waited {limit}ms for the commit gate's lock without getting it"
+    ))
+    .with_operation("store_events")
     .with_context("stream_id", stream_id)
     .with_context("stream_lock_wait_ms", limit)
 }
@@ -833,6 +850,37 @@ impl PostgresEventStore {
         Ok(read)
     }
 
+    /// Wait until every append that asked its commit gate before this call began has
+    /// committed or rolled back.
+    ///
+    /// The second half of switching a rule on, such as maintenance mode
+    /// ([ADR-0035](https://github.com/funkode-io/replay/blob/main/docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)):
+    /// commit the flag a [command middleware](crate::CommandMiddleware) reads in
+    /// `before_commit`, then call this. When it returns, no append that checked the old
+    /// flag can still commit, and every later append checks the new one — provided the
+    /// middleware reads the flag as it is, not from a cache.
+    ///
+    /// It covers appends through a [`Cqrs`](crate::Cqrs) with middleware, in this process
+    /// or any other on the same database. A direct append and a `Cqrs` without middleware
+    /// ask no gate, take no lock and are not waited for.
+    ///
+    /// It waits for as long as the slowest of those appends takes, and while it waits, new
+    /// ones queue behind it, each for at most the
+    /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait) before it fails as
+    /// [`replay::ErrorKind::Unavailable`]. It is meant for a switch, not a request path.
+    pub async fn await_in_flight_commits(&self) -> Result<(), replay::Error> {
+        // Exclusive, and transaction-scoped so the lock is gone with the commit, or with
+        // the connection if this future is dropped while it waits.
+        let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1, 0)")
+            .bind(COMMIT_GATE_LOCK_CLASS)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| crate::db_error(e).with_operation("await_in_flight_commits"))?;
+        transaction.commit().await.map_err(crate::db_error)?;
+        Ok(())
+    }
+
     /// Delete `stream_ids` for good, with everything this library keeps about them, and
     /// let the caller delete its own read-model rows in the same transaction.
     ///
@@ -1276,6 +1324,20 @@ impl EventStore for PostgresEventStore {
         }
         if has_projections && appended_count > 0 {
             self.mark_applied(&mut transaction).await?;
+        }
+
+        // No gap between the check and the commit (ADR-0035): a gate that asks anything is
+        // asked under the commit gate's lock, held shared until this transaction ends, so
+        // `await_in_flight_commits` waits for this append to commit or roll back. An open
+        // gate's answer cannot change, so a direct append takes nothing.
+        if !gate.always_continues() {
+            sqlx::query("SELECT pg_advisory_xact_lock_shared($1, 0)")
+                .bind(COMMIT_GATE_LOCK_CLASS)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    commit_gate_lock_error(error, stream_id.as_ref(), self.stream_lock_wait)
+                })?;
         }
 
         // The commit gate (ADR-0035): last, after every insert and inline projection

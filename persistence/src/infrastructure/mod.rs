@@ -1,3 +1,4 @@
+mod advisory_keys;
 mod in_memory_store;
 mod postgres;
 mod projection_catch_up;

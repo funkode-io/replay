@@ -6,7 +6,7 @@ use replay::{Aggregate, Event};
 use urn::Urn;
 
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
-use crate::{CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome};
+use crate::{CommandContext, CommandContextMut, CommandMiddleware, CommitGate, Next, Outcome};
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
 const DEFAULT_COMPACTION_CHUNK_SIZE: u32 = 100;
@@ -253,24 +253,13 @@ impl<ES: EventStore> Cqrs<ES> {
             .await?
             .map_err(|e| replay::Error::internal("aggregate event producer failed").with_source(e));
 
-        // The commit gate: every middleware's `before_commit`, in registration order; the
-        // first that does not continue has the last word.
-        let middlewares = &self.middlewares;
-        let gate = || async move {
-            let Some((context, busy)) = gate else {
-                return Next::Continue;
-            };
-            for middleware in middlewares.iter() {
-                match middleware.before_commit(context).await {
-                    Next::Continue => {}
-                    Next::Busy(reason) => {
-                        let _ = busy.set(reason.clone());
-                        return Next::Busy(reason);
-                    }
-                    stop => return stop,
-                }
-            }
-            Next::Continue
+        let gate = match gate {
+            Some((context, busy)) => ChainGate::Chain {
+                middlewares: &self.middlewares,
+                context,
+                busy,
+            },
+            None => ChainGate::Open,
         };
 
         self.store
@@ -427,5 +416,48 @@ impl<ES: EventStore> Cqrs<ES> {
         }
 
         Ok(())
+    }
+}
+
+/// The commit gate [`Cqrs::execute`] hands the store.
+///
+/// Without middleware it is open: it always continues and says so, so a store takes no
+/// in-flight lock for it. With middleware it runs every `before_commit`, in registration
+/// order, and the first that does not continue has the last word; a `Busy` answer's
+/// reason is recorded for `execute`.
+enum ChainGate<'a> {
+    Open,
+    Chain {
+        middlewares: &'a [Arc<dyn CommandMiddleware>],
+        context: &'a CommandContext,
+        busy: &'a std::sync::OnceLock<String>,
+    },
+}
+
+impl CommitGate for ChainGate<'_> {
+    async fn check(self) -> Next {
+        let ChainGate::Chain {
+            middlewares,
+            context,
+            busy,
+        } = self
+        else {
+            return Next::Continue;
+        };
+        for middleware in middlewares {
+            match middleware.before_commit(context).await {
+                Next::Continue => {}
+                Next::Busy(reason) => {
+                    let _ = busy.set(reason.clone());
+                    return Next::Busy(reason);
+                }
+                stop => return stop,
+            }
+        }
+        Next::Continue
+    }
+
+    fn always_continues(&self) -> bool {
+        matches!(self, ChainGate::Open)
     }
 }

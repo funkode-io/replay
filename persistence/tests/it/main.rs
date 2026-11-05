@@ -15,6 +15,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod await_in_flight_commits;
 mod bounded_queries;
 mod command_middleware;
 mod created_filter_index;
