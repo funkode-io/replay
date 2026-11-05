@@ -37,6 +37,13 @@ use crate::policy::RegisteredPolicy;
 use crate::policy_liveness::LivenessHandle;
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
+/// The first wait before trying a Policy's claim lock again, while another claim of that
+/// Policy is in flight; doubled up to [`CLAIM_LOCK_MAX_BACKOFF`].
+const CLAIM_LOCK_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+
+/// The longest wait between two tries of a Policy's claim lock.
+const CLAIM_LOCK_MAX_BACKOFF: Duration = Duration::from_millis(500);
+
 /// Record that `policy` consumes the bulk lane, and which stream types it tracks, so
 /// every bulk append from now on queues work for it.
 ///
@@ -209,12 +216,32 @@ impl BulkDelivery<'_> {
         // still dispatching, and a stream's later events would overtake its earlier ones.
         // Waiting here instead, the next claim starts from what the last one left. The
         // two-key form is a lock space of its own, apart from the leadership lock that the
-        // lock manager holds on `hashtext(policy)`.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('replay.bulk_claim'), hashtext($1))")
+        // lock manager holds on `hashtext(policy)`. Tried rather than waited on, so a
+        // stand-down ends the wait at once instead of when the other claim does.
+        let mut backoff = CLAIM_LOCK_INITIAL_BACKOFF;
+        loop {
+            let taken: bool = sqlx::query_scalar(
+                "SELECT pg_try_advisory_xact_lock(hashtext('replay.bulk_claim'), hashtext($1))",
+            )
             .bind(name)
-            .execute(&mut *claim)
+            .fetch_one(&mut *claim)
             .await
             .map_err(crate::db_error)?;
+            if taken {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = stand_down.signalled() => {
+                    return Err(replay::Error::unavailable(
+                        "bulk worker stopped leading while another claim was in flight",
+                    )
+                    .with_operation("policy_bulk_drain")
+                    .with_context("policy", name));
+                }
+            }
+            backoff = (backoff * 2).min(CLAIM_LOCK_MAX_BACKOFF);
+        }
         let positions: Vec<i64> = sqlx::query_scalar(
             "SELECT global_position FROM policy_bulk_work WHERE policy = $1 \
              ORDER BY global_position LIMIT $2 FOR UPDATE SKIP LOCKED",

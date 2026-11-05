@@ -411,12 +411,15 @@ define_aggregate! {
         state: {
             loaded: LoadCount,
             counted: i64,
+            open: bool,
         },
         commands: {
             Count { tag: String },
+            CountIfOpen { tag: String },
         },
         events: {
             Counted { tag: String },
+            Opened {},
         }
     }
 }
@@ -431,6 +434,7 @@ impl replay::EventStream for Tally {
     fn apply(&mut self, event: Self::Event) {
         match event {
             TallyEvent::Counted { .. } => self.counted += 1,
+            TallyEvent::Opened => self.open = true,
         }
     }
 }
@@ -447,6 +451,12 @@ impl replay::Aggregate for Tally {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             TallyCommand::Count { tag } => Ok(vec![TallyEvent::Counted { tag }]),
+            // A decision that appends nothing when it refuses: what a stale instance
+            // would get wrong without ever reaching the append's version check.
+            TallyCommand::CountIfOpen { tag } if self.open => Ok(vec![TallyEvent::Counted { tag }]),
+            TallyCommand::CountIfOpen { .. } => Err(replay::Error::business_rule_violation(
+                "the tally is not open",
+            )),
         }
     }
 }
@@ -482,7 +492,8 @@ async fn counted(harness: &PolicyDaemonHarness, tally: &str) -> Vec<String> {
     .into_iter()
     .map(|data| match serde_json::from_value(data) {
         Ok(TallyEvent::Counted { tag }) => tag,
-        Err(error) => panic!("a tally holds only counts: {error}"),
+        Ok(TallyEvent::Opened) => "opened".to_string(),
+        Err(error) => panic!("a tally holds only tally events: {error}"),
     })
     .collect()
 }
@@ -526,13 +537,24 @@ async fn commands_aimed_at_one_target_load_it_once_per_batch_postgres_test() {
     harness.shutdown().await;
 }
 
-/// Writes a `Counted { tag: "outside" }` into the `even` tally just before the second
-/// Tally command a Policy dispatches runs — between two commands of one target group, so
-/// the instance the group loaded is stale when the second one runs.
-#[derive(Clone, Default)]
+/// Writes `outside` into the tally just before the second Tally command a Policy
+/// dispatches runs — between two commands of one target group, so the instance the group
+/// loaded is stale when the second one runs.
+#[derive(Clone)]
 struct WriteBetweenCommands {
     pool: Arc<OnceLock<PgPool>>,
     tally_commands: Arc<AtomicUsize>,
+    outside: TallyEvent,
+}
+
+impl WriteBetweenCommands {
+    fn writing(outside: TallyEvent) -> Self {
+        Self {
+            pool: Arc::default(),
+            tally_commands: Arc::default(),
+            outside,
+        }
+    }
 }
 
 impl CommandMiddleware for WriteBetweenCommands {
@@ -543,15 +565,13 @@ impl CommandMiddleware for WriteBetweenCommands {
             }
             if self.tally_commands.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
                 let pool = self.pool.get().expect("the pool is set before any import");
-                let event = TallyEvent::Counted {
-                    tag: "outside".to_string(),
-                };
+                let event = &self.outside;
                 sqlx::query(
                     "SELECT id FROM write_event(gen_random_uuid(), $1, '{}'::jsonb, $2, $3, \
                      'Tally', NULL, FALSE)",
                 )
-                .bind(serde_json::to_value(&event).expect("a tally event serialises"))
-                .bind(replay::Event::event_type(&event))
+                .bind(serde_json::to_value(event).expect("a tally event serialises"))
+                .bind(replay::Event::event_type(event))
                 .bind(context.stream_id().to_string())
                 .fetch_one(pool)
                 .await
@@ -569,7 +589,9 @@ impl CommandMiddleware for WriteBetweenCommands {
 #[tokio::test]
 async fn a_write_between_grouped_commands_reloads_the_target_postgres_test() {
     let _counting = count_tally_loads().await;
-    let middleware = WriteBetweenCommands::default();
+    let middleware = WriteBetweenCommands::writing(TallyEvent::Counted {
+        tag: "outside".to_string(),
+    });
     let pool = Arc::clone(&middleware.pool);
     let harness = PolicyDaemonHarness::start_with_middleware(
         "grouped_stale",
@@ -628,8 +650,8 @@ async fn a_claim_waits_for_the_policys_claim_in_flight_postgres_test() {
         .observe("the worker to wait for the claim in flight", || async {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
-                  WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' \
-                    AND query LIKE '%replay.bulk_claim%')",
+                  WHERE pid <> pg_backend_pid() AND state = 'idle in transaction' \
+                    AND query LIKE '%pg_try_advisory_xact_lock%replay.bulk_claim%')",
             )
             .fetch_one(harness.pool())
             .await
@@ -643,10 +665,17 @@ async fn a_claim_waits_for_the_policys_claim_in_flight_postgres_test() {
         "nothing is claimed past the claim in flight"
     );
 
+    // A worker waiting for the claim stops when asked, without waiting the claim out.
+    tokio::time::timeout(std::time::Duration::from_secs(5), harness.stop())
+        .await
+        .expect("shutdown ends a worker waiting for another claim");
+    assert_eq!(harness.bulk_work(&policy).await, 3);
+
     in_flight
         .commit()
         .await
         .expect("ending the claim in flight");
+    harness.resume();
     harness
         .observe("the worker to drain once the claim ends", || async {
             (harness.bulk_work(&policy).await == 0).then_some(())
@@ -655,6 +684,72 @@ async fn a_claim_waits_for_the_policys_claim_in_flight_postgres_test() {
     for event in &imported {
         assert_eq!(reactions_to(&harness, &policy, event).await, 1);
     }
+
+    harness.shutdown().await;
+}
+
+/// [`count_alternately`], counting only on an open tally — but `t-0` unconditionally, so
+/// the first command of the `even` group commits and its instance is kept for the next.
+fn count_alternately_if_open(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
+    count_alternately(event)
+        .into_iter()
+        .map(|dispatch| {
+            let tally = dispatch.target_stream_id().clone();
+            let (_, command) = dispatch
+                .into_parts::<Tally>()
+                .unwrap_or_else(|_| panic!("count_alternately dispatches to a Tally"));
+            let TallyCommand::Count { tag } = command else {
+                unreachable!("count_alternately counts")
+            };
+            let command = if tag == "t-0" {
+                TallyCommand::Count { tag }
+            } else {
+                TallyCommand::CountIfOpen { tag }
+            };
+            Dispatch::to::<Tally>(tally.try_into().expect("a tally URN"), command)
+        })
+        .collect()
+}
+
+/// A decision that appends nothing is not made on stale state either: the second
+/// command's handler would refuse on the instance loaded before the tally was opened,
+/// and so append nothing for any version check to catch. It sees the stream moved before
+/// it decides, reloads, finds the tally open and counts.
+#[tokio::test]
+async fn a_refusal_is_not_decided_on_a_stale_instance_postgres_test() {
+    let _counting = count_tally_loads().await;
+    let middleware = WriteBetweenCommands::writing(TallyEvent::Opened {});
+    let pool = Arc::clone(&middleware.pool);
+    let harness = PolicyDaemonHarness::start_with_middleware(
+        "grouped_refusal",
+        middleware,
+        |builder, policy| {
+            builder
+                .register_services::<Tally>(())
+                .register_policy_fn::<ProbeEvent, _>(policy, bulk(), count_alternately_if_open)
+        },
+    )
+    .await;
+    pool.set(harness.pool().clone())
+        .expect("the pool is set once");
+    harness.await_bulk_registration(harness.policy_name()).await;
+
+    harness.bulk_import("refusal", &tags("t", 4)).await;
+
+    // t-0 counts and keeps the instance; the tally is opened before t-2, which would be
+    // refused on that instance and counts on a fresh one. The odd tally is never opened,
+    // so both of its commands are refused.
+    harness
+        .observe("the even tally to count once it is open", || async {
+            (counted(&harness, "even").await == ["t-0", "opened", "t-2"]).then_some(())
+        })
+        .await;
+    harness
+        .observe("every queue to be drained", || async {
+            (harness.all_bulk_work().await == 0).then_some(())
+        })
+        .await;
+    assert!(counted(&harness, "odd").await.is_empty());
 
     harness.shutdown().await;
 }
