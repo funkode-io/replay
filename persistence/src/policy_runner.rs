@@ -494,7 +494,9 @@ pub struct DeadLetterRetrySummary {
     /// Reactions whose every parked row resolved and was archived (reason
     /// `retried`).
     pub reactions_resolved: usize,
-    /// Reactions with at least one row still parked after the replay.
+    /// Reactions with at least one row still parked after the replay. A reaction
+    /// whose replay met a busy command is counted in
+    /// [`reactions_busy`](Self::reactions_busy) instead, though its rows are parked too.
     pub reactions_still_failing: usize,
     /// Reactions whose replay met a [`Busy`](replay::ErrorKind::Busy) command and
     /// settled nothing: every row left parked as it was ([`DeadLetterRetry::Busy`]).
@@ -1455,8 +1457,9 @@ impl PolicyRunner {
     /// row still parked is still failing, and one whose replay met a
     /// [`Busy`](replay::ErrorKind::Busy) command is busy, its rows left as they were
     /// ([`DeadLetterRetry::Busy`]). A busy reaction does not stop the run: the next
-    /// one is replayed, and answers for itself. `reactions_still_failing == 0` says
-    /// the run settled everything it read, not that the table is empty now — a
+    /// one is replayed, and answers for itself. `reactions_still_failing == 0` and
+    /// `reactions_busy == 0` together say the run settled everything it read — a busy
+    /// reaction settled nothing and is still parked — not that the table is empty now: a
     /// delivery parking a command while the run walks, or one statement after it
     /// returns, is a row the count cannot have seen. `PolicyStatus` is what
     /// answers "is anything parked", and the next bulk retry picks it up. A
