@@ -668,3 +668,64 @@ async fn a_panic_that_ends_a_hold_narrates_it_left_postgres_test() {
 
     harness.shutdown().await;
 }
+
+/// Refuses a Policy's command until told otherwise; after that it discards the row
+/// `discarding` names — an operator's concurrent discard, landing while the retry is
+/// replaying — and answers busy.
+#[derive(Clone, Default)]
+struct DiscardsWhileBusy {
+    discarding: Arc<std::sync::OnceLock<(sqlx::PgPool, i64)>>,
+}
+
+impl CommandMiddleware for DiscardsWhileBusy {
+    fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            if context.causation().is_none() {
+                return Next::Continue;
+            }
+            let Some((pool, id)) = self.discarding.get() else {
+                return Next::Error(replay::Error::invalid_input("refused by the gate"));
+            };
+            sqlx::query("DELETE FROM policy_dead_letters WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("the discard runs");
+            Next::Busy("maintenance in progress".to_string())
+        })
+    }
+}
+
+/// A busy retry reports the row it was asked about as busy only while it is still
+/// parked: one discarded while the replay ran is not found, as for any retry.
+#[tokio::test]
+async fn a_busy_retry_of_a_row_discarded_meanwhile_reports_it_not_found_postgres_test() {
+    let middleware = DiscardsWhileBusy::default();
+    let harness = PolicyDaemonHarness::start_with_middleware(
+        "busy_discarded",
+        middleware.clone(),
+        |builder, policy| {
+            builder.register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                echo,
+            )
+        },
+    )
+    .await;
+
+    harness.ping("subject-1", "hello").await;
+    let parked = harness.await_dead_letters(1).await;
+
+    middleware
+        .discarding
+        .set((harness.pool().clone(), parked[0].id))
+        .expect("set once");
+    assert_eq!(
+        harness.retry_parked_row(parked[0].id).await,
+        DeadLetterRetry::NotFound
+    );
+    assert_eq!(harness.dead_letters().await.len(), 0);
+
+    harness.shutdown().await;
+}

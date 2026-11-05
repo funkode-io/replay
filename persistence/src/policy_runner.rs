@@ -1156,9 +1156,19 @@ impl PolicyRunner {
                         "retried policy reaction met a busy command; leaving every \
                          dead letter it parked as it was"
                     );
+                    // The row asked about is busy if it is still parked; one a
+                    // concurrent discard took out while the replay ran is gone, and
+                    // says so, as a settlement that matched nothing does.
+                    let asked = match asked_about {
+                        Some(id) => Some(match unsettled(&self.pool, id).await? {
+                            DeadLetterRetry::NotFound => DeadLetterRetry::NotFound,
+                            _ => DeadLetterRetry::Busy,
+                        }),
+                        None => None,
+                    };
                     return Ok(ReactionSettlement {
                         busy: true,
-                        asked_about: asked_about.map(|_| DeadLetterRetry::Busy),
+                        asked_about: asked,
                         ..Default::default()
                     });
                 }
