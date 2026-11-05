@@ -11,8 +11,8 @@ use crate::common;
 
 use std::time::{Duration, Instant};
 
-use common::policy_harness::{PolicyDaemonHarness, ProbeEvent};
-use replay_persistence::{PolicySettings, StartAt};
+use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeEvent};
+use replay_persistence::{PolicySettings, StartAt, StreamFilter};
 
 /// Far longer than the backlog takes to work through, so a worker that sleeps it once
 /// between batches is caught by the bound below.
@@ -69,21 +69,16 @@ async fn a_backlog_deeper_than_one_read_batch_drains_without_waiting_out_the_int
     harness.resume();
     let resumed = Instant::now();
 
-    let mut drained = None;
-    while resumed.elapsed() < GIVE_UP_AFTER {
+    let drained = time_until(resumed, || async {
         let mut passed = true;
         for event in &last {
             passed &= harness.has_passed(event.global_position).await;
         }
-        if passed {
-            drained = Some(resumed.elapsed());
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        passed
+    })
+    .await;
     harness.shutdown().await;
 
-    let drained = drained.expect("the backlog was never worked through");
     eprintln!("backlog drained {drained:?} after the daemon resumed");
     assert!(
         drained < POLL_INTERVAL,
@@ -91,4 +86,76 @@ async fn a_backlog_deeper_than_one_read_batch_drains_without_waiting_out_the_int
          {POLL_INTERVAL:?} poll interval between full batches",
         (4 * READ_BATCH + 10).div_ceil(READ_BATCH),
     );
+}
+
+/// A Policy that tracks one stream type, behind a log several read batches deep of
+/// another, sweeps past it in less than one poll interval.
+///
+/// The sweep reads its `read_batch_size` of positions whatever streams they name and
+/// nominates none of these, so no stream is ever carried: the only thing that says
+/// more is waiting is that the sweep filled its page. A worker that slept between such
+/// polls passed one batch of the log per interval.
+#[tokio::test]
+async fn a_full_sweep_of_untracked_streams_sweeps_on_without_waiting_out_the_interval_postgres_test(
+) {
+    let mut harness =
+        PolicyDaemonHarness::start_polling_every("untracked", POLL_INTERVAL, |builder, policy| {
+            builder
+                .without_notifications()
+                .register_policy_fn::<ProbeEvent, _>(
+                    policy,
+                    PolicySettings::new()
+                        .starting_at(StartAt::Beginning)
+                        .with_stream_filter(StreamFilter::for_stream_type::<Probe>())
+                        .with_read_batch_size(READ_BATCH)
+                        .with_checkpoint_batch_size(READ_BATCH),
+                    |_| vec![],
+                )
+        })
+        .await;
+
+    // Appended with the daemon stopped, for the reason the backlog above is.
+    harness.stop().await;
+    let mut last = None;
+    for n in 0..5 * READ_BATCH {
+        let stream = format!("urn:ledger:untracked-{}", n % 3);
+        last = Some(harness.ping_of_type("Ledger", &stream, "ignored").await);
+    }
+    let last = last.expect("the log is not empty").global_position;
+    harness.resume();
+    let resumed = Instant::now();
+
+    let swept = time_until(resumed, || async {
+        harness.swept_through().await.is_some_and(|at| at >= last)
+    })
+    .await;
+    let places = harness.places().await;
+    harness.shutdown().await;
+
+    eprintln!("untracked log swept {swept:?} after the daemon resumed");
+    assert!(
+        places.is_empty(),
+        "the Policy read streams it does not track: {places:?}"
+    );
+    assert!(
+        swept < POLL_INTERVAL,
+        "sweeping five batches of untracked log took {swept:?}: the worker waited out its \
+         {POLL_INTERVAL:?} poll interval between full sweeps",
+    );
+}
+
+/// How long after `since` the observation `holds` first held, re-read until it does or
+/// [`GIVE_UP_AFTER`] passes.
+async fn time_until<F, Fut>(since: Instant, holds: F) -> Duration
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    while since.elapsed() < GIVE_UP_AFTER {
+        if holds().await {
+            return since.elapsed();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the observation never held within {GIVE_UP_AFTER:?}");
 }
