@@ -449,7 +449,7 @@ impl DeadLetterFilter {
     }
 
     /// Only rows whose triggering event has the type `event_type`, as the store wrote
-    /// it ([`PersistedEvent::r#type`]).
+    /// it ([`PersistedEvent::type`](crate::PersistedEvent#structfield.type)).
     pub fn triggered_by(mut self, event_type: impl Into<String>) -> Self {
         self.trigger_event_type = Some(event_type.into());
         self

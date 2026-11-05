@@ -933,8 +933,8 @@ impl PostgresEventStore {
     /// ask no gate, take no lock and are not waited for.
     ///
     /// It waits for as long as the slowest of those appends takes, and while it waits, new
-    /// ones queue behind it, each for at most the
-    /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait) before it fails as
+    /// ones queue behind it, each for at most the stream lock wait (`stream_lock_wait` on
+    /// the [builder](PostgresEventStore::builder)) before it fails as
     /// [`replay::ErrorKind::Unavailable`]. It is meant for a switch, not a request path.
     ///
     /// Each attempt at the lock is bounded on the server by that same stream lock wait (the
@@ -1008,8 +1008,8 @@ impl PostgresEventStore {
     /// registered it, and waits for every `build` in progress, a first registration
     /// included, so a catch-up or a rebuild never writes rows for these events after
     /// `read_models` has deleted them. Every lock wait of the transaction — `read_models`'
-    /// own statements included — is bounded by the
-    /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait), and one that runs
+    /// own statements included — is bounded by the stream lock wait (`stream_lock_wait`
+    /// on the [builder](PostgresEventStore::builder)), and one that runs
     /// out is [`replay::ErrorKind::Unavailable`], to be retried.
     ///
     /// Nothing that refers to these streams by the transactions that wrote them is touched:

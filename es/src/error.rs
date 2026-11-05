@@ -99,7 +99,7 @@ impl fmt::Debug for ErrorStatus {
 
 /// A flat, actionable error structure designed for both machine and human consumers.
 ///
-/// This design follows the principles from: https://fast.github.io/blog/stop-forwarding-errors-start-designing-them/
+/// This design follows the principles from: <https://fast.github.io/blog/stop-forwarding-errors-start-designing-them/>
 ///
 /// Key principles:
 /// - Categorize by action (ErrorKind), not by origin
