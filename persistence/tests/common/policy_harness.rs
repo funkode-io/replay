@@ -152,6 +152,7 @@ define_aggregate! {
         },
         commands: {
             Ping { tag: String },
+            Import { tags: Vec<String> },
             Echo { tag: String },
             Refuse { reason: String },
             Flake { reason: String },
@@ -192,6 +193,11 @@ impl replay::Aggregate for Probe {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
             ProbeCommand::Ping { tag } => Ok(vec![ProbeEvent::Pinged { tag }]),
+            // One `Pinged` per tag: a bulk decision, for `execute_bulk` to append.
+            ProbeCommand::Import { tags } => Ok(tags
+                .into_iter()
+                .map(|tag| ProbeEvent::Pinged { tag })
+                .collect()),
             ProbeCommand::Echo { tag } => Ok(vec![ProbeEvent::Echoed { tag }]),
             // A command that always fails permanently, so a test can drive a
             // reaction into the dead-letter path on purpose. `invalid_input`
@@ -416,6 +422,8 @@ pub struct PolicyDaemonHarness {
     /// How the policy under test is registered. Kept so [`restart`](Self::restart)
     /// can build the same daemon again against the same database.
     configure: Arc<Configure>,
+    /// How often the daemon polls the feed, kept for [`restart`](Self::restart).
+    poll_interval: Duration,
     escalations: Escalations,
     daemon: Option<PolicyRunnerDaemon>,
 }
@@ -437,7 +445,16 @@ impl PolicyDaemonHarness {
     where
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
-        Self::start_with(label, |cqrs| cqrs, configure).await
+        Self::start_with(label, DAEMON_POLL_INTERVAL, |cqrs| cqrs, configure).await
+    }
+
+    /// [`start`](Self::start), with the daemon polling every `poll_interval` instead of
+    /// the harness's short default: for a test about what the interval paces.
+    pub async fn start_polling_every<F>(label: &str, poll_interval: Duration, configure: F) -> Self
+    where
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
+    {
+        Self::start_with(label, poll_interval, |cqrs| cqrs, configure).await
     }
 
     /// [`start`](Self::start), with a [`CommandMiddleware`] registered on the `Cqrs`
@@ -449,11 +466,18 @@ impl PolicyDaemonHarness {
         M: CommandMiddleware + 'static,
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
-        Self::start_with(label, |cqrs| cqrs.with_middleware(middleware), configure).await
+        Self::start_with(
+            label,
+            DAEMON_POLL_INTERVAL,
+            |cqrs| cqrs.with_middleware(middleware),
+            configure,
+        )
+        .await
     }
 
     async fn start_with<F>(
         label: &str,
+        poll_interval: Duration,
         build: impl FnOnce(Cqrs<PostgresEventStore>) -> Cqrs<PostgresEventStore>,
         configure: F,
     ) -> Self
@@ -485,6 +509,7 @@ impl PolicyDaemonHarness {
             &policy_name,
             &escalations,
             PRIMARY_REPLICA,
+            poll_interval,
         );
 
         Self {
@@ -493,6 +518,7 @@ impl PolicyDaemonHarness {
             cqrs,
             policy_name,
             configure,
+            poll_interval,
             escalations,
             daemon: Some(daemon),
         }
@@ -533,6 +559,7 @@ impl PolicyDaemonHarness {
             &self.policy_name,
             &self.escalations,
             PRIMARY_REPLICA,
+            self.poll_interval,
         ));
     }
 
@@ -707,6 +734,104 @@ impl PolicyDaemonHarness {
             event_id,
             global_position,
             stream_id,
+        }
+    }
+
+    /// Execute a `Probe` import on the **bulk lane** through `Cqrs::execute_bulk`: one
+    /// `Pinged` per tag, appended to `stream` in one transaction, returned in the order
+    /// they were appended.
+    pub async fn bulk_import(&self, stream: &str, tags: &[String]) -> Vec<AppendedEvent> {
+        let id = ProbeUrn::new(stream).expect("stream name must be a valid URN NSS");
+        let marker = Uuid::new_v4();
+
+        self.cqrs
+            .execute_bulk::<Probe>(
+                &id,
+                replay::Metadata::new(serde_json::json!({ PING_MARKER_KEY: marker })),
+                ProbeCommand::Import {
+                    tags: tags.to_vec(),
+                },
+                &(),
+                None,
+            )
+            .await
+            .expect("the bulk execution must succeed");
+
+        let stream_id = id.to_urn().to_string();
+        sqlx::query(
+            "SELECT id, global_position FROM events WHERE metadata->>($1::text) = $2 \
+             ORDER BY global_position LIMIT $3",
+        )
+        .bind(PING_MARKER_KEY)
+        .bind(marker.to_string())
+        .bind(OBSERVATION_LIMIT)
+        .fetch_all(&self.pool)
+        .await
+        .expect("the imported events must be readable")
+        .into_iter()
+        .map(|row| AppendedEvent {
+            event_id: row.get("id"),
+            global_position: row.get("global_position"),
+            stream_id: stream_id.clone(),
+        })
+        .collect()
+    }
+
+    /// Wait until `policy` is registered on the bulk lane, so a bulk execution from now on
+    /// queues work for it. A runner registers it as its bulk worker starts.
+    pub async fn await_bulk_registration(&self, policy: &str) {
+        self.observe(
+            &format!("{policy} to be registered on the bulk lane"),
+            || async {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM policy_bulk_registrations WHERE policy = $1)",
+                )
+                .bind(policy)
+                .fetch_one(&self.pool)
+                .await
+                .expect("the bulk registrations must be readable")
+                .then_some(())
+            },
+        )
+        .await;
+    }
+
+    /// How many rows of bulk work are pending for `policy`.
+    pub async fn bulk_work(&self, policy: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM policy_bulk_work WHERE policy = $1")
+            .bind(policy)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the bulk work queue must be readable")
+    }
+
+    /// How many rows of bulk work are pending for any Policy.
+    pub async fn all_bulk_work(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM policy_bulk_work")
+            .fetch_one(&self.pool)
+            .await
+            .expect("the bulk work queue must be readable")
+    }
+
+    /// Start a second runner against this harness's database with policies of its own,
+    /// registered by `configure` — a Policy that arrives after the first one started, as
+    /// a deploy adds one.
+    pub fn start_runner<F>(&self, configure: F) -> PolicyDaemonReplica
+    where
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
+    {
+        let escalations = Escalations::default();
+        let daemon = spawn_daemon(
+            &self.cqrs,
+            &configure,
+            &self.policy_name,
+            &escalations,
+            SECOND_REPLICA,
+            self.poll_interval,
+        );
+        PolicyDaemonReplica {
+            escalations,
+            daemon: Some(daemon),
         }
     }
 
@@ -1152,6 +1277,7 @@ impl PolicyDaemonHarness {
             &self.policy_name,
             &escalations,
             SECOND_REPLICA,
+            self.poll_interval,
         );
         PolicyDaemonReplica {
             escalations,
@@ -1733,6 +1859,7 @@ fn spawn_daemon(
     policy_name: &str,
     escalations: &Escalations,
     replica_id: &str,
+    poll_interval: Duration,
 ) -> PolicyRunnerDaemon {
     configure(
         PolicyRunner::builder(cqrs.clone())
@@ -1744,5 +1871,5 @@ fn spawn_daemon(
         policy_name,
     )
     .build()
-    .start_polling(DAEMON_POLL_INTERVAL)
+    .start_polling(poll_interval)
 }

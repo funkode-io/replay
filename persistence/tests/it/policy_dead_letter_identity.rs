@@ -300,6 +300,12 @@ async fn a_row_parked_before_the_migration_is_still_listable_retryable_and_disca
     // before this migration parked them.
     let recovered = harness.ping("subject-1", "hello").await;
     let abandoned = harness.ping("subject-2", "hello").await;
+    // Both, not just the later one: the two are different streams, and a Policy
+    // delivers per stream, so the later dispatch says nothing about the earlier.
+    // A retry racing the daemon's own dispatch of the same reaction can lose.
+    harness
+        .await_dispatch_caused_by(recovered.global_position)
+        .await;
     harness
         .await_dispatch_caused_by(abandoned.global_position)
         .await;

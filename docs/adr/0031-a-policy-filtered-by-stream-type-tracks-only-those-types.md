@@ -34,15 +34,16 @@ the `streams` row, fixed when the stream is created.
 **When a Policy's filter is `StreamFilter::ForStreamTypes(types)`, the streams it tracks
 are the streams whose `streams.type` is in `types`, and every path honours that set:**
 
-- **The reconciliation** compares only those streams, by one walk of an index on
-  `streams (type, id)` per tracked type (migration 0036, which supersedes 0005's index on
-  `type` alone; migration 0037 drops that one once its replacement exists). Each walk is a
-  range of that index, `(s.type, s.id) > ($type, $rotation) AND s.type <= $type`, ordered
-  by `(type, id)` and stopped at the `LIMIT`; the walks are merged in id order under the
-  same `LIMIT`. Its cost is proportional to the tracked streams after the rotation, it
-  reads no row of another type, and what Postgres holds before the outer `LIMIT` is at
-  most `types × LIMIT` ids. The rotation rules of ADR-0026 are unchanged: it rotates
-  through the tracked streams, and moves only through streams the poll read.
+- **The reconciliation** compares a bounded window of those streams, by one walk of an
+  index on `streams (type, id)` per tracked type (migration 0036, which supersedes 0005's
+  index on `type` alone; migration 0037 drops that one once its replacement exists). Each
+  walk is a range of that index, `(s.type, s.id) > ($type, $rotation) AND s.type <= $type`,
+  ordered by `(type, id)` and stopped at `reconcile_window`; the walks are merged
+  in id order under the same limit. Its cost per statement is bounded by
+  `types × reconcile_window`, it reads no row of another type, and cursor lookups
+  happen only for the merged window. The rotation rules of ADR-0026 are unchanged: it
+  rotates through the tracked streams, passes caught-up streams it compared, and moves
+  through behind streams only after the poll reads them.
 
   The plan is type-first by the statement's shape, not by the planner's choice. The first
   form, `WHERE s.type = ANY($types) AND s.id > $rotation ORDER BY s.id`, was planned
@@ -89,10 +90,12 @@ pass a batch that holds nothing tracked in one poll rather than stopping in fron
 - **A Policy's cost no longer grows with the domains it does not read.** Its reconciliation
   examines its own types' streams; a new aggregate type costs it nothing but the sweep's
   constant per-poll page and a lookup per stream that page names.
-- **The reconciliation is still proportional to the tracked streams, not to the streams
-  behind.** `LIMIT` bounds what it returns; a caught-up Policy still walks every stream it
-  tracks to find nothing. This decision removes the untracked multiplier, not the scan.
-  Finding late writes without the full comparison is a separate change.
+- **Each reconciliation statement is bounded by the scan window, while a full pass remains
+  proportional to the tracked streams, not the streams behind.** A caught-up Policy reads
+  only the next window per cadence and eventually compares every stream it tracks. This
+  decision removes both the untracked multiplier and the per-statement full scan. Finding
+  late writes normally uses the commit-stamp lookup on the next poll (ADR-0030); this scan
+  remains the safety net.
 - **Existing places in untracked streams are left in place.** Deleting them automatically
   is unsafe: if the filter is later widened, a missing row means place 0, and the Policy
   would redeliver those streams' whole history — even a `StartAt::Now` one. The README

@@ -2621,13 +2621,14 @@ the runner knows which transactions it could not see. Once those transactions en
 indexed lookup of their `commit_txid`s nominates their streams on the next poll. A transaction
 whose id was assigned after the sweep snapshot is found by the carried transaction-id range.
 Both lookups are bounded by `read_batch_size` and lead the poll; the full comparison remains
-as a safety net. It costs a scan of one row per tracked stream — every stream, unless the
-policy is [filtered by stream type](#a-policy-filtered-by-stream-type-tracks-only-those-types)
-— so it runs on a cadence rather than per poll:
+as a safety net. Each cadence compares one bounded window of tracked streams, narrowed when
+the policy is [filtered by stream type](#a-policy-filtered-by-stream-type-tracks-only-those-types)
+with these bounds:
 
 | Setting | Default | What it bounds |
 |---------|---------|----------------|
 | `REPLAY_POLICY_RECONCILE_SECS` | 300 | Safety-net comparison cadence in seconds. Never *whether*. |
+| `PolicyRunnerBuilder::reconcile_window(NonZeroU32)` | 10,000 | Stream rows per statement (per tracked type before merging a typed window). |
 
 Lower it for faster recovery from a defect; normal late-write delivery does not wait for it.
 `PolicyRunnerBuilder::reconcile_every(Duration)` sets it per runner instead;
@@ -2645,14 +2646,14 @@ must not wait a cadence
 ([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A manual
 `PolicyRunner::drain` always compares on the spot.
 
-The reconciliation reads up to `read_batch_size` streams per cadence, **resumes where it
-left off** and wraps. The pass takes `ceil(streams behind / read_batch_size)` cadences
-while the policy is keeping up, plus the one a pass spends wrapping — a rotation standing
-past the last stream id reads an empty page and compares nothing that cadence, which is
-why even a policy behind on a single stream can take two. Longer when it is not keeping
-up: the reconciliation leads the poll it runs on, so it always reads at least one stream,
-and its rotation never steps over a stream it did not read. [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)
-owns the bound.
+Cadence comparisons advance through at most one scan window, stopping before any behind
+stream the poll did not read. The safety-net bound is
+`ceil(tracked streams / window) + streams behind + 1` cadences
+([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)).
+Startup and manual comparisons wrap once from the saved rotation until they find a
+candidate batch or complete a pass. When nothing is behind, that costs roughly
+`ceil(tracked streams / window)` statements plus boundary probes in one poll; delivery
+waits for the comparison to finish.
 
 `read_batch_size` is one budget for a whole poll, spent across the streams that poll looks
 at — not a batch per stream. A policy owed work in a hundred streams reads the same number
@@ -2773,7 +2774,7 @@ because a place is only read for a stream that poll is looking at:
 | The stream you moved | When it is picked up |
 |---|---|
 | is still being written to | the next poll, on the sweep |
-| is quiet and the sweep has passed it | the next full comparison that reaches it — `ceil(streams behind / read_batch_size) + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). A moved place has no writing transaction for the late-write lookup to find, so this is the one case that waits for the safety net; `PolicyRunner::drain` picks it up at once. |
+| is quiet and the sweep has passed it | the next comparison that reaches it — at most `ceil(tracked streams / window) + streams behind + 1` cadences of `REPLAY_POLICY_RECONCILE_SECS`, the `+ 1` being the cadence a pass spends wrapping past the last stream id ([ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md)). A moved place has no writing transaction for the late-write lookup to find, so this is the one case that waits for the safety net; `PolicyRunner::drain` compares immediately, up to one candidate batch. |
 
 Places themselves are never held in memory between polls, so no running process carries a
 stale copy of one forward.
@@ -2853,11 +2854,19 @@ Two batch sizes control throughput vs checkpoint frequency:
 
 The runner enforces `read_batch_size ≥ checkpoint_batch_size`.
 
+`read_batch_size` bounds one poll, not a policy's throughput. A poll that leaves work it
+knows about — streams it could not finish or reach, or log past where its sweep stopped —
+is followed by the next one at once, after a yield to the runtime and a check for shutdown
+and a change of leadership; the worker waits on the poll interval only once a poll finds
+itself caught up. A backlog is worked through at the speed of its reactions, and the
+interval stays what it is for: the safety net for a missed `NOTIFY`
+([#322](https://github.com/funkode-io/replay/issues/322)).
+
 `read_batch_size` counts positions in the log, not matches: a `stream_filter` decides
 what a policy reacts to, the cursor still walks past everything else
 ([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
-selective policy over a busy log may need several drains to reach its next event;
-raise `read_batch_size` if that latency matters.
+selective policy over a busy log may need several polls to reach its next event, run
+back to back; raise `read_batch_size` to spend fewer round trips on them.
 
 ### Dispatch timeout
 
@@ -2928,6 +2937,21 @@ what is holding the stream the error names — `pg_locks` joined to
 value you choose is the longest honest hold, and in this library that is `compact`:
 it is O(stream length), so a stream long enough to take more than the wait will
 fail the appends queued behind it.
+
+### Bulk segment size
+
+`Cqrs::execute_bulk` commits its events in segments, each one transaction holding the
+segment's events, their inline-projection rows and their bulk work. The segment bounds
+what a bulk holds at once — memory, the stream row, and the commit stamp every online
+Policy and projection catch-up waits behind — and what a failure rolls back: a failure
+mid-bulk leaves the segments before it committed and returns the error
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+
+| Setting | Store override | Env var | Default |
+|---------|----------------|---------|---------|
+| Events a bulk append commits per segment | `builder(pool).bulk_segment_size(n)` | `REPLAY_BULK_SEGMENT_SIZE` | `1000` |
+
+Values below 1 are clamped to 1. An online append is one transaction whatever this is.
 
 ### Failure handling
 
@@ -3575,6 +3599,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `last_checkpoint_at` | When the policy last advanced in any stream (staleness signal). |
 | `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. List them with `dead_letters` (see [Listing dead letters](#listing-dead-letters)). |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
+| `bulk_pending` | The bulk lane's queue depth: rows of bulk work queued for this policy and not yet reacted to, falling to `0` as an import drains. `None` for a policy never registered on the bulk lane. A policy on both lanes is listed once, with its online fields and this; a policy only on the bulk lane reports `0` lag. |
 | `condition` | At-a-glance health label (see below). |
 
 `lag` is a subtraction per stream, so a position burned by a failed write does not
@@ -3603,8 +3628,8 @@ nothing behind, or read each stream in its own order and record the **stream pla
 | Condition | When | Meaning |
 |-----------|------|---------|
 | `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
-| `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
-| `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
+| `Working` | no dead letters, `lag > 0` or `bulk_pending > 0` | Healthy and catching up. |
+| `CaughtUp` | no dead letters, `lag == 0`, no bulk work pending | Fully drained and up to date. |
 
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
 `"Degraded"`) for JSON/UI consumers.
@@ -3655,7 +3680,7 @@ None of the three stops a policy, and none of them needs an operator:
 | A write failed after taking a `global_position` | Nothing. The number is burned — `nextval` is not transactional — and a policy that reads no global order never looks at it. The place the write took in its stream *is* handed back, because that counter is a row and rolls back with the transaction. |
 | A write is still running | Its stream waits for it, and only its stream. Every other stream is delivered meanwhile. |
 | A write commits below a policy's sweep, with its leader unchanged | It is nominated on the next poll after its transaction commits. |
-| A leader changes, transaction counter resets, or late-write state exceeds its cap | The full comparison finds the write within one `REPLAY_POLICY_RECONCILE_SECS` cadence, plus the rotation terms in [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md). |
+| A leader changes, transaction counter resets, or late-write state exceeds its cap | Leader start schedules a full comparison within three poll intervals; a detected counter reset or cap overflow forces one immediately. Each full comparison stops at a candidate batch; remaining work follows the rotation bound in [ADR-0026](docs/adr/0026-a-policy-tracks-its-position-per-stream.md). |
 
 This is the structural fix for
 [#164](https://github.com/funkode-io/replay/issues/164), where a burned position

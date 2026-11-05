@@ -568,7 +568,7 @@ async fn bank_account_multi_event_append_with_expected_version_postgres_test() {
     // Three events appended in one call, expecting the stream to start at version 0.
     let mut observed_versions = Vec::new();
     store
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &stream_id,
             "bank-account".to_string(),
             replay::Metadata::default(),
@@ -588,6 +588,7 @@ async fn bank_account_multi_event_append_with_expected_version_postgres_test() {
             ]),
             Some(0),
             |event: &PersistedEvent<BankAccountEvent>| observed_versions.push(event.version),
+            replay_persistence::OpenGate,
         )
         .await
         .expect("multi-event append with correct expected version must succeed");
@@ -630,7 +631,7 @@ async fn bank_account_store_events_stream_sink_postgres_test() {
 
     let mut observed = Vec::new();
     store
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &stream_id,
             "bank-account".to_string(),
             replay::Metadata::default(),
@@ -648,6 +649,7 @@ async fn bank_account_store_events_stream_sink_postgres_test() {
             |event: &PersistedEvent<BankAccountEvent>| {
                 observed.push((event.version, event.data.clone()));
             },
+            replay_persistence::OpenGate,
         )
         .await
         .expect("streaming append must succeed");
@@ -698,7 +700,7 @@ async fn bank_account_store_events_stream_producer_error_rolls_back_postgres_tes
     let mut observed = 0;
 
     let result = store
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &stream_id,
             "bank-account".to_string(),
             replay::Metadata::default(),
@@ -713,6 +715,7 @@ async fn bank_account_store_events_stream_producer_error_rolls_back_postgres_tes
             |_event: &PersistedEvent<BankAccountEvent>| {
                 observed += 1;
             },
+            replay_persistence::OpenGate,
         )
         .await;
 
@@ -804,7 +807,7 @@ async fn bulk_payments_csv_streams_end_to_end_postgres_test() {
     let mut rows = 0u64;
     let mut sink_total = 0.0f64;
     store
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &stream_id,
             "BankAccount".to_string(),
             replay::Metadata::default(),
@@ -816,6 +819,7 @@ async fn bulk_payments_csv_streams_end_to_end_postgres_test() {
                     sink_total += *amount;
                 }
             },
+            replay_persistence::OpenGate,
         )
         .await
         .expect("streaming csv append must succeed");
@@ -1960,7 +1964,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
             },
         ];
         store
-            .store_events_stream::<BankAccount, _, _>(
+            .store_events_stream::<BankAccount, _, _, _>(
                 stream,
                 BankAccount::stream_type(),
                 replay::Metadata::default(),
@@ -1971,6 +1975,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
                         expected.push(event.id)
                     }
                 },
+                replay_persistence::OpenGate,
             )
             .await
             .unwrap();
@@ -2007,7 +2012,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
     }
 
     rebuilt
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &account,
             BankAccount::stream_type(),
             replay::Metadata::default(),
@@ -2017,6 +2022,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
             })]),
             None,
             |event: &PersistedEvent<BankAccountEvent>| expected.push(event.id),
+            replay_persistence::OpenGate,
         )
         .await
         .unwrap();
@@ -5498,15 +5504,9 @@ async fn policy_reconciliation_leads_the_poll_it_runs_on_postgres_test() {
     );
 }
 
-/// A rotation that has reached the end of the stream ids wraps, even across a poll that
-/// finds nothing to do.
-///
-/// The poll that ends a pass is an empty one by construction — the page past the last id
-/// is empty, so no source nominates anything and the poll returns early. A rotation
-/// recorded only on the path that reads a stream stays at the end for ever, and a stream
-/// sorting before it is never compared again (funkode-io/replay#231 review).
+/// A manual drain must find work before the saved rotation in the same poll (#299).
 #[tokio::test]
-async fn policy_reconciliation_wraps_across_an_empty_poll_postgres_test() {
+async fn policy_manual_reconciliation_wraps_within_one_poll_postgres_test() {
     let container = postgres_database().await;
     let pg_pool = connect_to_postgres(&container).await;
 
@@ -5553,20 +5553,11 @@ async fn policy_reconciliation_wraps_across_an_empty_poll_postgres_test() {
         )
         .build();
 
-    // The first drain finds nothing — that is the poll that has to wrap the rotation.
-    runner.drain().await.expect("drain must succeed");
-    assert!(
-        common::places::all(&pg_pool, "small_batch_policy")
-            .await
-            .is_empty(),
-        "nothing sorts after the cursor, so the first poll reads nothing"
-    );
-
     runner.drain().await.expect("drain must succeed");
     assert_eq!(
         common::places::all(&pg_pool, "small_batch_policy").await,
         vec![(account.to_urn().to_string(), 1)],
-        "and the pass that started over finds the stream that was behind the cursor"
+        "the first drain wraps and finds the stream behind the saved cursor"
     );
 }
 

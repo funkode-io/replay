@@ -25,6 +25,39 @@ pub enum StartAt {
     Beginning,
 }
 
+/// Which lane or lanes a Policy consumes
+/// ([ADR-0034](https://github.com/funkode-io/replay/blob/main/docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+///
+/// An event is stamped with its lane when it is appended: online through
+/// [`Cqrs::execute`](crate::Cqrs::execute), bulk through
+/// [`Cqrs::execute_bulk`](crate::Cqrs::execute_bulk). Each lane reaches a Policy its own
+/// way, and the same `react` serves both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lanes {
+    /// The online lane only, through the Policy feed. What every Policy consumed before
+    /// lanes existed, and the default.
+    #[default]
+    Online,
+    /// The bulk lane only, through the bulk work queue: the Policy reacts to the events
+    /// of [`Cqrs::execute_bulk`](crate::Cqrs::execute_bulk) and to nothing appended
+    /// online.
+    Bulk,
+    /// Both: online events through the feed, bulk events through the queue.
+    Both,
+}
+
+impl Lanes {
+    /// Whether the Policy reads the online feed.
+    pub fn online(self) -> bool {
+        matches!(self, Lanes::Online | Lanes::Both)
+    }
+
+    /// Whether the Policy has a bulk work queue.
+    pub fn bulk(self) -> bool {
+        matches!(self, Lanes::Bulk | Lanes::Both)
+    }
+}
+
 /// How the runner drives one [`Policy`]: everything about the reaction that is not the
 /// rule.
 ///
@@ -35,6 +68,7 @@ pub enum StartAt {
 pub struct PolicySettings {
     stream_filter: StreamFilter,
     start_at: StartAt,
+    lanes: Lanes,
     max_causation_depth: Option<u32>,
     read_batch_size: Option<u32>,
     checkpoint_batch_size: Option<u32>,
@@ -65,6 +99,22 @@ impl PolicySettings {
     /// commands across existing history.
     pub fn starting_at(mut self, start_at: StartAt) -> Self {
         self.start_at = start_at;
+        self
+    }
+
+    /// Which lane or lanes the policy consumes. Defaults to [`Lanes::Online`].
+    ///
+    /// A Policy on the bulk lane is registered for it when its runner starts, and from
+    /// then on every [`Cqrs::execute_bulk`](crate::Cqrs::execute_bulk) of a stream it
+    /// tracks queues one row of work for it per event, in the append's own transaction.
+    /// A bulk execution that committed before the registration is never delivered to
+    /// it, whatever [`starting_at`](Self::starting_at) says: as [`StartAt::Now`], a
+    /// Policy is not rebuilt from history.
+    ///
+    /// The bulk lane delivers a stream's events in that stream's order and orders
+    /// nothing across streams. Its reactions are at-least-once, as on the online lane.
+    pub fn on_lanes(mut self, lanes: Lanes) -> Self {
+        self.lanes = lanes;
         self
     }
 
@@ -121,6 +171,10 @@ impl PolicySettings {
         self.start_at
     }
 
+    pub fn lanes(&self) -> Lanes {
+        self.lanes
+    }
+
     pub fn max_causation_depth(&self) -> Option<u32> {
         self.max_causation_depth
     }
@@ -169,6 +223,10 @@ impl RegisteredPolicy {
 
     pub(crate) fn start_at(&self) -> StartAt {
         self.settings.start_at()
+    }
+
+    pub(crate) fn lanes(&self) -> Lanes {
+        self.settings.lanes()
     }
 
     pub(crate) fn react_erased(&self, raw: &PersistedEvent<serde_json::Value>) -> Vec<Dispatch> {

@@ -1,9 +1,10 @@
 //! Policy status read model.
 //!
 //! [`PolicyStatusStore`] reads operational tables that the runner already writes
-//! (`policy_cursors`, `policy_stream_cursors`, `streams` and `policy_dead_letters`) and
-//! returns one [`PolicyStatus`] per known policy — a lightweight health and lag signal
-//! for monitoring.
+//! (`policy_cursors`, `policy_stream_cursors`, `streams`, `policy_dead_letters`, and for
+//! the bulk lane `policy_bulk_registrations` and `policy_bulk_work`) and returns one
+//! [`PolicyStatus`] per known policy — a lightweight health and lag signal for
+//! monitoring.
 //!
 //! The lag it reports is a count of events, arrived at by subtracting each stream's place
 //! from its head (funkode-io/replay#196). The number it replaces was a subtraction of
@@ -59,6 +60,9 @@ const DEAD_LETTER_CHUNK: i64 = 100;
 /// | `CaughtUp` | `dead_letter_count == 0`, `lag == 0`                        |
 ///
 /// A policy that is *both* behind and has dead letters resolves to `Degraded`.
+///
+/// [`PolicyStatus::condition`] passes the work owed on both lanes as `lag`: the online
+/// lag plus the pending bulk work, so a Policy draining an import reads `Working`.
 ///
 /// There is no `Blocked`: a Policy reads each stream over a sequence that has no holes,
 /// so there is no position it can be parked in front of
@@ -140,9 +144,23 @@ pub struct PolicyStatus {
     /// one (funkode-io/replay#220), and a reaction failing on every delivery
     /// must not read like one that failed once and stopped.
     pub last_dead_letter_at: Option<DateTime<Utc>>,
+    /// Rows of bulk work queued for this Policy and not yet reacted to: its bulk lane's
+    /// queue depth, which falls to zero as an import drains (ADR-0034). `None` for a
+    /// Policy that has never been registered on the bulk lane.
+    ///
+    /// A row leaves the queue when the batch that claimed it commits, whether its
+    /// reaction committed, was declined or was parked as a dead letter, so a failed
+    /// reaction shows here as a `dead_letter_count`, never as work stuck in the queue.
+    ///
+    /// The online fields beside it are the online lane's view of the same Policy, so a
+    /// Policy on both lanes reports both in one status. A Policy only on the bulk lane
+    /// has no place on the online lane: its `lag`, `streams_behind` and
+    /// `discovered_through` are `0`, and its `last_checkpoint_at` is when it was first
+    /// registered on the bulk lane.
+    pub bulk_pending: Option<i64>,
     /// Derived condition: [`PolicyCondition::Degraded`] when `dead_letter_count > 0`,
-    /// otherwise [`PolicyCondition::Working`] when `lag > 0`, otherwise
-    /// [`PolicyCondition::CaughtUp`].
+    /// otherwise [`PolicyCondition::Working`] when `lag > 0` or `bulk_pending > 0`,
+    /// otherwise [`PolicyCondition::CaughtUp`].
     pub condition: PolicyCondition,
 }
 
@@ -163,15 +181,20 @@ impl PolicyStatusStore {
         Self { pool }
     }
 
-    /// Return one [`PolicyStatus`] for every policy that has a
-    /// `policy_cursors` row.  A registered-but-never-run policy (no row)
-    /// does not appear.
+    /// Return one [`PolicyStatus`] for every policy that has a `policy_cursors` row —
+    /// the online lane's — or a `policy_bulk_registrations` row — the bulk lane's. A
+    /// Policy on both lanes is listed once, with both views. A Policy with neither row —
+    /// registered on a runner that has never started it — does not appear.
     ///
     /// The result is produced by a **single** SQL read: a per-policy `LATERAL` over
-    /// `streams` against that policy's places, and a per-policy `LATERAL` aggregate over
-    /// `policy_dead_letters`. The dead-letter lateral is filtered by `pc.name` and reads
+    /// `streams` against that policy's places, a per-policy `LATERAL` aggregate over
+    /// `policy_dead_letters`, and for a bulk Policy a count of its `policy_bulk_work`
+    /// rows. The dead-letter lateral is filtered by the policy's name and reads
     /// `last_parked_at`, which `idx_dead_letters_policy_created_parked` carries as a
-    /// payload column, so it stays an index-only scan (funkode-io/replay#227).
+    /// payload column, so it stays an index-only scan (funkode-io/replay#227). The bulk
+    /// count reads the work table's primary key, which leads with the policy, so it
+    /// walks that Policy's pending rows and no other's — a number sized by what is owed,
+    /// never by history.
     ///
     /// The event log is never scanned, but the frontier lateral reads one row per stream
     /// a policy tracks, because no index can answer a comparison between two tables'
@@ -194,14 +217,22 @@ impl PolicyStatusStore {
         let rows = sqlx::query(
             r#"
             SELECT
-                pc.name,
-                pc.discovered_through,
-                pc.updated_at,
+                p.name,
+                COALESCE(pc.discovered_through, 0) AS discovered_through,
+                COALESCE(pc.updated_at, br.registered_at) AS updated_at,
                 COALESCE(f.lag, 0) AS lag,
                 COALESCE(f.streams_behind, 0) AS streams_behind,
                 COALESCE(dl.dead_letter_count, 0) AS dead_letter_count,
-                dl.last_dead_letter_at
-            FROM policy_cursors pc
+                dl.last_dead_letter_at,
+                bw.bulk_pending
+            FROM (
+                -- Every Policy either lane knows, once: a Policy on both has a row in each.
+                SELECT name FROM policy_cursors
+                UNION
+                SELECT policy FROM policy_bulk_registrations
+            ) p
+            LEFT JOIN policy_cursors pc ON pc.name = p.name
+            LEFT JOIN policy_bulk_registrations br ON br.policy = p.name
             LEFT JOIN LATERAL (
                 SELECT
                     -- `SUM` of a bigint is numeric in PostgreSQL; the count fits.
@@ -212,15 +243,18 @@ impl PolicyStatusStore {
                     -- one `IS NULL OR type = ANY` predicate, so each is planned on its own:
                     -- the first is a one-time filter that skips the scan entirely for a
                     -- Policy that tracks some types, and the second is an index scan on
-                    -- `idx_streams_type_id` that never reads a row of another type.
+                    -- `idx_streams_type_id` that never reads a row of another type. A
+                    -- Policy with no online row — only on the bulk lane — tracks nothing
+                    -- on the online lane, so both branches are filtered on the row being
+                    -- there, a one-time filter that skips their scans.
                     SELECT id, stream_seq FROM streams
-                     WHERE pc.tracked_stream_types IS NULL
+                     WHERE pc.name IS NOT NULL AND pc.tracked_stream_types IS NULL
                     UNION ALL
                     SELECT id, stream_seq FROM streams
-                     WHERE type = ANY(pc.tracked_stream_types)
+                     WHERE pc.name IS NOT NULL AND type = ANY(pc.tracked_stream_types)
                 ) s
                 LEFT JOIN policy_stream_cursors c
-                       ON c.policy = pc.name AND c.stream_id = s.id
+                       ON c.policy = p.name AND c.stream_id = s.id
                 WHERE s.stream_seq > COALESCE(c.stream_seq, 0)
             ) f ON TRUE
             LEFT JOIN LATERAL (
@@ -228,9 +262,18 @@ impl PolicyStatusStore {
                     COUNT(*)             AS dead_letter_count,
                     MAX(last_parked_at)  AS last_dead_letter_at
                 FROM policy_dead_letters
-                WHERE policy_name = pc.name
+                WHERE policy_name = p.name
             ) dl ON TRUE
-            ORDER BY pc.name
+            LEFT JOIN LATERAL (
+                -- No row, so NULL, for a Policy that is not on the bulk lane, rather than
+                -- 0: "no queue" and "an empty queue" are different answers. The same test
+                -- in the WHERE is a one-time filter, so such a Policy reads no work rows.
+                SELECT COUNT(*) AS bulk_pending
+                FROM policy_bulk_work w
+                WHERE br.policy IS NOT NULL AND w.policy = p.name
+                HAVING br.policy IS NOT NULL
+            ) bw ON TRUE
+            ORDER BY p.name
             "#,
         )
         .fetch_all(&self.pool)
@@ -250,7 +293,12 @@ impl PolicyStatusStore {
                 // Policy behind on nothing is behind by nothing.
                 let lag: i64 = r.get("lag");
                 let streams_behind: i64 = r.get("streams_behind");
-                let condition = PolicyCondition::from_fields(lag, dead_letter_count);
+                let bulk_pending: Option<i64> = r.get("bulk_pending");
+                // Work owed on either lane keeps a Policy `Working`.
+                let condition = PolicyCondition::from_fields(
+                    lag.saturating_add(bulk_pending.unwrap_or(0)),
+                    dead_letter_count,
+                );
                 PolicyStatus {
                     name,
                     lag,
@@ -259,6 +307,7 @@ impl PolicyStatusStore {
                     last_checkpoint_at: updated_at,
                     dead_letter_count,
                     last_dead_letter_at,
+                    bulk_pending,
                     condition,
                 }
             })
@@ -627,6 +676,7 @@ mod tests {
             last_checkpoint_at: now,
             dead_letter_count: 0,
             last_dead_letter_at: None,
+            bulk_pending: None,
             condition: PolicyCondition::from_fields(0, 0),
         };
         assert_eq!(caught_up.condition, PolicyCondition::CaughtUp);
@@ -640,6 +690,7 @@ mod tests {
             last_checkpoint_at: now,
             dead_letter_count: 0,
             last_dead_letter_at: None,
+            bulk_pending: None,
             condition: PolicyCondition::from_fields(5, 0),
         };
         assert_eq!(working.condition, PolicyCondition::Working);
@@ -657,6 +708,7 @@ mod tests {
             last_checkpoint_at: now,
             dead_letter_count: 2,
             last_dead_letter_at: Some(now),
+            bulk_pending: None,
             condition: PolicyCondition::from_fields(3, 2),
         };
         assert_eq!(degraded.condition, PolicyCondition::Degraded);

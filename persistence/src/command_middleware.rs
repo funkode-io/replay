@@ -24,6 +24,21 @@ pub enum Next {
     Error(replay::Error),
 }
 
+impl Next {
+    /// `Ok` on [`Continue`](Next::Continue); otherwise the error a caller sees: a
+    /// `replay::Error` of kind [`Busy`](replay::ErrorKind::Busy) carrying the reason, or
+    /// the middleware's error as it is.
+    ///
+    /// What a store returns when its [`CommitGate`](crate::CommitGate) does not continue.
+    pub fn into_result(self) -> Result<(), replay::Error> {
+        match self {
+            Next::Continue => Ok(()),
+            Next::Busy(reason) => Err(replay::Error::busy(reason)),
+            Next::Error(error) => Err(error),
+        }
+    }
+}
+
 /// How a command finished, as [`CommandMiddleware::after`] sees it.
 #[derive(Debug)]
 pub enum Outcome<'a> {
@@ -92,10 +107,11 @@ pub trait CommandMiddleware: Send + Sync {
     /// Runs at the commit gate: inside the append transaction, after the events are
     /// inserted and every inline projection has run, immediately before the commit.
     ///
-    /// Anything but [`Next::Continue`] rolls the append back.
-    ///
-    /// Not yet called: `Cqrs` passes the commit gate to the store in a later release
-    /// ([#313](https://github.com/funkode-io/replay/issues/313)).
+    /// Anything but [`Next::Continue`] rolls the append back, inline projection writes
+    /// included, and later middlewares do not run: the caller of
+    /// [`Cqrs::execute`](crate::Cqrs::execute) sees it as `before` would make it see it.
+    /// The context is the one `before` left, read-only. A middleware needs no transaction
+    /// handle, so it works on every store.
     fn before_commit<'a>(&'a self, context: &'a CommandContext) -> BoxFuture<'a, Next> {
         let _ = context;
         Box::pin(ready(Next::Continue))
@@ -374,7 +390,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use futures::TryStreamExt;
-    use replay::{Aggregate, ErrorKind, Metadata, WithId};
+    use replay::{Aggregate, ErrorKind, EventStream, Metadata, WithId};
     use replay_macros::Event;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
@@ -1072,6 +1088,372 @@ mod tests {
         }
         assert_eq!(*failures.lock().unwrap(), 2, "after saw both failures");
         assert_eq!(appended(&observed).await.len(), 1);
+    }
+
+    /// Answers `before` with `Continue` and `before_commit` with the answer it was built
+    /// with, recording the context it saw at the gate.
+    struct AtTheGate {
+        name: &'static str,
+        log: Log,
+        answer: fn() -> Next,
+    }
+
+    impl CommandMiddleware for AtTheGate {
+        fn before_commit<'a>(&'a self, context: &'a CommandContext) -> BoxFuture<'a, Next> {
+            Box::pin(async move {
+                self.log.lock().unwrap().push((self.name, context.clone()));
+                (self.answer)()
+            })
+        }
+    }
+
+    fn at_the_gate(name: &'static str, log: &Log, answer: fn() -> Next) -> AtTheGate {
+        AtTheGate {
+            name,
+            log: log.clone(),
+            answer,
+        }
+    }
+
+    /// An inline projection that keeps every amount it was handed.
+    #[derive(Clone, Default)]
+    struct Amounts(Arc<Mutex<Vec<i64>>>);
+
+    impl crate::InlineProjection for Amounts {
+        type Exec = ();
+        type Event = CounterEvent;
+
+        fn name(&self) -> &str {
+            "amounts"
+        }
+
+        fn version(&self) -> i32 {
+            1
+        }
+
+        async fn init(&mut self, _: &mut ()) -> Result<(), replay::Error> {
+            Ok(())
+        }
+
+        async fn handle(
+            &mut self,
+            _: &mut (),
+            events: &[PersistedEvent<CounterEvent>],
+        ) -> Result<(), replay::Error> {
+            for event in events {
+                let CounterEvent::Added { amount } = event.data;
+                self.0.lock().unwrap().push(amount);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_before_commit_rolls_the_append_back() {
+        let log = Log::default();
+        let amounts = Amounts::default();
+        let store = InMemoryEventStore::new().register_projection(amounts.clone());
+        let cqrs = Cqrs::new(store).with_middleware(at_the_gate("maintenance", &log, || {
+            Next::Busy("maintenance in progress".to_string())
+        }));
+        let handled = Handled::default();
+
+        let error = cqrs
+            .execute::<Counter>(&counter(), Metadata::default(), Add(1), &handled, None)
+            .await
+            .err()
+            .expect("a busy gate rolls the append back");
+
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert!(error.is_temporary());
+        assert_eq!(error.to_string(), "maintenance in progress");
+        assert!(
+            handled.0.load(Ordering::SeqCst),
+            "the gate runs after the handler"
+        );
+        assert!(appended(&cqrs).await.is_empty());
+        assert!(amounts.0.lock().unwrap().is_empty(), "the projection ran");
+    }
+
+    #[tokio::test]
+    async fn a_before_commit_error_reaches_the_caller_unchanged() {
+        let log = Log::default();
+        let cqrs =
+            Cqrs::new(InMemoryEventStore::new()).with_middleware(at_the_gate("auth", &log, || {
+                Next::Error(
+                    replay::Error::permanent(ErrorKind::Forbidden, "alice may not add")
+                        .with_operation("authorize")
+                        .with_context("user", "alice"),
+                )
+            }));
+
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                None,
+            )
+            .await
+            .err()
+            .expect("a refusing gate rolls the append back");
+
+        assert_eq!(error.kind(), ErrorKind::Forbidden);
+        assert_eq!(error.to_string(), "alice may not add");
+        assert_eq!(error.operation(), "authorize");
+        assert_eq!(error.context(), &[("user", "alice".to_string())]);
+        assert!(appended(&cqrs).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_first_middleware_to_refuse_the_commit_is_the_last_to_run() {
+        let log = Log::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(at_the_gate("first", &log, || Next::Continue))
+            .with_middleware(at_the_gate("second", &log, || {
+                Next::Busy("not now".to_string())
+            }))
+            .with_middleware(at_the_gate("third", &log, || Next::Continue));
+
+        let result = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                None,
+            )
+            .await;
+
+        assert_eq!(result.err().map(|e| e.kind()), Some(ErrorKind::Busy));
+        assert_eq!(ran(&log), vec!["first", "second"]);
+        assert!(appended(&cqrs).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gates_that_continue_run_in_registration_order_and_see_what_before_added() {
+        let log = Log::default();
+        let amounts = Amounts::default();
+        let store = InMemoryEventStore::new().register_projection(amounts.clone());
+        let cqrs = Cqrs::new(store)
+            .with_middleware(AddsTheUser)
+            .with_middleware(at_the_gate("first", &log, || Next::Continue))
+            .with_middleware(at_the_gate("second", &log, || Next::Continue));
+
+        let counted = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(4),
+                &Handled::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(counted.total, 4);
+        assert_eq!(ran(&log), vec!["first", "second"]);
+        let seen = log.lock().unwrap()[0].1.metadata().to_json();
+        assert_eq!(seen, json!({ "user": "alice" }));
+        assert_eq!(appended(&cqrs).await.len(), 1);
+        assert_eq!(*amounts.0.lock().unwrap(), vec![4]);
+    }
+
+    #[tokio::test]
+    async fn after_sees_a_busy_commit_gate_as_busy_with_its_reason() {
+        let afters = Afters::default();
+        let log = Log::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(observing("first", &afters, || Next::Continue))
+            .with_middleware(at_the_gate("maintenance", &log, || {
+                Next::Busy("maintenance in progress".to_string())
+            }))
+            .with_middleware(observing("last", &afters, || Next::Continue));
+
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                None,
+            )
+            .await
+            .err()
+            .expect("a busy gate rolls the append back");
+
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert_eq!(
+            observed(&afters),
+            vec![
+                ("last", "busy: maintenance in progress".to_string()),
+                ("first", "busy: maintenance in progress".to_string()),
+            ]
+        );
+        assert!(appended(&cqrs).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn after_sees_a_commit_gate_error_as_failed_with_that_error() {
+        let afters = Afters::default();
+        let log = Log::default();
+        let cqrs = Cqrs::new(InMemoryEventStore::new())
+            .with_middleware(observing("first", &afters, || Next::Continue))
+            .with_middleware(at_the_gate("auth", &log, || {
+                Next::Error(replay::Error::permanent(
+                    ErrorKind::Forbidden,
+                    "alice may not add",
+                ))
+            }));
+
+        let error = cqrs
+            .execute::<Counter>(
+                &counter(),
+                Metadata::default(),
+                Add(1),
+                &Handled::default(),
+                None,
+            )
+            .await
+            .err()
+            .expect("a refusing gate rolls the append back");
+
+        assert_eq!(error.kind(), ErrorKind::Forbidden);
+        assert_eq!(
+            observed(&afters),
+            vec![("first", "failed: alice may not add".to_string())]
+        );
+    }
+
+    /// Refuses every command in both hooks.
+    struct RefusesEverything(Log);
+
+    impl CommandMiddleware for RefusesEverything {
+        fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(("before", context.clone()));
+                Next::Busy("closed".to_string())
+            })
+        }
+
+        fn before_commit<'a>(&'a self, context: &'a CommandContext) -> BoxFuture<'a, Next> {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(("before_commit", context.clone()));
+                Next::Busy("closed".to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_append_through_the_store_runs_no_middleware() {
+        let log = Log::default();
+        let cqrs =
+            Cqrs::new(InMemoryEventStore::new()).with_middleware(RefusesEverything(log.clone()));
+
+        cqrs.store()
+            .store_events::<Counter>(
+                &counter(),
+                Counter::stream_type(),
+                Metadata::default(),
+                &[CounterEvent::Added { amount: 5 }],
+                None,
+            )
+            .await
+            .expect("a direct append is not a command");
+
+        assert!(ran(&log).is_empty(), "a middleware ran: {:?}", ran(&log));
+        assert_eq!(appended(&cqrs).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_does_not_continue_leaves_a_direct_store_append_unpublished() {
+        let store = InMemoryEventStore::new();
+
+        let error = store
+            .store_events_stream::<Counter, _, _, _>(
+                &counter(),
+                Counter::stream_type(),
+                Metadata::default(),
+                futures::stream::iter([Ok(CounterEvent::Added { amount: 1 })]),
+                None,
+                crate::NoSink,
+                || async { Next::Busy("not now".to_string()) },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        let events: Vec<PersistedEvent<CounterEvent>> = store
+            .stream_events_by_stream_id::<Counter>(&counter(), AggregateVersion::Latest, None, None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_append_held_at_the_gate_does_not_publish_a_version_another_append_took() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let (reached, at_gate) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+
+        let held = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .store_events_stream::<Counter, _, _, _>(
+                        &counter(),
+                        "Stale".to_string(),
+                        Metadata::default(),
+                        futures::stream::iter([Ok(CounterEvent::Added { amount: 1 })]),
+                        Some(0),
+                        crate::NoSink,
+                        || async move {
+                            reached.send(()).unwrap();
+                            released.await.unwrap();
+                            Next::Continue
+                        },
+                    )
+                    .await
+            }
+        });
+        at_gate.await.unwrap();
+        store
+            .store_events::<Counter>(
+                &counter(),
+                Counter::stream_type(),
+                Metadata::default(),
+                &[CounterEvent::Added { amount: 2 }],
+                Some(0),
+            )
+            .await
+            .expect("the competing append commits first");
+        release.send(()).unwrap();
+
+        let error = held.await.unwrap().unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        let events: Vec<PersistedEvent<CounterEvent>> = store
+            .stream_events_by_stream_id::<Counter>(&counter(), AggregateVersion::Latest, None, None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].version, 1);
+        assert_eq!(events[0].data, CounterEvent::Added { amount: 2 });
+        // The rejected append left the stream's type as the committed one recorded it.
+        let typed: Vec<PersistedEvent<CounterEvent>> = store
+            .stream_events(crate::StreamFilter::ForStreamTypes(vec![
+                "Counter".to_string()
+            ]))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(typed.len(), 1);
     }
 
     #[test]

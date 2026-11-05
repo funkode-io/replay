@@ -15,8 +15,9 @@ and ADR-0026's delivery bound for such a write is replaced by the one below. Dec
 A Policy finds the streams it owes work two ways (ADR-0026). The **sweep** reads new
 positions every poll and is cheap, but it can pass a **late write**: an append whose
 transaction had not committed when the sweep read past its position. The
-**reconciliation** catches late writes by comparing every stream's head with the
-Policy's place. That comparison costs one row per stream, so it runs on a cadence.
+**reconciliation** catches late writes by comparing stream heads with the Policy's
+places in a bounded window. A full pass still visits every tracked stream over successive
+cadences, so it remains the safety net rather than the per-poll path.
 
 At consumer scale this does not hold. In dxp-data-loom, 24 Policies over 131k streams
 made the comparison 98% of the database's execution time (#258), and production will
@@ -123,7 +124,9 @@ The full comparison, narrowed by #267, runs:
   correct.
 - **The cost of finding a late write is proportional to new events.** Each poll scans
   the stamp range assigned since the previous sweep, plus one indexed lookup per ended
-  transaction. The full comparison runs at leader start and every few minutes.
+  transaction. A full comparison starts at leader start and on demand; the recurring
+  safety net scans one bounded stream window every few minutes and rotates through the
+  tracked streams over successive cadences.
 - **The edge cases cost latency, never an event:**
 
   | Case | What happens |
