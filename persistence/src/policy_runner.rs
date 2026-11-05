@@ -3870,9 +3870,13 @@ impl Delivery<'_> {
                     Hold {
                         since: Instant::now(),
                         busy_attempts: 0,
-                        dispatch: identity,
+                        dispatch: identity.clone(),
                     }
                 });
+                // The hold follows whichever command is busy now: one held command
+                // running and the next one turning busy is still the same hold, with
+                // its start and its backoff, and it ends when this one answers.
+                held.dispatch = identity;
                 let backoff = hold_backoff(held.busy_attempts);
                 held.busy_attempts = held.busy_attempts.saturating_add(1);
                 tokio::select! {

@@ -410,3 +410,149 @@ async fn a_retry_that_meets_a_busy_command_leaves_the_row_parked_and_reports_bus
 
     harness.shutdown().await;
 }
+
+/// Fail retryably: the transient error a held command's sibling can meet.
+const FLAKE: u8 = 4;
+
+/// One answer for each of two commands, told apart by the stream each is sent to.
+#[derive(Clone)]
+struct TwoGates {
+    first: Arc<AtomicU8>,
+    second: Arc<AtomicU8>,
+    /// How many times each gate has been asked, in order `[first, second]`.
+    asked: Arc<[AtomicUsize; 2]>,
+}
+
+impl TwoGates {
+    fn answering(first: u8, second: u8) -> Self {
+        Self {
+            first: Arc::new(AtomicU8::new(first)),
+            second: Arc::new(AtomicU8::new(second)),
+            asked: Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]),
+        }
+    }
+
+    fn answer(&self, first: u8, second: u8) {
+        self.first.store(first, Ordering::SeqCst);
+        self.second.store(second, Ordering::SeqCst);
+    }
+
+    fn asked(&self, gate: usize) -> usize {
+        self.asked[gate].load(Ordering::SeqCst)
+    }
+}
+
+impl CommandMiddleware for TwoGates {
+    fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            let stream = context.stream_id().as_str().to_string();
+            let gate = if stream.ends_with("-first") {
+                0
+            } else if stream.ends_with("-second") {
+                1
+            } else {
+                return Next::Continue;
+            };
+            self.asked[gate].fetch_add(1, Ordering::SeqCst);
+            let answer = [&self.first, &self.second][gate].load(Ordering::SeqCst);
+            match answer {
+                BUSY => Next::Busy("maintenance in progress".to_string()),
+                FLAKE => Next::Error(replay::Error::unavailable("the downstream is down")),
+                _ => Next::Continue,
+            }
+        })
+    }
+}
+
+/// Echo into a `-first` stream, then into a `-second` stream.
+fn echo_twice(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
+    match &event.data {
+        ProbeEvent::Pinged { tag } => ["first", "second"]
+            .into_iter()
+            .map(|which| {
+                Dispatch::to::<Probe>(
+                    ProbeUrn::new(format!("{tag}-{which}")).unwrap(),
+                    ProbeCommand::Echo { tag: tag.clone() },
+                )
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// A hold passes from one busy command to the next: the first runs and the second
+/// turns busy, and it is still one hold — so the first failing retryably afterwards,
+/// before the second is reached, does not end it.
+#[tokio::test]
+#[traced_test]
+async fn a_hold_follows_the_command_that_is_busy_now_postgres_test() {
+    let gates = TwoGates::answering(BUSY, CONTINUE);
+    let harness = PolicyDaemonHarness::start_with_middleware(
+        "busy_handoff",
+        gates.clone(),
+        |builder, policy| {
+            builder.register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                echo_twice,
+            )
+        },
+    )
+    .await;
+    let policy = harness.policy_name().to_string();
+
+    let pinged = harness.ping("subject-1", "hello").await;
+    harness
+        .observe("the first command held", || async {
+            (gates.asked(0) >= 2).then_some(())
+        })
+        .await;
+
+    // The first runs; the second is busy now.
+    gates.answer(CONTINUE, BUSY);
+    let second_asked = gates.asked(1);
+    harness
+        .observe("the second command held", || async {
+            (gates.asked(1) >= second_asked + 2).then_some(())
+        })
+        .await;
+
+    // The first fails retryably from now on, so the second is reached only once the
+    // first has spent a whole retry budget — and the hold must survive that.
+    gates.answer(FLAKE, BUSY);
+    let first_asked = gates.asked(0);
+    harness
+        .observe("the first command failing retryably", || async {
+            (gates.asked(0) >= first_asked + 2).then_some(())
+        })
+        .await;
+
+    assert_eq!(harness.dead_letters().await.len(), 0);
+    assert!(!harness.has_passed(pinged.global_position).await);
+    logs_assert(|lines: &[&str]| {
+        let entered = hold_records(lines, &policy, "entered");
+        let left = hold_records(lines, &policy, "left");
+        if entered.len() != 1 || !left.is_empty() {
+            return Err(format!(
+                "expected one hold still open, got {entered:#?} entering and {left:#?} leaving"
+            ));
+        }
+        Ok(())
+    });
+
+    gates.answer(CONTINUE, CONTINUE);
+    harness.await_passed(pinged.global_position).await;
+    assert_eq!(harness.dead_letters().await.len(), 0);
+    logs_assert(|lines: &[&str]| {
+        let entered = hold_records(lines, &policy, "entered");
+        let left = hold_records(lines, &policy, "left");
+        if entered.len() != 1 || left.len() != 1 {
+            return Err(format!(
+                "expected one hold entered and left, got {entered:#?} and {left:#?}"
+            ));
+        }
+        Ok(())
+    });
+
+    harness.shutdown().await;
+}
