@@ -16,7 +16,7 @@ use common::policy_harness::{Probe, ProbeCommand, ProbeEvent, ProbeUrn, OBSERVE_
 use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
 use replay::Metadata;
 use replay_persistence::{
-    Causation, CommandContext, CommandMiddleware, Cqrs, Dispatch, Next, PolicyRunner,
+    Causation, CommandContextMut, CommandMiddleware, Cqrs, Dispatch, Next, PolicyRunner,
     PolicySettings, PostgresEventStore, StartAt,
 };
 
@@ -28,7 +28,7 @@ struct RecordsCausation(Arc<Mutex<Vec<Seen>>>);
 type Seen = (String, Option<Causation>);
 
 impl CommandMiddleware for RecordsCausation {
-    fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+    fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
         Box::pin(async move {
             self.0.lock().unwrap().push((
                 context.stream_id().to_string(),
@@ -44,7 +44,7 @@ impl CommandMiddleware for RecordsCausation {
 struct TampersWithCausation;
 
 impl CommandMiddleware for TampersWithCausation {
-    fn before<'a>(&'a self, context: &'a mut CommandContext) -> BoxFuture<'a, Next> {
+    fn before<'a>(&'a self, mut context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
         Box::pin(async move {
             if context.causation().is_some() {
                 assert!(context.set_metadata(Metadata::default()).is_err());

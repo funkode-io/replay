@@ -120,3 +120,12 @@ pub fn reset_peak() {
 pub fn peak_live_bytes() -> isize {
     PEAK.with(Cell::get)
 }
+
+/// Bytes requested by the current thread since it started.
+///
+/// Read it before and after an `async` block to total what the block requested: unlike
+/// [`allocated_bytes`], it needs no closure, so the block can be awaited in between. On a
+/// current-thread runtime everything the block runs is on this thread.
+pub fn allocated_so_far() -> usize {
+    ALLOCATED.with(Cell::get)
+}

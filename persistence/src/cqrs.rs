@@ -6,7 +6,7 @@ use replay::{Aggregate, Event};
 use urn::Urn;
 
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
-use crate::{CommandContext, CommandMiddleware, Next, Outcome};
+use crate::{CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome};
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
 const DEFAULT_COMPACTION_CHUNK_SIZE: u32 = 100;
@@ -130,9 +130,7 @@ impl<ES: EventStore> Cqrs<ES> {
     /// and later middlewares do not run: [`Next::Busy`] reaches the caller as a
     /// `replay::Error` of kind [`Busy`](replay::ErrorKind::Busy) carrying its reason,
     /// [`Next::Error`] as the error it carries. Metadata a middleware adds is carried by
-    /// the appended events. A middleware that continues after changing the command's
-    /// identity or its `causation` (by replacing the context whole) fails the command with
-    /// an [`Internal`](replay::ErrorKind::Internal) error.
+    /// the appended events; a middleware can change nothing else about the command.
     ///
     /// Once the command has finished, each middleware whose `before` answered `Continue`
     /// runs its `after`, in reverse registration order, with the [`Outcome`]: committed,
@@ -158,9 +156,6 @@ impl<ES: EventStore> Cqrs<ES> {
         }
 
         let mut context = CommandContext::new::<A>(id, metadata);
-        // What no middleware may change: `before` takes the context mutably, so one
-        // could replace it whole and slip past the metadata methods' own checks.
-        let arrived = context.clone();
         // How many middlewares answered `Continue`: the ones whose `after` runs.
         let mut continued = 0;
         // The reason a middleware gave when it answered `Busy`.
@@ -168,24 +163,13 @@ impl<ES: EventStore> Cqrs<ES> {
 
         let result = 'command: {
             for middleware in self.middlewares.iter() {
-                let answer = middleware.before(&mut context).await;
-                // A middleware that replaced the context whole, whatever it answers: the
-                // middlewares that ran before it, and the error the caller gets, name the
-                // command as it arrived, not the replacement.
-                let replaced = !context.is_the_command(&arrived);
-                if replaced {
-                    context = arrived.clone();
-                }
-                match answer {
-                    Next::Continue if replaced => {
-                        let error = replay::Error::internal(
-                            "a command middleware changed the command's identity or causation",
-                        )
-                        .with_operation("execute")
-                        .with_context("stream_id", context.stream_id())
-                        .with_context("command", context.command_type());
-                        break 'command Err(A::Error::from(error));
-                    }
+                // The handle lets `before` change the metadata, through its checked
+                // setters, and nothing else: the command's identity and causation stay
+                // as they arrived.
+                match middleware
+                    .before(CommandContextMut::new(&mut context))
+                    .await
+                {
                     Next::Continue => continued += 1,
                     Next::Busy(reason) => {
                         let error = replay::Error::busy(reason.clone())
