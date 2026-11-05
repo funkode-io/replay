@@ -7,14 +7,16 @@
 //! transaction an inline projection wrote each event's row in, and an online Policy
 //! delivering while a bulk is still between segments.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use replay::{Aggregate, EventStream, WithId};
 use replay_persistence::{
-    Cqrs, Lanes, PersistedEvent, PolicySettings, PostgresEventStore, StartAt, StreamFilter,
+    CommandContext, CommandMiddleware, Cqrs, Lanes, Next, Outcome, PersistedEvent, PolicySettings,
+    PostgresEventStore, StartAt, StreamFilter,
 };
 use tokio::sync::Notify;
 
@@ -25,6 +27,9 @@ use common::policy_harness::{PolicyDaemonHarness, ProbeEvent, ProbeUrn};
 /// The segment size every test here appends with: small, so a dozen events span
 /// several segments.
 const SEGMENT: usize = 5;
+
+/// The projection flush size of [`projected_store`]: below [`SEGMENT`].
+const PROJECTION_FLUSH: usize = 2;
 
 // ── Fixture: an importer whose handler stream can fail or pause part-way ─────
 
@@ -149,6 +154,62 @@ async fn transactions_of(harness: &PolicyDaemonHarness, stream: &ProbeUrn) -> i6
         .expect("the commit stamps must be readable")
 }
 
+/// A store committing a bulk every [`SEGMENT`] events, with an inline projection that
+/// records, for every event, the transaction it was applied in. Its flush size is
+/// [`PROJECTION_FLUSH`], below the segment, so a segment writes projection rows before
+/// it ends and a rollback has some to take back.
+async fn projected_store(harness: &PolicyDaemonHarness) -> PostgresEventStore {
+    sqlx::query(
+        "CREATE TABLE bulk_segment_seen (\
+             stream_id TEXT NOT NULL, version BIGINT NOT NULL, txid xid8 NOT NULL, \
+             PRIMARY KEY (stream_id, version))",
+    )
+    .execute(harness.pool())
+    .await
+    .expect("the projection's table must be created");
+
+    PostgresEventStore::builder(harness.pool().clone())
+        .bulk_segment_size(SEGMENT)
+        .projection_flush_size(PROJECTION_FLUSH)
+        .register_postgres_event_handler::<ProbeEvent, _>(
+            "bulk_segment_seen",
+            1,
+            |conn: &mut sqlx::PgConnection, events: &[PersistedEvent<ProbeEvent>]| {
+                let rows: Vec<(String, i64)> = events
+                    .iter()
+                    .map(|event| (event.stream_id.to_string(), event.version))
+                    .collect();
+                let fut: BoxFuture<'_, Result<(), replay::Error>> = Box::pin(async move {
+                    for (stream_id, version) in rows {
+                        sqlx::query(
+                            "INSERT INTO bulk_segment_seen (stream_id, version, txid) \
+                             VALUES ($1, $2, pg_current_xact_id())",
+                        )
+                        .bind(stream_id)
+                        .bind(version)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(replay_persistence::db_error)?;
+                    }
+                    Ok(())
+                });
+                fut
+            },
+        )
+        .build()
+        .await
+        .expect("the store must build")
+}
+
+/// How many of `stream`'s events the projection recorded.
+async fn projected_in(harness: &PolicyDaemonHarness, stream: &ProbeUrn) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM bulk_segment_seen WHERE stream_id = $1")
+        .bind(stream.to_urn().to_string())
+        .fetch_one(harness.pool())
+        .await
+        .expect("the projection's rows must be countable")
+}
+
 /// A handler stream that fails after two segments leaves those two segments committed,
 /// with a row of work for each of their events, and the caller sees the failure. The
 /// failing record sits inside the third segment, so what that segment had already
@@ -215,46 +276,7 @@ async fn an_inline_projection_sees_each_segment_inside_its_transaction_postgres_
         builder.register_policy_fn::<ProbeEvent, _>(policy, bulk(), |_| vec![])
     })
     .await;
-    sqlx::query(
-        "CREATE TABLE bulk_segment_seen (\
-             stream_id TEXT NOT NULL, version BIGINT NOT NULL, txid xid8 NOT NULL, \
-             PRIMARY KEY (stream_id, version))",
-    )
-    .execute(harness.pool())
-    .await
-    .expect("the projection's table must be created");
-
-    let store = PostgresEventStore::builder(harness.pool().clone())
-        .bulk_segment_size(SEGMENT)
-        .register_postgres_event_handler::<ProbeEvent, _>(
-            "bulk_segment_seen",
-            1,
-            |conn: &mut sqlx::PgConnection, events: &[PersistedEvent<ProbeEvent>]| {
-                let rows: Vec<(String, i64)> = events
-                    .iter()
-                    .map(|event| (event.stream_id.to_string(), event.version))
-                    .collect();
-                let fut: BoxFuture<'_, Result<(), replay::Error>> = Box::pin(async move {
-                    for (stream_id, version) in rows {
-                        sqlx::query(
-                            "INSERT INTO bulk_segment_seen (stream_id, version, txid) \
-                             VALUES ($1, $2, pg_current_xact_id())",
-                        )
-                        .bind(stream_id)
-                        .bind(version)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(replay_persistence::db_error)?;
-                    }
-                    Ok(())
-                });
-                fut
-            },
-        )
-        .build()
-        .await
-        .expect("the store must build");
-    let cqrs = Cqrs::new(store);
+    let cqrs = Cqrs::new(projected_store(&harness).await);
 
     let stream = importer("projected-import");
     cqrs.execute_bulk::<Importer>(
@@ -301,14 +323,9 @@ async fn an_inline_projection_sees_each_segment_inside_its_transaction_postgres_
     )
     .await
     .expect_err("the handler's error must reach the caller");
-    let projected: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM bulk_segment_seen WHERE stream_id = $1")
-            .bind(failing.to_urn().to_string())
-            .fetch_one(harness.pool())
-            .await
-            .expect("the projection's rows must be countable");
     assert_eq!(
-        projected, SEGMENT as i64,
+        projected_in(&harness, &failing).await,
+        SEGMENT as i64,
         "the rolled-back segment's projection rows roll back with it"
     );
 
@@ -386,6 +403,84 @@ async fn an_online_policy_delivers_while_a_bulk_is_between_segments_postgres_tes
         .expect("the bulk task must not panic")
         .expect("the bulk execution must succeed");
     assert_eq!(events_in(&harness, &stream).await, (2 * SEGMENT) as i64);
+
+    harness.shutdown().await;
+}
+
+/// Answers `Continue` at the first commit gate it is asked and `Busy` at every later
+/// one, and records how often it was asked and the outcome `after` was told.
+/// A clone shares the record, so the test keeps one while the `Cqrs` owns another.
+#[derive(Clone, Default)]
+struct BusyFromTheSecondSegment {
+    asked: Arc<AtomicUsize>,
+    outcome: Arc<Mutex<Option<String>>>,
+}
+
+impl CommandMiddleware for BusyFromTheSecondSegment {
+    fn before_commit<'a>(&'a self, _: &'a CommandContext) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            match self.asked.fetch_add(1, Ordering::SeqCst) {
+                0 => Next::Continue,
+                _ => Next::Busy("the import window closed".to_string()),
+            }
+        })
+    }
+
+    fn after<'a>(&'a self, _: &'a CommandContext, outcome: &'a Outcome<'a>) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            *self.outcome.lock().unwrap() = Some(match outcome {
+                Outcome::Committed => "committed".to_string(),
+                Outcome::Busy(reason) => format!("busy: {reason}"),
+                Outcome::Failed(error) => format!("failed: {error}"),
+            });
+        })
+    }
+}
+
+/// The commit gate is asked once per segment: a middleware that stops the second
+/// segment rolls back that segment alone — its events, projection rows and work —
+/// while the first stands, and both the caller and `after` see the `Busy`.
+#[tokio::test]
+async fn a_gate_that_stops_a_later_segment_rolls_back_that_segment_alone_postgres_test() {
+    let mut harness = PolicyDaemonHarness::start("bulk_segment_gate", |builder, policy| {
+        builder.register_policy_fn::<ProbeEvent, _>(policy, bulk(), |_| vec![])
+    })
+    .await;
+    let policy = harness.policy_name().to_string();
+    harness.await_bulk_registration(&policy).await;
+    harness.stop().await;
+
+    let gate = BusyFromTheSecondSegment::default();
+    let cqrs = Cqrs::new(projected_store(&harness).await).with_middleware(gate.clone());
+    let stream = importer("gated-import");
+    let stopped = cqrs
+        .execute_bulk::<Importer>(
+            &stream,
+            replay::Metadata::default(),
+            Import::of(2 * SEGMENT + 2),
+            &Arc::new(Notify::new()),
+            None,
+        )
+        .await;
+
+    let error = match stopped {
+        Ok(_) => panic!("the middleware's Busy must reach the caller"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), replay::ErrorKind::Busy, "got {error:?}");
+    assert_eq!(
+        gate.asked.load(Ordering::SeqCst),
+        2,
+        "asked before each segment's commit, and never again after it stopped one"
+    );
+    assert_eq!(
+        gate.outcome.lock().unwrap().as_deref(),
+        Some("busy: the import window closed"),
+        "after is told the Busy"
+    );
+    assert_eq!(events_in(&harness, &stream).await, SEGMENT as i64);
+    assert_eq!(projected_in(&harness, &stream).await, SEGMENT as i64);
+    assert_eq!(harness.bulk_work(&policy).await, SEGMENT as i64);
 
     harness.shutdown().await;
 }
