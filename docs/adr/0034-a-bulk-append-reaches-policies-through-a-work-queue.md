@@ -82,8 +82,12 @@ lane writes the Policy's row of `policy_bulk_registrations` when its worker star
 before the leader election. The row is separate from `policy_cursors`, so a bulk-only
 Policy gets no online cursor and nothing in the online machinery changes. A registration
 only ever **widens**. Every replica merges the stream types it tracks into the row, and
-`NULL` (every stream) absorbs any list. A rolling deploy therefore cannot drop work. The
-worker's read applies the Policy's own filter and deletes the work it does not deliver.
+`NULL` (every stream) absorbs any list, so an older replica in a rolling deploy cannot
+narrow the **fan-out** at the append. Delivery is narrower: the worker's read applies
+the Policy's filter as its own release knows it, and it deletes the claimed work it does
+not deliver. While an older leader still runs, work for a stream type that only the
+newer release tracks can therefore be deleted undelivered. Widening a bulk Policy's types
+needs the older leaders stopped before anything appends a bulk of the new type.
 
 A Policy removed from the code keeps its registration, and bulk appends keep queueing
 work for it. Retiring it is an operator's act: delete its registration and its work rows

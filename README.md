@@ -2870,16 +2870,10 @@ impl Aggregate for Import {
     }
 }
 
-// Commits in segments of `bulk_segment_size` events, each one transaction with its
-// inline-projection rows and its bulk work. Returns once every segment has committed.
-cqrs.execute_bulk::<Import>(&import_id, metadata.clone(), ImportCommand::ProcessFile { file }, &services, None)
-    .await?;
-
-// The domain records completion the ordinary way, if anyone needs to know.
-cqrs.execute::<Import>(&import_id, metadata, ImportCommand::Complete, &services, None)
-    .await?;
-
-PolicyRunner::builder(cqrs)
+// Register the bulk Policies before the first bulk: work is queued at the append, only
+// for the Policies registered by then. `drain` registers them and returns; building the
+// runner alone does not, and `start_polling` registers them in the background.
+let runner = PolicyRunner::builder(cqrs.clone())
     .register_policy(CreateSku, PolicySettings::new()
         .with_stream_filter(StreamFilter::for_stream_type::<Import>())
         .on_lanes(Lanes::Bulk))       // file records only, through the work queue
@@ -2888,6 +2882,17 @@ PolicyRunner::builder(cqrs)
         .on_lanes(Lanes::Both))       // UI records online, file records bulk
     .register_policy(DepositFee, PolicySettings::new())  // online by default; never sees a bulk event
     .build();
+runner.drain().await?;
+let daemon = runner.start_polling(Duration::from_secs(30));
+
+// Commits in segments of `bulk_segment_size` events, each one transaction with its
+// inline-projection rows and its bulk work. Returns once every segment has committed.
+cqrs.execute_bulk::<Import>(&import_id, metadata.clone(), ImportCommand::ProcessFile { file }, &services, None)
+    .await?;
+
+// The domain records completion the ordinary way, if anyone needs to know.
+cqrs.execute::<Import>(&import_id, metadata, ImportCommand::Complete, &services, None)
+    .await?;
 ```
 
 What each party sees:
@@ -2917,8 +2922,11 @@ The rules:
 - **External facts stay in tables.** The bulk lane is for decisions. A supplier's rows,
   a file's contents or another system's prices are input the domain reads when it
   decides, not events (see [Events record facts, not state](#events-record-facts-not-state)).
-- **A bulk Policy cannot be rebuilt from history.** One registered after a segment
-  committed never receives that segment, whatever its `StartAt`.
+- **Register before the first bulk; a bulk Policy cannot be rebuilt from history.** The
+  work is queued at the append, for the Policies registered by then, so one registered
+  after a segment committed never receives that segment, whatever its `StartAt`. A
+  Policy is registered when its runner drains or its worker starts, not when the runner
+  is built: on a fresh database, `drain` the runner once before the first `execute_bulk`.
 
 A command a bulk Policy dispatches is an ordinary online command, so its events reach
 online Policies as any other. A command that fails for good is a
