@@ -97,9 +97,9 @@ use super::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, Liveness,
-    PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
-    PostgresEventStore, StoppedWorker, WorkerLiveness,
+    CommandMiddleware, Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary,
+    Escalation, Liveness, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus,
+    PolicyStatusStore, PostgresEventStore, StoppedWorker, WorkerLiveness,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -416,6 +416,8 @@ pub struct PolicyDaemonHarness {
     /// How the policy under test is registered. Kept so [`restart`](Self::restart)
     /// can build the same daemon again against the same database.
     configure: Arc<Configure>,
+    /// How often the daemon polls the feed, kept for [`restart`](Self::restart).
+    poll_interval: Duration,
     escalations: Escalations,
     daemon: Option<PolicyRunnerDaemon>,
 }
@@ -434,6 +436,45 @@ impl PolicyDaemonHarness {
     /// woven into that name to keep it legible in logs and in a failed
     /// assertion.
     pub async fn start<F>(label: &str, configure: F) -> Self
+    where
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
+    {
+        Self::start_with(label, DAEMON_POLL_INTERVAL, |cqrs| cqrs, configure).await
+    }
+
+    /// [`start`](Self::start), with the daemon polling every `poll_interval` instead of
+    /// the harness's short default: for a test about what the interval paces.
+    pub async fn start_polling_every<F>(label: &str, poll_interval: Duration, configure: F) -> Self
+    where
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
+    {
+        Self::start_with(label, poll_interval, |cqrs| cqrs, configure).await
+    }
+
+    /// [`start`](Self::start), with a [`CommandMiddleware`] registered on the `Cqrs`
+    /// every command goes through: the daemon's dispatches, the out-of-band retries,
+    /// and the harness's own [`ping`](Self::ping)s alike — so a middleware that is to
+    /// stop only the Policy's commands tells them apart by their Causation.
+    pub async fn start_with_middleware<M, F>(label: &str, middleware: M, configure: F) -> Self
+    where
+        M: CommandMiddleware + 'static,
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
+    {
+        Self::start_with(
+            label,
+            DAEMON_POLL_INTERVAL,
+            |cqrs| cqrs.with_middleware(middleware),
+            configure,
+        )
+        .await
+    }
+
+    async fn start_with<F>(
+        label: &str,
+        poll_interval: Duration,
+        build: impl FnOnce(Cqrs<PostgresEventStore>) -> Cqrs<PostgresEventStore>,
+        configure: F,
+    ) -> Self
     where
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
@@ -462,7 +503,7 @@ impl PolicyDaemonHarness {
             .await
             .expect("failed to run migrations");
 
-        let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+        let cqrs = build(Cqrs::new(PostgresEventStore::new(pool.clone())));
         let policy_name = unique_policy_name(label);
         let configure: Arc<Configure> = Arc::new(configure);
         let escalations = Escalations::default();
@@ -473,6 +514,7 @@ impl PolicyDaemonHarness {
             &policy_name,
             &escalations,
             PRIMARY_REPLICA,
+            poll_interval,
         );
 
         Self {
@@ -481,6 +523,7 @@ impl PolicyDaemonHarness {
             cqrs,
             policy_name,
             configure,
+            poll_interval,
             escalations,
             daemon: Some(daemon),
         }
@@ -521,6 +564,7 @@ impl PolicyDaemonHarness {
             &self.policy_name,
             &self.escalations,
             PRIMARY_REPLICA,
+            self.poll_interval,
         ));
     }
 
@@ -661,6 +705,41 @@ impl PolicyDaemonHarness {
     ) -> HeldPing {
         let tx = self.pool.begin().await.expect("beginning must succeed");
         Self::append_held(tx, stream_type, stream_id, tag).await
+    }
+
+    /// Append a `Pinged` event to the probe stream `stream` on the **bulk lane**, through
+    /// the store's own writer: the internal append path a bulk append stamps its events
+    /// with (ADR-0034). No online Policy may react to it.
+    pub async fn bulk_ping(&self, stream: &str, tag: &str) -> AppendedEvent {
+        let stream_id = ProbeUrn::new(stream)
+            .expect("stream name must be a valid URN NSS")
+            .to_urn()
+            .to_string();
+        let event = ProbeEvent::Pinged {
+            tag: tag.to_string(),
+        };
+        let event_id = Uuid::new_v4();
+        sqlx::query("SELECT id FROM write_event($1, $2, $3, $4, $5, 'Probe', NULL, FALSE, 'bulk')")
+            .bind(event_id)
+            .bind(serde_json::to_value(&event).expect("a probe event must serialise"))
+            .bind(serde_json::json!({ PING_MARKER_KEY: Uuid::new_v4() }))
+            .bind(replay::Event::event_type(&event))
+            .bind(&stream_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the bulk append must succeed");
+        let global_position: i64 =
+            sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(&self.pool)
+                .await
+                .expect("the bulk event must have a position");
+
+        AppendedEvent {
+            event_id,
+            global_position,
+            stream_id,
+        }
     }
 
     /// Start a transaction that has taken its id and written nothing: an older writer, to
@@ -1105,6 +1184,7 @@ impl PolicyDaemonHarness {
             &self.policy_name,
             &escalations,
             SECOND_REPLICA,
+            self.poll_interval,
         );
         PolicyDaemonReplica {
             escalations,
@@ -1686,6 +1766,7 @@ fn spawn_daemon(
     policy_name: &str,
     escalations: &Escalations,
     replica_id: &str,
+    poll_interval: Duration,
 ) -> PolicyRunnerDaemon {
     configure(
         PolicyRunner::builder(cqrs.clone())
@@ -1697,5 +1778,5 @@ fn spawn_daemon(
         policy_name,
     )
     .build()
-    .start_polling(DAEMON_POLL_INTERVAL)
+    .start_polling(poll_interval)
 }

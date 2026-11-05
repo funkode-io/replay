@@ -462,6 +462,12 @@ pub enum DeadLetterRetry {
     /// nobody retried, or overwrite it with an error from a replay that started
     /// earlier (funkode-io/replay#227). Retry again to act on what is parked now.
     Superseded,
+    /// The replay met a command a middleware answered [`Busy`](replay::ErrorKind::Busy)
+    /// for — not now, rather than wrong (ADR-0036). Nothing was settled: every row of
+    /// the reaction is left parked exactly as it was, its retry count included, so a
+    /// retry made during maintenance does nothing and loses nothing. Retry again once
+    /// the middleware lets commands through.
+    Busy,
     /// No dead-letter row matched the supplied id: nothing to do.
     NotFound,
 }
@@ -488,8 +494,13 @@ pub struct DeadLetterRetrySummary {
     /// Reactions whose every parked row resolved and was archived (reason
     /// `retried`).
     pub reactions_resolved: usize,
-    /// Reactions with at least one row still parked after the replay.
+    /// Reactions with at least one row still parked after the replay. A reaction
+    /// whose replay met a busy command is counted in
+    /// [`reactions_busy`](Self::reactions_busy) instead, though its rows are parked too.
     pub reactions_still_failing: usize,
+    /// Reactions whose replay met a [`Busy`](replay::ErrorKind::Busy) command and
+    /// settled nothing: every row left parked as it was ([`DeadLetterRetry::Busy`]).
+    pub reactions_busy: usize,
 }
 
 /// Native runner that drives registered policies against the event feed.
@@ -906,6 +917,12 @@ impl PolicyRunner {
     /// policy's places rather than doing it on a cadence, so a place moved by hand is
     /// found by the very next call.
     ///
+    /// A command a middleware answers [`Busy`](replay::ErrorKind::Busy) for is held here
+    /// exactly as a daemon's worker holds it (ADR-0036): the call does not return until
+    /// the middleware lets the command through. Nothing is parked meanwhile, so dropping
+    /// the future — under a timeout of the caller's, say — loses nothing; the next drain
+    /// delivers the event again.
+    ///
     /// Returns how many dispatches **committed** across all policies — a progress
     /// signal, not an audit. A delivery that fails does not contribute its
     /// partial work: a permanent failure counts only the dispatches that
@@ -948,6 +965,11 @@ impl PolicyRunner {
     ///   settle their own rows; every other row of the group is updated to
     ///   [`PANIC_ERROR_KIND`] and the panic's message. The panic never reaches
     ///   the caller, so a bulk retry continues with the next reaction.
+    /// - a command is **busy** — a middleware answered `Busy` → the replay stops
+    ///   there and settles **nothing**: every row of the group is left parked as it
+    ///   was, retry count included, and the row reports [`DeadLetterRetry::Busy`]. A
+    ///   retry never holds the way the drain does; it is the operator's call, and it
+    ///   answers rather than waits (ADR-0036).
     ///
     /// A row that names no dispatch — parked before the identity migration, or
     /// parked for a panic in `react` itself — is settled by the replay as a
@@ -1087,6 +1109,9 @@ impl PolicyRunner {
                 executors: &self.executors,
                 policy_name,
                 dispatch_timeout: resolve_dispatch_timeout(policy.settings()),
+                // A retry never holds: it is the operator's call, and it answers busy
+                // instead of waiting for the middleware.
+                stand_down: &StandDown::never(),
             };
             for (ordinal, dispatch) in policy.react_erased(&raw).into_iter().enumerate() {
                 if !self.executors.contains_key(&dispatch.target()) {
@@ -1105,6 +1130,11 @@ impl PolicyRunner {
                     .await
                 {
                     Ok(()) => None,
+                    // Not now (ADR-0036): the replay stops here and settles nothing.
+                    // The dispatches after this one would meet the same middleware,
+                    // and what the ones before it concluded would settle only part
+                    // of a reaction that has not been tried as a whole.
+                    Err(busy) if busy.busy() => return Ok(Some(busy.to_string())),
                     // Stale reaction: the aggregate now declines it. A clean
                     // resolution, so the row it belongs to is archived.
                     Err(declined) if declined.declined() => None,
@@ -1112,16 +1142,40 @@ impl PolicyRunner {
                 };
                 concluded.push(identity, outcome);
             }
-            Ok(())
+            Ok(None)
         })
         .catch_unwind()
         .await;
 
         let replay = match attempt {
-            Ok(result) => {
-                result?;
-                Replay::Ran(concluded.take(None))
-            }
+            Ok(result) => match result? {
+                Some(reason) => {
+                    tracing::info!(
+                        policy   = %policy_name,
+                        event_id = %event_id,
+                        global_position,
+                        reason   = %reason,
+                        "retried policy reaction met a busy command; leaving every \
+                         dead letter it parked as it was"
+                    );
+                    // The row asked about is busy if it is still parked; one a
+                    // concurrent discard took out while the replay ran is gone, and
+                    // says so, as a settlement that matched nothing does.
+                    let asked = match asked_about {
+                        Some(id) => Some(match unsettled(&self.pool, id).await? {
+                            DeadLetterRetry::NotFound => DeadLetterRetry::NotFound,
+                            _ => DeadLetterRetry::Busy,
+                        }),
+                        None => None,
+                    };
+                    return Ok(ReactionSettlement {
+                        busy: true,
+                        asked_about: asked,
+                        ..Default::default()
+                    });
+                }
+                None => Replay::Ran(concluded.take(None)),
+            },
             Err(payload) => {
                 let message = panic_message(&*payload);
                 tracing::error!(
@@ -1400,8 +1454,12 @@ impl PolicyRunner {
     ///
     /// Returns a [`DeadLetterRetrySummary`] counting **reactions**, as this run
     /// settled them: one whose every row was archived is resolved, one with any
-    /// row still parked is still failing. `reactions_still_failing == 0` says
-    /// the run settled everything it read, not that the table is empty now — a
+    /// row still parked is still failing, and one whose replay met a
+    /// [`Busy`](replay::ErrorKind::Busy) command is busy, its rows left as they were
+    /// ([`DeadLetterRetry::Busy`]). A busy reaction does not stop the run: the next
+    /// one is replayed, and answers for itself. `reactions_still_failing == 0` and
+    /// `reactions_busy == 0` together say the run settled everything it read — a busy
+    /// reaction settled nothing and is still parked — not that the table is empty now: a
     /// delivery parking a command while the run walks, or one statement after it
     /// returns, is a row the count cannot have seen. `PolicyStatus` is what
     /// answers "is anything parked", and the next bulk retry picks it up. A
@@ -1443,7 +1501,9 @@ impl PolicyRunner {
             for reaction in page {
                 let settled = self.retry_reaction(reaction, OPERATION, None).await?;
 
-                if settled.any_still_failing {
+                if settled.busy {
+                    summary.reactions_busy += 1;
+                } else if settled.any_still_failing {
                     summary.reactions_still_failing += 1;
                 } else if settled.any_resolved {
                     summary.reactions_resolved += 1;
@@ -1699,9 +1759,13 @@ impl PolicyRunner {
             policy,
             progress,
             max_depth,
-            &mut Reporting { narration: None },
+            &mut Reporting {
+                narration: None,
+                stand_down: StandDown::never(),
+            },
         )
         .await
+        .map(|polled| polled.executed)
     }
 }
 
@@ -2197,7 +2261,7 @@ impl PolicyWorker {
                 // whose dispatches take minutes is working throughout, and a
                 // record earned only when the poll returns would be paced by the
                 // work rather than by the clock.
-                if let Err(error) = drain_policy_once(
+                let behind = match drain_policy_once(
                     &cqrs,
                     &pool,
                     &executors,
@@ -2206,21 +2270,41 @@ impl PolicyWorker {
                     max_depth,
                     &mut Reporting {
                         narration: Some(&mut narration),
+                        stand_down: StandDown::on(shutdown_rx.clone(), leader_rx.clone()),
                     },
                 )
                 .await
                 {
-                    // The failure earns no record of its own: it did not catch
-                    // up, and the error below is what says so. Whatever the poll
-                    // observed before failing — the window it opened on, the
-                    // positions it advanced over — happened, and its records
-                    // stand.
-                    tracing::error!(
-                        policy = %name,
-                        error = %error,
-                        "policy polling iteration failed"
-                    );
-                }
+                    Ok(polled) => polled.behind,
+                    Err(error) => {
+                        // The failure earns no record of its own: it did not catch
+                        // up, and the error below is what says so. Whatever the poll
+                        // observed before failing — the window it opened on, the
+                        // positions it advanced over — happened, and its records
+                        // stand.
+                        //
+                        // A poll cut short because this worker is to stop leading is
+                        // not a fault: a hold on a busy command ends that way, and has
+                        // said so itself.
+                        if *shutdown_rx.borrow() || !*leader_rx.borrow() {
+                            tracing::debug!(
+                                policy = %name,
+                                error = %error,
+                                "policy poll ended as the worker stopped leading"
+                            );
+                        } else {
+                            tracing::error!(
+                                policy = %name,
+                                error = %error,
+                                "policy polling iteration failed"
+                            );
+                        }
+                        // Waits out the interval like a caught-up poll: a failure
+                        // retried at once would only fail again at the speed of
+                        // the database.
+                        false
+                    }
+                };
 
                 // Published after the drain rather than before it, so the stamp
                 // reads "last poll that came back": a worker held inside one long
@@ -2230,11 +2314,24 @@ impl PolicyWorker {
                 // while a reaction holds it.
                 liveness.polled(Instant::now());
 
+                // A poll that left work it knows about polls again rather than
+                // sleeping: the interval is the safety net for a missed NOTIFY,
+                // not the pace a backlog is worked through at (funkode-io/replay#322).
+                // It gives the runtime a turn first, so the other Policies'
+                // workers and the lock manager are not starved by a long backlog,
+                // and still answers shutdown and a leadership change before it
+                // goes on: the select below is biased towards them, and its
+                // `behind` branch is ready only once neither has news.
+                if behind {
+                    tokio::task::yield_now().await;
+                }
+
                 // Wait for the next wakeup: NOTIFY broadcast (if enabled),
                 // poll timeout, leadership change, or shutdown — whichever
-                // fires first.
+                // fires first; at once if the poll left work behind.
                 if let Some(ref mut wake) = wake_rx {
                     tokio::select! {
+                        biased;
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 break;
@@ -2245,6 +2342,7 @@ impl PolicyWorker {
                                 return Stop::Abandoned;
                             }
                         }
+                        _ = std::future::ready(()), if behind => {}
                         _ = tokio::time::sleep(interval) => {}
                         res = wake.recv() => {
                             // Ok or Lagged both mean "drain now"; Closed
@@ -2256,6 +2354,7 @@ impl PolicyWorker {
                     }
                 } else {
                     tokio::select! {
+                        biased;
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 break;
@@ -2266,6 +2365,7 @@ impl PolicyWorker {
                                 return Stop::Abandoned;
                             }
                         }
+                        _ = std::future::ready(()), if behind => {}
                         _ = tokio::time::sleep(interval) => {}
                     }
                 }
@@ -2442,6 +2542,82 @@ fn panic_cause(error: tokio::task::JoinError) -> String {
 /// starting at 100 ms.
 const MAX_DISPATCH_RETRIES: u32 = 3;
 
+/// The first wait of a [hold](Delivery::execute_event_reactions), doubled after each
+/// busy attempt up to [`HOLD_MAX_BACKOFF`].
+const HOLD_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The ceiling a hold's backoff stops doubling at: the longest a held Policy can take
+/// to notice that its middleware lets commands through again. A maintenance window is
+/// minutes long, so a few seconds of it is small; one attempt per this long is what a
+/// hold costs the middleware while it lasts.
+const HOLD_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How long to wait before the next attempt of a hold that has already been busy
+/// `busy_attempts` times: [`HOLD_INITIAL_BACKOFF`] doubled per attempt, never past
+/// [`HOLD_MAX_BACKOFF`].
+fn hold_backoff(busy_attempts: u32) -> Duration {
+    HOLD_INITIAL_BACKOFF
+        .saturating_mul(1u32 << busy_attempts.min(16))
+        .min(HOLD_MAX_BACKOFF)
+}
+
+/// What ends a hold other than the command running: the worker being asked to stop
+/// leading, by a shutdown or a lost election.
+///
+/// A hold lasts for as long as a middleware stays busy, which has no bound the runner
+/// knows. A worker that only looked at its signals between polls would never see them
+/// from inside one: a shutdown would wait for the maintenance window to end, and a
+/// replica that lost its lock would keep dispatching after another had taken over.
+#[derive(Clone, Default)]
+struct StandDown {
+    /// The daemon's shutdown and this Policy's leadership, or `None` where nothing can
+    /// call a hold off — a manual [`PolicyRunner::drain`], whose caller drops the future
+    /// instead, and a retry, which never holds.
+    signals: Option<(watch::Receiver<bool>, watch::Receiver<bool>)>,
+}
+
+impl StandDown {
+    /// A hold nothing but its own end can call off.
+    fn never() -> Self {
+        Self::default()
+    }
+
+    /// A hold called off when `shutdown` turns true or `leader` turns false.
+    fn on(shutdown: watch::Receiver<bool>, leader: watch::Receiver<bool>) -> Self {
+        Self {
+            signals: Some((shutdown, leader)),
+        }
+    }
+
+    /// Resolves once the worker should stop leading; never, for [`Self::never`]. A
+    /// channel whose sender is gone resolves it too: nothing is left to say "carry on".
+    async fn signalled(&self) {
+        let Some((shutdown, leader)) = &self.signals else {
+            return std::future::pending().await;
+        };
+        let (mut shutdown, mut leader) = (shutdown.clone(), leader.clone());
+        tokio::select! {
+            _ = shutdown.wait_for(|stopping| *stopping) => {}
+            _ = leader.wait_for(|leading| !*leading) => {}
+        }
+    }
+}
+
+/// A Policy holding on one event because its command is busy (ADR-0036).
+///
+/// Lives for one delivery: it opens on the first busy attempt and closes on the first
+/// attempt that is anything else, so it is two [Narration] records however long it
+/// lasts.
+///
+/// [Narration]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#narration
+struct Hold {
+    since: Instant,
+    /// Busy attempts so far, which is what the backoff doubles on.
+    busy_attempts: u32,
+    /// The dispatch that was busy: the hold ends when it answers anything else.
+    dispatch: DispatchIdentity,
+}
+
 /// Returns `true` for errors whose cause may be transient and worth retrying.
 fn is_retryable(kind: replay::ErrorKind) -> bool {
     use replay::ErrorKind::{Conflict, RateLimited, Unavailable};
@@ -2465,6 +2641,13 @@ impl DispatchFailure {
     /// the runner's, and the cursor advances past it.
     fn declined(&self) -> bool {
         matches!(self, Self::Returned(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation)
+    }
+
+    /// A middleware (or the command handler) said not now: the runner holds the
+    /// reaction rather than spending its retry budget on it (ADR-0036). A timeout is
+    /// never busy — nothing came back to say so.
+    fn busy(&self) -> bool {
+        matches!(self, Self::Returned(e) if e.kind() == replay::ErrorKind::Busy)
     }
 
     /// A timeout is retryable by construction: the runner has no evidence the
@@ -2507,6 +2690,11 @@ struct Attempt {
     /// the delivery ends by unwinding out of a command handler instead of
     /// returning an error.
     in_flight: Option<DispatchIdentity>,
+    /// When the delivery's open hold on a busy command began, if one is open. Kept
+    /// across attempts, unlike the rest, so a panic that settles the delivery from
+    /// outside the attempt loop can close the hold it unwound out of in the
+    /// narration (ADR-0036: one record on entering, one on leaving).
+    held_since: Option<Instant>,
 }
 
 /// A dispatch that failed, and which dispatch it was.
@@ -2534,6 +2722,15 @@ struct DispatchIdentity {
 }
 
 impl DispatchIdentity {
+    /// Whether `other` is the same dispatch of the same reaction: its place in the
+    /// vector, and the command and instance it names.
+    fn is(&self, other: &DispatchIdentity) -> bool {
+        self.ordinal == other.ordinal
+            && self.aggregate_name == other.aggregate_name
+            && self.target_stream_id == other.target_stream_id
+            && self.command_name == other.command_name
+    }
+
     fn of(ordinal: usize, dispatch: &Dispatch) -> Self {
         Self {
             aggregate_name: dispatch.aggregate_name(),
@@ -2710,6 +2907,8 @@ struct ReactionSettlement {
     any_still_failing: bool,
     /// What the row a by-id retry asked about concluded.
     asked_about: Option<DeadLetterRetry>,
+    /// Whether the replay met a busy command and so settled nothing (ADR-0036).
+    busy: bool,
 }
 
 impl ReactionSettlement {
@@ -2720,7 +2919,7 @@ impl ReactionSettlement {
             DeadLetterRetry::StillFailing | DeadLetterRetry::Superseded => {
                 self.any_still_failing = true
             }
-            DeadLetterRetry::NotFound => {}
+            DeadLetterRetry::Busy | DeadLetterRetry::NotFound => {}
         }
         if asked_about == Some(id) {
             self.asked_about = Some(outcome);
@@ -3053,6 +3252,16 @@ impl PendingFailures {
         attempt.in_flight = None;
     }
 
+    /// A hold on a busy command opened at `since`.
+    fn hold_opened(&self, since: Instant) {
+        self.lock().held_since = Some(since);
+    }
+
+    /// The hold closed, and said so.
+    fn hold_closed(&self) {
+        self.lock().held_since = None;
+    }
+
     /// Record the dispatch about to be awaited, so a panic in its handler is
     /// parked naming it. Cleared by [`Self::returned`] whatever the outcome, so
     /// what an unwind finds here is the dispatch it unwound out of.
@@ -3124,6 +3333,10 @@ struct Reporting<'a> {
     /// which polls once on the caller's command: a manual drain that opened a
     /// burst would leave a bracket nothing ever closes.
     narration: Option<&'a mut Narration>,
+    /// What tells a hold on a busy command that the worker is to stop leading.
+    /// Carried here because it arrives on the same channels as the reasons a
+    /// burst is abandoned ([`Narration::stood_down`]).
+    stand_down: StandDown,
 }
 
 impl Reporting<'_> {
@@ -3145,18 +3358,20 @@ async fn drain_policy_once(
     progress: &mut PolicyProgress,
     max_depth: u32,
     reporting: &mut Reporting<'_>,
-) -> Result<usize, replay::Error> {
+) -> Result<Polled, replay::Error> {
     let started = Instant::now();
     let name = policy.name().to_string();
     let checkpoint_size = resolve_checkpoint_batch_size(policy.settings());
     let read_batch = resolve_read_batch_size(policy.settings(), checkpoint_size);
     let dispatch_timeout = resolve_dispatch_timeout(policy.settings());
+    let stand_down = reporting.stand_down.clone();
     let delivery = Delivery {
         cqrs,
         pool,
         executors,
         policy_name: &name,
         dispatch_timeout,
+        stand_down: &stand_down,
     };
 
     // Asked once per poll, not once per stream: it is the Policy's own code, and the
@@ -3456,7 +3671,22 @@ async fn drain_policy_once(
         reporting.tell(&name, Poll::Exhausted);
     }
 
-    Ok(executed)
+    Ok(Polled {
+        executed,
+        // What the poll could not get to is carried, and a sweep that filled its page
+        // stopped short of the log's end: either way the next poll has work waiting.
+        behind: !progress.unfinished.is_empty() || sweep.full,
+    })
+}
+
+/// What one poll did, and whether it knows the Policy is still behind.
+struct Polled {
+    /// The commands its reactions executed.
+    executed: usize,
+    /// Whether the poll left work it knows about: streams carried for the next poll, or
+    /// log past where its sweep stopped. A worker that is behind polls again rather than
+    /// waiting out its interval (funkode-io/replay#322).
+    behind: bool,
 }
 
 /// The runner's machinery for delivering events to **one** policy: the
@@ -3474,6 +3704,8 @@ struct Delivery<'a> {
     /// How long one dispatch may run before it is abandoned
     /// ([`resolve_dispatch_timeout`]).
     dispatch_timeout: Duration,
+    /// What calls off a hold on a busy command.
+    stand_down: &'a StandDown,
 }
 
 impl Delivery<'_> {
@@ -3529,6 +3761,18 @@ impl Delivery<'_> {
                 // already failed in this attempt are parked with it: the unwind
                 // crossed the buffer rather than carrying it off.
                 let attempt = pending.take();
+                // A hold the unwind came out of is over: it gets its closing
+                // record here, as the attempt loop would have written it.
+                if let Some(since) = attempt.held_since {
+                    tracing::info!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        global_position,
+                        held_ms         = since.elapsed().as_millis(),
+                        hold            = "left",
+                        "policy reaction panicked while holding a busy command; the hold is over"
+                    );
+                }
                 // The dispatch the unwind came out of, when it came out of one:
                 // a panic in `react` itself has none, and its row says so with
                 // null identity columns rather than with a guess.
@@ -3561,6 +3805,7 @@ impl Delivery<'_> {
     /// |-------------------------------------|---------------------------------------|
     /// | `Ok`                                | count as executed, continue           |
     /// | `BusinessRuleViolation`             | log + advance (aggregate said no)     |
+    /// | `Busy`                              | hold: back-off + retry, indefinitely, outside the budget |
     /// | Retryable (`Unavailable`, `Conflict`, `RateLimited`, or a timeout) within retry budget | back-off + retry |
     /// | Permanent or retries exhausted      | write `policy_dead_letters`, advance  |
     ///
@@ -3581,6 +3826,17 @@ impl Delivery<'_> {
     /// Each dispatch is awaited for at most [`Delivery::dispatch_timeout`], so
     /// an event costs at most one timeout per dispatch per attempt.
     ///
+    /// **Holding** (ADR-0036): a dispatch that fails with `Busy` keeps the Policy on
+    /// this event. The reaction is tried again after a backoff that doubles up to
+    /// [`HOLD_MAX_BACKOFF`], for as long as it stays busy; busy attempts spend nothing
+    /// of the retry budget and park nothing. The first attempt that is anything else
+    /// ends the hold and is settled by the rows above with a fresh budget; a sibling
+    /// that fails retryably before the held command is reached leaves the hold open.
+    /// The hold is narrated as an edge, once on entering and once on leaving. Only
+    /// the worker being asked to stop leading cuts it short ([`StandDown`]), at any
+    /// point of it — a backoff or a dispatch in flight: the delivery then fails,
+    /// nothing is parked or advanced, and the next leader delivers the event again.
+    ///
     /// **Re-react safety**: on retry the policy's `react` is called again for the
     /// same event.  `react` is pure, and the same event yields the same dispatches —
     /// including the idempotency key the command carries — so a target that absorbs a
@@ -3593,23 +3849,74 @@ impl Delivery<'_> {
         pending: &PendingFailures,
     ) -> Result<usize, replay::Error> {
         let policy_name = self.policy_name;
-        for attempt in 0..=MAX_DISPATCH_RETRIES {
+        let mut attempt = 0;
+        let mut hold: Option<Hold> = None;
+        loop {
             pending.begin(attempt);
             let dispatches = policy.react_erased(raw);
             let mut executed = 0usize;
             let mut need_retry = false;
+            let mut busy = None;
+            // Whether the dispatch the hold is on came back with anything but busy.
+            let mut held_dispatch_answered = false;
+            // Whether the held command's first answer out of busy was a transient
+            // failure, which starts the retry budget afresh from there.
+            let mut budget_starts_now = false;
 
             for (ordinal, dispatch) in dispatches.into_iter().enumerate() {
                 let identity = DispatchIdentity::of(ordinal, &dispatch);
                 pending.dispatching(identity.clone());
-                let outcome = self
-                    .execute_dispatch_within(global_position, raw, dispatch)
-                    .await;
+                let running = self.execute_dispatch_within(global_position, raw, dispatch);
+                // Inside a hold, a dispatch is raced against the worker standing down
+                // as the backoff is: a stand-down that waited for the dispatch could
+                // still advance the event, or park it, for a worker no longer leading.
+                // Cutting the dispatch loose is what its timeout already does
+                // (ADR-0018).
+                let outcome = match &hold {
+                    Some(held) => tokio::select! {
+                        outcome = running => outcome,
+                        _ = self.stand_down.signalled() => {
+                            return Err(self.abandon_hold(raw, global_position, held));
+                        }
+                    },
+                    None => running.await,
+                };
                 pending.returned();
+
+                let answers_the_hold = !matches!(&outcome, Err(failure) if failure.busy())
+                    && hold
+                        .as_ref()
+                        .is_some_and(|held| held.dispatch.is(&identity));
+                held_dispatch_answered |= answers_the_hold;
 
                 match outcome {
                     Ok(()) => {
                         executed += 1;
+                    }
+                    Err(failure) if failure.busy() => {
+                        busy = Some((identity, failure));
+                        break; // the reaction is tried again whole, like a retry
+                    }
+                    // Out of busy into a transient failure: the budget is the held
+                    // command's from here, whatever its siblings spent of it while it
+                    // was held — they ran every attempt, and it was reached only on
+                    // the ones they left it (ADR-0036: a fresh budget once it answers
+                    // anything else).
+                    Err(failure) if answers_the_hold && failure.retryable() => {
+                        tracing::warn!(
+                            policy          = %policy_name,
+                            event_id        = %raw.id,
+                            global_position,
+                            attempt,
+                            aggregate       = identity.aggregate_name,
+                            target          = %identity.target_stream_id,
+                            error           = %failure,
+                            "held policy dispatch is no longer busy but failed with a retryable \
+                             error; backing off before retry with a fresh budget"
+                        );
+                        need_retry = true;
+                        budget_starts_now = true;
+                        break;
                     }
                     Err(failure) if failure.declined() => {
                         tracing::info!(
@@ -3644,17 +3951,114 @@ impl Delivery<'_> {
                 }
             }
 
+            if let Some((identity, failure)) = busy {
+                // Whatever this attempt buffered is dropped with it when the next one
+                // begins: the reaction runs again whole, and the attempt that settles
+                // it is the one that parks.
+                let held = hold.get_or_insert_with(|| {
+                    tracing::info!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        stream_id       = %raw.stream_id,
+                        global_position,
+                        aggregate       = identity.aggregate_name,
+                        target          = %identity.target_stream_id,
+                        command         = identity.command_name,
+                        reason          = %failure,
+                        hold            = "entered",
+                        "policy dispatch is busy; holding on this event until it runs"
+                    );
+                    let since = Instant::now();
+                    pending.hold_opened(since);
+                    Hold {
+                        since,
+                        busy_attempts: 0,
+                        dispatch: identity.clone(),
+                    }
+                });
+                // The hold follows whichever command is busy now: one held command
+                // running and the next one turning busy is still the same hold, with
+                // its start and its backoff, and it ends when this one answers.
+                held.dispatch = identity;
+                let backoff = hold_backoff(held.busy_attempts);
+                held.busy_attempts = held.busy_attempts.saturating_add(1);
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = self.stand_down.signalled() => {
+                        return Err(self.abandon_hold(raw, global_position, held));
+                    }
+                }
+                // A fresh budget for whatever the reaction meets once it runs.
+                attempt = 0;
+                continue;
+            }
+
+            // The hold is over when the command it is on answers, or when the delivery
+            // settles without reaching it again. A sibling that fails retryably before
+            // the held command is reached leaves the hold open: closing it there would
+            // reopen it on the next busy answer, narrating a hold that never ended and
+            // restarting its backoff.
+            if held_dispatch_answered || !need_retry {
+                if let Some(held) = hold.take() {
+                    pending.hold_closed();
+                    tracing::info!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        global_position,
+                        busy_attempts   = held.busy_attempts,
+                        held_ms         = held.since.elapsed().as_millis(),
+                        hold            = "left",
+                        "policy dispatch is no longer busy; the hold is over"
+                    );
+                }
+            }
+
             if !need_retry {
                 self.park(global_position, raw, pending.take()).await?;
                 return Ok(executed);
             }
 
+            if budget_starts_now {
+                attempt = 0;
+            }
+
             // Exponential back-off: 100 ms, 200 ms, 400 ms, …
             let backoff = Duration::from_millis(100 * (1u64 << attempt.min(5)));
-            tokio::time::sleep(backoff).await;
+            match &hold {
+                Some(held) => tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = self.stand_down.signalled() => {
+                        return Err(self.abandon_hold(raw, global_position, held));
+                    }
+                },
+                None => tokio::time::sleep(backoff).await,
+            }
+            attempt += 1;
         }
+    }
 
-        Ok(0)
+    /// Let go of a hold because the worker is to stop leading, saying so, and return
+    /// the error that ends the poll: nothing is parked or advanced, and whoever leads
+    /// next delivers the event again.
+    fn abandon_hold(
+        &self,
+        raw: &PersistedEvent<Value>,
+        global_position: i64,
+        held: &Hold,
+    ) -> replay::Error {
+        tracing::info!(
+            policy          = %self.policy_name,
+            event_id        = %raw.id,
+            global_position,
+            busy_attempts   = held.busy_attempts,
+            held_ms         = held.since.elapsed().as_millis(),
+            hold            = "abandoned",
+            "policy stopped leading while holding a busy command; \
+             the event is delivered again by whoever leads next"
+        );
+        replay::Error::unavailable("policy stopped leading while holding a busy command")
+            .with_operation("policy_drain")
+            .with_context("policy", self.policy_name)
     }
 
     /// Write a dead letter for everything an attempt failed on, each row naming
@@ -4352,6 +4756,12 @@ async fn load_event_by_id(
 /// Two columns and an indexed range scan, bounded by `limit`: this runs on every poll, so
 /// it is the query the design is paid for. It reads no cursors and waits for no position
 /// to fill — a missing `global_position` names no stream, so there is nothing to stop at.
+///
+/// Online-lane rows only, through `idx_events_online_global_position`: a bulk append's
+/// rows are not in the index this walks, so however large it is the sweep neither reads
+/// it nor names its streams (ADR-0034). A stream that holds bulk events is still read
+/// when an online event, or the reconciliation, nominates it — and [`read_stream`] steps
+/// over them.
 async fn sweep_for_streams(
     pool: &Pool<Postgres>,
     from: i64,
@@ -4368,7 +4778,8 @@ async fn sweep_for_streams(
          ), active AS ( \
              SELECT COALESCE(array_agg(id), ARRAY[]::text[]) AS ids FROM active_ids \
          ), swept AS MATERIALIZED ( \
-             SELECT global_position, stream_id FROM events WHERE global_position > $1 \
+             SELECT global_position, stream_id FROM events \
+              WHERE global_position > $1 AND lane = 'online' \
               ORDER BY global_position ASC LIMIT $2 \
          ) \
          SELECT NULL::bigint AS global_position, NULL::text AS stream_id, \
@@ -4397,6 +4808,8 @@ async fn sweep_for_streams(
         .into_iter()
         .map(parse_txid)
         .collect::<Result<_, _>>()?;
+    // Every row but the snapshot's is one swept position.
+    let full = rows.len() > limit as usize;
     let discovered = discovered_from_sweep(
         from,
         rows.into_iter()
@@ -4411,6 +4824,7 @@ async fn sweep_for_streams(
 
     Ok(Sweep {
         discovered,
+        full,
         xmax,
         in_progress,
     })
@@ -4617,7 +5031,8 @@ impl LatePage {
 }
 
 /// A page of ended ids assigned above the previous snapshot's xmax. Its position bound is
-/// the last sweep that shared that snapshot.
+/// the last sweep that shared that snapshot. Online-lane rows only, as the sweep:
+/// `idx_events_online_commit_txid_position` holds no bulk transaction (ADR-0034).
 async fn late_tail_page(
     pool: &Pool<Postgres>,
     tail: &Tail,
@@ -4629,6 +5044,7 @@ async fn late_tail_page(
         "SELECT stream_id, commit_txid::text AS txid, global_position \
            FROM events \
           WHERE commit_txid >= $1::xid8 AND commit_txid < $2::xid8 \
+            AND lane = 'online' \
             AND global_position <= $3 \
             AND commit_txid::text <> ALL($4::text[]) \
             AND ($5::text IS NULL OR (commit_txid, global_position) > \
@@ -4659,7 +5075,8 @@ async fn late_tail_page(
     Ok(LatePage::of(rows, limit))
 }
 
-/// A page of one ended transaction's events. The index and LIMIT bound every result.
+/// A page of one ended transaction's online-lane events. The index and LIMIT bound every
+/// result; a bulk segment's transaction has no row in the index, so it nominates nothing.
 async fn ended_transaction_page(
     pool: &Pool<Postgres>,
     txid: u64,
@@ -4669,7 +5086,7 @@ async fn ended_transaction_page(
     let rows = sqlx::query(
         "SELECT stream_id, global_position \
            FROM events \
-          WHERE commit_txid = $1::xid8 \
+          WHERE commit_txid = $1::xid8 AND lane = 'online' \
             AND ($2::bigint IS NULL OR global_position > $2) \
           ORDER BY global_position LIMIT $3",
     )
@@ -4907,7 +5324,8 @@ async fn places_of(
 /// No contiguity to check: appends to a stream serialise on its row, so its places arrive
 /// in order and a missing one cannot be an append in flight — it is the operator's doing.
 /// The filter decides delivery only; an excluded row advances the place like a compaction
-/// snapshot does (ADR-0013, ADR-0004).
+/// snapshot does (ADR-0013, ADR-0004). A bulk-lane row is excluded the same way, whatever
+/// the filter: the place passes it and nothing fires (ADR-0034).
 async fn read_stream(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
@@ -4917,9 +5335,11 @@ async fn read_stream(
 ) -> Result<Vec<StreamEvent>, replay::Error> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-         global_position, stream_seq, compacted_snapshot, COALESCE((",
+         global_position, stream_seq, compacted_snapshot, lane = 'online' AND COALESCE((",
     );
-    // As a predicate NULL means no match; read as a value it must be collapsed.
+    // As a predicate NULL means no match; read as a value it must be collapsed. A
+    // bulk-lane row matches no online Policy's filter, whatever the filter says: the bulk
+    // lane reaches Policies through its own queue, never through this feed (ADR-0034).
     PostgresEventStore::add_filters(&mut qb, filter);
     qb.push("), FALSE) AS matches_filter FROM events WHERE stream_id = ");
     qb.push_bind(stream_id.to_string());
@@ -5236,6 +5656,9 @@ impl Tail {
 /// One statement's sweep rows and the transaction snapshot they were read under.
 struct Sweep {
     discovered: Discovered,
+    /// Whether the sweep read as many positions as it was allowed: the log may go on past
+    /// where it stopped.
+    full: bool,
     xmax: u64,
     in_progress: Vec<u64>,
 }
@@ -5879,8 +6302,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        dispatch_timeout_or_default, merge_dispatch_metadata, panic_message, DispatchFailure,
-        DEFAULT_DISPATCH_TIMEOUT, TIMEOUT_ERROR_KIND,
+        dispatch_timeout_or_default, hold_backoff, merge_dispatch_metadata, panic_message,
+        DispatchFailure, DEFAULT_DISPATCH_TIMEOUT, HOLD_INITIAL_BACKOFF, HOLD_MAX_BACKOFF,
+        TIMEOUT_ERROR_KIND,
     };
 
     #[test]
@@ -5961,6 +6385,40 @@ mod tests {
             permanent.error_kind(),
             replay::ErrorKind::InvalidInput.to_string()
         );
+    }
+
+    /// Busy is told apart from every other failure: not a refusal to advance past,
+    /// and not a transient error to spend the retry budget on (ADR-0036).
+    #[test]
+    fn a_busy_dispatch_is_neither_declined_nor_retryable() {
+        let busy = DispatchFailure::Returned(replay::Error::busy("maintenance in progress"));
+        let timed_out = DispatchFailure::TimedOut {
+            limit: Duration::from_millis(10),
+        };
+
+        assert!(busy.busy());
+        assert!(!busy.declined());
+        assert!(!busy.retryable());
+        assert!(!timed_out.busy(), "a timeout says nothing about being busy");
+    }
+
+    /// A hold backs off the way the restart supervision does: doubling from the
+    /// first wait, and level at the ceiling for as long as it lasts — however long
+    /// that is, without overflowing.
+    #[test]
+    fn a_hold_backs_off_doubling_up_to_its_ceiling() {
+        let waits: Vec<Duration> = (0..4).map(hold_backoff).collect();
+        assert_eq!(
+            waits,
+            vec![
+                HOLD_INITIAL_BACKOFF,
+                HOLD_INITIAL_BACKOFF * 2,
+                HOLD_INITIAL_BACKOFF * 4,
+                HOLD_INITIAL_BACKOFF * 8,
+            ]
+        );
+        assert_eq!(hold_backoff(10), HOLD_MAX_BACKOFF);
+        assert_eq!(hold_backoff(u32::MAX), HOLD_MAX_BACKOFF);
     }
 
     #[test]
@@ -7001,6 +7459,7 @@ mod progress_tests {
                 after: None,
             },
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: position,
@@ -7033,6 +7492,7 @@ mod progress_tests {
             &pool,
             &prior,
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: 60,
@@ -7054,6 +7514,7 @@ mod progress_tests {
             &pool,
             &LateWriteState::default(),
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: 0,
@@ -7093,6 +7554,7 @@ mod progress_tests {
             &pool,
             &prior,
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: 60,
@@ -9554,5 +10016,277 @@ mod reconcile_schedule_tests {
 
         assert!(!schedule.is_due(loaded + CADENCE - Duration::from_nanos(1)));
         assert!(schedule.is_due(loaded + CADENCE));
+    }
+}
+
+/// The online lane ignores a bulk-lane event (funkode-io/replay#301, ADR-0034).
+///
+/// Each source of the online feed is pinned on its own here — the sweep, both halves of
+/// the late-write lookup, the per-stream read and the reconciliation — because each
+/// reads the log by its own statement, and a statement that forgot the lane would still
+/// pass an end-to-end test that happens to be served by another source.
+/// `tests/it/policy_online_ignores_bulk.rs` asserts the same through a running Policy.
+#[cfg(test)]
+mod bulk_lane_tests {
+    use sqlx::PgPool;
+
+    use crate::filters::StreamFilter;
+
+    use super::progress_tests::start_postgres;
+    use super::{
+        checkpoint_places, late_tail_page, lookup_late_writes, places_of, read_stream,
+        streams_behind, sweep_for_streams, Discovered, LateWriteState, PolicyProgress, Reached,
+        StartAt, Sweep, Tail, TrackedStreams,
+    };
+
+    const POLICY: &str = "online_lane_under_test";
+
+    /// Write one event to `stream` on `lane` through the store's writer, the statement
+    /// every append goes through, and return its id.
+    async fn write_on<'c, E>(executor: E, stream: &str, lane: &str) -> uuid::Uuid
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Appended', $2, \
+             'Probe', NULL, FALSE, $3)",
+        )
+        .bind(id)
+        .bind(stream)
+        .bind(lane)
+        .fetch_one(executor)
+        .await
+        .expect("writing an event must succeed");
+        id
+    }
+
+    async fn append(pool: &PgPool, stream: &str, lane: &str, count: usize) {
+        for _ in 0..count {
+            write_on(pool, stream, lane).await;
+        }
+    }
+
+    async fn position_of(pool: &PgPool, id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the event must have a position")
+    }
+
+    async fn txid_of(pool: &PgPool, id: uuid::Uuid) -> u64 {
+        sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the event must have a transaction id")
+            .parse()
+            .expect("a transaction id is an unsigned 64-bit value")
+    }
+
+    /// Move the Policy's place in `stream` to `to`, as a poll that read up to it would.
+    async fn checkpoint(pool: &PgPool, stream: &str, to: i64) {
+        let global_position: i64 = sqlx::query_scalar(
+            "SELECT global_position FROM events WHERE stream_id = $1 AND stream_seq = $2",
+        )
+        .bind(stream)
+        .bind(to)
+        .fetch_one(pool)
+        .await
+        .expect("the place must hold an event");
+        let streams = vec![stream.to_string()];
+        let observed = places_of(pool, POLICY, &streams)
+            .await
+            .expect("reading the place must succeed");
+        let reached = Reached {
+            stream_id: stream.to_string(),
+            seq: to,
+            global_position,
+        };
+        let kept = checkpoint_places(pool, POLICY, &[reached], &observed)
+            .await
+            .expect("checkpointing must succeed");
+        assert!(kept.contains_key(stream), "nothing else writes this place");
+    }
+
+    async fn behind(pool: &PgPool) -> Vec<String> {
+        streams_behind(pool, POLICY, &TrackedStreams::Every, "", 10)
+            .await
+            .expect("the reconciliation's comparison must succeed")
+    }
+
+    /// A bulk append names no stream to the sweep, and spends none of its budget: a sweep
+    /// of one row past a bulk of three still finds the online event after it.
+    #[tokio::test]
+    async fn a_bulk_event_names_no_stream_to_the_sweep_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append(&pool, "urn:probe:bulk", "bulk", 3).await;
+        let online = write_on(&pool, "urn:probe:online", "online").await;
+        let online_position = position_of(&pool, online).await;
+
+        let sweep = sweep_for_streams(&pool, 0, 1)
+            .await
+            .expect("the sweep must succeed");
+
+        assert_eq!(
+            sweep.discovered.streams,
+            vec!["urn:probe:online".to_string()],
+            "the sweep reads past the bulk rows without counting them"
+        );
+        assert_eq!(sweep.discovered.swept_through, online_position);
+    }
+
+    /// A bulk segment's transaction that the sweep saw in progress is looked up once it
+    /// ends, as every such transaction is, and nominates nothing.
+    #[tokio::test]
+    async fn an_ended_bulk_transaction_nominates_nothing_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut held = pool.begin().await.expect("starting the held bulk segment");
+        let bulk = write_on(&mut *held, "urn:probe:held-bulk", "bulk").await;
+        let txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(bulk)
+                .fetch_one(&mut *held)
+                .await
+                .expect("the held event must have a transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+        let position: i64 = sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(bulk)
+            .fetch_one(&mut *held)
+            .await
+            .expect("the held event must have a position");
+        append(&pool, "urn:probe:advance-xmax", "online", 1).await;
+
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the sweep must succeed");
+        assert!(sweep.in_progress.contains(&txid));
+        let late = lookup_late_writes(&pool, &LateWriteState::default(), &sweep, position, 10)
+            .await
+            .expect("an open transaction is remembered, not read");
+        assert!(late.state.unseen.contains(&txid));
+
+        held.commit().await.expect("committing the bulk segment");
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the sweep must succeed");
+        let late = lookup_late_writes(&pool, &late.state, &sweep, position, 10)
+            .await
+            .expect("the ended transaction must be looked up");
+
+        assert!(
+            late.streams.is_empty(),
+            "a bulk transaction nominates no stream, found {:?}",
+            late.streams
+        );
+        assert!(!late.state.unseen.contains(&txid));
+        assert!(
+            !late.state.pending.contains_key(&txid),
+            "and it is settled, not carried to the next poll"
+        );
+    }
+
+    /// The tail half of the lookup: an id at the previous snapshot's xmax, below the
+    /// sweep's position, is found when it is online and not when it is bulk.
+    #[tokio::test]
+    async fn the_tail_holds_no_bulk_row_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let bulk = write_on(&pool, "urn:probe:tail-bulk", "bulk").await;
+        let txid = txid_of(&pool, bulk).await;
+        let position = position_of(&pool, bulk).await;
+
+        let page = late_tail_page(
+            &pool,
+            &Tail {
+                xmax: txid,
+                seen_xmax: txid,
+                swept_through: position,
+                after: None,
+            },
+            &Sweep {
+                full: false,
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: position,
+                },
+                xmax: txid + 1,
+                in_progress: Vec::new(),
+            },
+            10,
+        )
+        .await
+        .expect("the tail query must succeed");
+
+        assert!(
+            page.rows.is_empty(),
+            "the bulk row is not on the online tail"
+        );
+        assert!(page.complete);
+    }
+
+    /// The per-stream read steps over a bulk event as over a row the filter excludes: it
+    /// is returned, so the place can pass it, and it is not delivered — under a filter
+    /// that would deliver every other row.
+    #[tokio::test]
+    async fn the_stream_read_passes_a_bulk_event_without_delivering_it_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let stream = "urn:probe:mixed";
+        append(&pool, stream, "online", 1).await;
+        append(&pool, stream, "bulk", 1).await;
+        append(&pool, stream, "online", 1).await;
+
+        let events = read_stream(&pool, StreamFilter::All, stream, 0, 10)
+            .await
+            .expect("reading the stream must succeed");
+
+        let read: Vec<(i64, bool)> = events
+            .iter()
+            .map(|event| (event.stream_seq, event.delivered.is_some()))
+            .collect();
+        assert_eq!(
+            read,
+            vec![(1, true), (2, false), (3, true)],
+            "every place is read in order, and only the online events are delivered"
+        );
+    }
+
+    /// A caught-up Policy's reconciliation nominates a stream whose only new events are
+    /// bulk once, and settles: once the place has passed them, the stream is behind no
+    /// longer.
+    #[tokio::test]
+    async fn the_reconciliation_nominates_a_bulk_only_stream_once_and_settles_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let stream = "urn:probe:caught-up";
+        append(&pool, stream, "online", 2).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, TrackedStreams::Every)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, stream, 2).await;
+        assert!(behind(&pool).await.is_empty(), "the Policy is caught up");
+
+        append(&pool, stream, "bulk", 3).await;
+
+        assert_eq!(
+            behind(&pool).await,
+            vec![stream.to_string()],
+            "the stream's head moved, so the comparison names it"
+        );
+        let events = read_stream(&pool, StreamFilter::All, stream, 2, 10)
+            .await
+            .expect("reading the stream must succeed");
+        assert!(
+            events.iter().all(|event| event.delivered.is_none()),
+            "the poll it is read by delivers none of the bulk events"
+        );
+        let reached = events.last().expect("the bulk events are read").stream_seq;
+        assert_eq!(reached, 5);
+        checkpoint(&pool, stream, reached).await;
+
+        assert!(
+            behind(&pool).await.is_empty(),
+            "and once its place has passed them, the stream is not nominated again"
+        );
     }
 }

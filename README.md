@@ -2853,11 +2853,19 @@ Two batch sizes control throughput vs checkpoint frequency:
 
 The runner enforces `read_batch_size ≥ checkpoint_batch_size`.
 
+`read_batch_size` bounds one poll, not a policy's throughput. A poll that leaves work it
+knows about — streams it could not finish or reach, or log past where its sweep stopped —
+is followed by the next one at once, after a yield to the runtime and a check for shutdown
+and a change of leadership; the worker waits on the poll interval only once a poll finds
+itself caught up. A backlog is worked through at the speed of its reactions, and the
+interval stays what it is for: the safety net for a missed `NOTIFY`
+([#322](https://github.com/funkode-io/replay/issues/322)).
+
 `read_batch_size` counts positions in the log, not matches: a `stream_filter` decides
 what a policy reacts to, the cursor still walks past everything else
 ([ADR-0013](docs/adr/0013-policy-feed-contiguity-on-unfiltered-positions.md)). A
-selective policy over a busy log may need several drains to reach its next event;
-raise `read_batch_size` if that latency matters.
+selective policy over a busy log may need several polls to reach its next event, run
+back to back; raise `read_batch_size` to spend fewer round trips on them.
 
 ### Dispatch timeout
 
