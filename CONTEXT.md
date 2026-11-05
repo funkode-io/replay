@@ -60,7 +60,7 @@ takes an [Observed event] and returns dispatches. A rule whose commands all go t
 aggregate type declares it instead (`AggregatePolicy`) and returns `(StreamId, Command)`
 pairs; a blanket impl makes it a Policy, so a type implements one trait or the other,
 never both ([ADR-0028](docs/adr/0028-a-single-target-policy-declares-its-target.md)). How it is driven — feed, start
-position, batches, dispatch timeout, causation depth — is `PolicySettings`, given to the
+position, [Lane], batches, dispatch timeout, causation depth — is `PolicySettings`, given to the
 [Policy runner] at registration ([ADR-0027](docs/adr/0027-the-policy-rule-is-core-vocabulary.md)).
 _Avoid_: reactor, saga, process manager, automation, trigger, reaction.
 
@@ -141,6 +141,41 @@ nomination queries and the places honour that set — a stream the Policy does n
 never compared, read or given a place, and is never behind
 ([ADR-0031](docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 _Avoid_: subscription, stream, queue, backlog.
+
+### Lane
+
+Which of two delivery paths an appended event takes to a [Policy]. The **online lane**
+is the default and is the [Policy feed]: places, sweep, late-write lookup and
+reconciliation. The **bulk lane** is a work queue ([Bulk work]). The append fills it in
+its own transaction, and a worker in the Policy's [Leader] drains it in batches. It is
+for decisions that are bulk by design, such as a file import's accepted records
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+
+An event is stamped with its lane when it is appended (`events.lane`): online through
+`Cqrs::execute`, bulk through `Cqrs::execute_bulk`
+([`persistence/src/cqrs.rs`](persistence/src/cqrs.rs)). A bulk append commits in
+segments of `bulk_segment_size` events, and a failure rolls back only the segment it is
+in. A Policy declares at registration which lanes it consumes, with
+`PolicySettings::on_lanes(Lanes::Online | Lanes::Bulk | Lanes::Both)`
+([`persistence/src/policy.rs`](persistence/src/policy.rs)). The same `react` serves
+both lanes. The online feed never delivers a bulk event: it passes one as it passes a
+row its stream filter excludes. Each lane keeps a stream's events in order, and nothing
+orders one lane against the other.
+_Avoid_: channel, priority, queue (for the online lane), batch mode.
+
+### Bulk work
+
+One row of `policy_bulk_work` per bulk-lane event per [Policy] that consumes the bulk
+lane and tracks the event's stream. The append inserts it, and the worker that reacted
+to it deletes it. The table holds only pending work, so it is sized by what is owed,
+never by history, and nothing reconciles it. A Policy's registration on the bulk lane is
+its row of `policy_bulk_registrations`, which only widens. The worker claims a batch with
+`FOR UPDATE SKIP LOCKED`, reacts, dispatches grouped by target stream, and deletes the
+batch on the claim transaction, so a worker that dies leaves its rows for the next
+claim. Its queue depth is `PolicyStatus::bulk_pending` ([Policy status])
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md),
+[`persistence/src/policy_runner/bulk_lane.rs`](persistence/src/policy_runner/bulk_lane.rs)).
+_Avoid_: outbox, job, task, pending event.
 
 ### Causation
 
@@ -301,7 +336,8 @@ _controlling_ a Policy (acting on its failures by [Retry] or [Discard] of a
 [Liveness]. Its `lag` is an exact count of events not yet passed, summed over the streams
 the Policy is behind on, and `streams_behind` says how widely that is spread — one stream
 a million events behind and a million streams one event behind are the same lag and very
-different problems.
+different problems. A Policy on the bulk lane also reports `bulk_pending`, the depth of
+its [Bulk work] queue, and pending bulk work keeps it `Working`.
 _Avoid_: state, policy state, health check.
 
 ### Blocked policy
@@ -652,3 +688,5 @@ it:
 [Command middleware]: #command-middleware
 [Commit gate]: #commit-gate
 [Busy]: #busy
+[Lane]: #lane
+[Bulk work]: #bulk-work

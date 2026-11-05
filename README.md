@@ -264,6 +264,14 @@ Rules of thumb:
 - **Each way a thing comes about is its own event** (`CreatedByUser`, `ImportedFromFile`), so the handler can tell them apart.
 - **A correction is its own fact** (`MergeCorrected`), not the original event re-emitted with new values, and it carries what the actor did, not what the state was before: the previous value is already in the stream.
 - **An attested value is part of the fact.** `MonthlyClosed { closing_balance }` records the figure the month was closed with, which must not move if the rules change later. The test: if the rule that produced the value changed tomorrow, should the stored value change too? If yes, it is state — derive it in `apply`.
+- **Raw external input is not an event; what the domain decides about it is.** A
+  supplier's rows, a file's contents or another system's prices were not decided by the
+  domain. They belong in a table it reads when it decides, because a log fed with
+  someone else's data grows with that input and every consumer has to read through it.
+  The log records the decision: `RenamedByFile { name }` above is the product taking the
+  name the file proposed, not the file row. A decision that is bulk by design, such as
+  an import's accepted records, goes through [the bulk lane](#the-bulk-lane) so it never
+  slows the Policies that react to everything else.
 - **Compaction follows the same rule.** `compacted_events` returns events that rebuild the state through `apply`, so the rules stay in one place; it never writes the state itself into a made-up event.
 
 ### Compaction
@@ -2787,6 +2795,140 @@ next one. Moving forward skips the events in between (they are never delivered);
 backward re-delivers them, which is safe under the same idempotency contract that
 covers crash re-delivery. See
 [ADR-0012](docs/adr/0012-policy-cursor-is-an-operator-writable-control-surface.md).
+
+### The bulk lane
+
+Some decisions are bulk by design. A file import accepts thousands of records, and each
+acceptance is a decision that the same Policies react to as they would to a record
+accepted from the UI. On the online lane every Policy sweeps, nominates, reads and places
+each of those events, including the Policies that do not want them. The **bulk lane**
+takes that path out of their way. A bulk append writes its events to the event store
+and, in the same transaction, one row of work per event for each Policy that consumes
+the bulk lane. That Policy's worker claims the work in batches, calls the same `react`,
+dispatches and deletes it. Online Policies never receive a bulk event
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+
+Online stays the default. `execute`, `handle` and every Policy registered without a lane
+behave exactly as before, so adopting the bulk lane is a change per command and per
+Policy, made at the consumer's pace.
+
+**Before:** one online command. The handler collects every event into a `Vec`, `execute`
+appends them in one transaction, and every Policy reads them through its feed.
+
+```rust,ignore
+impl Aggregate for Import {
+    type Command = ImportCommand;
+    type Error = ImportError;
+    type Services = ImportFiles;
+
+    async fn handle(&self, cmd: ImportCommand, svc: &ImportFiles)
+        -> Result<Vec<ImportEvent>, ImportError>
+    {
+        match cmd {
+            ImportCommand::ProcessFile { file } => {
+                let rows = svc.parse(&file).await?;        // all 12k rows in memory
+                Ok(rows.into_iter().map(|row| ImportEvent::RecordAccepted { row }).collect())
+            }
+            // …
+        }
+    }
+}
+
+cqrs.execute::<Import>(&import_id, metadata, ImportCommand::ProcessFile { file }, &services, None)
+    .await?;
+
+PolicyRunner::builder(cqrs)
+    .register_policy(CreateSku, PolicySettings::new()
+        .with_stream_filter(StreamFilter::for_stream_type::<Import>()))
+    .register_policy(EnsureBrand, PolicySettings::new()
+        .with_stream_filter(StreamFilter::for_stream_type::<Import>()))
+    .register_policy(DepositFee, PolicySettings::new())  // unrelated, still sweeps the 12k
+    .build();
+```
+
+**After:** the handler streams instead of collecting, `execute` becomes `execute_bulk`
+followed by an ordinary completion command, and the Policies gain only a lane at
+registration. Their `react` does not change.
+
+```rust,ignore
+impl Aggregate for Import {
+    // …
+    async fn handle_stream(&self, cmd: ImportCommand, svc: &ImportFiles)
+        -> Result<BoxStream<'static, Result<ImportEvent, ImportError>>, ImportError>
+    {
+        match cmd {
+            ImportCommand::ProcessFile { file } => Ok(svc
+                .rows(&file)                                     // a stream, never a Vec
+                .map_ok(|row| ImportEvent::RecordAccepted { row })
+                .boxed()),
+            // `handle` still serves the online commands, such as `Complete`.
+            other => Ok(futures::stream::iter(self.handle(other, svc).await?)
+                .map(Ok)
+                .boxed()),
+        }
+    }
+}
+
+// Commits in segments of `bulk_segment_size` events, each one transaction with its
+// inline-projection rows and its bulk work. Returns once every segment has committed.
+cqrs.execute_bulk::<Import>(&import_id, metadata.clone(), ImportCommand::ProcessFile { file }, &services, None)
+    .await?;
+
+// The domain records completion the ordinary way, if anyone needs to know.
+cqrs.execute::<Import>(&import_id, metadata, ImportCommand::Complete, &services, None)
+    .await?;
+
+PolicyRunner::builder(cqrs)
+    .register_policy(CreateSku, PolicySettings::new()
+        .with_stream_filter(StreamFilter::for_stream_type::<Import>())
+        .on_lanes(Lanes::Bulk))       // file records only, through the work queue
+    .register_policy(EnsureBrand, PolicySettings::new()
+        .with_stream_filter(StreamFilter::for_stream_type::<Import>())
+        .on_lanes(Lanes::Both))       // UI records online, file records bulk
+    .register_policy(DepositFee, PolicySettings::new())  // online by default; never sees a bulk event
+    .build();
+```
+
+What each party sees:
+
+| | Online Policies | Bulk Policies | Inline projections |
+|---|---|---|---|
+| While `execute_bulk` runs | nothing: the sweep's partial indexes skip bulk rows, and a stream read passes them as filtered rows | batches, claimed as each segment commits | the rows of each segment, in its transaction |
+| After `execute_bulk` returns | the `Complete` event only | they drain the queue to empty, then idle | up to date |
+| A worker crashes mid-batch | unaffected | the batch's rows are claimed again: at-least-once | unaffected |
+| `execute_bulk` fails mid-way | unaffected | the committed segments' work is delivered | the committed segments' rows stand |
+
+The rules:
+
+- **Per-stream order only.** A bulk Policy receives a stream's events in that stream's
+  order, because one worker per Policy claims in `global_position` order. Nothing orders
+  one stream against another, and nothing orders a Policy's bulk events against its
+  online ones: a Policy on `Lanes::Both` must not rely on either.
+- **Reactions are idempotent.** Delivery is at-least-once, as on the online lane. A
+  worker that dies mid-batch leaves its rows for the next claim, and a rerun of a failed
+  `execute_bulk` re-emits from wherever the domain's `handle_stream` resumes.
+- **A bulk is not all-or-nothing.** A failure rolls back the segment it is in and is
+  returned. The segments before it stay committed with their work queued, as if the
+  domain had issued them as separate commands. The aggregate is the checkpoint: its
+  stream holds the committed prefix, so `handle_stream` decides where a rerun resumes.
+  The expected version is checked before the first segment only, and another writer
+  may append to the stream between segments.
+- **External facts stay in tables.** The bulk lane is for decisions. A supplier's rows,
+  a file's contents or another system's prices are input the domain reads when it
+  decides, not events (see [Events record facts, not state](#events-record-facts-not-state)).
+- **A bulk Policy cannot be rebuilt from history.** One registered after a segment
+  committed never receives that segment, whatever its `StartAt`.
+
+A command a bulk Policy dispatches is an ordinary online command, so its events reach
+online Policies as any other. A command that fails for good is a
+[dead letter](#failure-handling) for its triggering event, and its row leaves the queue
+with the batch, so one bad record never wedges an import. A busy command
+([ADR-0036](docs/adr/0036-a-busy-command-is-held-not-dead-lettered.md)) ends the batch, and
+its rows are claimed again on the next poll.
+`PolicyStatus::bulk_pending` is the queue depth, so an operator can watch an import
+drain ([Monitoring policy status](#monitoring-policy-status)). The segment size is a
+store setting ([Bulk segment size](#bulk-segment-size)), and the batch a worker claims
+is the Policy's `read_batch_size`.
 
 ### Advisory-lock leader election
 
