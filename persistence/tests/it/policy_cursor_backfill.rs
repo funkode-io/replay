@@ -19,9 +19,7 @@ use replay_persistence::{Cqrs, PostgresEventStore};
 
 use crate::common;
 use common::migrations::{through as migrations_through, MIGRATOR};
-use common::postgres_image::start_postgres_server;
-
-const POSTGRES_PORT: u16 = 5432;
+use common::postgres_image::postgres_database;
 
 /// The migration that moves a Policy's position per stream, and the one before it.
 const BEFORE_PER_STREAM: i64 = 33;
@@ -70,17 +68,11 @@ impl replay::Aggregate for Ledger {
     }
 }
 
-async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
-    let container = start_postgres_server().await;
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("the container must publish its port");
+async fn start_pool() -> (PgPool, common::postgres_image::TestDatabase) {
+    let container = postgres_database().await;
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("the pool must connect");
 

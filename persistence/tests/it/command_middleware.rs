@@ -13,7 +13,7 @@ use sqlx::postgres::PgPoolOptions;
 use crate::common;
 
 use common::policy_harness::{Probe, ProbeCommand, ProbeEvent, ProbeUrn, OBSERVE_TIMEOUT};
-use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
+use common::postgres_image::postgres_database;
 use replay::Metadata;
 use replay_persistence::{
     Causation, CommandContext, CommandMiddleware, Cqrs, Dispatch, Next, PolicyRunner,
@@ -59,23 +59,12 @@ impl CommandMiddleware for TampersWithCausation {
 
 #[tokio::test]
 async fn a_policy_command_shows_its_causation_and_an_application_command_none_postgres_test() {
-    let container = start_postgres_server().await;
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to read the container host")
-        .to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("failed to read the container port");
+    let container = postgres_database().await;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(OBSERVE_TIMEOUT)
         .idle_timeout(Duration::from_secs(5))
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("failed to create the postgres pool");
     common::migrations::MIGRATOR

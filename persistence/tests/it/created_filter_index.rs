@@ -6,9 +6,7 @@
 use sqlx::{PgPool, Row};
 
 use crate::common;
-use common::postgres_image::start_postgres_server;
-
-const POSTGRES_PORT: u16 = 5432;
+use common::postgres_image::postgres_database;
 
 /// A time-travel read narrow enough that the `created` bound is the selective one: the
 /// seeded rows are one second apart, so this keeps the ~20 oldest of 2 000. A bound that
@@ -18,19 +16,12 @@ const EXPLAIN_TIME_TRAVEL_READ: &str = "EXPLAIN (COSTS OFF) \
      SELECT id FROM events WHERE created <= now() - interval '1980 seconds' \
       ORDER BY global_position ASC";
 
-async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (PgPool, common::postgres_image::TestDatabase) {
+    let container = postgres_database().await;
 
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to connect to Postgres");
 

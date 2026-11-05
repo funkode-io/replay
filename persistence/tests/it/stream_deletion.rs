@@ -22,7 +22,7 @@ use replay_persistence::{
 
 use crate::common;
 use common::policy_harness::{PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn};
-use common::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT};
+use common::postgres_image::{postgres_database, TestDatabase};
 
 /// The stream id a probe named `name` is written under.
 fn probe(name: &str) -> Urn {
@@ -306,19 +306,12 @@ impl replay::Aggregate for Shelf {
     }
 }
 
-async fn start_pool() -> (PgPool, PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (PgPool, TestDatabase) {
+    let container = postgres_database().await;
 
     let pool = PgPoolOptions::new()
         .max_connections(8)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to connect to Postgres");
 
@@ -762,7 +755,8 @@ async fn hold_an_append_open(
 async fn await_a_lock_wait(pool: &PgPool) {
     common::wait::wait_for_count(
         pool,
-        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+        "SELECT count(*) FROM pg_stat_activity \
+          WHERE wait_event_type = 'Lock' AND datname = current_database()",
         1,
         Duration::from_secs(10),
         "the deletion to queue behind the writer holding what it needs",
