@@ -3583,6 +3583,7 @@ Each `PolicyStatus` carries the raw numbers plus a derived condition:
 | `last_checkpoint_at` | When the policy last advanced in any stream (staleness signal). |
 | `dead_letter_count` | Number of `policy_dead_letters` rows for this policy. List them with `dead_letters` (see [Listing dead letters](#listing-dead-letters)). |
 | `last_dead_letter_at` | Timestamp of the most recent dead letter, if any. |
+| `bulk_pending` | The bulk lane's queue depth: rows of bulk work queued for this policy and not yet reacted to, falling to `0` as an import drains. `None` for a policy never registered on the bulk lane. A policy on both lanes is listed once, with its online fields and this; a policy only on the bulk lane reports `0` lag. |
 | `condition` | At-a-glance health label (see below). |
 
 `lag` is a subtraction per stream, so a position burned by a failed write does not
@@ -3611,8 +3612,8 @@ nothing behind, or read each stream in its own order and record the **stream pla
 | Condition | When | Meaning |
 |-----------|------|---------|
 | `Degraded` | `dead_letter_count > 0` | At least one event was skipped; needs operator attention. |
-| `Working` | no dead letters, `lag > 0` | Healthy and catching up. |
-| `CaughtUp` | no dead letters, `lag == 0` | Fully drained and up to date. |
+| `Working` | no dead letters, `lag > 0` or `bulk_pending > 0` | Healthy and catching up. |
+| `CaughtUp` | no dead letters, `lag == 0`, no bulk work pending | Fully drained and up to date. |
 
 `condition` has a stable `as_str()` / `Display` form (`"CaughtUp"`, `"Working"`,
 `"Degraded"`) for JSON/UI consumers.
