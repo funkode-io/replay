@@ -121,6 +121,20 @@ fn stream_lock_error(
     .with_context("stream_lock_wait_ms", limit)
 }
 
+/// How long one attempt of `await_in_flight_commits` waits for the commit gate's lock.
+///
+/// Always finite: a stream lock wait of zero means "wait forever" for an append, but an
+/// attempt is retried anyway, and an unbounded one abandoned by a dropped call would hold
+/// a connection and queue every gated append behind it for as long as the appends in
+/// flight last.
+fn await_attempt_wait(stream_lock_wait: Duration) -> Duration {
+    if stream_lock_wait.is_zero() {
+        DEFAULT_STREAM_LOCK_WAIT
+    } else {
+        stream_lock_wait
+    }
+}
+
 /// What an append returns when the commit gate's lock was not free within the stream lock
 /// wait: an [`await_in_flight_commits`](PostgresEventStore::await_in_flight_commits) was
 /// waiting for, or holding, it the whole time.
@@ -869,8 +883,8 @@ impl PostgresEventStore {
     /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait) before it fails as
     /// [`replay::ErrorKind::Unavailable`]. It is meant for a switch, not a request path.
     ///
-    /// Each attempt at the lock is bounded on the server by that same stream lock wait and
-    /// retried until it succeeds: cancelling this future sends Postgres nothing, so an
+    /// Each attempt at the lock is bounded on the server by that same stream lock wait (the
+    /// default 30s when it is zero) and retried until it succeeds: cancelling this future sends Postgres nothing, so an
     /// unbounded wait abandoned by a dropped call would hold a pool connection, and queue
     /// every gated append behind it, for as long as the appends in flight last (ADR-0022).
     /// Dropped, it leaves at most one bounded wait behind.
@@ -887,7 +901,7 @@ impl PostgresEventStore {
     async fn try_await_in_flight_commits(&self) -> Result<bool, replay::Error> {
         // Exclusive, and transaction-scoped so the lock is gone with the commit.
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
-        crate::lock_wait::bound(&mut transaction, self.stream_lock_wait)
+        crate::lock_wait::bound(&mut transaction, await_attempt_wait(self.stream_lock_wait))
             .await
             .map_err(crate::db_error)?;
         match sqlx::query("SELECT pg_advisory_xact_lock($1, 0)")
@@ -1693,9 +1707,20 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        resolve_flush_size, stream_lock_wait_or_default, DEFAULT_PROJECTION_FLUSH_SIZE,
-        DEFAULT_STREAM_LOCK_WAIT,
+        await_attempt_wait, resolve_flush_size, stream_lock_wait_or_default,
+        DEFAULT_PROJECTION_FLUSH_SIZE, DEFAULT_STREAM_LOCK_WAIT,
     };
+
+    /// A stream lock wait of zero opts an append out of the bound; an attempt to await
+    /// the commits in flight stays bounded, so a dropped call never waits forever.
+    #[test]
+    fn an_await_attempt_is_bounded_even_when_the_stream_lock_wait_is_not() {
+        assert_eq!(await_attempt_wait(Duration::ZERO), DEFAULT_STREAM_LOCK_WAIT);
+        assert_eq!(
+            await_attempt_wait(Duration::from_millis(500)),
+            Duration::from_millis(500)
+        );
+    }
 
     #[test]
     fn flush_size_falls_back_to_the_built_in_default() {
