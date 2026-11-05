@@ -60,8 +60,9 @@ cargo publish -p es-replay-persistence
 
 ## Pre-flight gate
 
-The same checks CI runs (`.github/workflows/ci.yml`) and the pre-commit hook enforces
-(`.githooks/pre-commit`, installed with `make install-hooks`):
+The same checks CI runs (`.github/workflows/ci.yml`) and the git hooks enforce
+(`.githooks/pre-commit` runs fmt and clippy, `.githooks/pre-push` runs the tests; both
+installed with `make install-hooks`):
 
 ```sh
 cargo fmt --all --check
