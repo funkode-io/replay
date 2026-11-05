@@ -47,21 +47,33 @@ const CLAIM_LOCK_MAX_BACKOFF: Duration = Duration::from_millis(500);
 /// Record that `policy` consumes the bulk lane, and which stream types it tracks, so
 /// every bulk append from now on queues work for it.
 ///
-/// Idempotent: every replica writes it as its worker starts, and a row that already says
-/// the same is left alone. The types follow the Policy's filter as on the online lane
-/// (ADR-0031): only a top-level `ForStreamTypes` narrows them.
+/// Every replica writes it as its worker starts, and a registration only ever **widens**:
+/// the stored types become the union of what each replica tracks, and `NULL` — every
+/// stream — absorbs any list. The fan-out happens at the append, so a replica that
+/// narrowed the row (an older release in a rolling deploy, say) would lose bulk work for
+/// the types it dropped; work queued for a type the Policy no longer tracks costs only its
+/// row, because the worker's read applies the Policy's own filter and deletes what it
+/// does not deliver. Narrowing a registration is the operator's call (release notes).
+/// The types follow the Policy's filter as on the online lane (ADR-0031): only a
+/// top-level `ForStreamTypes` narrows them.
 pub(super) async fn register(
     pool: &Pool<Postgres>,
     policy: &RegisteredPolicy,
 ) -> Result<(), replay::Error> {
     let tracked = TrackedStreams::of(&policy.stream_filter());
     sqlx::query(
-        "INSERT INTO policy_bulk_registrations (policy, tracked_stream_types) \
+        "INSERT INTO policy_bulk_registrations AS r (policy, tracked_stream_types) \
          VALUES ($1, $2) \
          ON CONFLICT (policy) DO UPDATE \
-            SET tracked_stream_types = EXCLUDED.tracked_stream_types \
-          WHERE policy_bulk_registrations.tracked_stream_types \
-                IS DISTINCT FROM EXCLUDED.tracked_stream_types",
+            SET tracked_stream_types = CASE \
+                    WHEN r.tracked_stream_types IS NULL \
+                      OR EXCLUDED.tracked_stream_types IS NULL THEN NULL \
+                    ELSE ARRAY(SELECT DISTINCT t FROM unnest(r.tracked_stream_types \
+                               || EXCLUDED.tracked_stream_types) AS t ORDER BY t) \
+                END \
+          WHERE r.tracked_stream_types IS NOT NULL \
+            AND (EXCLUDED.tracked_stream_types IS NULL \
+                 OR NOT r.tracked_stream_types @> EXCLUDED.tracked_stream_types)",
     )
     .bind(policy.name())
     .bind(tracked.as_column())

@@ -1089,3 +1089,80 @@ async fn a_busy_gate_abandons_the_batch_even_when_the_stream_moved_postgres_test
 
     harness.shutdown().await;
 }
+
+/// The stream types `policy`'s bulk registration says it tracks, sorted; `None` for every
+/// stream.
+async fn registered_types(harness: &PolicyDaemonHarness, policy: &str) -> Option<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT tracked_stream_types FROM policy_bulk_registrations WHERE policy = $1",
+    )
+    .bind(policy)
+    .fetch_one(harness.pool())
+    .await
+    .expect("the registration must exist")
+}
+
+/// Two replicas of one bulk Policy that disagree on what it tracks — a rolling deploy —
+/// leave a registration covering both, so neither drops the other's bulk work; and a
+/// replica that tracks every stream widens it to every stream.
+#[tokio::test]
+async fn a_bulk_registration_only_widens_postgres_test() {
+    let types = |types: &[&str]| {
+        StreamFilter::ForStreamTypes(types.iter().map(|t| t.to_string()).collect())
+    };
+    let mut harness = start(
+        "registration_widens",
+        bulk().with_stream_filter(types(&["Probe"])),
+    )
+    .await;
+    let policy = harness.policy_name().to_string();
+    harness.await_bulk_registration(&policy).await;
+    assert_eq!(
+        registered_types(&harness, &policy).await,
+        Some(vec!["Probe".to_string()])
+    );
+
+    // The other replica, on another release, tracks another type under the same name.
+    let narrower = harness.start_runner({
+        let policy = policy.clone();
+        move |builder: PolicyRunnerBuilder, _| {
+            builder.register_policy_fn::<ProbeEvent, _>(
+                policy.clone(),
+                bulk().with_stream_filter(StreamFilter::ForStreamTypes(vec![
+                    "Elsewhere".to_string()
+                ])),
+                echo_into("echo"),
+            )
+        }
+    });
+    harness
+        .observe("the registration to cover both replicas", || async {
+            (registered_types(&harness, &policy).await
+                == Some(vec!["Elsewhere".to_string(), "Probe".to_string()]))
+            .then_some(())
+        })
+        .await;
+
+    // A Probe import is still queued for the Policy, whichever replica registered last.
+    narrower.shutdown().await;
+    harness.stop().await;
+    harness.bulk_import("still-queued", &tags("q", 3)).await;
+    assert_eq!(harness.bulk_work(&policy).await, 3);
+
+    // A replica tracking every stream widens the registration to every stream.
+    let everything = harness.start_runner({
+        let policy = policy.clone();
+        move |builder: PolicyRunnerBuilder, _| {
+            builder.register_policy_fn::<ProbeEvent, _>(policy.clone(), bulk(), echo_into("echo"))
+        }
+    });
+    harness
+        .observe("the registration to cover every stream", || async {
+            registered_types(&harness, &policy)
+                .await
+                .is_none()
+                .then_some(())
+        })
+        .await;
+    everything.shutdown().await;
+}
