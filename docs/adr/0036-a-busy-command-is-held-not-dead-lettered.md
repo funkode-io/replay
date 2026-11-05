@@ -33,15 +33,20 @@ runs rather than parking it.**
   answered `Busy`. Its message is the middleware's reason. Anyone may return it; a command
   handler that cannot proceed now may too.
 - **The runner holds.** A dispatch that fails with `Busy` keeps the Policy on that event and
-  tries the reaction again, with a backoff that doubles up to a ceiling, for as long as it
-  stays busy. Busy attempts do not count against the dispatch retry budget and never write a
+  tries the reaction again, with a backoff that doubles from 100 ms up to a 5 s ceiling, for
+  as long as it stays busy. The [Dispatch timeout] still bounds each attempt. Busy attempts do not count against the dispatch retry budget and never write a
   dead letter. Once the dispatch returns anything else, the reaction is settled by the
   existing rules, with a fresh budget.
 - **The hold is narrated.** It is an edge: one record when a Policy starts holding, one when
   it stops, never one per attempt ([Narration]). A held Policy keeps beating its
   [Heartbeat]: it is alive and waiting, which is not the same as a reaction that has hung.
+- **Only standing down ends a hold early.** A shutdown, or the worker losing its
+  leadership, calls the hold off wherever it is — in a backoff or a dispatch in flight:
+  the delivery fails, nothing is parked or advanced, the hold is narrated as abandoned, and
+  whoever leads next delivers the event again.
 - **A [Retry] that meets `Busy`** leaves the row parked, untouched, and reports the reaction
-  as busy: retrying during maintenance does nothing and loses nothing.
+  as busy (`DeadLetterRetry::Busy`; a bulk retry counts it in `reactions_busy`): retrying
+  during maintenance does nothing and loses nothing. A retry never holds.
 
 ## Considered options
 
@@ -71,3 +76,4 @@ runs rather than parking it.**
 [Narration]: ../../CONTEXT.md#narration
 [Heartbeat]: ../../CONTEXT.md#heartbeat
 [Retry]: ../../CONTEXT.md#retry
+[Dispatch timeout]: ../../CONTEXT.md#dispatch-timeout

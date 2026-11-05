@@ -18,6 +18,7 @@ mod common;
 mod await_in_flight_commits;
 mod bounded_queries;
 mod command_middleware;
+mod command_middleware_example;
 mod created_filter_index;
 mod dead_letter_listing;
 mod dead_letter_unique_command;

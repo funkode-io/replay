@@ -1859,6 +1859,271 @@ to ~1 s. List every type the projection's `Event` can hold — a type left out n
 Inline projections are Postgres-only. The in-memory store remains useful for tests, but the
 transactional guarantee belongs to the Postgres backend.
 
+## Command middleware
+
+A command middleware is code you register once on `Cqrs` to run around every command
+it executes: refuse commands during maintenance, add the acting user or a tenant id to
+their metadata, audit or measure them
+([ADR-0035](docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)).
+
+> The full, compilable source for both examples below lives in
+> [persistence/examples/command_middleware.rs](persistence/examples/command_middleware.rs)
+> and is exercised by the integration tests, so the README stays in lock-step with
+> working code. Run it (no database required) with
+> `cargo run -p es-replay-persistence --example command_middleware`.
+
+### The three hooks
+
+A middleware implements `CommandMiddleware`. Each hook defaults to doing nothing, so a
+middleware implements only the ones it needs:
+
+| Hook | Runs | Gets | Answers |
+|------|------|------|---------|
+| `before` | Before the aggregate is loaded | `CommandContextMut`: the context to read, the metadata to add to | `Next` |
+| `before_commit` | At the **commit gate**: inside the append transaction, after the events are inserted and every inline projection has run, immediately before the commit | `&CommandContext`, read-only | `Next` |
+| `after` | Once the command has finished, whatever its outcome | `&CommandContext` and the `Outcome` | nothing |
+
+The first two answer `Next`:
+
+```rust,ignore
+pub enum Next {
+    /// Go on: the next middleware runs, then the command.
+    Continue,
+    /// Not now; the same command may succeed later. Not a failure.
+    Busy(String),
+    /// The command is refused or the middleware failed.
+    Error(replay::Error),
+}
+```
+
+- **`before` stops or enriches.** `Busy` or `Error` stops the command before anything
+  is read: nothing is loaded, handled or appended. `insert_metadata` and `set_metadata`
+  add to the command's metadata; later middlewares see what was added, and the appended
+  events carry it. Nothing else about the command can change, and the `causation` key is
+  the Policy runner's: a middleware cannot alter it.
+- **`before_commit` rolls back.** Anything but `Continue` rolls the whole append back,
+  inline projection writes included. It gets no transaction handle — the middleware
+  decides, the store commits or rolls back — so the same middleware works on Postgres
+  and on the in-memory store.
+- **`after` only observes.** `Outcome` is `Committed`, `Busy(reason)` or
+  `Failed(error)`. Nothing `after` does changes what `execute` returns.
+
+The context carries the aggregate type, the stream type, the stream id, the command's
+type name, the metadata and, when a Policy dispatched the command, its `Causation`
+(`None` for an application's command). It does not carry the command itself: one
+middleware serves every aggregate, so a rule that must decide on a command's content
+decides on its metadata.
+
+### Ordering
+
+```rust,ignore
+let cqrs = Cqrs::new(store)
+    .with_middleware(maintenance.clone())
+    .with_middleware(ActingUser);
+```
+
+Middlewares run in registration order, as web-server middleware does. The first that
+does not answer `Continue`, in `before` or in `before_commit`, stops the chain; later
+ones do not run. `after` runs in reverse order, and only for the middlewares whose
+`before` answered `Continue`, so the hooks nest: a middleware that stopped the command,
+and every one registered after it, runs no `after`. Clones of a `Cqrs` share its chain,
+and a `Cqrs` without middleware behaves as if the feature did not exist.
+
+### What a caller sees
+
+`Cqrs::execute` still returns the aggregate's error type, through
+`A::Error: From<replay::Error>` like every store error:
+
+- `Next::Error(e)` reaches the caller as `e`, unchanged: a `Forbidden` refusal stays
+  `Forbidden`.
+- `Next::Busy(reason)` reaches the caller as a `replay::Error` of kind
+  `ErrorKind::Busy` carrying `reason` as its message. `Busy` is temporary — the same
+  command may succeed later — so an HTTP layer maps it to `503 Service Unavailable`.
+  Anyone may return `replay::Error::busy(reason)`; a command handler that cannot
+  proceed now may too.
+
+### What middleware covers, and what it does not
+
+Middleware runs on every command `Cqrs` executes: an application's call and a Policy's
+dispatch alike, because the runner executes through the `Cqrs` it was built with. It
+runs on nothing that is not a command: a direct append through the store
+(`store_events`), compaction, stream deletion, an inline projection rebuild or a
+catch-up never reach it. It is not a projection: it writes no row to the projection
+registry and no applied mark, so it leaves no catch-up debt.
+
+### Example: maintenance mode
+
+Maintenance mode answers `Busy` in **both** hooks while a flag is on. `before` stops a
+command that arrives during maintenance before it reads anything; `before_commit`
+stops one that checked the flag just before it was switched on and has not committed
+yet.
+
+```rust
+/// Holds every command while maintenance mode is on.
+///
+/// It answers [`Next::Busy`] in `before`, so a command that arrives during maintenance
+/// costs no read and no append, and again in `before_commit`, so a command that checked
+/// the flag just before it was switched on still cannot commit. A caller sees
+/// `ErrorKind::Busy`; a Policy holds the command and runs it once maintenance is over.
+///
+/// The flag here is this process's own. A fleet of processes reads it from where every
+/// one of them sees it, as it is on each check — a row read on every call, never a cached
+/// copy — or `await_in_flight_commits` cannot vouch for the other processes' appends.
+#[derive(Clone, Default)]
+pub struct MaintenanceMode {
+    switched_on: Arc<AtomicBool>,
+}
+
+impl MaintenanceMode {
+    /// Switch maintenance mode on, and return once no command that checked the flag
+    /// while it was off can still commit: from then on the store is quiet.
+    pub async fn switch_on(&self, store: &PostgresEventStore) -> replay::Result<()> {
+        self.switched_on.store(true, Ordering::SeqCst);
+        store.await_in_flight_commits().await
+    }
+
+    /// Switch maintenance mode off. Held Policies resume on their own.
+    pub fn switch_off(&self) {
+        self.switched_on.store(false, Ordering::SeqCst);
+    }
+
+    fn check(&self) -> Next {
+        if self.switched_on.load(Ordering::SeqCst) {
+            Next::Busy("maintenance in progress".to_string())
+        } else {
+            Next::Continue
+        }
+    }
+}
+
+impl CommandMiddleware for MaintenanceMode {
+    fn before<'a>(&'a self, _context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+        Box::pin(async move { self.check() })
+    }
+
+    fn before_commit<'a>(&'a self, _context: &'a CommandContext) -> BoxFuture<'a, Next> {
+        Box::pin(async move { self.check() })
+    }
+}
+```
+
+The switch is the other half: set the flag, then call
+`PostgresEventStore::await_in_flight_commits()`. When a `Cqrs` has middleware, each
+of its appends takes a shared lock just before its commit gate and holds it until it
+commits or rolls back; `await_in_flight_commits` takes the same lock exclusively. So
+when it returns, every append that checked the flag while it was off has committed or
+rolled back, and every later append checks it on — the store is quiet. That holds for
+the appends of every process on the same database, provided each reads the flag as it
+is: a flag in a database row read on every check, not a cached copy.
+
+`await_in_flight_commits` waits for as long as the slowest append in flight takes, and
+while it waits new gated appends queue behind it, each for at most the
+[stream lock wait](#stream-lock-wait) before failing as `Unavailable`. It is meant for
+an operator's switch, not for a request path. Appends that ask no gate — a direct
+append, or a `Cqrs` with no middleware — take no lock and are never waited for.
+
+### Example: the acting user
+
+An enricher adds what every event should record — here the user a command acts for —
+without each command handler stamping it. The user comes from the request, through a
+task-local the application's request layer sets around the commands it executes; a
+Policy's command acts for the Policy, named from its causation. `after` audits how the
+command ended.
+
+```rust
+tokio::task_local! {
+    /// The user the current request acts for, set by the application's request layer
+    /// around the commands it executes.
+    pub static ACTING_USER: String;
+}
+
+/// The metadata key [`ActingUser`] writes.
+pub const ACTING_USER_KEY: &str = "acting_user";
+
+/// Adds the user a command acts for to its metadata, so the events it appends record
+/// who did it, and audits how each command ended.
+///
+/// An application's command acts for the request's [`ACTING_USER`]; a command without
+/// one is refused as `Unauthorized`. A Policy's command acts for the Policy, named from
+/// the command's causation.
+pub struct ActingUser;
+
+impl CommandMiddleware for ActingUser {
+    fn before<'a>(&'a self, mut context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            let acting_user = match context.causation() {
+                Some(causation) => format!("policy:{}", causation.policy()),
+                None => match ACTING_USER.try_with(Clone::clone) {
+                    Ok(user) => user,
+                    Err(_) => {
+                        return Next::Error(replay::Error::unauthorized(
+                            "a command needs an acting user",
+                        ))
+                    }
+                },
+            };
+            match context.insert_metadata(ACTING_USER_KEY, acting_user) {
+                Ok(()) => Next::Continue,
+                Err(error) => Next::Error(error),
+            }
+        })
+    }
+
+    fn after<'a>(
+        &'a self,
+        context: &'a CommandContext,
+        outcome: &'a Outcome<'a>,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let acting_user = context.metadata().as_json().get(ACTING_USER_KEY);
+            tracing::info!(
+                command = context.command_type(),
+                stream_id = %context.stream_id(),
+                acting_user = ?acting_user,
+                outcome = ?outcome,
+                "command finished"
+            );
+        })
+    }
+}
+```
+
+```rust,ignore
+ACTING_USER
+    .scope(
+        "alice".to_string(),
+        cqrs.execute::<BankAccount>(&account, Default::default(), deposit(100.0), &(), None),
+    )
+    .await?;
+```
+
+A `tokio::task_local!` is visible to the futures polled inside its `scope`, which is
+where `execute` runs the middleware; it is not inherited by a task spawned from there.
+
+### A busy command in a Policy
+
+A Policy's command passes through the same middleware, so maintenance mode covers
+background work with no second configuration. When a dispatch answers `Busy`, the
+runner **holds** the Policy on that event instead of parking a dead letter
+([ADR-0036](docs/adr/0036-a-busy-command-is-held-not-dead-lettered.md)):
+
+- it tries the reaction again after a backoff that starts at 100 ms and doubles up to
+  5 s, for as long as it stays busy;
+- busy attempts spend nothing of the dispatch retry budget and never write a dead
+  letter; the first attempt that answers anything else is settled by the usual
+  [failure handling](#failure-handling), with a fresh budget;
+- the hold is narrated once on entering and once on leaving, never per attempt
+  ([What a policy logs](#what-a-policy-logs)), and the worker keeps beating its
+  heartbeat: it is alive and waiting, not hung;
+- each attempt is still bounded by the [dispatch timeout](#dispatch-timeout), and a
+  shutdown or a lost leadership calls the hold off: nothing is parked or advanced, and
+  whoever leads next delivers the event again;
+- a `retry_dead_letter` whose replay meets `Busy` leaves the rows parked as they were
+  and reports `DeadLetterRetry::Busy`.
+
+Switching maintenance off needs nothing more: a held Policy runs its command on its
+next attempt and catches up.
+
 ## Querying Events from Multiple Aggregates
 
 When building CQRS queries, you often need to process events from multiple aggregate types together. The `query_events!` macro simplifies creating a wrapper enum that can hold events from different aggregates:
@@ -2945,6 +3210,7 @@ When a dispatch fails the runner classifies the error and responds accordingly:
 |----------------|-----------|--------|
 | **Business-rule violation** | `ErrorKind::BusinessRuleViolation` | Advance cursor immediately — the event is correct, the domain logic rejected the command. No retry, no dead-letter. |
 | **Retryable** | `Unavailable`, `RateLimited`, `Conflict`, or a dispatch that exceeded its timeout | Exponential back-off, `MAX_DISPATCH_RETRIES` (3) retries after the first attempt — four in all. |
+| **Busy** | `ErrorKind::Busy` — a [command middleware](#command-middleware) answered not now | **Hold**: retry after a back-off doubling from 100 ms to 5 s, for as long as it stays busy, outside the retry budget and never dead-lettered; the first other answer is settled by this table with a fresh budget ([A busy command in a Policy](#a-busy-command-in-a-policy)). |
 | **Permanent** | All other errors, or retries exhausted | Write to `policy_dead_letters`, advance cursor. The policy keeps running. |
 | **Timeout** | The dispatch was still running when its `dispatch_timeout` expired | Abandon it, log at `warn` with the elapsed time, retry; on exhaustion write `error_kind = 'Timeout'` and advance cursor. |
 | **Panic** | The reaction (or a command it dispatched) panicked | Write to `policy_dead_letters` with `error_kind = 'Panic'` and the panic's message, log at `error`, advance cursor. Never retried — a reaction that panicked panics again ([ADR-0016](docs/adr/0016-panicking-reaction-parked-as-a-permanent-failure.md)). |
@@ -3259,9 +3525,9 @@ band. None take an advisory lock or move the policy cursor:
 
 | Method | Reaction | Outcome |
 |--------|----------|---------|
-| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), `Superseded` (another writer parked that command while the replay ran, and its row was left as it stands), or `NotFound`. |
+| `retry_dead_letter(id)` | Re-runs the reaction the row belongs to against **current** aggregate state through the same `Cqrs` path the live drain uses, and settles **every** row that reaction parked. | For the row `id` names: `Resolved` (its command succeeded, was declined with a `BusinessRuleViolation`, or is no longer emitted), `StillFailing` (re-parked in place with its **own** fresh error), `Superseded` (another writer parked that command while the replay ran, and its row was left as it stands), `Busy` (the replay met a command a middleware answered `Busy` for: every row of the reaction is left parked exactly as it was — retry once the middleware lets commands through), or `NotFound`. |
 | `discard_dead_letter(id)` | None — pure bookkeeping: no `react`, no command, no new event. | `Discarded` or `NotFound`. |
-| `retry_policy_dead_letters(name)` | Bulk: groups the policy's parked rows by the reaction they came from and replays each **once**, oldest-first. | `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing }`. |
+| `retry_policy_dead_letters(name)` | Bulk: groups the policy's parked rows by the reaction they came from and replays each **once**, oldest-first. | `DeadLetterRetrySummary { reactions_resolved, reactions_still_failing, reactions_busy }`. |
 
 The unit of a retry is the **reaction** — one Policy's reaction to one event —
 not the row ([ADR-0021](docs/adr/0021-retry-settles-a-reaction-not-a-row.md)). A
@@ -3302,6 +3568,7 @@ match runner.retry_dead_letter(id).await? {
     DeadLetterRetry::Resolved => { /* this row's command resolved: archived */ }
     DeadLetterRetry::StillFailing => { /* updated in place, still retryable */ }
     DeadLetterRetry::Superseded => { /* another writer parked it mid-replay */ }
+    DeadLetterRetry::Busy => { /* a middleware said not now: left as it was */ }
     DeadLetterRetry::NotFound => { /* nothing matched the id */ }
 }
 
@@ -3520,6 +3787,9 @@ happened", not "nothing is known".
 | `policy is working through its backlog` | the first cursor advance at least 30 s after the previous record | events so far, elapsed |
 | `policy is caught up` | the first poll that finds nothing owed | events in the burst, elapsed |
 | `policy dispatch committed` | every dispatch that commits, at `debug` | event, aggregate, elapsed |
+| `policy dispatch is busy; holding on this event until it runs` | a dispatch first answers `Busy` (`hold = "entered"`) | event, command, reason |
+| `policy dispatch is no longer busy; the hold is over` | the held command answers anything else (`hold = "left"`) | busy attempts, time held |
+| `policy stopped leading while holding a busy command; …` | a shutdown or lost leadership calls a hold off (`hold = "abandoned"`) | busy attempts, time held |
 
 The counts are places the policy advanced over, not reactions executed: a policy whose
 `stream_filter` excludes a whole stream worked through it, and is not caught up until

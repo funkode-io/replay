@@ -242,7 +242,9 @@ does, and each row is settled by its own command's outcome, resolved rows
 archived and still-failing ones left retryable with their own error
 ([ADR-0021](docs/adr/0021-retry-settles-a-reaction-not-a-row.md)). A retry
 summary therefore counts reactions where `dead_letter_count` counts parked
-commands.
+commands. A retry whose replay meets a [Busy] command settles nothing: the rows stay
+parked as they were and the reaction is reported busy
+([ADR-0036](docs/adr/0036-a-busy-command-is-held-not-dead-lettered.md)).
 Distinct from a [Rebuild], which resets and replays a whole [Projection].
 _Avoid_: reprocess, requeue, redrive.
 
@@ -482,8 +484,9 @@ by a record when work appears and the [Caught up] record that ends it, with a
 bounded progress record in between while a backlog is still draining
 ([ADR-0021](docs/adr/0021-a-policy-narrates-its-transitions.md)). Output is
 proportional to how often a Policy changes state, not to how much work it does,
-which is what keeps an idle Policy's silence readable as a signal. Per-dispatch
-detail exists at `debug` and is off by default.
+which is what keeps an idle Policy's silence readable as a signal. A hold on a
+[Busy] command is an edge too: one record on entering it and one on leaving, never
+one per attempt. Per-dispatch detail exists at `debug` and is off by default.
 _Avoid_: logging, tracing, audit trail, telemetry.
 
 ### Scoped URN

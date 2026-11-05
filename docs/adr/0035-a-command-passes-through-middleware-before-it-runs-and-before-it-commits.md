@@ -90,18 +90,23 @@ and no applied mark. A `Cqrs` without middleware behaves as before.
 `EventStore::store_events_stream` takes a **commit gate**: an async callback returning
 `Next`, beside the existing sink. A store calls it once per transaction, after the
 inserts and the inline projections, and commits only on `Continue`. `Cqrs` passes its
-middleware chain; a direct append passes a gate that always continues. Every store
-implements the same three steps, so a new store needs nothing else to support middleware.
+middleware chain; a direct append, and a `Cqrs` with no middleware, pass a gate that
+always continues (`OpenGate`) and says so (`CommitGate::always_continues`), so a store
+may skip the lock below for it. Every store implements the same three steps, so a new
+store needs nothing else to support middleware.
 
 ### No gap between the check and the commit
 
 A gate that returns `Continue` and a commit that follows are two steps. A flag turned on
 between them would let one append commit after the operator believed writes had stopped.
 
-The Postgres store closes it. When a gate is present it takes a shared, transaction-scoped
-advisory lock on a key Replay owns, before calling the gate, and holds it until the
-transaction ends. `PostgresEventStore::await_in_flight_commits()` takes the same lock
-exclusively and releases it. Maintenance mode is then: commit the flag, call
+The Postgres store closes it. For any gate but the one that always continues it takes a
+shared, transaction-scoped advisory lock on a key Replay owns, before calling the gate, and
+holds it until the transaction ends. `PostgresEventStore::await_in_flight_commits()` takes
+the same lock exclusively and releases it. Each attempt at that exclusive lock is bounded on
+the server by the stream lock wait (ADR-0022), and retried until it succeeds, so a call
+dropped by its caller leaves at most one bounded wait behind rather than one that holds a
+connection, and queues every gated append, for as long as the appends in flight last. Maintenance mode is then: commit the flag, call
 `await_in_flight_commits()`. Every append that checked before the flag was set still holds
 its lock, so the call waits for it; every append that takes the lock afterwards checks
 after the flag was set. The middleware must read the flag as it is, not from a cache.
@@ -133,7 +138,9 @@ after the flag was set. The middleware must read the flag as it is, not from a c
   migration.
 - **Each append through a `Cqrs` with middleware takes one shared advisory lock.**
   `await_in_flight_commits()` waits behind every append in flight and, while it waits,
-  new appends queue behind it; it is meant for a switch, not a request path.
+  new appends queue behind it, each for at most the stream lock wait before it fails as
+  `Unavailable`; it is meant for a switch, not a request path. A direct append and a
+  `Cqrs` without middleware take no lock and are never waited for.
 - **A generic transaction abstraction** (one append flow, each store implementing begin,
   commit and rollback) would let a new store inherit the gate and the lock. It is left
   for its own issue.
