@@ -264,6 +264,12 @@ Rules of thumb:
 - **Each way a thing comes about is its own event** (`CreatedByUser`, `ImportedFromFile`), so the handler can tell them apart.
 - **A correction is its own fact** (`MergeCorrected`), not the original event re-emitted with new values, and it carries what the actor did, not what the state was before: the previous value is already in the stream.
 - **An attested value is part of the fact.** `MonthlyClosed { closing_balance }` records the figure the month was closed with, which must not move if the rules change later. The test: if the rule that produced the value changed tomorrow, should the stored value change too? If yes, it is state — derive it in `apply`.
+- **An external fact is not an event.** A supplier's row, a file's contents, another
+  system's prices: the domain did not decide them, so they belong in a table it reads
+  when it decides, not in the log. The log records the decision — `RecordAccepted`,
+  `PriceTakenFromFile` — and a decision that is bulk by design goes through the bulk lane
+  ([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)) so
+  it never slows the Policies reacting to everything else.
 - **Compaction follows the same rule.** `compacted_events` returns events that rebuild the state through `apply`, so the rules stay in one place; it never writes the state itself into a made-up event.
 
 ### Compaction

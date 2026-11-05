@@ -142,6 +142,26 @@ never compared, read or given a place, and is never behind
 ([ADR-0031](docs/adr/0031-a-policy-filtered-by-stream-type-tracks-only-those-types.md)).
 _Avoid_: subscription, stream, queue, backlog.
 
+### Lane
+
+Which of two delivery paths an appended event takes to a [Policy]. The **online lane**,
+the default, is the [Policy feed]: places, sweep, late-write lookup, reconciliation. The
+**bulk lane** is a work queue the append fills in its own transaction and a worker
+drains in batches, for decisions that are bulk by design, such as a file import's
+accepted records
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)). An
+event is stamped with its lane at the append; a Policy declares at registration which
+lane or lanes it consumes. The online lane never reads a bulk event.
+_Avoid_: channel, priority, queue (for the online lane), batch mode.
+
+### Bulk work
+
+One row per bulk-lane event per [Policy] that consumes the bulk lane, inserted by the
+append and deleted by the worker that reacted to it. The table holds only pending work,
+so it is sized by what is owed, never by history, and nothing reconciles it
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+_Avoid_: outbox, job, task, pending event.
+
 ### Causation
 
 The link from the event that triggered a [Policy] to the command and resulting
