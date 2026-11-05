@@ -458,6 +458,10 @@ impl CommandMiddleware for TwoGates {
             match answer {
                 BUSY => Next::Busy("maintenance in progress".to_string()),
                 FLAKE => Next::Error(replay::Error::unavailable("the downstream is down")),
+                FLAKE_ONCE => {
+                    [&self.first, &self.second][gate].store(CONTINUE, Ordering::SeqCst);
+                    Next::Error(replay::Error::unavailable("the downstream blinked"))
+                }
                 _ => Next::Continue,
             }
         })
@@ -553,6 +557,60 @@ async fn a_hold_follows_the_command_that_is_busy_now_postgres_test() {
         }
         Ok(())
     });
+
+    harness.shutdown().await;
+}
+
+/// Fail retryably once, then let the command through.
+const FLAKE_ONCE: u8 = 5;
+
+/// The held command's budget starts when it stops being busy. Behind a sibling that
+/// always fails retryably it is reached only once its sibling has spent the reaction's
+/// budget; a transient failure on that first answer out of busy is retried, not parked.
+#[tokio::test]
+async fn a_held_command_gets_a_fresh_budget_when_it_stops_being_busy_postgres_test() {
+    let gates = TwoGates::answering(FLAKE, BUSY);
+    let harness = PolicyDaemonHarness::start_with_middleware(
+        "busy_fresh_budget",
+        gates.clone(),
+        |builder, policy| {
+            builder.register_policy_fn::<ProbeEvent, _>(
+                policy,
+                PolicySettings::new().starting_at(StartAt::Beginning),
+                echo_twice,
+            )
+        },
+    )
+    .await;
+
+    let pinged = harness.ping("subject-1", "hello").await;
+    harness
+        .observe("the second command held", || async {
+            (gates.asked(1) >= 2).then_some(())
+        })
+        .await;
+
+    gates.answer(FLAKE, FLAKE_ONCE);
+    harness.await_passed(pinged.global_position).await;
+
+    let parked = harness.dead_letters().await;
+    assert_eq!(
+        parked.len(),
+        1,
+        "only the sibling that never recovers is parked"
+    );
+    assert_eq!(
+        parked[0].target_stream_id.as_deref(),
+        Some("urn:probe:hello-first")
+    );
+    assert!(
+        harness
+            .dispatches()
+            .await
+            .iter()
+            .any(|dispatched| dispatched.stream_id == "urn:probe:hello-second"),
+        "the held command committed once its transient failure was retried"
+    );
 
     harness.shutdown().await;
 }

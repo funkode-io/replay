@@ -3780,6 +3780,9 @@ impl Delivery<'_> {
             let mut busy = None;
             // Whether the dispatch the hold is on came back with anything but busy.
             let mut held_dispatch_answered = false;
+            // Whether the held command's first answer out of busy was a transient
+            // failure, which starts the retry budget afresh from there.
+            let mut budget_starts_now = false;
 
             for (ordinal, dispatch) in dispatches.into_iter().enumerate() {
                 let identity = DispatchIdentity::of(ordinal, &dispatch);
@@ -3801,13 +3804,11 @@ impl Delivery<'_> {
                 };
                 pending.returned();
 
-                if !matches!(&outcome, Err(failure) if failure.busy())
+                let answers_the_hold = !matches!(&outcome, Err(failure) if failure.busy())
                     && hold
                         .as_ref()
-                        .is_some_and(|held| held.dispatch.is(&identity))
-                {
-                    held_dispatch_answered = true;
-                }
+                        .is_some_and(|held| held.dispatch.is(&identity));
+                held_dispatch_answered |= answers_the_hold;
 
                 match outcome {
                     Ok(()) => {
@@ -3816,6 +3817,27 @@ impl Delivery<'_> {
                     Err(failure) if failure.busy() => {
                         busy = Some((identity, failure));
                         break; // the reaction is tried again whole, like a retry
+                    }
+                    // Out of busy into a transient failure: the budget is the held
+                    // command's from here, whatever its siblings spent of it while it
+                    // was held — they ran every attempt, and it was reached only on
+                    // the ones they left it (ADR-0036: a fresh budget once it answers
+                    // anything else).
+                    Err(failure) if answers_the_hold && failure.retryable() => {
+                        tracing::warn!(
+                            policy          = %policy_name,
+                            event_id        = %raw.id,
+                            global_position,
+                            attempt,
+                            aggregate       = identity.aggregate_name,
+                            target          = %identity.target_stream_id,
+                            error           = %failure,
+                            "held policy dispatch is no longer busy but failed with a retryable \
+                             error; backing off before retry with a fresh budget"
+                        );
+                        need_retry = true;
+                        budget_starts_now = true;
+                        break;
                     }
                     Err(failure) if failure.declined() => {
                         tracing::info!(
@@ -3912,6 +3934,10 @@ impl Delivery<'_> {
             if !need_retry {
                 self.park(global_position, raw, pending.take()).await?;
                 return Ok(executed);
+            }
+
+            if budget_starts_now {
+                attempt = 0;
             }
 
             // Exponential back-off: 100 ms, 200 ms, 400 ms, …
