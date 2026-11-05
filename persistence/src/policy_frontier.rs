@@ -1155,6 +1155,10 @@ mod liveness_simulation {
         burst: u64,
         /// Cadences it has been behind without being read. The number under test.
         waited: u32,
+        /// The most streams behind at any cadence of the current wait. The bound is taken
+        /// against this, not the count now: other streams catching up while this one
+        /// waits shrinks the count but not the cadences already spent on them.
+        behind_during_wait: u32,
         read_this_cadence: bool,
     }
 
@@ -1268,6 +1272,7 @@ mod liveness_simulation {
                     busy: rng.chance(2),
                     burst: rng.between(1, u64::from(read_batch) + 2),
                     waited: 0,
+                    behind_during_wait: 0,
                     read_this_cadence: false,
                 });
                 // A backlog to start from, so the first cadences are not all empty.
@@ -1398,6 +1403,7 @@ mod liveness_simulation {
                 stream.place += events;
                 stream.read_this_cadence = true;
                 stream.waited = 0;
+                stream.behind_during_wait = 0;
                 read.push(format!("{}+{events}", turn.stream_id));
                 plan.read(&turn, events as u32);
                 plan.delivered(&turn);
@@ -1460,7 +1466,9 @@ mod liveness_simulation {
         /// ```
         ///
         /// The worst case spends one cadence per caught-up window or behind stream,
-        /// plus the empty page that wraps the rotation.
+        /// plus the empty page that wraps the rotation. "Streams behind" is the most there
+        /// were at any cadence of the wait, since streams that caught up during it still
+        /// spent their cadences.
         fn account(&mut self) -> Result<(), String> {
             let windows = (self.streams.len() as u32).div_ceil(self.scan_window);
             let behind = self.streams.iter().filter(|s| s.head > s.place).count() as u32;
@@ -1469,13 +1477,16 @@ mod liveness_simulation {
             for stream in &mut self.streams {
                 if stream.read_this_cadence || stream.head == stream.place {
                     stream.waited = 0;
+                    stream.behind_during_wait = 0;
                 } else {
                     stream.waited += 1;
-                    let bound = windows + behind + 1;
+                    stream.behind_during_wait = stream.behind_during_wait.max(behind);
+                    let most_behind = stream.behind_during_wait;
+                    let bound = windows + most_behind + 1;
                     if stream.waited > bound {
                         starved.push(format!(
                             "{} (owed {}, unread for {} cadences, bound {bound} = {windows} \
-                             caught-up windows + {behind} behind streams + wrap)",
+                             caught-up windows + {most_behind} behind streams + wrap)",
                             stream.id,
                             stream.head - stream.place,
                             stream.waited,
