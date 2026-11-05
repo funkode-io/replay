@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# Pre-commit hook: run lint and tests before allowing a commit.
+# Pre-commit hook: run the fast lint checks (fmt and clippy) before allowing
+# a commit. The workspace tests run in the pre-push hook instead, so a commit
+# finishes in seconds.
 #
 # Install with:
 #   git config core.hooksPath .githooks
@@ -9,9 +11,6 @@
 #
 # Skip on a one-off commit with:
 #   git commit --no-verify
-#
-# Skip the (Docker-dependent) tests with:
-#   SKIP_TESTS=1 git commit
 
 set -euo pipefail
 
@@ -23,12 +22,5 @@ cargo fmt --all -- --check
 
 echo "pre-commit: cargo clippy"
 cargo clippy --workspace --all-targets -- -D warnings
-
-if [[ "${SKIP_TESTS:-0}" == "1" ]]; then
-  echo "pre-commit: SKIP_TESTS=1 set, skipping tests"
-else
-  echo "pre-commit: cargo test"
-  cargo test --workspace
-fi
 
 echo "pre-commit: all checks passed"

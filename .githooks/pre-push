@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Pre-push hook: run the workspace tests before allowing a push. A failing
+# test blocks the push. Lint (fmt and clippy) runs in the pre-commit hook.
+#
+# Install with:
+#   git config core.hooksPath .githooks
+# or:
+#   make install-hooks
+#
+# Skip on a one-off push with:
+#   git push --no-verify
+#
+# Skip the (Docker-dependent) tests with:
+#   SKIP_TESTS=1 git push
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if [[ "${SKIP_TESTS:-0}" == "1" ]]; then
+  echo "pre-push: SKIP_TESTS=1 set, skipping tests"
+  exit 0
+fi
+
+echo "pre-push: cargo test"
+cargo test --workspace
+
+echo "pre-push: all checks passed"

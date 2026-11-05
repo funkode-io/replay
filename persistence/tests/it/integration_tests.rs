@@ -5195,6 +5195,7 @@ async fn retry_policy_dead_letters_resolves_all_oldest_first_postgres_test() {
         replay_persistence::DeadLetterRetrySummary {
             reactions_resolved: 3,
             reactions_still_failing: 0,
+            reactions_busy: 0,
         }
     );
 
@@ -5268,6 +5269,7 @@ async fn retry_policy_dead_letters_mixed_leaves_unresolved_postgres_test() {
         replay_persistence::DeadLetterRetrySummary {
             reactions_resolved: 2,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         }
     );
 
