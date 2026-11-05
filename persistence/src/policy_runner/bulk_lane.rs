@@ -129,6 +129,18 @@ where
                     .with_operation("policy_bulk_execute")
             })?;
 
+            // A command that names the version it expects is decided as `execute` decides
+            // it — on the stream at that version — so it is never served from the cache,
+            // and the cached instance is dropped: this command may move the stream.
+            if expected_version.is_some() {
+                self.loaded = None;
+                self.cqrs
+                    .execute::<A>(&id, metadata, command, self.services, expected_version)
+                    .await
+                    .map_err(Into::into)?;
+                return Ok(());
+            }
+
             self.cqrs
                 .execute_cached(
                     &mut self.loaded,
