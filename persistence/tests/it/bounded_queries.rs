@@ -79,22 +79,17 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/policy_runner.rs",
-        function: "streams_behind",
-        justification: "Rows returned: SQL carries LIMIT $limit, the policy's resolved \
-                        read_batch_size (default 100), so a Policy far behind catches up \
-                        over several cadences instead of in one allocation; the batch \
-                        resumes after the last id it examined, so the bound costs a \
-                        rotation rather than leaving a stream unexamined (ADR-0026). Rows \
-                        examined: not bounded by the LIMIT — the behind predicate compares \
-                        two tables and is applied after the join, so a caught-up Policy \
-                        walks every stream it tracks to return nothing. What bounds that \
-                        is what the Policy tracks: every stream, or for a \
-                        ForStreamTypes(types) filter the streams of those types after the \
-                        rotation, read off idx_streams_type_id by one range walk per type \
-                        without a row of any other type (ADR-0031). Each walk stops at \
-                        the LIMIT, so Postgres holds at most types x LIMIT ids before the \
-                        outer LIMIT. It costs Postgres a scan, not this process memory: \
-                        only the LIMIT reaches the Vec.",
+        function: "reconciliation_page",
+        justification: "A cadence reads at most reconcile_window stream rows for \
+                        every tracked stream, then probes places only for that bounded \
+                        window. A ForStreamTypes(types) Policy reads at most \
+                        types x reconcile_window rows through idx_streams_type_id, \
+                        with no rows of untracked types (ADR-0031); its outer window and \
+                        cursor probes are capped at reconcile_window. A forced \
+                        startup or manual comparison walks the same bounded pages and \
+                        retains at most read_batch_size behind ids. The persisted rotation \
+                        advances only through caught-up or read candidates, so it costs a \
+                        pass rather than skipping behind work (ADR-0026).",
     },
     Reviewed {
         file: "src/policy_runner.rs",
