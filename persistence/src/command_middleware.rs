@@ -1039,7 +1039,7 @@ mod tests {
                 store
                     .store_events_stream::<Counter, _, _, _>(
                         &counter(),
-                        Counter::stream_type(),
+                        "Stale".to_string(),
                         Metadata::default(),
                         futures::stream::iter([Ok(CounterEvent::Added { amount: 1 })]),
                         Some(0),
@@ -1077,6 +1077,15 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].version, 1);
         assert_eq!(events[0].data, CounterEvent::Added { amount: 2 });
+        // The rejected append left the stream's type as the committed one recorded it.
+        let typed: Vec<PersistedEvent<CounterEvent>> = store
+            .stream_events(crate::StreamFilter::ForStreamTypes(vec![
+                "Counter".to_string()
+            ]))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(typed.len(), 1);
     }
 
     #[test]

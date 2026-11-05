@@ -297,12 +297,6 @@ impl EventStore for InMemoryEventStore {
         // A middleware's error is returned as it is, so it is not decorated here.
         gate.check().await.into_result()?;
 
-        // Record the stream's type so `ForStreamTypes` filters can be evaluated per-event.
-        self.stream_types
-            .write()
-            .unwrap()
-            .insert(stream_id.clone(), stream_type);
-
         // Publish the staged events atomically under the write lock, then release it before
         // driving any async projections (the `RwLockWriteGuard` is not held across an await).
         {
@@ -324,6 +318,13 @@ impl EventStore for InMemoryEventStore {
                     head,
                 ));
             }
+            // Record the stream's type so `ForStreamTypes` filters can be evaluated per-event;
+            // only once the append is known to publish, so a rejected one changes nothing.
+            // Same lock order as the rest of the store: events, then stream types.
+            self.stream_types
+                .write()
+                .unwrap()
+                .insert(stream_id.clone(), stream_type);
             for event in staged.iter().cloned() {
                 stream.push((*next_position, event));
                 *next_position += 1;
