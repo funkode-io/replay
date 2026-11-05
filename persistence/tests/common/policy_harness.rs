@@ -663,6 +663,41 @@ impl PolicyDaemonHarness {
         Self::append_held(tx, stream_type, stream_id, tag).await
     }
 
+    /// Append a `Pinged` event to the probe stream `stream` on the **bulk lane**, through
+    /// the store's own writer: the internal append path a bulk append stamps its events
+    /// with (ADR-0034). No online Policy may react to it.
+    pub async fn bulk_ping(&self, stream: &str, tag: &str) -> AppendedEvent {
+        let stream_id = ProbeUrn::new(stream)
+            .expect("stream name must be a valid URN NSS")
+            .to_urn()
+            .to_string();
+        let event = ProbeEvent::Pinged {
+            tag: tag.to_string(),
+        };
+        let event_id = Uuid::new_v4();
+        sqlx::query("SELECT id FROM write_event($1, $2, $3, $4, $5, 'Probe', NULL, FALSE, 'bulk')")
+            .bind(event_id)
+            .bind(serde_json::to_value(&event).expect("a probe event must serialise"))
+            .bind(serde_json::json!({ PING_MARKER_KEY: Uuid::new_v4() }))
+            .bind(replay::Event::event_type(&event))
+            .bind(&stream_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the bulk append must succeed");
+        let global_position: i64 =
+            sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+                .bind(event_id)
+                .fetch_one(&self.pool)
+                .await
+                .expect("the bulk event must have a position");
+
+        AppendedEvent {
+            event_id,
+            global_position,
+            stream_id,
+        }
+    }
+
     /// Start a transaction that has taken its id and written nothing: an older writer, to
     /// [`ping_in`](Self::ping_in) later, after a younger one has drawn its position.
     pub async fn take_an_id(&self) -> Transaction<'static, Postgres> {

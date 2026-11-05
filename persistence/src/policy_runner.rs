@@ -4352,6 +4352,12 @@ async fn load_event_by_id(
 /// Two columns and an indexed range scan, bounded by `limit`: this runs on every poll, so
 /// it is the query the design is paid for. It reads no cursors and waits for no position
 /// to fill — a missing `global_position` names no stream, so there is nothing to stop at.
+///
+/// Online-lane rows only, through `idx_events_online_global_position`: a bulk append's
+/// rows are not in the index this walks, so however large it is the sweep neither reads
+/// it nor names its streams (ADR-0034). A stream that holds bulk events is still read
+/// when an online event, or the reconciliation, nominates it — and [`read_stream`] steps
+/// over them.
 async fn sweep_for_streams(
     pool: &Pool<Postgres>,
     from: i64,
@@ -4368,7 +4374,8 @@ async fn sweep_for_streams(
          ), active AS ( \
              SELECT COALESCE(array_agg(id), ARRAY[]::text[]) AS ids FROM active_ids \
          ), swept AS MATERIALIZED ( \
-             SELECT global_position, stream_id FROM events WHERE global_position > $1 \
+             SELECT global_position, stream_id FROM events \
+              WHERE global_position > $1 AND lane = 'online' \
               ORDER BY global_position ASC LIMIT $2 \
          ) \
          SELECT NULL::bigint AS global_position, NULL::text AS stream_id, \
@@ -4617,7 +4624,8 @@ impl LatePage {
 }
 
 /// A page of ended ids assigned above the previous snapshot's xmax. Its position bound is
-/// the last sweep that shared that snapshot.
+/// the last sweep that shared that snapshot. Online-lane rows only, as the sweep:
+/// `idx_events_online_commit_txid_position` holds no bulk transaction (ADR-0034).
 async fn late_tail_page(
     pool: &Pool<Postgres>,
     tail: &Tail,
@@ -4629,6 +4637,7 @@ async fn late_tail_page(
         "SELECT stream_id, commit_txid::text AS txid, global_position \
            FROM events \
           WHERE commit_txid >= $1::xid8 AND commit_txid < $2::xid8 \
+            AND lane = 'online' \
             AND global_position <= $3 \
             AND commit_txid::text <> ALL($4::text[]) \
             AND ($5::text IS NULL OR (commit_txid, global_position) > \
@@ -4659,7 +4668,8 @@ async fn late_tail_page(
     Ok(LatePage::of(rows, limit))
 }
 
-/// A page of one ended transaction's events. The index and LIMIT bound every result.
+/// A page of one ended transaction's online-lane events. The index and LIMIT bound every
+/// result; a bulk segment's transaction has no row in the index, so it nominates nothing.
 async fn ended_transaction_page(
     pool: &Pool<Postgres>,
     txid: u64,
@@ -4669,7 +4679,7 @@ async fn ended_transaction_page(
     let rows = sqlx::query(
         "SELECT stream_id, global_position \
            FROM events \
-          WHERE commit_txid = $1::xid8 \
+          WHERE commit_txid = $1::xid8 AND lane = 'online' \
             AND ($2::bigint IS NULL OR global_position > $2) \
           ORDER BY global_position LIMIT $3",
     )
@@ -4907,7 +4917,8 @@ async fn places_of(
 /// No contiguity to check: appends to a stream serialise on its row, so its places arrive
 /// in order and a missing one cannot be an append in flight — it is the operator's doing.
 /// The filter decides delivery only; an excluded row advances the place like a compaction
-/// snapshot does (ADR-0013, ADR-0004).
+/// snapshot does (ADR-0013, ADR-0004). A bulk-lane row is excluded the same way, whatever
+/// the filter: the place passes it and nothing fires (ADR-0034).
 async fn read_stream(
     pool: &Pool<Postgres>,
     filter: StreamFilter,
@@ -4917,9 +4928,11 @@ async fn read_stream(
 ) -> Result<Vec<StreamEvent>, replay::Error> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, data, metadata, stream_id, type, version, created, aggregate_version, \
-         global_position, stream_seq, compacted_snapshot, COALESCE((",
+         global_position, stream_seq, compacted_snapshot, lane = 'online' AND COALESCE((",
     );
-    // As a predicate NULL means no match; read as a value it must be collapsed.
+    // As a predicate NULL means no match; read as a value it must be collapsed. A
+    // bulk-lane row matches no online Policy's filter, whatever the filter says: the bulk
+    // lane reaches Policies through its own queue, never through this feed (ADR-0034).
     PostgresEventStore::add_filters(&mut qb, filter);
     qb.push("), FALSE) AS matches_filter FROM events WHERE stream_id = ");
     qb.push_bind(stream_id.to_string());
@@ -9554,5 +9567,276 @@ mod reconcile_schedule_tests {
 
         assert!(!schedule.is_due(loaded + CADENCE - Duration::from_nanos(1)));
         assert!(schedule.is_due(loaded + CADENCE));
+    }
+}
+
+/// The online lane ignores a bulk-lane event (funkode-io/replay#301, ADR-0034).
+///
+/// Each source of the online feed is pinned on its own here — the sweep, both halves of
+/// the late-write lookup, the per-stream read and the reconciliation — because each
+/// reads the log by its own statement, and a statement that forgot the lane would still
+/// pass an end-to-end test that happens to be served by another source.
+/// `tests/it/policy_online_ignores_bulk.rs` asserts the same through a running Policy.
+#[cfg(test)]
+mod bulk_lane_tests {
+    use sqlx::PgPool;
+
+    use crate::filters::StreamFilter;
+
+    use super::progress_tests::start_postgres;
+    use super::{
+        checkpoint_places, late_tail_page, lookup_late_writes, places_of, read_stream,
+        streams_behind, sweep_for_streams, Discovered, LateWriteState, PolicyProgress, Reached,
+        StartAt, Sweep, Tail, TrackedStreams,
+    };
+
+    const POLICY: &str = "online_lane_under_test";
+
+    /// Write one event to `stream` on `lane` through the store's writer, the statement
+    /// every append goes through, and return its id.
+    async fn write_on<'c, E>(executor: E, stream: &str, lane: &str) -> uuid::Uuid
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "SELECT id FROM write_event($1, '{}'::jsonb, '{}'::jsonb, 'Appended', $2, \
+             'Probe', NULL, FALSE, $3)",
+        )
+        .bind(id)
+        .bind(stream)
+        .bind(lane)
+        .fetch_one(executor)
+        .await
+        .expect("writing an event must succeed");
+        id
+    }
+
+    async fn append(pool: &PgPool, stream: &str, lane: &str, count: usize) {
+        for _ in 0..count {
+            write_on(pool, stream, lane).await;
+        }
+    }
+
+    async fn position_of(pool: &PgPool, id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the event must have a position")
+    }
+
+    async fn txid_of(pool: &PgPool, id: uuid::Uuid) -> u64 {
+        sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the event must have a transaction id")
+            .parse()
+            .expect("a transaction id is an unsigned 64-bit value")
+    }
+
+    /// Move the Policy's place in `stream` to `to`, as a poll that read up to it would.
+    async fn checkpoint(pool: &PgPool, stream: &str, to: i64) {
+        let global_position: i64 = sqlx::query_scalar(
+            "SELECT global_position FROM events WHERE stream_id = $1 AND stream_seq = $2",
+        )
+        .bind(stream)
+        .bind(to)
+        .fetch_one(pool)
+        .await
+        .expect("the place must hold an event");
+        let streams = vec![stream.to_string()];
+        let observed = places_of(pool, POLICY, &streams)
+            .await
+            .expect("reading the place must succeed");
+        let reached = Reached {
+            stream_id: stream.to_string(),
+            seq: to,
+            global_position,
+        };
+        let kept = checkpoint_places(pool, POLICY, &[reached], &observed)
+            .await
+            .expect("checkpointing must succeed");
+        assert!(kept.contains_key(stream), "nothing else writes this place");
+    }
+
+    async fn behind(pool: &PgPool) -> Vec<String> {
+        streams_behind(pool, POLICY, &TrackedStreams::Every, "", 10)
+            .await
+            .expect("the reconciliation's comparison must succeed")
+    }
+
+    /// A bulk append names no stream to the sweep, and spends none of its budget: a sweep
+    /// of one row past a bulk of three still finds the online event after it.
+    #[tokio::test]
+    async fn a_bulk_event_names_no_stream_to_the_sweep_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        append(&pool, "urn:probe:bulk", "bulk", 3).await;
+        let online = write_on(&pool, "urn:probe:online", "online").await;
+        let online_position = position_of(&pool, online).await;
+
+        let sweep = sweep_for_streams(&pool, 0, 1)
+            .await
+            .expect("the sweep must succeed");
+
+        assert_eq!(
+            sweep.discovered.streams,
+            vec!["urn:probe:online".to_string()],
+            "the sweep reads past the bulk rows without counting them"
+        );
+        assert_eq!(sweep.discovered.swept_through, online_position);
+    }
+
+    /// A bulk segment's transaction that the sweep saw in progress is looked up once it
+    /// ends, as every such transaction is, and nominates nothing.
+    #[tokio::test]
+    async fn an_ended_bulk_transaction_nominates_nothing_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let mut held = pool.begin().await.expect("starting the held bulk segment");
+        let bulk = write_on(&mut *held, "urn:probe:held-bulk", "bulk").await;
+        let txid: u64 =
+            sqlx::query_scalar::<_, String>("SELECT commit_txid::text FROM events WHERE id = $1")
+                .bind(bulk)
+                .fetch_one(&mut *held)
+                .await
+                .expect("the held event must have a transaction id")
+                .parse()
+                .expect("a transaction id is an unsigned 64-bit value");
+        let position: i64 = sqlx::query_scalar("SELECT global_position FROM events WHERE id = $1")
+            .bind(bulk)
+            .fetch_one(&mut *held)
+            .await
+            .expect("the held event must have a position");
+        append(&pool, "urn:probe:advance-xmax", "online", 1).await;
+
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the sweep must succeed");
+        assert!(sweep.in_progress.contains(&txid));
+        let late = lookup_late_writes(&pool, &LateWriteState::default(), &sweep, position, 10)
+            .await
+            .expect("an open transaction is remembered, not read");
+        assert!(late.state.unseen.contains(&txid));
+
+        held.commit().await.expect("committing the bulk segment");
+        let sweep = sweep_for_streams(&pool, position, 10)
+            .await
+            .expect("the sweep must succeed");
+        let late = lookup_late_writes(&pool, &late.state, &sweep, position, 10)
+            .await
+            .expect("the ended transaction must be looked up");
+
+        assert!(
+            late.streams.is_empty(),
+            "a bulk transaction nominates no stream, found {:?}",
+            late.streams
+        );
+        assert!(!late.state.unseen.contains(&txid));
+        assert!(
+            !late.state.pending.contains_key(&txid),
+            "and it is settled, not carried to the next poll"
+        );
+    }
+
+    /// The tail half of the lookup: an id at the previous snapshot's xmax, below the
+    /// sweep's position, is found when it is online and not when it is bulk.
+    #[tokio::test]
+    async fn the_tail_holds_no_bulk_row_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let bulk = write_on(&pool, "urn:probe:tail-bulk", "bulk").await;
+        let txid = txid_of(&pool, bulk).await;
+        let position = position_of(&pool, bulk).await;
+
+        let page = late_tail_page(
+            &pool,
+            &Tail {
+                xmax: txid,
+                seen_xmax: txid,
+                swept_through: position,
+                after: None,
+            },
+            &Sweep {
+                discovered: Discovered {
+                    streams: Vec::new(),
+                    swept_through: position,
+                },
+                xmax: txid + 1,
+                in_progress: Vec::new(),
+            },
+            10,
+        )
+        .await
+        .expect("the tail query must succeed");
+
+        assert!(
+            page.rows.is_empty(),
+            "the bulk row is not on the online tail"
+        );
+        assert!(page.complete);
+    }
+
+    /// The per-stream read steps over a bulk event as over a row the filter excludes: it
+    /// is returned, so the place can pass it, and it is not delivered — under a filter
+    /// that would deliver every other row.
+    #[tokio::test]
+    async fn the_stream_read_passes_a_bulk_event_without_delivering_it_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let stream = "urn:probe:mixed";
+        append(&pool, stream, "online", 1).await;
+        append(&pool, stream, "bulk", 1).await;
+        append(&pool, stream, "online", 1).await;
+
+        let events = read_stream(&pool, StreamFilter::All, stream, 0, 10)
+            .await
+            .expect("reading the stream must succeed");
+
+        let read: Vec<(i64, bool)> = events
+            .iter()
+            .map(|event| (event.stream_seq, event.delivered.is_some()))
+            .collect();
+        assert_eq!(
+            read,
+            vec![(1, true), (2, false), (3, true)],
+            "every place is read in order, and only the online events are delivered"
+        );
+    }
+
+    /// A caught-up Policy's reconciliation nominates a stream whose only new events are
+    /// bulk once, and settles: once the place has passed them, the stream is behind no
+    /// longer.
+    #[tokio::test]
+    async fn the_reconciliation_nominates_a_bulk_only_stream_once_and_settles_postgres_test() {
+        let (pool, _container) = start_postgres().await;
+        let stream = "urn:probe:caught-up";
+        append(&pool, stream, "online", 2).await;
+        PolicyProgress::load(&pool, POLICY, StartAt::Beginning, TrackedStreams::Every)
+            .await
+            .expect("loading must succeed");
+        checkpoint(&pool, stream, 2).await;
+        assert!(behind(&pool).await.is_empty(), "the Policy is caught up");
+
+        append(&pool, stream, "bulk", 3).await;
+
+        assert_eq!(
+            behind(&pool).await,
+            vec![stream.to_string()],
+            "the stream's head moved, so the comparison names it"
+        );
+        let events = read_stream(&pool, StreamFilter::All, stream, 2, 10)
+            .await
+            .expect("reading the stream must succeed");
+        assert!(
+            events.iter().all(|event| event.delivered.is_none()),
+            "the poll it is read by delivers none of the bulk events"
+        );
+        let reached = events.last().expect("the bulk events are read").stream_seq;
+        assert_eq!(reached, 5);
+        checkpoint(&pool, stream, reached).await;
+
+        assert!(
+            behind(&pool).await.is_empty(),
+            "and once its place has passed them, the stream is not nominated again"
+        );
     }
 }
