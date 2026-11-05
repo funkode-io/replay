@@ -1,9 +1,8 @@
 name: CI
 
+# CI runs locally before every push; this workflow is manual.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
