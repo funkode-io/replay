@@ -19,7 +19,7 @@ use tokio::time::timeout;
 use crate::common;
 
 use common::policy_harness::{Probe, ProbeCommand, ProbeEvent, ProbeUrn, OBSERVE_TIMEOUT};
-use common::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT};
+use common::postgres_image::{start_postgres_server, TestDatabase};
 use replay_persistence::{
     CommandContext, CommandContextMut, CommandMiddleware, Cqrs, EventStore, Next,
     PostgresEventStore,
@@ -29,24 +29,13 @@ use replay_persistence::{
 const COMMIT_GATE_LOCK_CLASS: i32 = 0x5243_4754;
 
 /// A fresh server, migrated, with the one-row `maintenance` table an operator flips.
-async fn flag_pool() -> (PgPool, PostgresServer) {
+async fn flag_pool() -> (PgPool, TestDatabase) {
     let container = start_postgres_server().await;
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to read the container host")
-        .to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("failed to read the container port");
     // Each append in flight holds a connection for its transaction and borrows another
     // for the middleware's read of the flag.
     let pool = PgPoolOptions::new()
         .max_connections(30)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("failed to create the postgres pool");
     common::migrations::MIGRATOR
