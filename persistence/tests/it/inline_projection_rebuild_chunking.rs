@@ -18,9 +18,7 @@ use replay_macros::define_aggregate;
 use replay_persistence::{EventStore, InlineProjection, PersistedEvent};
 
 use crate::common;
-use common::postgres_image::start_postgres_server;
-
-const POSTGRES_PORT: u16 = 5432;
+use common::postgres_image::postgres_database;
 
 define_aggregate! {
     Ledger {
@@ -65,19 +63,12 @@ impl replay::Aggregate for Ledger {
     }
 }
 
-async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (PgPool, common::postgres_image::TestDatabase) {
+    let container = postgres_database().await;
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to connect to Postgres");
 

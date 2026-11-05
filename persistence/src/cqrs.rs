@@ -211,7 +211,8 @@ impl<ES: EventStore> Cqrs<ES> {
     /// Once the command has finished, each middleware whose `before` answered `Continue`
     /// runs its `after`, in reverse registration order, with the [`Outcome`]: committed,
     /// busy with the reason, or failed with the error this call returns. A middleware that
-    /// stopped the command, and every one after it, runs no `after`. `after` only
+    /// stopped the command in `before`, and every one after it, runs no `after`; a refusal
+    /// at the commit gate leaves every middleware's `after` to run. `after` only
     /// observes: what it does never changes what this call returns.
     ///
     /// Each middleware's `before_commit` then runs at the append's commit gate, in

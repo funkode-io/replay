@@ -17,15 +17,13 @@ use replay_persistence::PersistedEvent;
 
 mod common;
 use common::alloc::{allocated_bytes, CountingAllocator};
-use common::postgres_image::{start_postgres_server, PostgresServer};
+use common::postgres_image::{postgres_database, TestDatabase};
 use common::report::report;
 
 /// Every test binary registers its own global allocator; the counting itself is
 /// shared (`tests/common/alloc.rs`).
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-const POSTGRES_PORT: u16 = 5432;
 
 /// The stored shape of the events these tests read back: a few fat text blocks,
 /// like the localized Markdown payloads that surfaced the amplification.
@@ -47,21 +45,12 @@ fn fat_event(version: i64) -> Value {
     json!({ "reference": format!("event-{version}"), "blocks": blocks })
 }
 
-async fn start_pool() -> (PostgresServer, PgPool) {
-    let container = start_postgres_server().await;
-
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (TestDatabase, PgPool) {
+    let container = postgres_database().await;
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&format!(
-            "postgres://postgres:postgres@{}:{}/postgres",
-            host, port
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to create postgres pool");
 

@@ -117,11 +117,13 @@ Which streams to read is found three ways. A sweep of the log by [Global positio
 poll is fast, and may pass a write that had not committed yet (a [Late write]). A
 late-write lookup every poll finds those by their [Commit stamp] once their transaction
 ends ([ADR-0030](docs/adr/0030-a-late-write-is-found-by-its-commit-stamp.md)). A
-reconciliation compares every stream's head with the Policy's place: at leader start,
-on a manual drain, and on a slow cadence as a safety net. None of them decides what is
-owed; they nominate streams. The sweep and the reconciliation take a
-batch and resume where the last one stopped, so "bounded" costs a rotation rather than a
-stream nobody looks at.
+reconciliation compares a bounded window of stream heads with the Policy's places: one
+window on its slow safety cadence, and bounded keyset pages at leader start or on a manual
+drain until it finds a candidate batch or completes a pass, wrapping at the saved rotation.
+A caught-up full comparison costs roughly `ceil(tracked streams / window)` statements plus
+boundary probes in one poll, delaying delivery until it finishes. None of these paths
+decides what is owed; they nominate streams. The sweep and the reconciliation resume where the last one
+stopped, so "bounded" costs a rotation rather than a stream nobody looks at.
 
 Which streams a poll reads, in what order, how far its event budget gets and where that
 leaves the rotation is **one decision, taken over what the two nomination queries

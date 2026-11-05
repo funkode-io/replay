@@ -15,7 +15,7 @@ use replay_macros::define_aggregate;
 use replay_persistence::{EventStore, InlineProjection, PersistedEvent, PostgresEventStore};
 
 use crate::common;
-use common::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT};
+use common::postgres_image::{postgres_database, start_postgres_server, TestDatabase};
 
 define_aggregate! {
     Till {
@@ -63,19 +63,22 @@ impl replay::Aggregate for Till {
     }
 }
 
-async fn start_pool() -> (PgPool, PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (PgPool, TestDatabase) {
+    pool_on(postgres_database().await).await
+}
 
+/// A pool on a server of the test's own, for a test that counts the rows a catch-up
+/// reads. The catch-up reads from its horizon, the oldest transaction still running, and
+/// transaction ids are server-wide: on the shared server another test's open transaction
+/// holds the horizon back and the count with it.
+async fn start_pool_on_own_server() -> (PgPool, TestDatabase) {
+    pool_on(start_postgres_server().await).await
+}
+
+async fn pool_on(container: TestDatabase) -> (PgPool, TestDatabase) {
     let pool = PgPoolOptions::new()
         .max_connections(8)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to connect to Postgres");
 
@@ -749,12 +752,14 @@ async fn close_and_report(pool: &PgPool, store: PostgresEventStore, one: PgPool,
     one.close().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let alive: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1")
-                .bind(name)
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let alive: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+                  WHERE application_name = $1 AND datname = current_database()",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
         if alive == 0 {
             return;
         }
@@ -842,7 +847,7 @@ async fn event_reads_since(
 #[tokio::test]
 async fn a_catch_up_reads_from_its_horizon_on_its_hundredth_run_on_one_connection_postgres_test() {
     const LOGGED: i64 = 4_000;
-    let (pool, _container) = start_pool().await;
+    let (pool, _container) = start_pool_on_own_server().await;
     let (new_pod, measured) = measured_store(&pool).await;
     seed_old_pod_history(&pool, LOGGED).await;
     let before = event_reads(&pool).await;
@@ -895,7 +900,7 @@ async fn a_catch_up_reads_from_its_horizon_on_its_hundredth_run_on_one_connectio
 async fn a_catch_up_reads_from_its_horizon_when_the_gap_is_most_of_the_log_postgres_test() {
     const HISTORY: i64 = 2_000;
     const GAP: i64 = 8_000;
-    let (pool, _container) = start_pool().await;
+    let (pool, _container) = start_pool_on_own_server().await;
     let (new_pod, measured) = measured_store(&pool).await;
 
     // The history is applied by another process starting up, on a connection that has

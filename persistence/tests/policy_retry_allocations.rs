@@ -15,7 +15,7 @@ mod common;
 
 use common::alloc::{peak_live_bytes, reset_peak, CountingAllocator};
 use common::policy_harness::{Probe, ProbeCommand, ProbeUrn};
-use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
+use common::postgres_image::postgres_database;
 use common::report::report;
 
 use replay_persistence::{
@@ -171,23 +171,12 @@ async fn park_retired_commands(
 }
 
 /// A database with the crate's schema, and the container that owns it.
-async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to read the container host")
-        .to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("failed to read the container port");
+async fn start_pool() -> (PgPool, common::postgres_image::TestDatabase) {
+    let container = postgres_database().await;
 
     let pool = PgPoolOptions::new()
         .max_connections(4)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("failed to create the postgres pool");
 

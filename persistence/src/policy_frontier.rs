@@ -62,8 +62,14 @@ pub(crate) struct Nominations {
     /// What the late-write lookup found, which leads the poll because it may not be
     /// nominated again.
     pub(crate) late: Vec<String>,
-    /// What the reconciliation compared, empty when none is due — and empty when one is
-    /// due and found nothing, which is a different fact and the one `reconciling` carries.
+    /// Rotation order: a cadence window including caught-up streams, or only the
+    /// candidates retained by a full comparison.
+    pub(crate) page: Vec<String>,
+    /// The limit that distinguishes a complete scan page from the end of the key range.
+    pub(crate) page_limit: u32,
+    /// Behind streams in the reconciliation window, empty when none is due — and empty
+    /// when one is due and found nothing, which is a different fact carried by
+    /// `reconciling`.
     pub(crate) examined: Vec<String>,
     /// Whether a reconciliation ran on this poll.
     pub(crate) reconciling: bool,
@@ -89,9 +95,12 @@ const RECOVERED: usize = 2;
 pub(crate) struct PollPlan {
     /// The candidates, in read order.
     streams: Vec<String>,
-    /// What the reconciliation compared, kept whole: the rotation moves through *this*
-    /// order, which is stream id order, and not through the order the poll read in.
+    /// The comparison's rotation order, which may wrap at the saved cursor. Full
+    /// comparisons retain only candidates; cadence windows include caught-up streams.
     page: Vec<String>,
+    page_limit: u32,
+    /// The streams in `page` that owe events to the Policy.
+    owed: Vec<String>,
     reconciling: bool,
     read_batch: u32,
     /// The queue this poll started from, whole and in order — not just the part that
@@ -153,16 +162,18 @@ impl PollPlan {
             carried,
             swept,
             late,
+            page,
+            page_limit,
             examined,
             reconciling,
             read_batch,
             share_from,
         } = nominations;
 
-        // Bounded by the batch, like every other collection here: the page is what the
-        // reconciliation read, which its own `LIMIT` capped, and the queue is what the
-        // last poll handed on, which this one caps again before it hands it on.
-        let page = examined.clone();
+        // `page` is bounded by the reconciliation scan window, while `examined` is its
+        // behind subset. The queue is what the last poll handed on, which this one caps
+        // again before it hands it on.
+        let owed = examined.clone();
         // A late write the queue already holds is offered there, so it does not lead: a
         // stream written late on every poll would otherwise take the first slot of every
         // poll, and a burst the size of the batch spend each poll's budget on it alone.
@@ -170,9 +181,8 @@ impl PollPlan {
             .into_iter()
             .filter(|stream| !carried.contains(stream))
             .collect();
-        // Bounded by twice the batch: `examined` is what the reconciliation's `LIMIT` read,
-        // `late` what the lookup read under `read_batch`. The page first, so a late write
-        // never costs the reconciliation's rotation a slot and ADR-0026's bound holds.
+        // Bounded by the reconciliation scan size plus the late-write batch. The page first,
+        // so a late write never costs the reconciliation's rotation a slot (ADR-0026).
         let mut recovered = examined;
         for stream in &late {
             if !recovered.contains(stream) {
@@ -214,6 +224,8 @@ impl PollPlan {
         Self {
             streams: taken,
             page,
+            page_limit,
+            owed,
             reconciling,
             read_batch,
             carried: queue,
@@ -285,26 +297,12 @@ impl PollPlan {
 
     /// What the poll leaves behind.
     ///
-    /// The rotation advances through what the poll *read*, not through what it admitted: a
-    /// candidate the event budget never reached is carried, and stepping the rotation over
-    /// it would leave it for a full pass — or for ever, if the front of the page is always
-    /// what the budget spends itself on. Contiguous from the front of the page, because
-    /// the rotation is one id and cannot describe a hole in the middle.
+    /// The rotation advances through the scanned window, skipping streams already caught
+    /// up and behind streams this poll finished. It stops before the first behind stream
+    /// the poll did not read, because the rotation is one id and cannot describe a hole in
+    /// the middle.
     ///
     pub(crate) fn settle(self) -> Settled {
-        // Only on the polls a reconciliation ran on: off the cadence there is no page for
-        // the rotation to move through, and the set would be hashed for nothing.
-        let rotation = self.reconciling.then(|| {
-            let read: HashSet<&String> = self.streams[..self.visited].iter().collect();
-            let read_through = self
-                .page
-                .iter()
-                .take_while(|stream| read.contains(stream))
-                .count();
-
-            rotation_after(&self.page, read_through, self.read_batch)
-        });
-
         // What the next poll starts from, oldest claim first.
         //
         // The stream the poll was in the middle of leads: at most one, handed out and
@@ -333,6 +331,21 @@ impl PollPlan {
                 carried.push(stream.clone());
             }
         }
+
+        // A caught-up stream needs no read. A behind stream is safe to pass only when this
+        // poll finished it; a carried candidate stays in front of the rotation and will be
+        // compared again after its place catches up.
+        let rotation = self.reconciling.then(|| {
+            let done: HashSet<&String> = self.streams[..self.visited].iter().collect();
+            let owed: HashSet<&String> = self.owed.iter().collect();
+            let read_through = self
+                .page
+                .iter()
+                .take_while(|stream| !owed.contains(stream) || done.contains(stream))
+                .count();
+
+            rotation_after(&self.page, read_through, self.page_limit)
+        });
 
         Settled {
             carried,
@@ -580,6 +593,8 @@ mod sharing_tests {
             carried: streams(&["carried", "late"]),
             swept: streams(&["swept"]),
             late: streams(&["late"]),
+            page: Vec::new(),
+            page_limit: 1,
             examined: Vec::new(),
             reconciling: false,
             read_batch: 1,
@@ -602,6 +617,8 @@ mod sharing_tests {
             carried: Vec::new(),
             swept: streams(&["swept"]),
             late: streams(&["late"]),
+            page: streams(&["behind-a", "behind-b"]),
+            page_limit: 2,
             examined: streams(&["behind-a", "behind-b"]),
             reconciling: true,
             read_batch: 2,
@@ -623,6 +640,8 @@ mod sharing_tests {
             carried: streams(&["c"]),
             swept: streams(&["s"]),
             late: streams(&["l1", "l2", "l3"]),
+            page: Vec::new(),
+            page_limit: 3,
             examined: Vec::new(),
             reconciling: false,
             read_batch: 3,
@@ -643,6 +662,8 @@ mod sharing_tests {
             carried: streams(&["carried"]),
             swept: streams(&["swept"]),
             late: streams(&["late"]),
+            page: Vec::new(),
+            page_limit: 1,
             examined: Vec::new(),
             reconciling: false,
             read_batch: 1,
@@ -664,6 +685,10 @@ mod sharing_tests {
 #[cfg(test)]
 mod settling_tests {
     use super::{Nominations, PollPlan};
+
+    fn streams(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
 
     /// What a poll that failed hands on: its own unwritten places first, then what its
     /// plan settled, each stream once and capped.
@@ -712,6 +737,8 @@ mod settling_tests {
             carried: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
             swept: vec!["urn:probe:c".to_string(), "urn:probe:d".to_string()],
             late: Vec::new(),
+            page: Vec::new(),
+            page_limit: 2,
             examined: Vec::new(),
             reconciling: false,
             read_batch: 2,
@@ -745,6 +772,8 @@ mod settling_tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             late: Vec::new(),
+            page: Vec::new(),
+            page_limit: 3,
             examined: Vec::new(),
             reconciling: false,
             read_batch: 3,
@@ -784,6 +813,8 @@ mod settling_tests {
             carried: vec!["urn:probe:a".to_string(), "urn:probe:z".to_string()],
             swept: vec!["urn:probe:a".to_string()],
             late: Vec::new(),
+            page: Vec::new(),
+            page_limit: 2,
             examined: vec!["urn:probe:p".to_string()],
             reconciling: false,
             read_batch: 2,
@@ -815,6 +846,8 @@ mod settling_tests {
             carried: vec!["urn:probe:old".to_string()],
             swept: vec!["urn:probe:swept".to_string()],
             late: Vec::new(),
+            page: Vec::new(),
+            page_limit: 1,
             examined: Vec::new(),
             reconciling: false,
             read_batch: 1,
@@ -846,6 +879,8 @@ mod settling_tests {
             carried: Vec::new(),
             swept: Vec::new(),
             late: Vec::new(),
+            page: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
+            page_limit: 4,
             examined: vec!["urn:probe:a".to_string(), "urn:probe:b".to_string()],
             reconciling: true,
             read_batch: 4,
@@ -866,6 +901,105 @@ mod settling_tests {
             settled.rotation, None,
             "and the rotation stays where it was, because nothing was read"
         );
+    }
+
+    /// Caught-up rows are safe to pass, but a behind stream the shared cap did not admit
+    /// stays in front of the rotation.
+    #[test]
+    fn rotation_passes_caught_up_rows_and_stops_before_unretained_work() {
+        let mut plan = PollPlan::plan(Nominations {
+            carried: streams(&["urn:probe:carried", "urn:probe:older"]),
+            swept: Vec::new(),
+            late: Vec::new(),
+            page: streams(&["urn:probe:a", "urn:probe:b"]),
+            page_limit: 2,
+            examined: streams(&["urn:probe:a", "urn:probe:b"]),
+            reconciling: true,
+            read_batch: 2,
+            share_from: 0,
+        });
+        assert_eq!(
+            plan.streams(),
+            ["urn:probe:a".to_string(), "urn:probe:carried".to_string()]
+        );
+
+        let first = plan.turn().expect("the reconciliation leads");
+        plan.read(&first, 1);
+        plan.delivered(&first);
+        let second = plan.turn().expect("the prior queue gets the other slot");
+        plan.read(&second, 0);
+        plan.delivered(&second);
+
+        let settled = plan.settle();
+        assert_eq!(settled.rotation, Some("urn:probe:a".to_string()));
+        assert!(
+            !settled.carried.contains(&"urn:probe:b".to_string()),
+            "the behind stream that got no slot is not carried"
+        );
+    }
+
+    /// A bounded scan can make progress through a caught-up window without reading any
+    /// stream; an empty behind set still advances the rotation.
+    #[test]
+    fn a_caught_up_reconciliation_window_advances_without_candidates() {
+        let plan = PollPlan::plan(Nominations {
+            carried: Vec::new(),
+            swept: Vec::new(),
+            late: Vec::new(),
+            page: streams(&["urn:probe:a", "urn:probe:b"]),
+            page_limit: 3,
+            examined: Vec::new(),
+            reconciling: true,
+            read_batch: 3,
+            share_from: 0,
+        });
+
+        let settled = plan.settle();
+
+        assert_eq!(settled.rotation, Some(String::new()));
+        assert!(settled.carried.is_empty());
+    }
+
+    /// A caught-up prefix does not block rotation when the behind stream in the same
+    /// window is finished.
+    #[test]
+    fn rotation_passes_a_caught_up_prefix_before_behind_work() {
+        let mut plan = PollPlan::plan(Nominations {
+            carried: Vec::new(),
+            swept: Vec::new(),
+            late: Vec::new(),
+            page: streams(&["urn:probe:a", "urn:probe:b"]),
+            page_limit: 2,
+            examined: streams(&["urn:probe:b"]),
+            reconciling: true,
+            read_batch: 2,
+            share_from: 0,
+        });
+        let turn = plan.turn().expect("the one behind stream is nominated");
+        assert_eq!(turn.stream_id, "urn:probe:b");
+        plan.read(&turn, 1);
+        plan.delivered(&turn);
+
+        assert_eq!(plan.settle().rotation, Some("urn:probe:b".to_string()));
+    }
+
+    /// The scan-window bound, not the event budget, decides whether a reconciliation page
+    /// was short and reached the end of the key range.
+    #[test]
+    fn a_full_scan_window_does_not_wrap_when_read_batch_is_larger() {
+        let plan = PollPlan::plan(Nominations {
+            carried: Vec::new(),
+            swept: Vec::new(),
+            late: Vec::new(),
+            page: streams(&["urn:probe:a", "urn:probe:b", "urn:probe:c"]),
+            page_limit: 3,
+            examined: Vec::new(),
+            reconciling: true,
+            read_batch: 5,
+            share_from: 0,
+        });
+
+        assert_eq!(plan.settle().rotation, Some("urn:probe:c".to_string()));
     }
 }
 
@@ -1021,9 +1155,10 @@ mod liveness_simulation {
         burst: u64,
         /// Cadences it has been behind without being read. The number under test.
         waited: u32,
-        /// The most streams seen behind at once while it has been waiting, which is the
-        /// numerator of ADR-0026's bound for *this* wait.
-        behind_while_waiting: u32,
+        /// The most streams behind at any cadence of the current wait. The bound is taken
+        /// against this, not the count now: other streams catching up while this one
+        /// waits shrinks the count but not the cadences already spent on them.
+        behind_during_wait: u32,
         read_this_cadence: bool,
     }
 
@@ -1039,9 +1174,9 @@ mod liveness_simulation {
         /// Polls with no candidates at all — the state a finished pass ends on, and the
         /// only one that wraps the rotation.
         empty_polls: u32,
-        /// Wraps taken on one of those polls: the rotation was past the last stream id
-        /// and nothing was read.
-        wraps_on_an_empty_poll: u32,
+        /// Wraps taken on a poll whose reconciliation page was empty: the rotation was
+        /// past the last stream id, whatever the other nomination sources offered.
+        wraps_on_an_empty_page: u32,
         /// Polls whose event budget ran out before their candidate list did, which is
         /// where a slot stops meaning a read.
         budgets_spent_early: u32,
@@ -1057,7 +1192,7 @@ mod liveness_simulation {
     impl Coverage {
         fn add(&mut self, other: &Coverage) {
             self.empty_polls += other.empty_polls;
-            self.wraps_on_an_empty_poll += other.wraps_on_an_empty_poll;
+            self.wraps_on_an_empty_page += other.wraps_on_an_empty_page;
             self.budgets_spent_early += other.budgets_spent_early;
             self.pages_at_the_batch += other.pages_at_the_batch;
             self.polls_between_cadences += other.polls_between_cadences;
@@ -1070,6 +1205,7 @@ mod liveness_simulation {
         seed: u64,
         streams: Vec<Stream>,
         read_batch: u32,
+        scan_window: u32,
         polls_per_cadence: u32,
         /// The log, as the sweep reads it: one entry per event of a stream it can see.
         log: Vec<usize>,
@@ -1102,6 +1238,7 @@ mod liveness_simulation {
                 seed,
                 streams: Vec::new(),
                 read_batch,
+                scan_window: 1 + (seed % 7) as u32,
                 polls_per_cadence,
                 log: Vec::new(),
                 late: Vec::new(),
@@ -1135,7 +1272,7 @@ mod liveness_simulation {
                     busy: rng.chance(2),
                     burst: rng.between(1, u64::from(read_batch) + 2),
                     waited: 0,
-                    behind_while_waiting: 0,
+                    behind_during_wait: 0,
                     read_this_cadence: false,
                 });
                 // A backlog to start from, so the first cadences are not all empty.
@@ -1179,14 +1316,22 @@ mod liveness_simulation {
             streams
         }
 
-        /// `streams_behind`, against the modelled streams: those owed events, sorting
-        /// after the rotation, in id order, capped by the batch.
-        fn examined(&self) -> Vec<String> {
+        /// The bounded keyset window `streams_behind` compares, in id order.
+        fn page(&self) -> Vec<String> {
             self.streams
                 .iter()
-                .filter(|stream| stream.head > stream.place && stream.id > self.rotation)
+                .filter(|stream| stream.id > self.rotation)
                 .map(|stream| stream.id.clone())
-                .take(self.read_batch as usize)
+                .take(self.scan_window as usize)
+                .collect()
+        }
+
+        /// The streams in `page` whose heads are past the Policy's places.
+        fn examined(&self, page: &[String]) -> Vec<String> {
+            self.streams
+                .iter()
+                .filter(|stream| stream.head > stream.place && page.contains(&stream.id))
+                .map(|stream| stream.id.clone())
                 .collect()
         }
 
@@ -1214,18 +1359,18 @@ mod liveness_simulation {
             if !late.is_empty() {
                 self.seen.late_nominations += 1;
             }
-            let examined = if reconciling {
-                self.examined()
-            } else {
-                Vec::new()
-            };
-            let page = examined.join(",");
-            let page_len = examined.len();
+            let page = if reconciling { self.page() } else { Vec::new() };
+            let examined = self.examined(&page);
+            let page_last = page.last().cloned().unwrap_or_default();
+            let page_label = page.join(",");
+            let page_len = page.len();
 
             let mut plan = PollPlan::plan(Nominations {
                 carried: carried.clone(),
                 swept: swept.clone(),
                 late: late.clone(),
+                page,
+                page_limit: self.scan_window,
                 examined,
                 reconciling,
                 read_batch: self.read_batch,
@@ -1238,9 +1383,12 @@ mod liveness_simulation {
                 self.seen.empty_polls += 1;
             }
             if reconciling {
-                // A full page is only evidence of a page too small for what is behind if
-                // something was left out of it.
-                if page_len == self.read_batch as usize && self.behind().len() > page_len {
+                // A full page with behind streams after it means the rotation spans pages.
+                if page_len == self.scan_window as usize
+                    && self.streams.iter().any(|stream| {
+                        stream.head > stream.place && stream.id.as_str() > page_last.as_str()
+                    })
+                {
                     self.seen.pages_at_the_batch += 1;
                 }
             } else {
@@ -1255,6 +1403,7 @@ mod liveness_simulation {
                 stream.place += events;
                 stream.read_this_cadence = true;
                 stream.waited = 0;
+                stream.behind_during_wait = 0;
                 read.push(format!("{}+{events}", turn.stream_id));
                 plan.read(&turn, events as u32);
                 plan.delivered(&turn);
@@ -1269,8 +1418,8 @@ mod liveness_simulation {
             self.carried = settled.carried.clone();
             if settled.reconciled {
                 if let Some(through) = settled.rotation {
-                    if through.is_empty() && !was.is_empty() && read.is_empty() {
-                        self.seen.wraps_on_an_empty_poll += 1;
+                    if through.is_empty() && !was.is_empty() && page_len == 0 {
+                        self.seen.wraps_on_an_empty_page += 1;
                     }
                     self.rotation = through;
                 }
@@ -1289,7 +1438,7 @@ mod liveness_simulation {
                 carried.join(","),
                 swept.join(","),
                 late.join(","),
-                page,
+                page_label,
                 read.join(","),
                 settled.carried.join(","),
                 self.behind().join(","),
@@ -1313,40 +1462,34 @@ mod liveness_simulation {
         /// compare each against [ADR-0026](../../docs/adr/0026-a-policy-tracks-its-position-per-stream.md):
         ///
         /// ```text
-        /// cadences ≤ ceil(streams behind / streams read per cadence) + 1
+        /// cadences ≤ ceil(tracked streams / window) + streams behind + 1
         /// ```
         ///
-        /// Taken at its floor, which is the guarantee the ADR gives rather than its best
-        /// case: the reconciliation leads the poll it runs on, so **one** behind stream is
-        /// read per cadence at worst, and the division is by one. The numerator is the
-        /// most streams seen behind at once *during that stream's wait* — the rotation
-        /// only spends a cadence on a stream that is behind. The ADR's `+ 1` is the
-        /// cadence a finished pass spends wrapping on an empty page.
+        /// The worst case spends one cadence per caught-up window or behind stream,
+        /// plus the empty page that wraps the rotation. "Streams behind" is the most there
+        /// were at any cadence of the wait, since streams that caught up during it still
+        /// spent their cadences.
         fn account(&mut self) -> Result<(), String> {
-            let behind_now = self
-                .streams
-                .iter()
-                .filter(|stream| stream.head > stream.place)
-                .count() as u32;
+            let windows = (self.streams.len() as u32).div_ceil(self.scan_window);
+            let behind = self.streams.iter().filter(|s| s.head > s.place).count() as u32;
             let mut starved: Vec<String> = Vec::new();
 
             for stream in &mut self.streams {
                 if stream.read_this_cadence || stream.head == stream.place {
                     stream.waited = 0;
-                    stream.behind_while_waiting = 0;
+                    stream.behind_during_wait = 0;
                 } else {
                     stream.waited += 1;
-                    stream.behind_while_waiting = stream.behind_while_waiting.max(behind_now);
-                    let bound = stream.behind_while_waiting + 1;
+                    stream.behind_during_wait = stream.behind_during_wait.max(behind);
+                    let most_behind = stream.behind_during_wait;
+                    let bound = windows + most_behind + 1;
                     if stream.waited > bound {
                         starved.push(format!(
-                            "{} (owed {}, unread for {} cadences, bound {bound} = at most \
-                             {} behind at once while it waited, read one a cadence, plus \
-                             the cadence a pass ends on)",
+                            "{} (owed {}, unread for {} cadences, bound {bound} = {windows} \
+                             caught-up windows + {most_behind} behind streams + wrap)",
                             stream.id,
                             stream.head - stream.place,
                             stream.waited,
-                            stream.behind_while_waiting,
                         ));
                     }
                 }
@@ -1359,9 +1502,9 @@ mod liveness_simulation {
 
             Err(format!(
                 "a stream the Policy is behind on went unread for longer than ADR-0026's \
-                 bound, ceil(streams behind / streams read per cadence) + 1:\n  \
+                 bound, ceil(tracked streams / window) + streams behind + 1:\n  \
                  starved: {}\n  \
-                 seed: {}\n  streams: {} ({} quiet, {} busy)\n  read_batch: {}\n  \
+                 seed: {}\n  streams: {} ({} quiet, {} busy)\n  read_batch: {}\n  scan_window: {}\n  \
                  polls per cadence: {}\n  schedule:\n    {}",
                 starved.join("\n           "),
                 self.seed,
@@ -1369,6 +1512,7 @@ mod liveness_simulation {
                 self.streams.iter().filter(|s| s.quiet).count(),
                 self.streams.iter().filter(|s| s.busy).count(),
                 self.read_batch,
+                self.scan_window,
                 self.polls_per_cadence,
                 self.transcript.join("\n    "),
             ))
@@ -1426,10 +1570,9 @@ mod liveness_simulation {
              finished pass ends on"
         );
         assert!(
-            seen.wraps_on_an_empty_poll > 0,
-            "no schedule wrapped the rotation on a poll that read nothing: the rotation \
-             reached the last stream id and every source was empty, which is the one \
-             state the poll's early return used to step over"
+            seen.wraps_on_an_empty_page > 0,
+            "no schedule wrapped the rotation on an empty reconciliation page: the \
+             rotation reached the last stream id and the next scan found nothing after it"
         );
         assert!(
             seen.budgets_spent_early > 0,

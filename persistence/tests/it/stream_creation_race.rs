@@ -17,7 +17,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
 use crate::common;
 use common::migrations::MIGRATOR;
-use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
+use common::postgres_image::postgres_database;
 
 /// The stream both racers append to. It does not exist when they start.
 const STREAM_ID: &str = "urn:ledger:contested";
@@ -42,21 +42,14 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// it has to read.
 const SERIALIZATION_FAILURE: &str = "40001";
 
-async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (PgPool, common::postgres_image::TestDatabase) {
+    let container = postgres_database().await;
 
     // Three at once: the two racers hold one each for as long as their transactions
     // last, and the observer that watches them block needs one of its own.
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to connect to Postgres");
 
@@ -106,10 +99,15 @@ async fn numbering(pool: &PgPool) -> Vec<(i64, i64)> {
 async fn await_blocked(pool: &PgPool) {
     let deadline = Instant::now() + BLOCKED_TIMEOUT;
     loop {
-        let blocked: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
-            .fetch_one(pool)
-            .await
-            .expect("reading pg_locks must succeed");
+        let blocked: i64 = sqlx::query_scalar(
+            // A row wait is a lock on the holder's transaction id, which names no
+            // database: the waiting backend's does.
+            "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid) \
+              WHERE NOT l.granted AND a.datname = current_database()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("reading pg_locks must succeed");
 
         if blocked > 0 {
             return;

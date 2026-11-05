@@ -703,6 +703,7 @@ async fn a_claim_waits_for_the_policys_claim_in_flight_postgres_test() {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
                   WHERE pid <> pg_backend_pid() AND state = 'idle in transaction' \
+                    AND datname = current_database() \
                     AND query LIKE '%pg_try_advisory_xact_lock%replay.bulk_claim%')",
             )
             .fetch_one(harness.pool())

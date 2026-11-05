@@ -122,8 +122,10 @@ pub trait CommandMiddleware: Send + Sync {
     ///
     /// It runs in reverse registration order, and only for the middlewares whose
     /// [`before`](CommandMiddleware::before) answered [`Next::Continue`], so the hooks
-    /// nest as web middleware does: a middleware that stopped the command, and every one
-    /// registered after it, runs no `after`. The context carries the metadata the
+    /// nest as web middleware does: a middleware that stopped the command in `before`, and
+    /// every one registered after it, runs no `after`. A refusal at the commit gate comes
+    /// after every `before` continued, so every middleware runs its `after`, the one that
+    /// refused included. The context carries the metadata the
     /// appended events carry, with what every `before` added.
     fn after<'a>(
         &'a self,
