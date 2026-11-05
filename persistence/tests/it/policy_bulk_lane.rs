@@ -394,6 +394,24 @@ async fn count_tally_loads() -> tokio::sync::MutexGuard<'static, ()> {
     guard
 }
 
+/// Armed with a pool, the next `Tally` handler opens its own tally through it while it
+/// decides — after the worker checked the head, before the decision lands. Only tests
+/// holding [`TALLY_TESTS`] arm it, so it is that test's.
+static OPEN_WHILE_DECIDING: std::sync::Mutex<Option<PgPool>> = std::sync::Mutex::new(None);
+
+async fn write_tally_event(pool: &PgPool, stream_id: &str, event: &TallyEvent) {
+    sqlx::query(
+        "SELECT id FROM write_event(gen_random_uuid(), $1, '{}'::jsonb, $2, $3, 'Tally', \
+         NULL, FALSE)",
+    )
+    .bind(serde_json::to_value(event).expect("a tally event serialises"))
+    .bind(replay::Event::event_type(event))
+    .bind(stream_id)
+    .fetch_one(pool)
+    .await
+    .expect("the outside write must succeed");
+}
+
 /// A field whose construction is a load of its aggregate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LoadCount;
@@ -449,6 +467,14 @@ impl replay::Aggregate for Tally {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
+        // A write by somebody else while this handler decides, when a test has armed one.
+        let armed = OPEN_WHILE_DECIDING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pool) = armed {
+            write_tally_event(&pool, self.id.to_urn().as_ref(), &TallyEvent::Opened).await;
+        }
         match command {
             TallyCommand::Count { tag } => Ok(vec![TallyEvent::Counted { tag }]),
             // A decision that appends nothing when it refuses: what a stale instance
@@ -896,6 +922,70 @@ async fn a_recreated_stream_is_not_mistaken_for_the_cached_one_postgres_test() {
             (counted(&harness, "even").await == ["opened", "t-2"]).then_some(())
         })
         .await;
+
+    harness.shutdown().await;
+}
+
+/// Arms [`OPEN_WHILE_DECIDING`] for the second command the `even` tally receives.
+#[derive(Clone, Default)]
+struct ArmOnSecondCommand {
+    pool: Arc<OnceLock<PgPool>>,
+    tally_commands: Arc<AtomicUsize>,
+}
+
+impl CommandMiddleware for ArmOnSecondCommand {
+    fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            if context.stream_type() == "Tally"
+                && context.causation().is_some()
+                && self.tally_commands.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                *OPEN_WHILE_DECIDING
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(self.pool.get().expect("the pool is set").clone());
+            }
+            Next::Continue
+        })
+    }
+}
+
+/// A write landing while the handler decides — after the head was checked — does not
+/// let a refusal decided on the stale instance stand: the head is read again after a
+/// decision that appended nothing, the refusal becomes a conflict, and the retry counts
+/// on the opened tally.
+#[tokio::test]
+async fn a_refusal_raced_by_a_write_is_retried_postgres_test() {
+    let _counting = count_tally_loads().await;
+    let middleware = ArmOnSecondCommand::default();
+    let pool = Arc::clone(&middleware.pool);
+    let harness = PolicyDaemonHarness::start_with_middleware(
+        "grouped_raced",
+        middleware,
+        |builder, policy| {
+            builder
+                .register_services::<Tally>(())
+                .register_policy_fn::<ProbeEvent, _>(policy, bulk(), count_alternately_if_open)
+        },
+    )
+    .await;
+    pool.set(harness.pool().clone())
+        .expect("the pool is set once");
+    harness.await_bulk_registration(harness.policy_name()).await;
+
+    harness.bulk_import("raced", &tags("t", 4)).await;
+
+    harness
+        .observe("the raced refusal to be retried and count", || async {
+            (counted(&harness, "even").await == ["t-0", "opened", "t-2"]).then_some(())
+        })
+        .await;
+    harness
+        .observe("every queue to be drained", || async {
+            (harness.all_bulk_work().await == 0).then_some(())
+        })
+        .await;
+    assert_eq!(harness.parked_row_count().await, 0, "nothing was parked");
 
     harness.shutdown().await;
 }

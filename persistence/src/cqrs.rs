@@ -595,13 +595,14 @@ impl Cqrs<PostgresEventStore> {
     /// the load too.
     ///
     /// A cached instance is reused only while the stream's head is the one it was loaded
-    /// or last appended at, checked before the handler decides — so a decision that
-    /// appends nothing, a refusal included, is never made on state somebody else has
-    /// moved — and compared by `stream_seq`, which a compaction does not reset. The
-    /// append is then made against the cached `version`, unless the command names its
-    /// own, so a write landing between the check and the append fails it as a
-    /// `Conflict`. On any failure `cached` is left empty, because the instance may hold
-    /// events whose append rolled back.
+    /// or last appended at — compared by `stream_seq`, which a compaction does not reset,
+    /// and by the head event, which a recreated stream does not share — checked before
+    /// the handler decides. A write landing after that check cannot pass either: an
+    /// append is made against the cached `version`, unless the command names its own,
+    /// and fails as a `Conflict`; an outcome that appends nothing, a refusal included, is
+    /// checked against the head again and becomes a `Conflict` if it moved. A `Conflict`
+    /// is retried on a fresh load. On any failure `cached` is left empty, because the
+    /// instance may hold events whose append rolled back.
     pub(crate) async fn execute_cached<A: Aggregate>(
         &self,
         cached: &mut Option<Loaded<A>>,
@@ -633,8 +634,25 @@ impl Cqrs<PostgresEventStore> {
                     expected,
                     gate,
                 )
-                .await?;
-            if let Some((version, count, event)) = appended {
+                .await;
+            // An outcome that appended nothing — a refusal, a no-op, any failure — met no
+            // version check, so it is only as good as the state it was decided on. Read the
+            // head again: a stream that moved while the handler decided makes the outcome a
+            // `Conflict`, and the caller retries on a fresh load.
+            if !matches!(appended, Ok(Some(_))) {
+                let now = self.head_of::<A>(id).await?;
+                if now != loaded.head {
+                    return Err(A::Error::from(
+                        crate::concurrency_error(
+                            id.clone().into(),
+                            loaded.head.version,
+                            now.version,
+                        )
+                        .with_operation("execute_cached"),
+                    ));
+                }
+            }
+            if let Some((version, count, event)) = appended? {
                 // The append was checked against the cached version, so the head moved by
                 // exactly what it wrote.
                 loaded.head = StreamHead {
