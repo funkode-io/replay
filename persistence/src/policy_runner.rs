@@ -41,6 +41,8 @@ use crate::policy_liveness::{
 use crate::policy_narration::{Narration, Poll, Record, PROGRESS_EVERY};
 use crate::{Cqrs, PersistedEvent, PostgresEventStore, StreamFilter};
 
+mod bulk_lane;
+
 /// Erased, services-bound execution path for one aggregate type.
 ///
 /// Registered via [`PolicyRunnerBuilder::register_services`], which captures the
@@ -56,6 +58,13 @@ trait AggregateExecutor: Send + Sync {
         dispatch: Dispatch,
         metadata: Metadata,
     ) -> BoxFuture<'a, Result<(), replay::Error>>;
+
+    /// Open a session that executes commands against one instance of this aggregate,
+    /// loading it once: the bulk lane's grouped dispatch (ADR-0034).
+    fn session<'a>(
+        &'a self,
+        cqrs: &'a Cqrs<PostgresEventStore>,
+    ) -> Box<dyn bulk_lane::TargetSession + 'a>;
 }
 
 struct TypedExecutor<A: Aggregate> {
@@ -87,6 +96,17 @@ where
                 .await
                 .map(|_| ())
                 .map_err(Into::into)
+        })
+    }
+
+    fn session<'a>(
+        &'a self,
+        cqrs: &'a Cqrs<PostgresEventStore>,
+    ) -> Box<dyn bulk_lane::TargetSession + 'a> {
+        Box::new(bulk_lane::TypedSession::<A> {
+            cqrs,
+            services: &self.services,
+            loaded: None,
         })
     }
 }
@@ -932,7 +952,20 @@ impl PolicyRunner {
     pub async fn drain(&self) -> Result<usize, replay::Error> {
         let mut total = 0;
         for policy in &self.policies {
-            total += self.drain_policy(policy.as_ref()).await?;
+            if policy.lanes().online() {
+                total += self.drain_policy(policy.as_ref()).await?;
+            }
+            if policy.lanes().bulk() {
+                bulk_lane::register(&self.pool, policy).await?;
+                total += bulk_lane::BulkDelivery {
+                    cqrs: &self.cqrs,
+                    pool: &self.pool,
+                    executors: &self.executors,
+                    policy: policy.as_ref(),
+                }
+                .drain(&StandDown::never())
+                .await?;
+            }
         }
         Ok(total)
     }
@@ -1652,6 +1685,40 @@ impl PolicyRunner {
             let leader_rx = leadership_rx
                 .remove(&name)
                 .expect("every policy has a leadership channel");
+            let lanes = policy.lanes();
+
+            // A Policy on the bulk lane gets a worker of its own, elected by the same
+            // advisory lock: whoever leads the Policy drains its queue (ADR-0034). It
+            // reports liveness only when there is no online worker to report it.
+            if lanes.bulk() {
+                let worker = bulk_lane::BulkWorker {
+                    policy: Arc::clone(policy),
+                    cqrs: self.cqrs.clone(),
+                    pool: self.pool.clone(),
+                    executors: self.executors.clone(),
+                    shutdown_rx: shutdown_rx.clone(),
+                    leader_rx: leader_rx.clone(),
+                    wake_tx: wake_tx.clone(),
+                    interval,
+                    liveness: (!lanes.online()).then(|| liveness.register(&name)),
+                    name: name.clone(),
+                };
+                tasks.push(tokio::spawn(supervise(
+                    SupervisedTask {
+                        kind: "bulk worker",
+                        policy: Some(name.clone()),
+                        stopped: stopped_workers.clone(),
+                        liveness: worker.liveness.clone(),
+                        on_escalation: Arc::clone(&self.on_escalation),
+                    },
+                    self.supervision,
+                    shutdown_rx.clone(),
+                    move || tokio::spawn(worker.clone().run()),
+                )));
+            }
+            if !lanes.online() {
+                continue;
+            }
 
             let worker = PolicyWorker {
                 policy: Arc::clone(policy),
@@ -2587,6 +2654,13 @@ impl StandDown {
         Self {
             signals: Some((shutdown, leader)),
         }
+    }
+
+    /// Whether the worker should stop leading now; never, for [`Self::never`].
+    fn now(&self) -> bool {
+        self.signals
+            .as_ref()
+            .is_some_and(|(shutdown, leader)| *shutdown.borrow() || !*leader.borrow())
     }
 
     /// Resolves once the worker should stop leading; never, for [`Self::never`]. A

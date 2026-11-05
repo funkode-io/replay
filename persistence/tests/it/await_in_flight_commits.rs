@@ -532,3 +532,54 @@ async fn an_abandoned_await_stops_queueing_gated_appends_postgres_test() {
         .expect("the held append commits");
     assert_eq!(events(&pool).await, 2);
 }
+
+/// A bulk append commits each segment through the same gate: through middleware, a
+/// segment waits for the commit gate's lock like any gated append; without middleware it
+/// takes none.
+#[tokio::test]
+async fn a_bulk_segment_takes_the_lock_only_through_middleware_postgres_test() {
+    let (pool, _container) = flag_pool().await;
+    let store = PostgresEventStore::builder(pool.clone())
+        .stream_lock_wait(Duration::from_millis(200))
+        .build()
+        .await
+        .expect("building the store must succeed");
+
+    let mut awaiting = pool.begin().await.expect("the holder must begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1, 0)")
+        .bind(COMMIT_GATE_LOCK_CLASS)
+        .execute(&mut *awaiting)
+        .await
+        .expect("the holder must take the commit gate's lock");
+
+    timeout(
+        OBSERVE_TIMEOUT,
+        Cqrs::new(store.clone()).execute_bulk::<Probe>(
+            &probe("bulk-plain"),
+            Metadata::default(),
+            ping("plain"),
+            &(),
+            None,
+        ),
+    )
+    .await
+    .expect("a bulk append without middleware must not wait for the commit gate's lock")
+    .expect("a bulk append without middleware commits");
+    assert_eq!(events(&pool).await, 1);
+
+    let refused = Cqrs::new(store.clone())
+        .with_middleware(Passes)
+        .execute_bulk::<Probe>(
+            &probe("bulk-gated"),
+            Metadata::default(),
+            ping("gated"),
+            &(),
+            None,
+        )
+        .await
+        .expect_err("a bulk segment through middleware waits for the commit gate's lock");
+    assert_eq!(refused.kind(), ErrorKind::Unavailable, "{refused}");
+    assert_eq!(events(&pool).await, 1, "the gated segment rolled back");
+
+    awaiting.rollback().await.expect("the holder must let go");
+}
