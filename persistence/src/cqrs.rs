@@ -14,13 +14,16 @@ pub(crate) struct Loaded<A> {
     head: StreamHead,
 }
 
-/// Where a stream's head is, as `streams` records it. `stream_seq` never goes back, a
-/// compaction included, so two equal heads mean nobody wrote in between; `version` is
-/// what the append's optimistic-concurrency check compares.
+/// Where a stream's head is, as `streams` records it, and which event holds it.
+/// `stream_seq` never goes back, a compaction included, and the head event's id is never
+/// reused, a stream deleted and recreated to the same counts included — so two equal
+/// heads mean nobody wrote in between. `version` is what the append's
+/// optimistic-concurrency check compares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 struct StreamHead {
     version: i64,
     stream_seq: i64,
+    event: Option<uuid::Uuid>,
 }
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
@@ -271,7 +274,7 @@ impl<ES: EventStore> Cqrs<ES> {
         command: A::Command,
         services: &A::Services,
         expected_version: Option<i64>,
-    ) -> Result<Option<(i64, i64)>, A::Error>
+    ) -> Result<Option<(i64, i64, uuid::Uuid)>, A::Error>
     where
         A::Event: 'static,
         A::Error: 'static,
@@ -280,7 +283,7 @@ impl<ES: EventStore> Cqrs<ES> {
         let stream_type = A::stream_type();
         // The stream version of the last event appended and how many were, for a caller
         // that keeps the aggregate and appends against it again.
-        let mut appended: Option<(i64, i64)> = None;
+        let mut appended: Option<(i64, i64, uuid::Uuid)> = None;
 
         // Stream-first: the producer yields events lazily and owns its data — it does not
         // borrow the aggregate — so once it is built the borrow on `&aggregate` is released
@@ -302,7 +305,8 @@ impl<ES: EventStore> Cqrs<ES> {
                 event_stream,
                 expected_version,
                 |event: &PersistedEvent<A::Event>| {
-                    appended = Some((event.version, appended.map_or(1, |(_, n)| n + 1)));
+                    let count = appended.map_or(1, |(_, n, _)| n + 1);
+                    appended = Some((event.version, count, event.id));
                     aggregate.apply(event.data.clone())
                 },
             )
@@ -566,12 +570,13 @@ impl Cqrs<PostgresEventStore> {
                     expected,
                 )
                 .await?;
-            if let Some((version, count)) = appended {
+            if let Some((version, count, event)) = appended {
                 // The append was checked against the cached version, so the head moved by
                 // exactly what it wrote.
                 loaded.head = StreamHead {
                     version,
                     stream_seq: loaded.head.stream_seq + count,
+                    event: Some(event),
                 };
             }
             *cached = Some(loaded);
@@ -584,16 +589,24 @@ impl Cqrs<PostgresEventStore> {
     /// that does not exist yet.
     async fn head_of<A: Aggregate>(&self, id: &A::StreamId) -> Result<StreamHead, A::Error> {
         let stream_id: Urn = id.clone().into();
-        let head: Option<(i64, i64)> =
-            sqlx::query_as("SELECT version, stream_seq FROM streams WHERE id = $1")
-                .bind(stream_id.to_string())
-                .fetch_optional(self.store.pool())
-                .await
-                .map_err(|error| A::Error::from(crate::db_error(error)))?;
+        // The head event through `uidx_events_stream_seq`; none for a stream whose head
+        // place holds no live event, which every reader of it then sees the same way.
+        let head: Option<(i64, i64, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT s.version, s.stream_seq, e.id FROM streams s \
+               LEFT JOIN events e ON e.stream_id = s.id AND e.stream_seq = s.stream_seq \
+              WHERE s.id = $1",
+        )
+        .bind(stream_id.to_string())
+        .fetch_optional(self.store.pool())
+        .await
+        .map_err(|error| A::Error::from(crate::db_error(error)))?;
         Ok(
-            head.map_or_else(StreamHead::default, |(version, stream_seq)| StreamHead {
-                version,
-                stream_seq,
+            head.map_or_else(StreamHead::default, |(version, stream_seq, event)| {
+                StreamHead {
+                    version,
+                    stream_seq,
+                    event,
+                }
             }),
         )
     }

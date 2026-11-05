@@ -545,6 +545,8 @@ struct WriteBetweenCommands {
     pool: Arc<OnceLock<PgPool>>,
     tally_commands: Arc<AtomicUsize>,
     outside: TallyEvent,
+    /// Delete the stream first, so `outside` recreates it.
+    recreate: bool,
 }
 
 impl WriteBetweenCommands {
@@ -553,6 +555,14 @@ impl WriteBetweenCommands {
             pool: Arc::default(),
             tally_commands: Arc::default(),
             outside,
+            recreate: false,
+        }
+    }
+
+    fn recreating_with(outside: TallyEvent) -> Self {
+        Self {
+            recreate: true,
+            ..Self::writing(outside)
         }
     }
 }
@@ -566,6 +576,18 @@ impl CommandMiddleware for WriteBetweenCommands {
             if self.tally_commands.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
                 let pool = self.pool.get().expect("the pool is set before any import");
                 let event = &self.outside;
+                if self.recreate {
+                    for statement in [
+                        "DELETE FROM events WHERE stream_id = $1",
+                        "DELETE FROM streams WHERE id = $1",
+                    ] {
+                        sqlx::query(statement)
+                            .bind(context.stream_id().to_string())
+                            .execute(pool)
+                            .await
+                            .expect("deleting the stream must succeed");
+                    }
+                }
                 sqlx::query(
                     "SELECT id FROM write_event(gen_random_uuid(), $1, '{}'::jsonb, $2, $3, \
                      'Tally', NULL, FALSE)",
@@ -750,6 +772,127 @@ async fn a_refusal_is_not_decided_on_a_stale_instance_postgres_test() {
         })
         .await;
     assert!(counted(&harness, "odd").await.is_empty());
+
+    harness.shutdown().await;
+}
+
+/// Answers `Busy` for the Policy's commands to the `gated-echo` stream until it is opened,
+/// counting how often it did.
+#[derive(Clone, Default)]
+struct BusyGate {
+    open: Arc<std::sync::atomic::AtomicBool>,
+    busy_answers: Arc<AtomicUsize>,
+}
+
+impl CommandMiddleware for BusyGate {
+    fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            if context.causation().is_none()
+                || !context.stream_id().as_str().ends_with("gated-echo")
+                || self.open.load(Ordering::SeqCst)
+            {
+                return Next::Continue;
+            }
+            self.busy_answers.fetch_add(1, Ordering::SeqCst);
+            Next::Busy("the gate is closed".to_string())
+        })
+    }
+}
+
+/// `refuse` is refused for good, and `gated` is echoed into the `gated-echo` stream.
+fn refuse_then_echo(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
+    match &event.data {
+        ProbeEvent::Pinged { tag } if tag == "refuse" => vec![Dispatch::to::<Probe>(
+            ProbeUrn::new("refused").expect("a valid NSS"),
+            ProbeCommand::Refuse {
+                reason: "for good".to_string(),
+            },
+        )],
+        ProbeEvent::Pinged { tag } => vec![Dispatch::to::<Probe>(
+            ProbeUrn::new(format!("{tag}-echo")).expect("a valid NSS"),
+            ProbeCommand::Echo { tag: tag.clone() },
+        )],
+        ProbeEvent::Echoed { .. } => vec![],
+    }
+}
+
+/// A batch abandoned on a busy command takes the dead letters it parked with it: while the
+/// gate is closed the refused command's park rolls back with every claim, and once the
+/// batch settles it is parked once.
+#[tokio::test]
+async fn an_abandoned_batch_parks_nothing_postgres_test() {
+    let gate = BusyGate::default();
+    let (open, busy_answers) = (Arc::clone(&gate.open), Arc::clone(&gate.busy_answers));
+    let harness =
+        PolicyDaemonHarness::start_with_middleware("abandoned_parks", gate, |builder, policy| {
+            builder.register_policy_fn::<ProbeEvent, _>(policy, bulk(), refuse_then_echo)
+        })
+        .await;
+    harness.await_bulk_registration(harness.policy_name()).await;
+
+    harness
+        .bulk_import("abandoned", &["refuse".to_string(), "gated".to_string()])
+        .await;
+
+    // The second busy answer comes from a second claim of the batch: the first was
+    // abandoned after its refused command had been parked inside it.
+    harness
+        .observe("the batch to be abandoned and claimed again", || async {
+            (busy_answers.load(Ordering::SeqCst) >= 2).then_some(())
+        })
+        .await;
+    assert_eq!(
+        harness.parked_row_count().await,
+        0,
+        "an abandoned batch leaves no dead letter behind"
+    );
+
+    open.store(true, Ordering::SeqCst);
+    harness
+        .observe("the batch to settle", || async {
+            (harness.all_bulk_work().await == 0).then_some(())
+        })
+        .await;
+    let parked = harness.dead_letters().await;
+    assert_eq!(parked.len(), 1, "the refused command is parked: {parked:?}");
+    assert_eq!(
+        parked[0].deliveries, 1,
+        "by the delivery that settled the batch, and by no abandoned one"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A stream deleted and recreated between two grouped commands, to the very counts the
+/// cached instance holds, is not mistaken for it: its head is another event. The second
+/// command decides on the recreated tally, which is open, and counts.
+#[tokio::test]
+async fn a_recreated_stream_is_not_mistaken_for_the_cached_one_postgres_test() {
+    let middleware = WriteBetweenCommands::recreating_with(TallyEvent::Opened);
+    let pool = Arc::clone(&middleware.pool);
+    let harness = PolicyDaemonHarness::start_with_middleware(
+        "grouped_recreated",
+        middleware,
+        |builder, policy| {
+            builder
+                .register_services::<Tally>(())
+                .register_policy_fn::<ProbeEvent, _>(policy, bulk(), count_alternately_if_open)
+        },
+    )
+    .await;
+    pool.set(harness.pool().clone())
+        .expect("the pool is set once");
+    harness.await_bulk_registration(harness.policy_name()).await;
+
+    harness.bulk_import("recreated", &tags("t", 4)).await;
+
+    // t-0 counts: version 1, place 1. The tally is deleted and recreated with one event,
+    // version 1, place 1 again — and t-2 counts on it because it is open.
+    harness
+        .observe("the recreated tally to count", || async {
+            (counted(&harness, "even").await == ["opened", "t-2"]).then_some(())
+        })
+        .await;
 
     harness.shutdown().await;
 }

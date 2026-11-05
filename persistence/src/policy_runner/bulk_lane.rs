@@ -260,7 +260,7 @@ impl BulkDelivery<'_> {
         }
 
         let events = read_claimed(&mut claim, self.policy.stream_filter(), &positions).await?;
-        let groups = self.react(&events).await?;
+        let groups = self.react(&mut claim, &events).await?;
 
         // Raced against the stand-down, as the online lane races a hold: a worker that is
         // to stop leading abandons the batch — a dispatch in flight or a retry's backoff
@@ -268,7 +268,7 @@ impl BulkDelivery<'_> {
         let dispatched = async {
             let mut executed = 0;
             for group in groups {
-                executed += self.dispatch_group(&events, group).await?;
+                executed += self.dispatch_group(&mut claim, &events, group).await?;
             }
             Ok::<_, replay::Error>(executed)
         };
@@ -307,6 +307,7 @@ impl BulkDelivery<'_> {
     /// by target stream, each group in the order its commands were returned.
     async fn react(
         &self,
+        claim: &mut sqlx::PgConnection,
         events: &[(i64, PersistedEvent<Value>)],
     ) -> Result<Vec<TargetGroup>, replay::Error> {
         let name = self.policy.name();
@@ -345,8 +346,15 @@ impl BulkDelivery<'_> {
                         lane            = "bulk",
                         "policy reaction panicked; writing dead-letter"
                     );
-                    self.park(*global_position, raw, None, PANIC_ERROR_KIND, &message)
-                        .await?;
+                    self.park(
+                        claim,
+                        *global_position,
+                        raw,
+                        None,
+                        PANIC_ERROR_KIND,
+                        &message,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -380,6 +388,7 @@ impl BulkDelivery<'_> {
     /// again on the next poll.
     async fn dispatch_group(
         &self,
+        claim: &mut sqlx::PgConnection,
         events: &[(i64, PersistedEvent<Value>)],
         group: TargetGroup,
     ) -> Result<usize, replay::Error> {
@@ -395,6 +404,7 @@ impl BulkDelivery<'_> {
                 .with_context("policy", name)
                 .with_context("aggregate", identity.aggregate_name);
                 self.park(
+                    claim,
                     *global_position,
                     raw,
                     Some(&identity),
@@ -451,6 +461,7 @@ impl BulkDelivery<'_> {
                             "policy dispatch panicked; writing dead-letter"
                         );
                         self.park(
+                            claim,
                             *global_position,
                             raw,
                             Some(&identity),
@@ -507,6 +518,7 @@ impl BulkDelivery<'_> {
                             "policy dispatch failed permanently; writing dead-letter"
                         );
                         self.park(
+                            claim,
                             *global_position,
                             raw,
                             Some(&identity),
@@ -559,8 +571,14 @@ impl BulkDelivery<'_> {
 
     /// Write a dead letter for one command of the batch, or for a reaction that panicked
     /// before it returned any (`identity` `None`).
+    ///
+    /// In the claim transaction, with the deletion of the claimed rows: a batch that is
+    /// abandoned — a busy command, a stand-down — rolls its parks back with its claim, so
+    /// a row is parked once, by the delivery that settles it, and never left behind for a
+    /// command a later delivery of the same work commits.
     async fn park(
         &self,
+        claim: &mut sqlx::PgConnection,
         global_position: i64,
         raw: &PersistedEvent<Value>,
         identity: Option<&DispatchIdentity>,
@@ -568,7 +586,7 @@ impl BulkDelivery<'_> {
         error_message: &str,
     ) -> Result<(), replay::Error> {
         let parked = write_dead_letter(
-            self.pool,
+            claim,
             DeadLetterWrite {
                 policy_name: self.policy.name(),
                 global_position,
