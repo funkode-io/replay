@@ -192,13 +192,14 @@ async fn peak_live_bytes_scale_with_the_flush_size_not_the_append_postgres_test(
     reset_peak();
 
     store
-        .store_events_stream::<FatStream, _, _>(
+        .store_events_stream::<FatStream, _, _, _>(
             &stream_id,
             "FatStream".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<FatEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("streamed append must succeed");

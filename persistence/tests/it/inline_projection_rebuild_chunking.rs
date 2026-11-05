@@ -98,13 +98,14 @@ async fn seed_history(pool: &PgPool, stream: &str, count: usize) -> LedgerUrn {
         futures::stream::iter((0..count).map(|i| Ok(LedgerEvent::Added { amount: i as f64 })));
 
     store
-        .store_events_stream::<Ledger, _, _>(
+        .store_events_stream::<Ledger, _, _, _>(
             &stream_id,
             "Ledger".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<LedgerEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("seeding history must succeed");

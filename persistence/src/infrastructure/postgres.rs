@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::projection_catch_up::{self as catch_up, Cut, ErasedPostgresProjection, Scope};
 use super::stream_deletion::{self as deletion, DeletedStreams};
 use crate::inline_projection::InlineProjection;
-use crate::{CompactionOutcome, EventSink, EventStore, PersistedEvent, StreamFilter};
+use crate::{CommitGate, CompactionOutcome, EventSink, EventStore, PersistedEvent, StreamFilter};
 use replay::{Compactable, Event, Metadata, ObservedEvent};
 
 /// Convenience marker trait for inline projections that run on Postgres.
@@ -1119,7 +1119,7 @@ impl PostgresEventStore {
 }
 
 impl EventStore for PostgresEventStore {
-    async fn store_events_stream<S, ES, Sink>(
+    async fn store_events_stream<S, ES, Sink, Gate>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
@@ -1127,11 +1127,13 @@ impl EventStore for PostgresEventStore {
         domain_events: ES,
         expected_version: Option<i64>,
         mut sink: Sink,
+        gate: Gate,
     ) -> Result<(), replay::Error>
     where
         S: replay::EventStream,
         ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
         Sink: EventSink<S::Event> + Send,
+        Gate: CommitGate,
     {
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
         let stream_id: Urn = stream_id.clone().into();
@@ -1275,6 +1277,12 @@ impl EventStore for PostgresEventStore {
         if has_projections && appended_count > 0 {
             self.mark_applied(&mut transaction).await?;
         }
+
+        // The commit gate (ADR-0035): last, after every insert and inline projection
+        // write, so it has the final word. Returning early drops the transaction, which
+        // rolls the whole append back, projection writes included.
+        // A middleware's error is returned as it is, so it is not decorated here.
+        gate.check().await.into_result()?;
 
         transaction.commit().await.map_err(crate::db_error)?;
 

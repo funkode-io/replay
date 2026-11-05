@@ -133,6 +133,11 @@ impl<ES: EventStore> Cqrs<ES> {
     /// the appended events. A middleware that continues after changing the command's
     /// identity or its `causation` (by replacing the context whole) fails the command with
     /// an [`Internal`](replay::ErrorKind::Internal) error.
+    ///
+    /// Each middleware's `before_commit` then runs at the append's commit gate, in
+    /// registration order, after the events and every inline projection write are in
+    /// place: the first that does not continue rolls the whole append back and reaches the
+    /// caller the same way.
     pub async fn execute<A: Aggregate>(
         &self,
         id: &A::StreamId,
@@ -145,8 +150,9 @@ impl<ES: EventStore> Cqrs<ES> {
         A::Event: 'static,
         A::Error: 'static,
     {
-        let metadata = if self.middlewares.is_empty() {
-            metadata
+        // The context `before` left, for the commit gate; `None` without middleware.
+        let (context, metadata) = if self.middlewares.is_empty() {
+            (None, metadata)
         } else {
             let mut command = CommandContext::new::<A>(id, metadata);
             // What no middleware may change: `before` takes the context mutably, so one
@@ -176,7 +182,8 @@ impl<ES: EventStore> Cqrs<ES> {
                     Next::Error(error) => return Err(A::Error::from(error)),
                 }
             }
-            command.metadata().clone()
+            let metadata = command.metadata().clone();
+            (Some(command), metadata)
         };
 
         // Always load the latest (current) event stream for command handling.
@@ -198,14 +205,31 @@ impl<ES: EventStore> Cqrs<ES> {
             .await?
             .map_err(|e| replay::Error::internal("aggregate event producer failed").with_source(e));
 
+        // The commit gate: every middleware's `before_commit`, in registration order; the
+        // first that does not continue has the last word.
+        let middlewares = &self.middlewares;
+        let gate = || async move {
+            let Some(context) = context.as_ref() else {
+                return Next::Continue;
+            };
+            for middleware in middlewares.iter() {
+                match middleware.before_commit(context).await {
+                    Next::Continue => {}
+                    stop => return stop,
+                }
+            }
+            Next::Continue
+        };
+
         self.store
-            .store_events_stream::<A, _, _>(
+            .store_events_stream::<A, _, _, _>(
                 id,
                 stream_type,
                 metadata,
                 event_stream,
                 expected_version,
                 |event: &PersistedEvent<A::Event>| aggregate.apply(event.data.clone()),
+                gate,
             )
             .await
             .map_err(A::Error::from)?;

@@ -166,13 +166,14 @@ async fn ring(store: &PostgresEventStore, till: &str, amounts: &[f64]) {
         .map(|amount| Ok(TillEvent::Rang { amount: *amount }))
         .collect();
     store
-        .store_events_stream::<Till, _, _>(
+        .store_events_stream::<Till, _, _, _>(
             &TillUrn::new(till).unwrap(),
             "Till".to_string(),
             replay::Metadata::default(),
             futures::stream::iter(events),
             None,
             |_: &PersistedEvent<TillEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("append must succeed");
@@ -591,13 +592,14 @@ impl InlineProjection for RangOnly {
 /// Append one `Voided` event to a till.
 async fn void(store: &PostgresEventStore, till: &str) {
     store
-        .store_events_stream::<Till, _, _>(
+        .store_events_stream::<Till, _, _, _>(
             &TillUrn::new(till).unwrap(),
             "Till".to_string(),
             replay::Metadata::default(),
             futures::stream::iter(vec![Ok(TillEvent::Voided { amount: 1.0 })]),
             None,
             |_: &PersistedEvent<TillEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("append must succeed");

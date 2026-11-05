@@ -189,13 +189,14 @@ async fn peak_live_bytes_scale_with_the_flush_size_not_the_history_postgres_test
     }));
 
     store
-        .store_events_stream::<FatStream, _, _>(
+        .store_events_stream::<FatStream, _, _, _>(
             &stream_id,
             "FatStream".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<FatEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("seeding history must succeed");
@@ -259,13 +260,14 @@ async fn peak_live_bytes_of_a_catch_up_scale_with_the_flush_size_not_the_gap_pos
         })
     }));
     old_pod
-        .store_events_stream::<FatStream, _, _>(
+        .store_events_stream::<FatStream, _, _, _>(
             &stream_id,
             "FatStream".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<FatEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("appending the gap must succeed");

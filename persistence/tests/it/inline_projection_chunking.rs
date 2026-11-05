@@ -180,13 +180,14 @@ async fn streamed_append_flushes_inline_projections_in_bounded_chunks_postgres_t
         futures::stream::iter((0..35).map(|i| Ok(LedgerEvent::Added { amount: i as f64 })));
 
     store
-        .store_events_stream::<Ledger, _, _>(
+        .store_events_stream::<Ledger, _, _, _>(
             &stream_id,
             "Ledger".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<LedgerEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("streamed append must succeed");
@@ -231,13 +232,14 @@ async fn append_smaller_than_the_chunk_arrives_in_one_call_postgres_test() {
     let events = futures::stream::iter((0..3).map(|i| Ok(LedgerEvent::Added { amount: i as f64 })));
 
     store
-        .store_events_stream::<Ledger, _, _>(
+        .store_events_stream::<Ledger, _, _, _>(
             &stream_id,
             "Ledger".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<LedgerEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("streamed append must succeed");
@@ -334,13 +336,14 @@ async fn failure_in_a_later_chunk_rolls_back_earlier_chunks_postgres_test() {
         futures::stream::iter((0..20).map(|i| Ok(LedgerEvent::Added { amount: i as f64 })));
 
     let result = store
-        .store_events_stream::<Ledger, _, _>(
+        .store_events_stream::<Ledger, _, _, _>(
             &stream_id,
             "Ledger".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<LedgerEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await;
 
@@ -400,13 +403,14 @@ async fn peak_retention_stays_bounded_for_a_large_append_postgres_test() {
         futures::stream::iter((0..APPEND).map(|i| Ok(LedgerEvent::Added { amount: i as f64 })));
 
     store
-        .store_events_stream::<Ledger, _, _>(
+        .store_events_stream::<Ledger, _, _, _>(
             &stream_id,
             "Ledger".to_string(),
             replay::Metadata::default(),
             events,
             None,
             |_: &PersistedEvent<LedgerEvent>| {},
+            replay_persistence::OpenGate,
         )
         .await
         .expect("large streamed append must succeed");

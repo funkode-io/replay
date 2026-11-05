@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use crate::inline_projection::ErasedInlineProjection;
 use crate::{
-    CompactionOutcome, EventSink, EventStore, InlineProjection, PersistedEvent, StreamFilter,
+    CommitGate, CompactionOutcome, EventSink, EventStore, InlineProjection, PersistedEvent,
+    StreamFilter,
 };
 use replay::{Compactable, Event, ObservedEvent};
 
@@ -194,7 +195,7 @@ impl Default for InMemoryEventStore {
 }
 
 impl EventStore for InMemoryEventStore {
-    async fn store_events_stream<S, ES, Sink>(
+    async fn store_events_stream<S, ES, Sink, Gate>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
@@ -202,19 +203,15 @@ impl EventStore for InMemoryEventStore {
         domain_events: ES,
         expected_version: Option<i64>,
         mut sink: Sink,
+        gate: Gate,
     ) -> Result<(), replay::Error>
     where
         S: replay::EventStream,
         ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
         Sink: EventSink<S::Event> + Send,
+        Gate: CommitGate,
     {
         let stream_id: Urn = stream_id.clone().into();
-
-        // Record the stream's type so `ForStreamTypes` filters can be evaluated per-event.
-        self.stream_types
-            .write()
-            .unwrap()
-            .insert(stream_id.clone(), stream_type);
 
         // Determine the starting version and check optimistic concurrency once, up front
         // (mirrors the Postgres "check expected_version at the head of the transaction").
@@ -290,6 +287,18 @@ impl EventStore for InMemoryEventStore {
                 },
             });
         }
+
+        // The commit gate (ADR-0035), before anything of the append is visible: on anything
+        // but `Continue` the staged events are dropped. The best-effort projections below
+        // cannot be rolled back, so here they run after the gate rather than before it.
+        // A middleware's error is returned as it is, so it is not decorated here.
+        gate.check().await.into_result()?;
+
+        // Record the stream's type so `ForStreamTypes` filters can be evaluated per-event.
+        self.stream_types
+            .write()
+            .unwrap()
+            .insert(stream_id.clone(), stream_type);
 
         // Publish the staged events atomically under the write lock, then release it before
         // driving any async projections (the `RwLockWriteGuard` is not held across an await).
@@ -1484,7 +1493,7 @@ mod tests {
 
         let mut observed = Vec::new();
         store
-            .store_events_stream::<BankAccountStream, _, _>(
+            .store_events_stream::<BankAccountStream, _, _, _>(
                 &stream_id,
                 "BankAccount".to_string(),
                 replay::Metadata::default(),
@@ -1493,6 +1502,7 @@ mod tests {
                 |event: &PersistedEvent<BankAccountEvent>| {
                     observed.push((event.version, event.data.clone()));
                 },
+                crate::OpenGate,
             )
             .await
             .unwrap();
@@ -1520,13 +1530,14 @@ mod tests {
 
         let mut observed_versions = Vec::new();
         store
-            .store_events_stream::<BankAccountStream, _, _>(
+            .store_events_stream::<BankAccountStream, _, _, _>(
                 &stream_id,
                 "BankAccount".to_string(),
                 replay::Metadata::default(),
                 futures::stream::iter(events.into_iter().map(Ok::<_, replay::Error>)),
                 Some(0),
                 |event: &PersistedEvent<BankAccountEvent>| observed_versions.push(event.version),
+                crate::OpenGate,
             )
             .await
             .expect("multi-event append with correct expected version must succeed");
@@ -1541,7 +1552,7 @@ mod tests {
 
         // Advance the stream to version 1.
         store
-            .store_events_stream::<BankAccountStream, _, _>(
+            .store_events_stream::<BankAccountStream, _, _, _>(
                 &stream_id,
                 "BankAccount".to_string(),
                 replay::Metadata::default(),
@@ -1553,13 +1564,14 @@ mod tests {
                 ),
                 Some(0),
                 crate::NoSink,
+                crate::OpenGate,
             )
             .await
             .expect("first append must succeed");
 
         // A second append still expecting version 0 must conflict and persist nothing new.
         let result = store
-            .store_events_stream::<BankAccountStream, _, _>(
+            .store_events_stream::<BankAccountStream, _, _, _>(
                 &stream_id,
                 "BankAccount".to_string(),
                 replay::Metadata::default(),
@@ -1571,6 +1583,7 @@ mod tests {
                 ),
                 Some(0),
                 crate::NoSink,
+                crate::OpenGate,
             )
             .await;
 
@@ -1597,7 +1610,7 @@ mod tests {
         let stream_id = make_stream_id("stream-producer-error");
 
         let result = store
-            .store_events_stream::<BankAccountStream, _, _>(
+            .store_events_stream::<BankAccountStream, _, _, _>(
                 &stream_id,
                 "BankAccount".to_string(),
                 replay::Metadata::default(),
@@ -1607,6 +1620,7 @@ mod tests {
                 ]),
                 None,
                 crate::NoSink,
+                crate::OpenGate,
             )
             .await;
 
