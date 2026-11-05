@@ -1832,6 +1832,7 @@ impl PolicyRunner {
             },
         )
         .await
+        .map(|polled| polled.executed)
     }
 }
 
@@ -2327,7 +2328,7 @@ impl PolicyWorker {
                 // whose dispatches take minutes is working throughout, and a
                 // record earned only when the poll returns would be paced by the
                 // work rather than by the clock.
-                if let Err(error) = drain_policy_once(
+                let behind = match drain_policy_once(
                     &cqrs,
                     &pool,
                     &executors,
@@ -2341,29 +2342,36 @@ impl PolicyWorker {
                 )
                 .await
                 {
-                    // The failure earns no record of its own: it did not catch
-                    // up, and the error below is what says so. Whatever the poll
-                    // observed before failing — the window it opened on, the
-                    // positions it advanced over — happened, and its records
-                    // stand.
-                    //
-                    // A poll cut short because this worker is to stop leading is
-                    // not a fault: a hold on a busy command ends that way, and has
-                    // said so itself.
-                    if *shutdown_rx.borrow() || !*leader_rx.borrow() {
-                        tracing::debug!(
-                            policy = %name,
-                            error = %error,
-                            "policy poll ended as the worker stopped leading"
-                        );
-                    } else {
-                        tracing::error!(
-                            policy = %name,
-                            error = %error,
-                            "policy polling iteration failed"
-                        );
+                    Ok(polled) => polled.behind,
+                    Err(error) => {
+                        // The failure earns no record of its own: it did not catch
+                        // up, and the error below is what says so. Whatever the poll
+                        // observed before failing — the window it opened on, the
+                        // positions it advanced over — happened, and its records
+                        // stand.
+                        //
+                        // A poll cut short because this worker is to stop leading is
+                        // not a fault: a hold on a busy command ends that way, and has
+                        // said so itself.
+                        if *shutdown_rx.borrow() || !*leader_rx.borrow() {
+                            tracing::debug!(
+                                policy = %name,
+                                error = %error,
+                                "policy poll ended as the worker stopped leading"
+                            );
+                        } else {
+                            tracing::error!(
+                                policy = %name,
+                                error = %error,
+                                "policy polling iteration failed"
+                            );
+                        }
+                        // Waits out the interval like a caught-up poll: a failure
+                        // retried at once would only fail again at the speed of
+                        // the database.
+                        false
                     }
-                }
+                };
 
                 // Published after the drain rather than before it, so the stamp
                 // reads "last poll that came back": a worker held inside one long
@@ -2373,11 +2381,24 @@ impl PolicyWorker {
                 // while a reaction holds it.
                 liveness.polled(Instant::now());
 
+                // A poll that left work it knows about polls again rather than
+                // sleeping: the interval is the safety net for a missed NOTIFY,
+                // not the pace a backlog is worked through at (funkode-io/replay#322).
+                // It gives the runtime a turn first, so the other Policies'
+                // workers and the lock manager are not starved by a long backlog,
+                // and still answers shutdown and a leadership change before it
+                // goes on: the select below is biased towards them, and its
+                // `behind` branch is ready only once neither has news.
+                if behind {
+                    tokio::task::yield_now().await;
+                }
+
                 // Wait for the next wakeup: NOTIFY broadcast (if enabled),
                 // poll timeout, leadership change, or shutdown — whichever
-                // fires first.
+                // fires first; at once if the poll left work behind.
                 if let Some(ref mut wake) = wake_rx {
                     tokio::select! {
+                        biased;
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 break;
@@ -2388,6 +2409,7 @@ impl PolicyWorker {
                                 return Stop::Abandoned;
                             }
                         }
+                        _ = std::future::ready(()), if behind => {}
                         _ = tokio::time::sleep(interval) => {}
                         res = wake.recv() => {
                             // Ok or Lagged both mean "drain now"; Closed
@@ -2399,6 +2421,7 @@ impl PolicyWorker {
                     }
                 } else {
                     tokio::select! {
+                        biased;
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 break;
@@ -2409,6 +2432,7 @@ impl PolicyWorker {
                                 return Stop::Abandoned;
                             }
                         }
+                        _ = std::future::ready(()), if behind => {}
                         _ = tokio::time::sleep(interval) => {}
                     }
                 }
@@ -3408,7 +3432,7 @@ async fn drain_policy_once(
     progress: &mut PolicyProgress,
     max_depth: u32,
     reporting: &mut Reporting<'_>,
-) -> Result<usize, replay::Error> {
+) -> Result<Polled, replay::Error> {
     let started = Instant::now();
     let name = policy.name().to_string();
     let checkpoint_size = resolve_checkpoint_batch_size(policy.settings());
@@ -3721,7 +3745,22 @@ async fn drain_policy_once(
         reporting.tell(&name, Poll::Exhausted);
     }
 
-    Ok(executed)
+    Ok(Polled {
+        executed,
+        // What the poll could not get to is carried, and a sweep that filled its page
+        // stopped short of the log's end: either way the next poll has work waiting.
+        behind: !progress.unfinished.is_empty() || sweep.full,
+    })
+}
+
+/// What one poll did, and whether it knows the Policy is still behind.
+struct Polled {
+    /// The commands its reactions executed.
+    executed: usize,
+    /// Whether the poll left work it knows about: streams carried for the next poll, or
+    /// log past where its sweep stopped. A worker that is behind polls again rather than
+    /// waiting out its interval (funkode-io/replay#322).
+    behind: bool,
 }
 
 /// The runner's machinery for delivering events to **one** policy: the
@@ -4843,6 +4882,8 @@ async fn sweep_for_streams(
         .into_iter()
         .map(parse_txid)
         .collect::<Result<_, _>>()?;
+    // Every row but the snapshot's is one swept position.
+    let full = rows.len() > limit as usize;
     let discovered = discovered_from_sweep(
         from,
         rows.into_iter()
@@ -4857,6 +4898,7 @@ async fn sweep_for_streams(
 
     Ok(Sweep {
         discovered,
+        full,
         xmax,
         in_progress,
     })
@@ -5688,6 +5730,9 @@ impl Tail {
 /// One statement's sweep rows and the transaction snapshot they were read under.
 struct Sweep {
     discovered: Discovered,
+    /// Whether the sweep read as many positions as it was allowed: the log may go on past
+    /// where it stopped.
+    full: bool,
     xmax: u64,
     in_progress: Vec<u64>,
 }
@@ -7488,6 +7533,7 @@ mod progress_tests {
                 after: None,
             },
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: position,
@@ -7520,6 +7566,7 @@ mod progress_tests {
             &pool,
             &prior,
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: 60,
@@ -7541,6 +7588,7 @@ mod progress_tests {
             &pool,
             &LateWriteState::default(),
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: 0,
@@ -7580,6 +7628,7 @@ mod progress_tests {
             &pool,
             &prior,
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: 60,
@@ -10231,6 +10280,7 @@ mod bulk_lane_tests {
                 after: None,
             },
             &Sweep {
+                full: false,
                 discovered: Discovered {
                     streams: Vec::new(),
                     swept_through: position,

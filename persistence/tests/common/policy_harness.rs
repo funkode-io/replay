@@ -422,6 +422,8 @@ pub struct PolicyDaemonHarness {
     /// How the policy under test is registered. Kept so [`restart`](Self::restart)
     /// can build the same daemon again against the same database.
     configure: Arc<Configure>,
+    /// How often the daemon polls the feed, kept for [`restart`](Self::restart).
+    poll_interval: Duration,
     escalations: Escalations,
     daemon: Option<PolicyRunnerDaemon>,
 }
@@ -443,7 +445,16 @@ impl PolicyDaemonHarness {
     where
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
-        Self::start_with(label, |cqrs| cqrs, configure).await
+        Self::start_with(label, DAEMON_POLL_INTERVAL, |cqrs| cqrs, configure).await
+    }
+
+    /// [`start`](Self::start), with the daemon polling every `poll_interval` instead of
+    /// the harness's short default: for a test about what the interval paces.
+    pub async fn start_polling_every<F>(label: &str, poll_interval: Duration, configure: F) -> Self
+    where
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
+    {
+        Self::start_with(label, poll_interval, |cqrs| cqrs, configure).await
     }
 
     /// [`start`](Self::start), with a [`CommandMiddleware`] registered on the `Cqrs`
@@ -455,11 +466,18 @@ impl PolicyDaemonHarness {
         M: CommandMiddleware + 'static,
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
-        Self::start_with(label, |cqrs| cqrs.with_middleware(middleware), configure).await
+        Self::start_with(
+            label,
+            DAEMON_POLL_INTERVAL,
+            |cqrs| cqrs.with_middleware(middleware),
+            configure,
+        )
+        .await
     }
 
     async fn start_with<F>(
         label: &str,
+        poll_interval: Duration,
         build: impl FnOnce(Cqrs<PostgresEventStore>) -> Cqrs<PostgresEventStore>,
         configure: F,
     ) -> Self
@@ -502,6 +520,7 @@ impl PolicyDaemonHarness {
             &policy_name,
             &escalations,
             PRIMARY_REPLICA,
+            poll_interval,
         );
 
         Self {
@@ -510,6 +529,7 @@ impl PolicyDaemonHarness {
             cqrs,
             policy_name,
             configure,
+            poll_interval,
             escalations,
             daemon: Some(daemon),
         }
@@ -550,6 +570,7 @@ impl PolicyDaemonHarness {
             &self.policy_name,
             &self.escalations,
             PRIMARY_REPLICA,
+            self.poll_interval,
         ));
     }
 
@@ -1266,6 +1287,7 @@ impl PolicyDaemonHarness {
             &self.policy_name,
             &escalations,
             SECOND_REPLICA,
+            self.poll_interval,
         );
         PolicyDaemonReplica {
             escalations,
@@ -1847,6 +1869,7 @@ fn spawn_daemon(
     policy_name: &str,
     escalations: &Escalations,
     replica_id: &str,
+    poll_interval: Duration,
 ) -> PolicyRunnerDaemon {
     configure(
         PolicyRunner::builder(cqrs.clone())
@@ -1858,5 +1881,5 @@ fn spawn_daemon(
         policy_name,
     )
     .build()
-    .start_polling(DAEMON_POLL_INTERVAL)
+    .start_polling(poll_interval)
 }
