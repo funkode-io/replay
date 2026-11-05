@@ -39,6 +39,9 @@ fn echo_stream(source: &str) -> ProbeUrn {
 
 /// Echo every ping into [`echo_stream`] of its source, except a ping tagged `refuse…`
 /// while `refusing` holds, which is answered by a command the Probe refuses for good.
+///
+/// The refusal is aimed at the same echo stream, so it sits in one target group with the
+/// echoes, in its event's place: what the group runs after a parked command is seen.
 fn echo_unless_refusing(
     refusing: Arc<AtomicBool>,
 ) -> impl Fn(&ObservedEvent<ProbeEvent>) -> Vec<Dispatch> + Send + Sync + 'static {
@@ -47,7 +50,7 @@ fn echo_unless_refusing(
             if tag.starts_with("refuse") && refusing.load(Ordering::SeqCst) =>
         {
             vec![Dispatch::to::<Probe>(
-                ProbeUrn::new(format!("refused-{tag}")).expect("a valid NSS"),
+                echo_stream(event.stream_id.as_str()),
                 ProbeCommand::Refuse {
                     reason: format!("{tag} is refused"),
                 },
