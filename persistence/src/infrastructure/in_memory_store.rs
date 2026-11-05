@@ -229,6 +229,9 @@ impl EventStore for InMemoryEventStore {
                 .unwrap_or(0)
         };
 
+        // The head the staged versions are numbered from; rechecked when they are published.
+        let staged_from = last_version;
+
         if let Some(expected_version) = expected_version {
             if last_version != expected_version {
                 return Err(crate::concurrency_error(
@@ -306,6 +309,21 @@ impl EventStore for InMemoryEventStore {
             let mut store = self.events.write().unwrap();
             let mut next_position = self.next_position.write().unwrap();
             let stream = store.entry(stream_id.clone()).or_default();
+            // The producer and the gate both await, so another append to this stream may have
+            // published since the head was read. Publishing now would repeat its versions:
+            // reject the stale append instead, as a version conflict.
+            let head = stream
+                .iter()
+                .rfind(|(_, e)| e.aggregate_version.is_none())
+                .map(|(_, e)| e.version)
+                .unwrap_or(0);
+            if head != staged_from {
+                return Err(crate::concurrency_error(
+                    stream_id.clone(),
+                    expected_version.unwrap_or(staged_from),
+                    head,
+                ));
+            }
             for event in staged.iter().cloned() {
                 stream.push((*next_position, event));
                 *next_position += 1;

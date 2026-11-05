@@ -1027,6 +1027,58 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    #[tokio::test]
+    async fn an_append_held_at_the_gate_does_not_publish_a_version_another_append_took() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let (reached, at_gate) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+
+        let held = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .store_events_stream::<Counter, _, _, _>(
+                        &counter(),
+                        Counter::stream_type(),
+                        Metadata::default(),
+                        futures::stream::iter([Ok(CounterEvent::Added { amount: 1 })]),
+                        Some(0),
+                        crate::NoSink,
+                        || async move {
+                            reached.send(()).unwrap();
+                            released.await.unwrap();
+                            Next::Continue
+                        },
+                    )
+                    .await
+            }
+        });
+        at_gate.await.unwrap();
+        store
+            .store_events::<Counter>(
+                &counter(),
+                Counter::stream_type(),
+                Metadata::default(),
+                &[CounterEvent::Added { amount: 2 }],
+                Some(0),
+            )
+            .await
+            .expect("the competing append commits first");
+        release.send(()).unwrap();
+
+        let error = held.await.unwrap().unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        let events: Vec<PersistedEvent<CounterEvent>> = store
+            .stream_events_by_stream_id::<Counter>(&counter(), AggregateVersion::Latest, None, None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].version, 1);
+        assert_eq!(events[0].data, CounterEvent::Added { amount: 2 });
+    }
+
     #[test]
     fn metadata_may_be_replaced_when_the_causation_is_kept() {
         let mut context = CommandContext::new::<Counter>(&counter(), stamped().into_metadata());
