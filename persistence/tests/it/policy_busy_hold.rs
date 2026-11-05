@@ -614,3 +614,57 @@ async fn a_held_command_gets_a_fresh_budget_when_it_stops_being_busy_postgres_te
 
     harness.shutdown().await;
 }
+
+/// Echo into the gated `-echo` stream, then explode in the command handler.
+fn echo_then_explode(event: &ObservedEvent<ProbeEvent>) -> Vec<Dispatch> {
+    match &event.data {
+        ProbeEvent::Pinged { tag } => vec![
+            Dispatch::to::<Probe>(
+                ProbeUrn::new(format!("{tag}-echo")).unwrap(),
+                ProbeCommand::Echo { tag: tag.clone() },
+            ),
+            Dispatch::to::<Probe>(
+                ProbeUrn::new(format!("{tag}-boom")).unwrap(),
+                ProbeCommand::Explode {
+                    reason: "after the hold".to_string(),
+                },
+            ),
+        ],
+        _ => vec![],
+    }
+}
+
+/// A panic that settles a delivery with its hold still open closes the hold in the
+/// narration too: an operator never reads a hold that entered and never left.
+#[tokio::test]
+#[traced_test]
+async fn a_panic_that_ends_a_hold_narrates_it_left_postgres_test() {
+    let gate = Gate::answering(BUSY);
+    let harness = start_reacting("busy_panic", &gate, echo_then_explode).await;
+    let policy = harness.policy_name().to_string();
+
+    let pinged = harness.ping("subject-1", "hello").await;
+    harness
+        .observe("the command held", || async {
+            (gate.busy_answers() >= 2).then_some(())
+        })
+        .await;
+
+    gate.answer(CONTINUE);
+    let parked = harness.await_dead_letters(1).await;
+    assert_eq!(parked[0].error_kind, replay_persistence::PANIC_ERROR_KIND);
+    harness.await_passed(pinged.global_position).await;
+
+    logs_assert(|lines: &[&str]| {
+        let entered = hold_records(lines, &policy, "entered");
+        let left = hold_records(lines, &policy, "left");
+        if entered.len() != 1 || left.len() != 1 {
+            return Err(format!(
+                "expected one hold entered and left, got {entered:#?} and {left:#?}"
+            ));
+        }
+        Ok(())
+    });
+
+    harness.shutdown().await;
+}

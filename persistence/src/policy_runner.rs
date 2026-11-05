@@ -2653,6 +2653,11 @@ struct Attempt {
     /// the delivery ends by unwinding out of a command handler instead of
     /// returning an error.
     in_flight: Option<DispatchIdentity>,
+    /// When the delivery's open hold on a busy command began, if one is open. Kept
+    /// across attempts, unlike the rest, so a panic that settles the delivery from
+    /// outside the attempt loop can close the hold it unwound out of in the
+    /// narration (ADR-0036: one record on entering, one on leaving).
+    held_since: Option<Instant>,
 }
 
 /// A dispatch that failed, and which dispatch it was.
@@ -3210,6 +3215,16 @@ impl PendingFailures {
         attempt.in_flight = None;
     }
 
+    /// A hold on a busy command opened at `since`.
+    fn hold_opened(&self, since: Instant) {
+        self.lock().held_since = Some(since);
+    }
+
+    /// The hold closed, and said so.
+    fn hold_closed(&self) {
+        self.lock().held_since = None;
+    }
+
     /// Record the dispatch about to be awaited, so a panic in its handler is
     /// parked naming it. Cleared by [`Self::returned`] whatever the outcome, so
     /// what an unwind finds here is the dispatch it unwound out of.
@@ -3694,6 +3709,18 @@ impl Delivery<'_> {
                 // already failed in this attempt are parked with it: the unwind
                 // crossed the buffer rather than carrying it off.
                 let attempt = pending.take();
+                // A hold the unwind came out of is over: it gets its closing
+                // record here, as the attempt loop would have written it.
+                if let Some(since) = attempt.held_since {
+                    tracing::info!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        global_position,
+                        held_ms         = since.elapsed().as_millis(),
+                        hold            = "left",
+                        "policy reaction panicked while holding a busy command; the hold is over"
+                    );
+                }
                 // The dispatch the unwind came out of, when it came out of one:
                 // a panic in `react` itself has none, and its row says so with
                 // null identity columns rather than with a guess.
@@ -3889,8 +3916,10 @@ impl Delivery<'_> {
                         hold            = "entered",
                         "policy dispatch is busy; holding on this event until it runs"
                     );
+                    let since = Instant::now();
+                    pending.hold_opened(since);
                     Hold {
-                        since: Instant::now(),
+                        since,
                         busy_attempts: 0,
                         dispatch: identity.clone(),
                     }
@@ -3919,6 +3948,7 @@ impl Delivery<'_> {
             // restarting its backoff.
             if held_dispatch_answered || !need_retry {
                 if let Some(held) = hold.take() {
+                    pending.hold_closed();
                     tracing::info!(
                         policy          = %policy_name,
                         event_id        = %raw.id,
