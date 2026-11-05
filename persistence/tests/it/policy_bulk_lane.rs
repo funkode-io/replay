@@ -380,8 +380,8 @@ async fn a_bulk_policy_registered_after_a_bulk_execution_does_not_receive_it_pos
 // ── One load per target stream ───────────────────────────────────────────────
 
 /// Loads of a [`Tally`], counted where every load starts: `with_id` builds each field
-/// from its `Default`. A test that counts holds [`TALLY_TESTS`] for its whole run and
-/// starts from zero, so the count is that test's.
+/// from its `Default`. Every test that loads a `Tally` holds [`TALLY_TESTS`] for its
+/// whole run and starts from zero, so a count is that test's.
 static TALLY_LOADS: AtomicUsize = AtomicUsize::new(0);
 
 /// Serialises the tests that count [`TALLY_LOADS`].
@@ -868,6 +868,9 @@ async fn an_abandoned_batch_parks_nothing_postgres_test() {
 /// command decides on the recreated tally, which is open, and counts.
 #[tokio::test]
 async fn a_recreated_stream_is_not_mistaken_for_the_cached_one_postgres_test() {
+    // Loads a Tally, so it holds the counter's guard like every test that does: an
+    // unguarded load would land in another test's exact count.
+    let _counting = count_tally_loads().await;
     let middleware = WriteBetweenCommands::recreating_with(TallyEvent::Opened);
     let pool = Arc::clone(&middleware.pool);
     let harness = PolicyDaemonHarness::start_with_middleware(
