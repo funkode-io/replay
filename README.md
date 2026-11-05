@@ -1931,8 +1931,13 @@ whose `before` answered `Continue`, so the hooks nest:
   it, runs no `after`;
 - a refusal at the **commit gate** comes after every `before` has continued, so every
   middleware runs its `after` — the one that refused and those registered after it
-  included — and sees the `Busy` or `Failed` outcome. An `after` that releases what its
-  `before` took always runs once that `before` has continued. Clones of a `Cqrs` share its chain,
+  included — and sees the `Busy` or `Failed` outcome.
+
+`after` runs only when `execute` runs to its end. If its future is dropped before then (a
+caller's timeout, or the Policy runner's [dispatch timeout](#dispatch-timeout) abandoning a
+dispatch), or the command panics, no `after` runs. So a middleware that takes something in
+`before` that must be given back, such as a permit or a lock, gives it back from a guard's
+`Drop`, not only from `after`. Clones of a `Cqrs` share its chain,
 and a `Cqrs` without middleware behaves as if the feature did not exist.
 
 ### What a caller sees
