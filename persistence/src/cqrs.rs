@@ -77,6 +77,11 @@ impl CommitGate for MiddlewareGate {
         }
         Next::Continue
     }
+
+    /// Open without middleware, so a store takes no in-flight lock for it.
+    fn always_continues(&self) -> bool {
+        self.context.is_none()
+    }
 }
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].

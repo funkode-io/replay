@@ -22,7 +22,7 @@ use replay_persistence::{Cqrs, PostgresEventStore};
 use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, Connection, PgConnection, PgPool};
 
 use common::migrations::MIGRATOR;
-use common::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT};
+use common::postgres_image::{postgres_database, TestDatabase};
 
 /// The bound the tests set. Long enough that a loaded CI box does not report it
 /// before the blocker is even in place, short enough that a test waiting it out
@@ -101,14 +101,9 @@ impl replay::Compactable for Ledger {
 /// has to override in both directions.
 async fn start_postgres_with(
     session_lock_timeout: Option<&'static str>,
-) -> (PgPool, String, PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.expect("host").to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("port");
-    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+) -> (PgPool, String, TestDatabase) {
+    let container = postgres_database().await;
+    let url = container.url();
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -136,7 +131,7 @@ async fn start_postgres_with(
 }
 
 /// The common case: a pool carrying no `lock_timeout` of its own.
-async fn start_pool() -> (PgPool, String, PostgresServer) {
+async fn start_pool() -> (PgPool, String, TestDatabase) {
     start_postgres_with(None).await
 }
 

@@ -220,7 +220,8 @@ async fn a_worker_that_dies_mid_batch_leaves_its_claim_for_the_next_postgres_tes
         "SELECT pg_terminate_backend(pid) FROM pg_locks \
           WHERE locktype = 'advisory' AND objsubid = 2 \
             AND classid = hashtext('replay.bulk_claim')::oid \
-            AND objid = hashtext($1)::oid",
+            AND objid = hashtext($1)::oid \
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
     )
     .bind(&policy)
     .fetch_all(harness.pool())
@@ -233,7 +234,9 @@ async fn a_worker_that_dies_mid_batch_leaves_its_claim_for_the_next_postgres_tes
                 "SELECT NOT EXISTS (SELECT 1 FROM pg_locks \
                   WHERE locktype = 'advisory' AND objsubid = 2 \
                     AND classid = hashtext('replay.bulk_claim')::oid \
-                    AND objid = hashtext($1)::oid)",
+                    AND objid = hashtext($1)::oid \
+                    AND database = (SELECT oid FROM pg_database \
+                                     WHERE datname = current_database()))",
             )
             .bind(&policy)
             .fetch_one(harness.pool())

@@ -16,9 +16,7 @@ use replay_persistence::{Cqrs, PostgresEventStore};
 
 use crate::common;
 use common::migrations::{self, through as migrations_through, MIGRATOR};
-use common::postgres_image::start_postgres_server;
-
-const POSTGRES_PORT: u16 = 5432;
+use common::postgres_image::postgres_database;
 
 /// The migration that adds the stamp, and the one before it: the tests that stage a
 /// pre-stamp database migrate up to `BEFORE_STAMP` and then run the rest.
@@ -106,19 +104,12 @@ impl replay::Compactable for Ledger {
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
-async fn start_pool() -> (PgPool, common::postgres_image::PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (PgPool, common::postgres_image::TestDatabase) {
+    let container = postgres_database().await;
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to connect to Postgres");
 
@@ -366,6 +357,7 @@ async fn await_blocked_on_events(pool: &PgPool) {
         let blocked: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_locks l \
                JOIN pg_class c ON c.oid = l.relation \
+               JOIN pg_database d ON d.oid = l.database AND d.datname = current_database() \
               WHERE c.relname = 'events' AND NOT l.granted",
         )
         .fetch_one(pool)

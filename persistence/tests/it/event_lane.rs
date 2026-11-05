@@ -9,7 +9,7 @@ use sqlx::{PgPool, Row};
 
 use crate::common;
 use common::migrations::{through, MIGRATOR};
-use common::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT};
+use common::postgres_image::{postgres_database, TestDatabase};
 
 /// The last migration before the lane existed.
 const BEFORE_LANES: i64 = 38;
@@ -20,18 +20,11 @@ const ONLINE_INDEXES: [(i64, &str); 2] = [
     (41, "idx_events_online_commit_txid_position"),
 ];
 
-async fn start_pool() -> (PgPool, PostgresServer) {
-    let container = start_postgres_server().await;
-    let host = container.get_host().await.unwrap().to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("Error getting docker port");
+async fn start_pool() -> (PgPool, TestDatabase) {
+    let container = postgres_database().await;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("Failed to connect to Postgres");
     (pool, container)

@@ -18,7 +18,7 @@ use common::policy_harness::{
     reconciliation_timeout, PolicyDaemonHarness, Probe, ProbeCommand, ProbeEvent, ProbeUrn,
     OBSERVE_TIMEOUT,
 };
-use common::postgres_image::{start_postgres_server, POSTGRES_PORT};
+use common::postgres_image::{postgres_database, TestDatabase};
 use replay_persistence::{
     Cqrs, Dispatch, ObservedEvent, PolicyRunner, PolicySettings, PolicyStatusStore,
     PostgresEventStore, StartAt, StreamFilter,
@@ -207,14 +207,12 @@ async fn a_policy_tracking_one_stream_type_reads_as_caught_up_whatever_else_is_w
 /// The read budget the sweep test registers: small, so a handful of events fills it.
 const READ_BATCH: u32 = 3;
 
-async fn migrated_pool(port: u16, host: &str) -> PgPool {
+async fn migrated_pool(container: &TestDatabase) -> PgPool {
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(OBSERVE_TIMEOUT)
         .idle_timeout(Duration::from_secs(5))
-        .connect(&format!(
-            "postgres://postgres:postgres@{host}:{port}/postgres"
-        ))
+        .connect(&container.url())
         .await
         .expect("failed to create the postgres pool");
     common::migrations::MIGRATOR
@@ -266,17 +264,8 @@ async fn swept_through(pool: &PgPool, policy: &str) -> i64 {
 /// test can count rather than infer from a daemon's timing.
 #[tokio::test]
 async fn the_sweep_passes_a_batch_of_untracked_events_one_limit_at_a_time_postgres_test() {
-    let container = start_postgres_server().await;
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to read the container host")
-        .to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("failed to read the container port");
-    let pool = migrated_pool(port, &host).await;
+    let container = postgres_database().await;
+    let pool = migrated_pool(&container).await;
 
     let mut untracked = Vec::new();
     for n in 0..(READ_BATCH * 3) {
@@ -325,17 +314,8 @@ async fn the_sweep_passes_a_batch_of_untracked_events_one_limit_at_a_time_postgr
 /// types, and from then on the lag is counted over those streams alone.
 #[tokio::test]
 async fn status_counts_every_stream_until_a_runner_records_what_the_policy_tracks_postgres_test() {
-    let container = start_postgres_server().await;
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to read the container host")
-        .to_string();
-    let port = container
-        .get_host_port_ipv4(POSTGRES_PORT)
-        .await
-        .expect("failed to read the container port");
-    let pool = migrated_pool(port, &host).await;
+    let container = postgres_database().await;
+    let pool = migrated_pool(&container).await;
 
     let policy = "tracks_types_unrecorded";
     let runner = || {

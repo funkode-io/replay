@@ -45,6 +45,18 @@ impl<E: Event> EventSink<E> for NoSink {
 pub trait CommitGate: Send {
     /// Whether the append may commit. A store calls it at most once per append.
     fn check(self) -> impl Future<Output = Next> + Send;
+
+    /// Whether this gate continues without asking anything, as [`OpenGate`] does.
+    ///
+    /// A store may then skip what it does to close the gap between the check and the
+    /// commit: the Postgres store takes its in-flight lock only for a gate that answers
+    /// `false`, so a direct append, or a [`Cqrs`](crate::Cqrs) without middleware, never
+    /// waits for [`await_in_flight_commits`](crate::PostgresEventStore::await_in_flight_commits).
+    /// The default is `false`, which is always safe; answer `true` only for a gate whose
+    /// answer cannot change.
+    fn always_continues(&self) -> bool {
+        false
+    }
 }
 
 impl<F, Fut> CommitGate for F
@@ -65,6 +77,10 @@ pub struct OpenGate;
 impl CommitGate for OpenGate {
     fn check(self) -> impl Future<Output = Next> + Send {
         std::future::ready(Next::Continue)
+    }
+
+    fn always_continues(&self) -> bool {
+        true
     }
 }
 

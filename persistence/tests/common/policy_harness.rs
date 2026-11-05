@@ -74,10 +74,10 @@
 //!
 //! ## Isolation
 //!
-//! Each harness owns its own container, hence its own database, and names its
+//! Each harness owns its own database on the binary's shared server, and names its
 //! policy with a process-unique suffix. Cursors, dead letters and the advisory
-//! locks that elect a leader are therefore private to one test even if it runs
-//! concurrently with every other one.
+//! locks that elect a leader (an advisory lock is scoped to its database) are
+//! therefore private to one test even if it runs concurrently with every other one.
 
 // Each test binary uses a subset of the observations; an unused one here is not
 // a defect.
@@ -93,7 +93,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use super::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT};
+use super::postgres_image::{postgres_database, TestDatabase};
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
@@ -414,8 +414,8 @@ impl Escalations {
 /// Build one with [`start`](Self::start) and end every test with
 /// [`shutdown`](Self::shutdown).
 pub struct PolicyDaemonHarness {
-    /// Dropping this stops the database; the field is never read.
-    _container: PostgresServer,
+    /// Dropping this drops the database; the field is never read.
+    _container: TestDatabase,
     pool: PgPool,
     cqrs: Cqrs<PostgresEventStore>,
     policy_name: String,
@@ -484,23 +484,12 @@ impl PolicyDaemonHarness {
     where
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
-        let container = start_postgres_server().await;
-        let host = container
-            .get_host()
-            .await
-            .expect("failed to read the container host")
-            .to_string();
-        let port = container
-            .get_host_port_ipv4(POSTGRES_PORT)
-            .await
-            .expect("failed to read the container port");
+        let container = postgres_database().await;
 
         let pool = PgPoolOptions::new()
             .max_connections(20)
             .idle_timeout(Duration::from_secs(5))
-            .connect(&format!(
-                "postgres://postgres:postgres@{host}:{port}/postgres"
-            ))
+            .connect(&container.url())
             .await
             .expect("failed to create the postgres pool");
 

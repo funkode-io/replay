@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use urn::Urn;
 use uuid::Uuid;
 
+use super::advisory_keys::COMMIT_GATE_LOCK_CLASS;
 use super::projection_catch_up::{self as catch_up, Cut, ErasedPostgresProjection, Scope};
 use super::stream_deletion::{self as deletion, DeletedStreams};
 use crate::inline_projection::InlineProjection;
@@ -146,6 +147,36 @@ fn stream_lock_error(
         "waited {limit}ms for the stream row lock without getting it"
     ))
     .with_operation(operation)
+    .with_context("stream_id", stream_id)
+    .with_context("stream_lock_wait_ms", limit)
+}
+
+/// How long one attempt of `await_in_flight_commits` waits for the commit gate's lock.
+///
+/// Always finite: a stream lock wait of zero means "wait forever" for an append, but an
+/// attempt is retried anyway, and an unbounded one abandoned by a dropped call would hold
+/// a connection and queue every gated append behind it for as long as the appends in
+/// flight last.
+fn await_attempt_wait(stream_lock_wait: Duration) -> Duration {
+    if stream_lock_wait.is_zero() {
+        DEFAULT_STREAM_LOCK_WAIT
+    } else {
+        stream_lock_wait
+    }
+}
+
+/// What an append returns when the commit gate's lock was not free within the stream lock
+/// wait: an [`await_in_flight_commits`](PostgresEventStore::await_in_flight_commits) was
+/// waiting for, or holding, it the whole time.
+fn commit_gate_lock_error(error: sqlx::Error, stream_id: &str, wait: Duration) -> replay::Error {
+    if !crate::lock_wait::is_lock_not_available(&error) {
+        return crate::db_error(error);
+    }
+    let limit = crate::lock_wait::limit_ms(wait);
+    replay::Error::unavailable(format!(
+        "waited {limit}ms for the commit gate's lock without getting it"
+    ))
+    .with_operation("store_events")
     .with_context("stream_id", stream_id)
     .with_context("stream_lock_wait_ms", limit)
 }
@@ -887,6 +918,61 @@ impl PostgresEventStore {
         Ok(read)
     }
 
+    /// Wait until every append that asked its commit gate before this call began has
+    /// committed or rolled back.
+    ///
+    /// The second half of switching a rule on, such as maintenance mode
+    /// ([ADR-0035](https://github.com/funkode-io/replay/blob/main/docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)):
+    /// commit the flag a [command middleware](crate::CommandMiddleware) reads in
+    /// `before_commit`, then call this. When it returns, no append that checked the old
+    /// flag can still commit, and every later append checks the new one — provided the
+    /// middleware reads the flag as it is, not from a cache.
+    ///
+    /// It covers appends through a [`Cqrs`](crate::Cqrs) with middleware, in this process
+    /// or any other on the same database. A direct append and a `Cqrs` without middleware
+    /// ask no gate, take no lock and are not waited for.
+    ///
+    /// It waits for as long as the slowest of those appends takes, and while it waits, new
+    /// ones queue behind it, each for at most the
+    /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait) before it fails as
+    /// [`replay::ErrorKind::Unavailable`]. It is meant for a switch, not a request path.
+    ///
+    /// Each attempt at the lock is bounded on the server by that same stream lock wait (the
+    /// default 30s when it is zero) and retried until it succeeds: cancelling this future sends Postgres nothing, so an
+    /// unbounded wait abandoned by a dropped call would hold a pool connection, and queue
+    /// every gated append behind it, for as long as the appends in flight last (ADR-0022).
+    /// Dropped, it leaves at most one bounded wait behind.
+    pub async fn await_in_flight_commits(&self) -> Result<(), replay::Error> {
+        // Retrying is safe: whenever the lock is taken, every append that held it shared
+        // before then has ended, and every append that takes it later asks its gate after
+        // the caller's flag was committed.
+        while !self.try_await_in_flight_commits().await? {}
+        Ok(())
+    }
+
+    /// One bounded attempt at [`await_in_flight_commits`](Self::await_in_flight_commits):
+    /// `false` when the stream lock wait ran out first.
+    async fn try_await_in_flight_commits(&self) -> Result<bool, replay::Error> {
+        // Exclusive, and transaction-scoped so the lock is gone with the commit.
+        let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
+        crate::lock_wait::bound(&mut transaction, await_attempt_wait(self.stream_lock_wait))
+            .await
+            .map_err(crate::db_error)?;
+        match sqlx::query("SELECT pg_advisory_xact_lock($1, 0)")
+            .bind(COMMIT_GATE_LOCK_CLASS)
+            .execute(&mut *transaction)
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if crate::lock_wait::is_lock_not_available(&error) => return Ok(false),
+            Err(error) => {
+                return Err(crate::db_error(error).with_operation("await_in_flight_commits"))
+            }
+        }
+        transaction.commit().await.map_err(crate::db_error)?;
+        Ok(true)
+    }
+
     /// Delete `stream_ids` for good, with everything this library keeps about them, and
     /// let the caller delete its own read-model rows in the same transaction.
     ///
@@ -1390,6 +1476,24 @@ where
             PostgresEventStore::queue_bulk_work(&mut transaction, &self.stream_type).await?;
         }
 
+        // No gap between the check and the commit (ADR-0035): a gate that asks anything is
+        // asked under the commit gate's lock, held shared until this transaction ends, so
+        // `await_in_flight_commits` waits for it to commit or roll back. An open gate's
+        // answer cannot change, so a direct append takes nothing.
+        if !gate.always_continues() {
+            sqlx::query("SELECT pg_advisory_xact_lock_shared($1, 0)")
+                .bind(COMMIT_GATE_LOCK_CLASS)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    commit_gate_lock_error(
+                        error,
+                        self.stream_id.as_ref(),
+                        self.store.stream_lock_wait,
+                    )
+                })?;
+        }
+
         // The commit gate (ADR-0035): last, after every insert and inline projection
         // write, so it has the final word. Returning early drops the transaction, which
         // rolls it back, projection writes included.
@@ -1877,9 +1981,21 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        bulk_segment_size_or_default, resolve_flush_size, stream_lock_wait_or_default,
-        DEFAULT_BULK_SEGMENT_SIZE, DEFAULT_PROJECTION_FLUSH_SIZE, DEFAULT_STREAM_LOCK_WAIT,
+        await_attempt_wait, bulk_segment_size_or_default, resolve_flush_size,
+        stream_lock_wait_or_default, DEFAULT_BULK_SEGMENT_SIZE, DEFAULT_PROJECTION_FLUSH_SIZE,
+        DEFAULT_STREAM_LOCK_WAIT,
     };
+
+    /// A stream lock wait of zero opts an append out of the bound; an attempt to await
+    /// the commits in flight stays bounded, so a dropped call never waits forever.
+    #[test]
+    fn an_await_attempt_is_bounded_even_when_the_stream_lock_wait_is_not() {
+        assert_eq!(await_attempt_wait(Duration::ZERO), DEFAULT_STREAM_LOCK_WAIT);
+        assert_eq!(
+            await_attempt_wait(Duration::from_millis(500)),
+            Duration::from_millis(500)
+        );
+    }
 
     #[test]
     fn the_bulk_segment_size_falls_back_to_the_built_in_default() {
