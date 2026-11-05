@@ -5,7 +5,7 @@ Date: 2026-11-04
 ## Status
 
 Accepted. Decides [#308](https://github.com/funkode-io/replay/issues/308). The bulk lane
-([#288](https://github.com/funkode-io/replay/issues/288)) follows it when it lands.
+([#288](https://github.com/funkode-io/replay/issues/288)), which landed after it, follows it.
 
 ## Context
 
@@ -78,8 +78,10 @@ the metadata, which is where a consumer puts what such rules need.
 ### Where it runs
 
 On every command `Cqrs` executes: an application's call, a Policy dispatch (the runner
-executes through the `Cqrs` it was built with, so it shares its middleware) and, once it
-lands, the bulk lane, where `before_commit` runs before every segment's commit.
+executes through the `Cqrs` it was built with, so it shares its middleware) and a bulk
+execution (`Cqrs::execute_bulk`), where `before` runs once and `before_commit` runs before
+every segment's commit: a middleware that stops a segment rolls back that segment only, and
+the segments before it stay committed.
 
 Not on what is not a command: a direct append through the store, compaction, stream
 deletion, a rebuild or a catch-up. A middleware writes no row to the projection registry

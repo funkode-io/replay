@@ -40,6 +40,9 @@ runs rather than parking it.**
 - **The hold is narrated.** It is an edge: one record when a Policy starts holding, one when
   it stops, never one per attempt ([Narration]). A held Policy keeps beating its
   [Heartbeat]: it is alive and waiting, which is not the same as a reaction that has hung.
+- **On the bulk lane** a busy command ends the batch instead of holding inside it: the
+  batch's claim rolls back, parking nothing, and its work is claimed again on the next
+  poll — the same outcome, held at the queue rather than in memory.
 - **Only standing down ends a hold early.** A shutdown, or the worker losing its
   leadership, calls the hold off wherever it is — in a backoff or a dispatch in flight:
   the delivery fails, nothing is parked or advanced, the hold is narrated as abandoned, and

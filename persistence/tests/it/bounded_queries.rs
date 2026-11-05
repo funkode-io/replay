@@ -32,6 +32,20 @@ struct Reviewed {
 /// Every `fetch_all` in `persistence/src`, with the bound that makes it safe.
 const REVIEWED: &[Reviewed] = &[
     Reviewed {
+        file: "src/policy_runner/bulk_lane.rs",
+        function: "deliver_batch",
+        justification: "The claim carries LIMIT $batch, the policy's resolved \
+                        read_batch_size (default 100): one bulk-lane batch of positions, \
+                        never the whole queue.",
+    },
+    Reviewed {
+        file: "src/policy_runner/bulk_lane.rs",
+        function: "read_claimed",
+        justification: "global_position = ANY($positions), the positions one claim \
+                        returned: at most read_batch_size events, and global_position \
+                        is unique.",
+    },
+    Reviewed {
         file: "src/policy_runner.rs",
         function: "sweep_for_streams",
         justification: "At most limit + 1 rows: the sweep carries LIMIT $limit, the \

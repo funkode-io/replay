@@ -1945,8 +1945,12 @@ and a `Cqrs` without middleware behaves as if the feature did not exist.
 ### What middleware covers, and what it does not
 
 Middleware runs on every command `Cqrs` executes: an application's call and a Policy's
-dispatch alike, because the runner executes through the `Cqrs` it was built with. It
-runs on nothing that is not a command: a direct append through the store
+dispatch alike, because the runner executes through the `Cqrs` it was built with, and a
+bulk execution (`Cqrs::execute_bulk`). A bulk execution runs `before` once and asks
+`before_commit` before each segment commits, so a middleware that stops it mid-way rolls
+back the segment it is in, and the segments before it stay committed — maintenance mode
+switched on during a bulk import stops it at a segment boundary. Middleware runs on
+nothing that is not a command: a direct append through the store
 (`store_events`), compaction, stream deletion, an inline projection rebuild or a
 catch-up never reach it. It is not a projection: it writes no row to the projection
 registry and no applied mark, so it leaves no catch-up debt.
@@ -2119,7 +2123,10 @@ runner **holds** the Policy on that event instead of parking a dead letter
   shutdown or a lost leadership calls the hold off: nothing is parked or advanced, and
   whoever leads next delivers the event again;
 - a `retry_dead_letter` whose replay meets `Busy` leaves the rows parked as they were
-  and reports `DeadLetterRetry::Busy`.
+  and reports `DeadLetterRetry::Busy`;
+- a Policy on the bulk lane does not hold inside a batch: a busy command ends the batch,
+  its claim rolls back with nothing parked, and the work is claimed again on the next
+  poll.
 
 Switching maintenance off needs nothing more: a held Policy runs its command on its
 next attempt and catches up.
@@ -3201,6 +3208,21 @@ what is holding the stream the error names — `pg_locks` joined to
 value you choose is the longest honest hold, and in this library that is `compact`:
 it is O(stream length), so a stream long enough to take more than the wait will
 fail the appends queued behind it.
+
+### Bulk segment size
+
+`Cqrs::execute_bulk` commits its events in segments, each one transaction holding the
+segment's events, their inline-projection rows and their bulk work. The segment bounds
+what a bulk holds at once — memory, the stream row, and the commit stamp every online
+Policy and projection catch-up waits behind — and what a failure rolls back: a failure
+mid-bulk leaves the segments before it committed and returns the error
+([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+
+| Setting | Store override | Env var | Default |
+|---------|----------------|---------|---------|
+| Events a bulk append commits per segment | `builder(pool).bulk_segment_size(n)` | `REPLAY_BULK_SEGMENT_SIZE` | `1000` |
+
+Values below 1 are clamped to 1. An online append is one transaction whatever this is.
 
 ### Failure handling
 
