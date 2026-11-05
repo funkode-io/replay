@@ -465,3 +465,70 @@ async fn the_commit_gate_lock_is_apart_from_every_other_advisory_lock_postgres_t
         .expect("await_in_flight_commits must succeed");
     holder.rollback().await.expect("the holder must let go");
 }
+
+/// A caller that gives up on `await_in_flight_commits` while an append is held leaves no
+/// waiter behind for longer than the stream lock wait: once it is gone, another gated
+/// append commits even though the first is still held.
+#[tokio::test]
+async fn an_abandoned_await_stops_queueing_gated_appends_postgres_test() {
+    let (pool, _container) = flag_pool().await;
+    let store = PostgresEventStore::builder(pool.clone())
+        .stream_lock_wait(Duration::from_millis(500))
+        .build()
+        .await
+        .expect("building the store must succeed");
+    let hold = Hold::default();
+    let held = Cqrs::new(store.clone()).with_middleware(Maintenance {
+        hold: Some(hold.clone()),
+        ..Maintenance::new(&pool)
+    });
+    let appending = tokio::spawn(async move {
+        held.execute::<Probe>(&probe("held"), Metadata::default(), ping("held"), &(), None)
+            .await
+    });
+    hold.reached().await;
+
+    // The operator gives up while the held append still has the lock shared.
+    timeout(Duration::from_millis(200), store.await_in_flight_commits())
+        .await
+        .expect_err("await_in_flight_commits waits while the append is held");
+
+    // The abandoned wait ends on the server, within the stream lock wait.
+    let deadline = std::time::Instant::now() + OBSERVE_TIMEOUT;
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("counting lock waits must succeed");
+        if waiting == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the abandoned wait for the commit gate's lock never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    Cqrs::new(store.clone())
+        .with_middleware(Passes)
+        .execute::<Probe>(
+            &probe("other"),
+            Metadata::default(),
+            ping("other"),
+            &(),
+            None,
+        )
+        .await
+        .expect("no abandoned waiter queues a gated append");
+    assert!(!appending.is_finished(), "the first append is still held");
+
+    hold.release.notify_one();
+    appending
+        .await
+        .expect("the append must not panic")
+        .expect("the held append commits");
+    assert_eq!(events(&pool).await, 2);
+}

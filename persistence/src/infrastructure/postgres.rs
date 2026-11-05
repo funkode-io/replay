@@ -868,17 +868,41 @@ impl PostgresEventStore {
     /// ones queue behind it, each for at most the
     /// [stream lock wait](PostgresEventStoreBuilder::stream_lock_wait) before it fails as
     /// [`replay::ErrorKind::Unavailable`]. It is meant for a switch, not a request path.
+    ///
+    /// Each attempt at the lock is bounded on the server by that same stream lock wait and
+    /// retried until it succeeds: cancelling this future sends Postgres nothing, so an
+    /// unbounded wait abandoned by a dropped call would hold a pool connection, and queue
+    /// every gated append behind it, for as long as the appends in flight last (ADR-0022).
+    /// Dropped, it leaves at most one bounded wait behind.
     pub async fn await_in_flight_commits(&self) -> Result<(), replay::Error> {
-        // Exclusive, and transaction-scoped so the lock is gone with the commit, or with
-        // the connection if this future is dropped while it waits.
+        // Retrying is safe: whenever the lock is taken, every append that held it shared
+        // before then has ended, and every append that takes it later asks its gate after
+        // the caller's flag was committed.
+        while !self.try_await_in_flight_commits().await? {}
+        Ok(())
+    }
+
+    /// One bounded attempt at [`await_in_flight_commits`](Self::await_in_flight_commits):
+    /// `false` when the stream lock wait ran out first.
+    async fn try_await_in_flight_commits(&self) -> Result<bool, replay::Error> {
+        // Exclusive, and transaction-scoped so the lock is gone with the commit.
         let mut transaction = self.pool.begin().await.map_err(crate::db_error)?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1, 0)")
+        crate::lock_wait::bound(&mut transaction, self.stream_lock_wait)
+            .await
+            .map_err(crate::db_error)?;
+        match sqlx::query("SELECT pg_advisory_xact_lock($1, 0)")
             .bind(COMMIT_GATE_LOCK_CLASS)
             .execute(&mut *transaction)
             .await
-            .map_err(|e| crate::db_error(e).with_operation("await_in_flight_commits"))?;
+        {
+            Ok(_) => {}
+            Err(error) if crate::lock_wait::is_lock_not_available(&error) => return Ok(false),
+            Err(error) => {
+                return Err(crate::db_error(error).with_operation("await_in_flight_commits"))
+            }
+        }
         transaction.commit().await.map_err(crate::db_error)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Delete `stream_ids` for good, with everything this library keeps about them, and
