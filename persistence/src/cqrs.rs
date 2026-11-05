@@ -8,6 +8,12 @@ use urn::Urn;
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent, PostgresEventStore};
 use crate::{CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome};
 
+/// An aggregate kept between commands, and the stream version its state is at.
+pub(crate) struct Loaded<A> {
+    aggregate: A,
+    version: i64,
+}
+
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
 const DEFAULT_COMPACTION_CHUNK_SIZE: u32 = 100;
 
@@ -155,15 +161,22 @@ impl<ES: EventStore> Cqrs<ES> {
         .await
     }
 
-    /// Run `command` against `aggregate`, already loaded, append what it produces and
-    /// fold it in: [`execute`](Self::execute) without the load, middleware included.
+    /// Run `command` against the aggregate at `id`, reusing the instance in `cached`
+    /// when it is that aggregate, and leave the aggregate there once the command
+    /// commits: [`execute`](Self::execute) with the load shared across commands.
     ///
     /// What lets the bulk lane's worker dispatch every command a batch aims at one
-    /// stream with one load of its aggregate (ADR-0034). A failure can leave `aggregate`
-    /// holding events whose append rolled back, so a caller discards it on any error.
-    pub(crate) async fn execute_on<A: Aggregate>(
+    /// stream with one load of its aggregate (ADR-0034). The load happens inside the
+    /// middleware chain, as in `execute`, so a middleware that stops the command stops
+    /// the load too. A reused instance is appended against the stream version it was
+    /// loaded or last appended at, unless the command names its own: a write by anybody
+    /// else in between fails the append as a `Conflict` rather than letting the handler
+    /// decide on stale state. On any failure `cached` is left empty, because the
+    /// instance may hold events whose append rolled back.
+    pub(crate) async fn execute_cached<A: Aggregate>(
         &self,
-        aggregate: &mut A,
+        cached: &mut Option<Loaded<A>>,
+        id: &A::StreamId,
         metadata: replay::Metadata,
         command: A::Command,
         services: &A::Services,
@@ -173,12 +186,53 @@ impl<ES: EventStore> Cqrs<ES> {
         A::Event: 'static,
         A::Error: 'static,
     {
-        let id = aggregate.get_id().clone();
-        self.through_middleware::<A, _, _, _>(&id, metadata, |metadata| async move {
-            self.handle_and_append::<A>(aggregate, metadata, command, services, expected_version)
-                .await
+        let reused = cached
+            .take()
+            .filter(|loaded| loaded.aggregate.get_id() == id);
+        self.through_middleware::<A, _, _, _>(id, metadata, |metadata| async move {
+            let mut loaded = match reused {
+                Some(loaded) => loaded,
+                None => self.fetch_loaded::<A>(id).await?,
+            };
+            let expected = expected_version.or(Some(loaded.version));
+            if let Some(version) = self
+                .handle_and_append::<A>(
+                    &mut loaded.aggregate,
+                    metadata,
+                    command,
+                    services,
+                    expected,
+                )
+                .await?
+            {
+                loaded.version = version;
+            }
+            *cached = Some(loaded);
+            Ok(())
         })
         .await
+    }
+
+    /// Load the aggregate at `id` at its latest state, and the stream version that state
+    /// is at: the version of the last live event folded in, `0` for an empty stream.
+    async fn fetch_loaded<A: Aggregate + Sync>(
+        &self,
+        id: &A::StreamId,
+    ) -> Result<Loaded<A>, A::Error> {
+        let events = self
+            .store
+            .stream_events_by_stream_id::<A>(id, AggregateVersion::Latest, None, None)
+            .map_err(A::Error::from);
+        let mut loaded = Loaded {
+            aggregate: A::with_id(id.clone()),
+            version: 0,
+        };
+        futures::pin_mut!(events);
+        while let Some(event) = events.try_next().await? {
+            loaded.version = event.version;
+            loaded.aggregate.apply(event.into_data());
+        }
+        Ok(loaded)
     }
 
     /// Pass a command through the middleware chain around `command`, which does the
@@ -282,13 +336,16 @@ impl<ES: EventStore> Cqrs<ES> {
         command: A::Command,
         services: &A::Services,
         expected_version: Option<i64>,
-    ) -> Result<(), A::Error>
+    ) -> Result<Option<i64>, A::Error>
     where
         A::Event: 'static,
         A::Error: 'static,
     {
         let id = aggregate.get_id().clone();
         let stream_type = A::stream_type();
+        // The stream version of the last event appended, for a caller that keeps the
+        // aggregate and appends against it again.
+        let mut appended_version = None;
 
         // Stream-first: the producer yields events lazily and owns its data — it does not
         // borrow the aggregate — so once it is built the borrow on `&aggregate` is released
@@ -309,12 +366,15 @@ impl<ES: EventStore> Cqrs<ES> {
                 metadata,
                 event_stream,
                 expected_version,
-                |event: &PersistedEvent<A::Event>| aggregate.apply(event.data.clone()),
+                |event: &PersistedEvent<A::Event>| {
+                    appended_version = Some(event.version);
+                    aggregate.apply(event.data.clone())
+                },
             )
             .await
             .map_err(A::Error::from)?;
 
-        Ok(())
+        Ok(appended_version)
     }
 
     /// Compact the event stream for an aggregate.

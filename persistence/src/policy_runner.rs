@@ -963,7 +963,7 @@ impl PolicyRunner {
                     executors: &self.executors,
                     policy: policy.as_ref(),
                 }
-                .drain(|| false)
+                .drain(&StandDown::never())
                 .await?;
             }
         }
@@ -2630,6 +2630,13 @@ impl StandDown {
         Self {
             signals: Some((shutdown, leader)),
         }
+    }
+
+    /// Whether the worker should stop leading now; never, for [`Self::never`].
+    fn now(&self) -> bool {
+        self.signals
+            .as_ref()
+            .is_some_and(|(shutdown, leader)| *shutdown.borrow() || !*leader.borrow())
     }
 
     /// Resolves once the worker should stop leading; never, for [`Self::never`]. A

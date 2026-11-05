@@ -30,8 +30,8 @@ use super::{
     causation_metadata, event_causation_depth, merge_dispatch_metadata, panic_message,
     parked_nothing, resolve_checkpoint_batch_size, resolve_dispatch_timeout, resolve_max_depth,
     resolve_read_batch_size, write_dead_letter, AggregateExecutor, DeadLetterWrite,
-    DispatchFailure, DispatchIdentity, Parking, Stop, TrackedStreams, MAX_DISPATCH_RETRIES,
-    PANIC_ERROR_KIND,
+    DispatchFailure, DispatchIdentity, Parking, StandDown, Stop, TrackedStreams,
+    MAX_DISPATCH_RETRIES, PANIC_ERROR_KIND,
 };
 use crate::policy::RegisteredPolicy;
 use crate::policy_liveness::LivenessHandle;
@@ -83,11 +83,11 @@ pub(super) trait TargetSession: Send {
 pub(super) struct TypedSession<'a, A: Aggregate> {
     pub(super) cqrs: &'a Cqrs<PostgresEventStore>,
     pub(super) services: &'a A::Services,
-    /// The aggregate as the last command that committed left it. Taken out while a
-    /// command runs and put back only when it commits: a command that fails, or whose
-    /// future is dropped on a timeout, may have folded in events whose append rolled
-    /// back, so the next command loads the aggregate afresh.
-    pub(super) loaded: Option<A>,
+    /// The aggregate as the last command that committed left it, with its stream
+    /// version. Taken out while a command runs and put back only when it commits: a
+    /// command that fails, or whose future is dropped on a timeout, may have folded in
+    /// events whose append rolled back, so the next command loads the aggregate afresh.
+    pub(super) loaded: Option<crate::cqrs::Loaded<A>>,
 }
 
 impl<A> TargetSession for TypedSession<'_, A>
@@ -110,17 +110,10 @@ where
                     .with_operation("policy_bulk_execute")
             })?;
 
-            let mut aggregate = match self.loaded.take() {
-                Some(loaded) if loaded.get_id() == &id => loaded,
-                _ => self
-                    .cqrs
-                    .fetch_aggregate::<A>(&id)
-                    .await
-                    .map_err(Into::into)?,
-            };
             self.cqrs
-                .execute_on(
-                    &mut aggregate,
+                .execute_cached(
+                    &mut self.loaded,
+                    &id,
                     metadata,
                     command,
                     self.services,
@@ -128,7 +121,6 @@ where
                 )
                 .await
                 .map_err(Into::into)?;
-            self.loaded = Some(aggregate);
             Ok(())
         })
     }
@@ -174,10 +166,12 @@ pub(super) struct BulkDelivery<'a> {
 
 impl BulkDelivery<'_> {
     /// Claim, react to and delete batches of this Policy's work until a claim comes back
-    /// short — the queue is empty — or `stop` says the worker is to stop leading.
+    /// short — the queue is empty — or `stand_down` says the worker is to stop leading.
+    /// A stand-down mid-batch abandons the batch: the claim rolls back, and whoever leads
+    /// next claims the same rows.
     ///
     /// Returns how many dispatches committed.
-    pub(super) async fn drain(&self, stop: impl Fn() -> bool) -> Result<usize, replay::Error> {
+    pub(super) async fn drain(&self, stand_down: &StandDown) -> Result<usize, replay::Error> {
         // The online lane's read batch is the bulk lane's claim: one setting bounds what a
         // Policy holds in memory whichever lane fed it.
         let checkpoint = resolve_checkpoint_batch_size(self.policy.settings());
@@ -187,9 +181,9 @@ impl BulkDelivery<'_> {
             let Batch {
                 claimed,
                 executed: committed,
-            } = self.deliver_batch(batch).await?;
+            } = self.deliver_batch(batch, stand_down).await?;
             executed += committed;
-            if claimed < batch as usize || stop() {
+            if claimed < batch as usize || stand_down.now() {
                 return Ok(executed);
             }
         }
@@ -202,9 +196,25 @@ impl BulkDelivery<'_> {
     /// locks and the rows are there again for the next claim: at-least-once, as the
     /// online lane. Everything held here is bounded by `batch` — the claimed positions,
     /// their events, and the commands their reactions return.
-    async fn deliver_batch(&self, batch: u32) -> Result<Batch, replay::Error> {
+    async fn deliver_batch(
+        &self,
+        batch: u32,
+        stand_down: &StandDown,
+    ) -> Result<Batch, replay::Error> {
         let name = self.policy.name();
         let mut claim = self.pool.begin().await.map_err(crate::db_error)?;
+        // One claim at a time per Policy, whoever makes it: a daemon's worker, the one that
+        // leads after a handoff while the old leader is finishing its batch, or a manual
+        // drain. `SKIP LOCKED` alone would hand the next claimer the rows after a batch
+        // still dispatching, and a stream's later events would overtake its earlier ones.
+        // Waiting here instead, the next claim starts from what the last one left. The
+        // two-key form is a lock space of its own, apart from the leadership lock that the
+        // lock manager holds on `hashtext(policy)`.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('replay.bulk_claim'), hashtext($1))")
+            .bind(name)
+            .execute(&mut *claim)
+            .await
+            .map_err(crate::db_error)?;
         let positions: Vec<i64> = sqlx::query_scalar(
             "SELECT global_position FROM policy_bulk_work WHERE policy = $1 \
              ORDER BY global_position LIMIT $2 FOR UPDATE SKIP LOCKED",
@@ -225,10 +235,32 @@ impl BulkDelivery<'_> {
         let events = read_claimed(&mut claim, self.policy.stream_filter(), &positions).await?;
         let groups = self.react(&events).await?;
 
-        let mut executed = 0;
-        for group in groups {
-            executed += self.dispatch_group(&events, group).await?;
-        }
+        // Raced against the stand-down, as the online lane races a hold: a worker that is
+        // to stop leading abandons the batch — a dispatch in flight or a retry's backoff
+        // included — and the claim rolls back with nothing deleted.
+        let dispatched = async {
+            let mut executed = 0;
+            for group in groups {
+                executed += self.dispatch_group(&events, group).await?;
+            }
+            Ok::<_, replay::Error>(executed)
+        };
+        let executed = tokio::select! {
+            executed = dispatched => executed?,
+            _ = stand_down.signalled() => {
+                tracing::info!(
+                    policy = %name,
+                    claimed = positions.len(),
+                    "bulk worker stopped leading mid-batch; the claim is released for \
+                     whoever leads next"
+                );
+                return Err(replay::Error::unavailable(
+                    "bulk worker stopped leading mid-batch",
+                )
+                .with_operation("policy_bulk_drain")
+                .with_context("policy", name));
+            }
+        };
 
         sqlx::query("DELETE FROM policy_bulk_work WHERE policy = $1 AND global_position = ANY($2)")
             .bind(name)
@@ -657,9 +689,15 @@ impl BulkWorker {
                     executors: &executors,
                     policy: policy.as_ref(),
                 };
-                let stop = || *shutdown_rx.borrow() || !*leader_rx.borrow();
-                if let Err(error) = delivery.drain(stop).await {
-                    if error.kind() == replay::ErrorKind::Busy {
+                let stand_down = StandDown::on(shutdown_rx.clone(), leader_rx.clone());
+                if let Err(error) = delivery.drain(&stand_down).await {
+                    if stand_down.now() {
+                        tracing::debug!(
+                            policy = %name,
+                            error = %error,
+                            "bulk drain ended as the worker stopped leading"
+                        );
+                    } else if error.kind() == replay::ErrorKind::Busy {
                         tracing::info!(
                             policy = %name,
                             error = %error,

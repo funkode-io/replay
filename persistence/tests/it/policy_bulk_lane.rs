@@ -10,6 +10,10 @@
 //! dispatch — how many times the target aggregate was loaded.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use futures::future::BoxFuture;
+use sqlx::PgPool;
 
 use serde::{Deserialize, Serialize};
 use urn::Urn;
@@ -22,7 +26,8 @@ use common::policy_harness::{
 };
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Dispatch, Lanes, ObservedEvent, PolicyRunnerBuilder, PolicySettings, StartAt, StreamFilter,
+    CommandContextMut, CommandMiddleware, Dispatch, Lanes, Next, ObservedEvent,
+    PolicyRunnerBuilder, PolicySettings, StartAt, StreamFilter,
 };
 
 /// Echo every ping into the stream `<prefix>-<source>`, one per source stream, so what a
@@ -375,9 +380,19 @@ async fn a_bulk_policy_registered_after_a_bulk_execution_does_not_receive_it_pos
 // ── One load per target stream ───────────────────────────────────────────────
 
 /// Loads of a [`Tally`], counted where every load starts: `with_id` builds each field
-/// from its `Default`. Only [`commands_aimed_at_one_target_load_it_once_per_batch_postgres_test`]
-/// uses `Tally`, so the count is that test's.
+/// from its `Default`. A test that counts holds [`TALLY_TESTS`] for its whole run and
+/// starts from zero, so the count is that test's.
 static TALLY_LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Serialises the tests that count [`TALLY_LOADS`].
+static TALLY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take the tally counter for this test, from zero.
+async fn count_tally_loads() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = TALLY_TESTS.lock().await;
+    TALLY_LOADS.store(0, Ordering::SeqCst);
+    guard
+}
 
 /// A field whose construction is a load of its aggregate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -477,6 +492,7 @@ async fn counted(harness: &PolicyDaemonHarness, tally: &str) -> Vec<String> {
 /// its commands in the order of the events that caused them.
 #[tokio::test]
 async fn commands_aimed_at_one_target_load_it_once_per_batch_postgres_test() {
+    let _counting = count_tally_loads().await;
     let harness = PolicyDaemonHarness::start("grouped_by_target", |builder, policy| {
         builder
             .register_services::<Tally>(())
@@ -506,6 +522,139 @@ async fn commands_aimed_at_one_target_load_it_once_per_batch_postgres_test() {
         2,
         "one load per target stream for the whole batch"
     );
+
+    harness.shutdown().await;
+}
+
+/// Writes a `Counted { tag: "outside" }` into the `even` tally just before the second
+/// Tally command a Policy dispatches runs — between two commands of one target group, so
+/// the instance the group loaded is stale when the second one runs.
+#[derive(Clone, Default)]
+struct WriteBetweenCommands {
+    pool: Arc<OnceLock<PgPool>>,
+    tally_commands: Arc<AtomicUsize>,
+}
+
+impl CommandMiddleware for WriteBetweenCommands {
+    fn before<'a>(&'a self, context: CommandContextMut<'a>) -> BoxFuture<'a, Next> {
+        Box::pin(async move {
+            if context.stream_type() != "Tally" || context.causation().is_none() {
+                return Next::Continue;
+            }
+            if self.tally_commands.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                let pool = self.pool.get().expect("the pool is set before any import");
+                let event = TallyEvent::Counted {
+                    tag: "outside".to_string(),
+                };
+                sqlx::query(
+                    "SELECT id FROM write_event(gen_random_uuid(), $1, '{}'::jsonb, $2, $3, \
+                     'Tally', NULL, FALSE)",
+                )
+                .bind(serde_json::to_value(&event).expect("a tally event serialises"))
+                .bind(replay::Event::event_type(&event))
+                .bind(context.stream_id().to_string())
+                .fetch_one(pool)
+                .await
+                .expect("the outside write must succeed");
+            }
+            Next::Continue
+        })
+    }
+}
+
+/// A write by anybody else between two grouped commands of one target is not decided
+/// over: the second command's append is checked against the version the group loaded,
+/// fails as a conflict, and is retried on a fresh load — so the target holds the outside
+/// write between the two, and is loaded twice.
+#[tokio::test]
+async fn a_write_between_grouped_commands_reloads_the_target_postgres_test() {
+    let _counting = count_tally_loads().await;
+    let middleware = WriteBetweenCommands::default();
+    let pool = Arc::clone(&middleware.pool);
+    let harness = PolicyDaemonHarness::start_with_middleware(
+        "grouped_stale",
+        middleware,
+        |builder, policy| {
+            builder
+                .register_services::<Tally>(())
+                .register_policy_fn::<ProbeEvent, _>(policy, bulk(), count_alternately)
+        },
+    )
+    .await;
+    pool.set(harness.pool().clone())
+        .expect("the pool is set once");
+    harness.await_bulk_registration(harness.policy_name()).await;
+
+    harness.bulk_import("stale", &tags("t", 4)).await;
+
+    let even = vec!["t-0".to_string(), "outside".to_string(), "t-2".to_string()];
+    let odd = vec!["t-1".to_string(), "t-3".to_string()];
+    harness
+        .observe("both tallies to hold their counts", || async {
+            (counted(&harness, "even").await == even && counted(&harness, "odd").await == odd)
+                .then_some(())
+        })
+        .await;
+
+    assert_eq!(
+        TALLY_LOADS.load(Ordering::SeqCst),
+        3,
+        "the stale target is loaded again; the other target once"
+    );
+
+    harness.shutdown().await;
+}
+
+/// One claim at a time per Policy: while another transaction holds the Policy's claim,
+/// its worker waits rather than claiming the rows after it, and drains once it ends.
+#[tokio::test]
+async fn a_claim_waits_for_the_policys_claim_in_flight_postgres_test() {
+    let mut harness = start("claim_in_flight", bulk()).await;
+    let policy = harness.policy_name().to_string();
+    harness.await_bulk_registration(&policy).await;
+    harness.stop().await;
+    let imported = harness.bulk_import("waits", &tags("waits", 3)).await;
+
+    // Another claimer — a manual drain, or the previous leader finishing its batch.
+    let mut in_flight = harness.pool().begin().await.expect("a transaction");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('replay.bulk_claim'), hashtext($1))")
+        .bind(&policy)
+        .execute(&mut *in_flight)
+        .await
+        .expect("taking the policy's claim lock");
+
+    harness.resume();
+    harness
+        .observe("the worker to wait for the claim in flight", || async {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' \
+                    AND query LIKE '%replay.bulk_claim%')",
+            )
+            .fetch_one(harness.pool())
+            .await
+            .expect("pg_stat_activity must be readable")
+            .then_some(())
+        })
+        .await;
+    assert_eq!(
+        harness.bulk_work(&policy).await,
+        3,
+        "nothing is claimed past the claim in flight"
+    );
+
+    in_flight
+        .commit()
+        .await
+        .expect("ending the claim in flight");
+    harness
+        .observe("the worker to drain once the claim ends", || async {
+            (harness.bulk_work(&policy).await == 0).then_some(())
+        })
+        .await;
+    for event in &imported {
+        assert_eq!(reactions_to(&harness, &policy, event).await, 1);
+    }
 
     harness.shutdown().await;
 }
