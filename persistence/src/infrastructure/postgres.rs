@@ -1118,8 +1118,76 @@ impl PostgresEventStore {
     }
 }
 
-impl EventStore for PostgresEventStore {
-    async fn store_events_stream<S, ES, Sink>(
+/// Which lane an append stamps its events with
+/// ([ADR-0034](https://github.com/funkode-io/replay/blob/main/docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppendLane {
+    /// Read by the online Policy feed: every append but a bulk one.
+    Online,
+    /// Reaches Policies only through the bulk work queue the same transaction fills.
+    Bulk,
+}
+
+impl PostgresEventStore {
+    /// [`EventStore::store_events_stream`] on the **bulk lane**: the same append, every
+    /// event stamped `lane = 'bulk'`, and — in the same transaction, before it commits —
+    /// one row of `policy_bulk_work` per event for each Policy registered on the bulk lane
+    /// that tracks this stream's type (ADR-0034).
+    pub(crate) async fn store_bulk_events_stream<S, ES, Sink>(
+        &self,
+        stream_id: &S::StreamId,
+        stream_type: String,
+        metadata: replay::Metadata,
+        domain_events: ES,
+        expected_version: Option<i64>,
+        sink: Sink,
+    ) -> Result<(), replay::Error>
+    where
+        S: replay::EventStream,
+        ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
+        Sink: EventSink<S::Event> + Send,
+    {
+        self.append_on_lane::<S, ES, Sink>(
+            stream_id,
+            stream_type,
+            metadata,
+            domain_events,
+            expected_version,
+            sink,
+            AppendLane::Bulk,
+        )
+        .await
+    }
+
+    /// Queue this transaction's bulk-lane events for every Policy registered on the bulk
+    /// lane that tracks `stream_type`, one row per event per Policy.
+    ///
+    /// One statement, run in the database: the events are found by the transaction that
+    /// wrote them, through `idx_events_commit_txid_position`, so nothing about the append
+    /// is held here whatever its size. The registrations it fans out over are the ones
+    /// committed when it runs.
+    async fn queue_bulk_work(
+        conn: &mut sqlx::PgConnection,
+        stream_type: &str,
+    ) -> Result<(), replay::Error> {
+        sqlx::query(
+            "INSERT INTO policy_bulk_work (policy, global_position) \
+             SELECT r.policy, e.global_position \
+               FROM events e \
+               JOIN policy_bulk_registrations r \
+                 ON r.tracked_stream_types IS NULL OR $1 = ANY(r.tracked_stream_types) \
+              WHERE e.commit_txid = pg_current_xact_id() AND e.lane = 'bulk' \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(stream_type)
+        .execute(conn)
+        .await
+        .map_err(crate::db_error)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_on_lane<S, ES, Sink>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
@@ -1127,6 +1195,7 @@ impl EventStore for PostgresEventStore {
         domain_events: ES,
         expected_version: Option<i64>,
         mut sink: Sink,
+        lane: AppendLane,
     ) -> Result<(), replay::Error>
     where
         S: replay::EventStream,
@@ -1177,26 +1246,35 @@ impl EventStore for PostgresEventStore {
             // original expectation would spuriously conflict.
             let expected = if is_first { expected_version } else { None };
 
-            let row = sqlx::query(
-                "SELECT id, version, created FROM append_event($1, $2, $3, $4, $5, $6, $7)",
-            )
-            .bind(id)
-            .bind(&event_data)
-            .bind(&metadata_json)
-            .bind(&event_type)
-            .bind(stream_id.to_string())
-            .bind(&stream_type)
-            .bind(expected)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|error| {
-                stream_lock_error(
-                    error,
-                    stream_id.as_ref(),
-                    self.stream_lock_wait,
-                    "store_events",
-                )
-            })?;
+            // The online lane keeps the statement every release before lanes used; the
+            // bulk lane names its lane to the writer that `append_event` delegates to.
+            let statement = match lane {
+                AppendLane::Online => {
+                    "SELECT id, version, created FROM append_event($1, $2, $3, $4, $5, $6, $7)"
+                }
+                AppendLane::Bulk => {
+                    "SELECT id, version, created \
+                       FROM write_event($1, $2, $3, $4, $5, $6, $7, FALSE, 'bulk')"
+                }
+            };
+            let row = sqlx::query(statement)
+                .bind(id)
+                .bind(&event_data)
+                .bind(&metadata_json)
+                .bind(&event_type)
+                .bind(stream_id.to_string())
+                .bind(&stream_type)
+                .bind(expected)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    stream_lock_error(
+                        error,
+                        stream_id.as_ref(),
+                        self.stream_lock_wait,
+                        "store_events",
+                    )
+                })?;
 
             // No row means an optimistic-concurrency mismatch in `append_event` (only
             // possible on the first append). Surface it as a concurrency_error and let the
@@ -1275,6 +1353,9 @@ impl EventStore for PostgresEventStore {
         if has_projections && appended_count > 0 {
             self.mark_applied(&mut transaction).await?;
         }
+        if lane == AppendLane::Bulk && appended_count > 0 {
+            Self::queue_bulk_work(&mut transaction, &stream_type).await?;
+        }
 
         transaction.commit().await.map_err(crate::db_error)?;
 
@@ -1291,6 +1372,34 @@ impl EventStore for PostgresEventStore {
         }
 
         Ok(())
+    }
+}
+
+impl EventStore for PostgresEventStore {
+    async fn store_events_stream<S, ES, Sink>(
+        &self,
+        stream_id: &S::StreamId,
+        stream_type: String,
+        metadata: replay::Metadata,
+        domain_events: ES,
+        expected_version: Option<i64>,
+        sink: Sink,
+    ) -> Result<(), replay::Error>
+    where
+        S: replay::EventStream,
+        ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
+        Sink: EventSink<S::Event> + Send,
+    {
+        self.append_on_lane::<S, ES, Sink>(
+            stream_id,
+            stream_type,
+            metadata,
+            domain_events,
+            expected_version,
+            sink,
+            AppendLane::Online,
+        )
+        .await
     }
 
     fn stream_events<E: Event>(

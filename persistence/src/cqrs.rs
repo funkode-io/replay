@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use replay::{Aggregate, Event};
 use urn::Urn;
 
-use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent};
+use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent, PostgresEventStore};
 use crate::{CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome};
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
@@ -149,10 +149,55 @@ impl<ES: EventStore> Cqrs<ES> {
         A::Event: 'static,
         A::Error: 'static,
     {
+        self.through_middleware::<A, _, _, _>(id, metadata, |metadata| {
+            self.run::<A>(id, metadata, command, services, expected_version)
+        })
+        .await
+    }
+
+    /// Run `command` against `aggregate`, already loaded, append what it produces and
+    /// fold it in: [`execute`](Self::execute) without the load, middleware included.
+    ///
+    /// What lets the bulk lane's worker dispatch every command a batch aims at one
+    /// stream with one load of its aggregate (ADR-0034). A failure can leave `aggregate`
+    /// holding events whose append rolled back, so a caller discards it on any error.
+    pub(crate) async fn execute_on<A: Aggregate>(
+        &self,
+        aggregate: &mut A,
+        metadata: replay::Metadata,
+        command: A::Command,
+        services: &A::Services,
+        expected_version: Option<i64>,
+    ) -> Result<(), A::Error>
+    where
+        A::Event: 'static,
+        A::Error: 'static,
+    {
+        let id = aggregate.get_id().clone();
+        self.through_middleware::<A, _, _, _>(&id, metadata, |metadata| async move {
+            self.handle_and_append::<A>(aggregate, metadata, command, services, expected_version)
+                .await
+        })
+        .await
+    }
+
+    /// Pass a command through the middleware chain around `command`, which does the
+    /// work with the metadata the middlewares leave: what [`execute`](Self::execute)
+    /// documents, shared by every way a command is executed.
+    async fn through_middleware<A, T, F, Fut>(
+        &self,
+        id: &A::StreamId,
+        metadata: replay::Metadata,
+        command: F,
+    ) -> Result<T, A::Error>
+    where
+        A: Aggregate,
+        A::Error: 'static,
+        F: FnOnce(replay::Metadata) -> Fut,
+        Fut: std::future::Future<Output = Result<T, A::Error>>,
+    {
         if self.middlewares.is_empty() {
-            return self
-                .run::<A>(id, metadata, command, services, expected_version)
-                .await;
+            return command(metadata).await;
         }
 
         let mut context = CommandContext::new::<A>(id, metadata);
@@ -182,14 +227,7 @@ impl<ES: EventStore> Cqrs<ES> {
                     Next::Error(error) => break 'command Err(A::Error::from(error)),
                 }
             }
-            self.run::<A>(
-                id,
-                context.metadata().clone(),
-                command,
-                services,
-                expected_version,
-            )
-            .await
+            command(context.metadata().clone()).await
         };
 
         let outcome = match (&result, &busy) {
@@ -223,6 +261,33 @@ impl<ES: EventStore> Cqrs<ES> {
             .fetch_aggregate_at::<A>(id, AggregateVersion::Latest, expected_version, None)
             .await?;
 
+        self.handle_and_append::<A>(
+            &mut aggregate,
+            metadata,
+            command,
+            services,
+            expected_version,
+        )
+        .await?;
+
+        Ok(aggregate)
+    }
+
+    /// Handle `command` on the loaded `aggregate` and append what it produces, folding
+    /// each persisted event back into it.
+    async fn handle_and_append<A: Aggregate>(
+        &self,
+        aggregate: &mut A,
+        metadata: replay::Metadata,
+        command: A::Command,
+        services: &A::Services,
+        expected_version: Option<i64>,
+    ) -> Result<(), A::Error>
+    where
+        A::Event: 'static,
+        A::Error: 'static,
+    {
+        let id = aggregate.get_id().clone();
         let stream_type = A::stream_type();
 
         // Stream-first: the producer yields events lazily and owns its data — it does not
@@ -239,7 +304,7 @@ impl<ES: EventStore> Cqrs<ES> {
 
         self.store
             .store_events_stream::<A, _, _>(
-                id,
+                &id,
                 stream_type,
                 metadata,
                 event_stream,
@@ -249,7 +314,7 @@ impl<ES: EventStore> Cqrs<ES> {
             .await
             .map_err(A::Error::from)?;
 
-        Ok(aggregate)
+        Ok(())
     }
 
     /// Compact the event stream for an aggregate.
@@ -390,5 +455,70 @@ impl<ES: EventStore> Cqrs<ES> {
         }
 
         Ok(())
+    }
+}
+
+impl Cqrs<PostgresEventStore> {
+    /// Run `command` against the aggregate at `id` on the **bulk lane**, and append the
+    /// events it produces stamped bulk
+    /// ([ADR-0034](https://github.com/funkode-io/replay/blob/main/docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
+    ///
+    /// For a decision that is bulk by design — a file import whose every accepted record
+    /// is an event the same Policies react to as one accepted from the UI. Everything
+    /// [`execute`](Self::execute) documents holds — the middleware chain, the load, the
+    /// handler, inline projections, optimistic concurrency — with two differences:
+    ///
+    /// - **No online Policy reacts to these events.** The online feed passes them as it
+    ///   passes a row its stream filter excludes.
+    /// - **Each Policy registered on the bulk lane** (see
+    ///   [`PolicySettings::on_lanes`](crate::PolicySettings::on_lanes)) whose tracked
+    ///   stream types include this stream gets one row of bulk work per event, inserted
+    ///   in the append's own transaction. Its worker claims that work in batches, calls
+    ///   the same `react` on each event, dispatches and deletes it.
+    ///
+    /// The events are appended in one transaction, so the call is all or nothing. A
+    /// Policy registered after it commits never receives it.
+    pub async fn execute_bulk<A: Aggregate>(
+        &self,
+        id: &A::StreamId,
+        metadata: replay::Metadata,
+        command: A::Command,
+        services: &A::Services,
+        expected_version: Option<i64>,
+    ) -> Result<A, A::Error>
+    where
+        A::Event: 'static,
+        A::Error: 'static,
+    {
+        self.through_middleware::<A, _, _, _>(id, metadata, |metadata| async move {
+            let mut aggregate = self
+                .fetch_aggregate_at::<A>(id, AggregateVersion::Latest, expected_version, None)
+                .await?;
+            let stream_type = A::stream_type();
+
+            // As in `handle_and_append`: the producer owns its data, so each persisted
+            // event is folded back into the aggregate as it streams into the store.
+            let event_stream = aggregate
+                .handle_stream(command, services)
+                .await?
+                .map_err(|e| {
+                    replay::Error::internal("aggregate event producer failed").with_source(e)
+                });
+
+            self.store
+                .store_bulk_events_stream::<A, _, _>(
+                    id,
+                    stream_type,
+                    metadata,
+                    event_stream,
+                    expected_version,
+                    |event: &PersistedEvent<A::Event>| aggregate.apply(event.data.clone()),
+                )
+                .await
+                .map_err(A::Error::from)?;
+
+            Ok(aggregate)
+        })
+        .await
     }
 }
