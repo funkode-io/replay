@@ -2839,6 +2839,9 @@ cqrs.execute::<Import>(&import_id, metadata, ImportCommand::ProcessFile { file }
     .await?;
 
 PolicyRunner::builder(cqrs)
+    .register_services::<Sku>(sku_services)            // the aggregates the Policies dispatch to
+    .register_services::<Brand>(())
+    .register_services::<FeeLedger>(fee_services)
     .register_policy(CreateSku, PolicySettings::new()
         .with_stream_filter(StreamFilter::for_stream_type::<Import>()))
     .register_policy(EnsureBrand, PolicySettings::new()
@@ -2874,6 +2877,9 @@ impl Aggregate for Import {
 // for the Policies registered by then. `drain` registers them and returns; building the
 // runner alone does not, and `start_polling` registers them in the background.
 let runner = PolicyRunner::builder(cqrs.clone())
+    .register_services::<Sku>(sku_services)            // the aggregates the Policies dispatch to
+    .register_services::<Brand>(())
+    .register_services::<FeeLedger>(fee_services)
     .register_policy(CreateSku, PolicySettings::new()
         .with_stream_filter(StreamFilter::for_stream_type::<Import>())
         .on_lanes(Lanes::Bulk))       // file records only, through the work queue
