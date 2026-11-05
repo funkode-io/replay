@@ -383,6 +383,7 @@ async fn a_bulk_retry_replays_a_reaction_once_and_keeps_each_rows_own_error_post
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         },
         "one broken reaction counts as one, whatever it parked"
     );
@@ -428,6 +429,7 @@ async fn a_bulk_retry_replays_a_reaction_once_and_keeps_each_rows_own_error_post
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         }
     );
     assert_eq!(reaction.replays() - before, 1);
@@ -484,6 +486,7 @@ async fn a_retry_archives_the_commands_that_now_succeed_and_reparks_the_rest_pos
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         },
         "a reaction with one command still failing is still failing"
     );
@@ -510,6 +513,7 @@ async fn a_retry_archives_the_commands_that_now_succeed_and_reparks_the_rest_pos
         DeadLetterRetrySummary {
             reactions_resolved: 1,
             reactions_still_failing: 0,
+            reactions_busy: 0,
         },
         "a reaction whose every command succeeds is one resolved reaction"
     );
@@ -606,6 +610,7 @@ async fn a_row_with_no_identity_is_settled_by_the_whole_replay_postgres_test() {
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         }
     );
 
@@ -634,6 +639,7 @@ async fn a_row_with_no_identity_is_settled_by_the_whole_replay_postgres_test() {
         DeadLetterRetrySummary {
             reactions_resolved: 1,
             reactions_still_failing: 0,
+            reactions_busy: 0,
         }
     );
     assert!(harness.dead_letters().await.is_empty());
@@ -688,6 +694,7 @@ async fn identical_dispatches_settle_their_rows_in_production_order_postgres_tes
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         }
     );
     let left = harness.dead_letters().await;
@@ -732,6 +739,7 @@ async fn a_panic_mid_replay_leaves_what_concluded_before_it_intact_postgres_test
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         },
         "a reaction that panics is one reaction still failing, and the panic \
          must not reach the caller"
@@ -786,6 +794,7 @@ async fn a_bulk_retry_pages_a_backlog_settling_each_reaction_once_postgres_test(
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: MORE_THAN_A_PAGE,
+            reactions_busy: 0,
         },
         "every reaction of the backlog is counted, not only the first page"
     );
@@ -826,6 +835,7 @@ async fn a_redeliverys_duplicate_row_is_settled_by_the_command_it_names_postgres
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         },
         "one reaction, however many rows it has parked over its deliveries"
     );
@@ -854,6 +864,7 @@ async fn a_redeliverys_duplicate_row_is_settled_by_the_command_it_names_postgres
         DeadLetterRetrySummary {
             reactions_resolved: 1,
             reactions_still_failing: 0,
+            reactions_busy: 0,
         }
     );
     assert!(harness.dead_letters().await.is_empty());
@@ -898,6 +909,7 @@ async fn a_row_the_panic_cut_short_is_not_settled_by_its_concluded_twin_postgres
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         }
     );
 
@@ -944,6 +956,7 @@ async fn a_row_is_not_settled_by_a_dispatch_that_parked_nothing_postgres_test() 
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         },
         "the reaction still fails: one of its commands is still refused"
     );
@@ -970,6 +983,7 @@ async fn a_row_is_not_settled_by_a_dispatch_that_parked_nothing_postgres_test() 
         DeadLetterRetrySummary {
             reactions_resolved: 1,
             reactions_still_failing: 0,
+            reactions_busy: 0,
         }
     );
     assert!(harness.dead_letters().await.is_empty());
@@ -1007,6 +1021,7 @@ async fn a_failing_command_keeps_a_row_even_when_a_duplicate_aligns_the_counts_p
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         },
         "the reaction still fails, so the retry says so"
     );
@@ -1025,6 +1040,7 @@ async fn a_failing_command_keeps_a_row_even_when_a_duplicate_aligns_the_counts_p
         DeadLetterRetrySummary {
             reactions_resolved: 1,
             reactions_still_failing: 0,
+            reactions_busy: 0,
         }
     );
     assert!(harness.dead_letters().await.is_empty());
@@ -1055,6 +1071,7 @@ async fn a_panicking_dispatch_settles_its_own_row_not_its_siblings_postgres_test
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         },
         "a reaction that still panics has not recovered"
     );
@@ -1135,6 +1152,7 @@ async fn a_retry_parks_a_failure_the_reaction_had_not_parked_postgres_test() {
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         },
         "a reaction that still fails permanently is not resolved, whichever \
          command it now fails on"
@@ -1609,6 +1627,7 @@ async fn an_older_row_with_no_identity_does_not_speak_for_its_neighbours_postgre
         DeadLetterRetrySummary {
             reactions_resolved: 0,
             reactions_still_failing: 1,
+            reactions_busy: 0,
         }
     );
 

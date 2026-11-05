@@ -97,9 +97,9 @@ use super::postgres_image::{start_postgres_server, PostgresServer, POSTGRES_PORT
 
 use replay_macros::define_aggregate;
 use replay_persistence::{
-    Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary, Escalation, Liveness,
-    PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus, PolicyStatusStore,
-    PostgresEventStore, StoppedWorker, WorkerLiveness,
+    CommandMiddleware, Cqrs, DeadLetterDiscard, DeadLetterRetry, DeadLetterRetrySummary,
+    Escalation, Liveness, PolicyRunner, PolicyRunnerBuilder, PolicyRunnerDaemon, PolicyStatus,
+    PolicyStatusStore, PostgresEventStore, StoppedWorker, WorkerLiveness,
 };
 
 /// How often the daemon under test polls the feed. Short: these tests wait on
@@ -437,6 +437,29 @@ impl PolicyDaemonHarness {
     where
         F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
     {
+        Self::start_with(label, |cqrs| cqrs, configure).await
+    }
+
+    /// [`start`](Self::start), with a [`CommandMiddleware`] registered on the `Cqrs`
+    /// every command goes through: the daemon's dispatches, the out-of-band retries,
+    /// and the harness's own [`ping`](Self::ping)s alike — so a middleware that is to
+    /// stop only the Policy's commands tells them apart by their Causation.
+    pub async fn start_with_middleware<M, F>(label: &str, middleware: M, configure: F) -> Self
+    where
+        M: CommandMiddleware + 'static,
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
+    {
+        Self::start_with(label, |cqrs| cqrs.with_middleware(middleware), configure).await
+    }
+
+    async fn start_with<F>(
+        label: &str,
+        build: impl FnOnce(Cqrs<PostgresEventStore>) -> Cqrs<PostgresEventStore>,
+        configure: F,
+    ) -> Self
+    where
+        F: Fn(PolicyRunnerBuilder, &str) -> PolicyRunnerBuilder + Send + Sync + 'static,
+    {
         let container = start_postgres_server().await;
         let host = container
             .get_host()
@@ -462,7 +485,7 @@ impl PolicyDaemonHarness {
             .await
             .expect("failed to run migrations");
 
-        let cqrs = Cqrs::new(PostgresEventStore::new(pool.clone()));
+        let cqrs = build(Cqrs::new(PostgresEventStore::new(pool.clone())));
         let policy_name = unique_policy_name(label);
         let configure: Arc<Configure> = Arc::new(configure);
         let escalations = Escalations::default();

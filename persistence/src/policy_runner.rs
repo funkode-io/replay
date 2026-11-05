@@ -462,6 +462,12 @@ pub enum DeadLetterRetry {
     /// nobody retried, or overwrite it with an error from a replay that started
     /// earlier (funkode-io/replay#227). Retry again to act on what is parked now.
     Superseded,
+    /// The replay met a command a middleware answered [`Busy`](replay::ErrorKind::Busy)
+    /// for — not now, rather than wrong (ADR-0036). Nothing was settled: every row of
+    /// the reaction is left parked exactly as it was, its retry count included, so a
+    /// retry made during maintenance does nothing and loses nothing. Retry again once
+    /// the middleware lets commands through.
+    Busy,
     /// No dead-letter row matched the supplied id: nothing to do.
     NotFound,
 }
@@ -490,6 +496,9 @@ pub struct DeadLetterRetrySummary {
     pub reactions_resolved: usize,
     /// Reactions with at least one row still parked after the replay.
     pub reactions_still_failing: usize,
+    /// Reactions whose replay met a [`Busy`](replay::ErrorKind::Busy) command and
+    /// settled nothing: every row left parked as it was ([`DeadLetterRetry::Busy`]).
+    pub reactions_busy: usize,
 }
 
 /// Native runner that drives registered policies against the event feed.
@@ -906,6 +915,12 @@ impl PolicyRunner {
     /// policy's places rather than doing it on a cadence, so a place moved by hand is
     /// found by the very next call.
     ///
+    /// A command a middleware answers [`Busy`](replay::ErrorKind::Busy) for is held here
+    /// exactly as a daemon's worker holds it (ADR-0036): the call does not return until
+    /// the middleware lets the command through. Nothing is parked meanwhile, so dropping
+    /// the future — under a timeout of the caller's, say — loses nothing; the next drain
+    /// delivers the event again.
+    ///
     /// Returns how many dispatches **committed** across all policies — a progress
     /// signal, not an audit. A delivery that fails does not contribute its
     /// partial work: a permanent failure counts only the dispatches that
@@ -948,6 +963,11 @@ impl PolicyRunner {
     ///   settle their own rows; every other row of the group is updated to
     ///   [`PANIC_ERROR_KIND`] and the panic's message. The panic never reaches
     ///   the caller, so a bulk retry continues with the next reaction.
+    /// - a command is **busy** — a middleware answered `Busy` → the replay stops
+    ///   there and settles **nothing**: every row of the group is left parked as it
+    ///   was, retry count included, and the row reports [`DeadLetterRetry::Busy`]. A
+    ///   retry never holds the way the drain does; it is the operator's call, and it
+    ///   answers rather than waits (ADR-0036).
     ///
     /// A row that names no dispatch — parked before the identity migration, or
     /// parked for a panic in `react` itself — is settled by the replay as a
@@ -1087,6 +1107,9 @@ impl PolicyRunner {
                 executors: &self.executors,
                 policy_name,
                 dispatch_timeout: resolve_dispatch_timeout(policy.settings()),
+                // A retry never holds: it is the operator's call, and it answers busy
+                // instead of waiting for the middleware.
+                stand_down: &StandDown::never(),
             };
             for (ordinal, dispatch) in policy.react_erased(&raw).into_iter().enumerate() {
                 if !self.executors.contains_key(&dispatch.target()) {
@@ -1105,6 +1128,11 @@ impl PolicyRunner {
                     .await
                 {
                     Ok(()) => None,
+                    // Not now (ADR-0036): the replay stops here and settles nothing.
+                    // The dispatches after this one would meet the same middleware,
+                    // and what the ones before it concluded would settle only part
+                    // of a reaction that has not been tried as a whole.
+                    Err(busy) if busy.busy() => return Ok(Some(busy.to_string())),
                     // Stale reaction: the aggregate now declines it. A clean
                     // resolution, so the row it belongs to is archived.
                     Err(declined) if declined.declined() => None,
@@ -1112,16 +1140,30 @@ impl PolicyRunner {
                 };
                 concluded.push(identity, outcome);
             }
-            Ok(())
+            Ok(None)
         })
         .catch_unwind()
         .await;
 
         let replay = match attempt {
-            Ok(result) => {
-                result?;
-                Replay::Ran(concluded.take(None))
-            }
+            Ok(result) => match result? {
+                Some(reason) => {
+                    tracing::info!(
+                        policy   = %policy_name,
+                        event_id = %event_id,
+                        global_position,
+                        reason   = %reason,
+                        "retried policy reaction met a busy command; leaving every \
+                         dead letter it parked as it was"
+                    );
+                    return Ok(ReactionSettlement {
+                        busy: true,
+                        asked_about: asked_about.map(|_| DeadLetterRetry::Busy),
+                        ..Default::default()
+                    });
+                }
+                None => Replay::Ran(concluded.take(None)),
+            },
             Err(payload) => {
                 let message = panic_message(&*payload);
                 tracing::error!(
@@ -1400,7 +1442,10 @@ impl PolicyRunner {
     ///
     /// Returns a [`DeadLetterRetrySummary`] counting **reactions**, as this run
     /// settled them: one whose every row was archived is resolved, one with any
-    /// row still parked is still failing. `reactions_still_failing == 0` says
+    /// row still parked is still failing, and one whose replay met a
+    /// [`Busy`](replay::ErrorKind::Busy) command is busy, its rows left as they were
+    /// ([`DeadLetterRetry::Busy`]). A busy reaction does not stop the run: the next
+    /// one is replayed, and answers for itself. `reactions_still_failing == 0` says
     /// the run settled everything it read, not that the table is empty now — a
     /// delivery parking a command while the run walks, or one statement after it
     /// returns, is a row the count cannot have seen. `PolicyStatus` is what
@@ -1443,7 +1488,9 @@ impl PolicyRunner {
             for reaction in page {
                 let settled = self.retry_reaction(reaction, OPERATION, None).await?;
 
-                if settled.any_still_failing {
+                if settled.busy {
+                    summary.reactions_busy += 1;
+                } else if settled.any_still_failing {
                     summary.reactions_still_failing += 1;
                 } else if settled.any_resolved {
                     summary.reactions_resolved += 1;
@@ -1699,7 +1746,10 @@ impl PolicyRunner {
             policy,
             progress,
             max_depth,
-            &mut Reporting { narration: None },
+            &mut Reporting {
+                narration: None,
+                stand_down: StandDown::never(),
+            },
         )
         .await
     }
@@ -2206,6 +2256,7 @@ impl PolicyWorker {
                     max_depth,
                     &mut Reporting {
                         narration: Some(&mut narration),
+                        stand_down: StandDown::on(shutdown_rx.clone(), leader_rx.clone()),
                     },
                 )
                 .await
@@ -2215,11 +2266,23 @@ impl PolicyWorker {
                     // observed before failing — the window it opened on, the
                     // positions it advanced over — happened, and its records
                     // stand.
-                    tracing::error!(
-                        policy = %name,
-                        error = %error,
-                        "policy polling iteration failed"
-                    );
+                    //
+                    // A poll cut short because this worker is to stop leading is
+                    // not a fault: a hold on a busy command ends that way, and has
+                    // said so itself.
+                    if *shutdown_rx.borrow() || !*leader_rx.borrow() {
+                        tracing::debug!(
+                            policy = %name,
+                            error = %error,
+                            "policy poll ended as the worker stopped leading"
+                        );
+                    } else {
+                        tracing::error!(
+                            policy = %name,
+                            error = %error,
+                            "policy polling iteration failed"
+                        );
+                    }
                 }
 
                 // Published after the drain rather than before it, so the stamp
@@ -2442,6 +2505,80 @@ fn panic_cause(error: tokio::task::JoinError) -> String {
 /// starting at 100 ms.
 const MAX_DISPATCH_RETRIES: u32 = 3;
 
+/// The first wait of a [hold](Delivery::execute_event_reactions), doubled after each
+/// busy attempt up to [`HOLD_MAX_BACKOFF`].
+const HOLD_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The ceiling a hold's backoff stops doubling at: the longest a held Policy can take
+/// to notice that its middleware lets commands through again. A maintenance window is
+/// minutes long, so a few seconds of it is small; one attempt per this long is what a
+/// hold costs the middleware while it lasts.
+const HOLD_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How long to wait before the next attempt of a hold that has already been busy
+/// `busy_attempts` times: [`HOLD_INITIAL_BACKOFF`] doubled per attempt, never past
+/// [`HOLD_MAX_BACKOFF`].
+fn hold_backoff(busy_attempts: u32) -> Duration {
+    HOLD_INITIAL_BACKOFF
+        .saturating_mul(1u32 << busy_attempts.min(16))
+        .min(HOLD_MAX_BACKOFF)
+}
+
+/// What ends a hold other than the command running: the worker being asked to stop
+/// leading, by a shutdown or a lost election.
+///
+/// A hold lasts for as long as a middleware stays busy, which has no bound the runner
+/// knows. A worker that only looked at its signals between polls would never see them
+/// from inside one: a shutdown would wait for the maintenance window to end, and a
+/// replica that lost its lock would keep dispatching after another had taken over.
+#[derive(Clone, Default)]
+struct StandDown {
+    /// The daemon's shutdown and this Policy's leadership, or `None` where nothing can
+    /// call a hold off — a manual [`PolicyRunner::drain`], whose caller drops the future
+    /// instead, and a retry, which never holds.
+    signals: Option<(watch::Receiver<bool>, watch::Receiver<bool>)>,
+}
+
+impl StandDown {
+    /// A hold nothing but its own end can call off.
+    fn never() -> Self {
+        Self::default()
+    }
+
+    /// A hold called off when `shutdown` turns true or `leader` turns false.
+    fn on(shutdown: watch::Receiver<bool>, leader: watch::Receiver<bool>) -> Self {
+        Self {
+            signals: Some((shutdown, leader)),
+        }
+    }
+
+    /// Resolves once the worker should stop leading; never, for [`Self::never`]. A
+    /// channel whose sender is gone resolves it too: nothing is left to say "carry on".
+    async fn signalled(&self) {
+        let Some((shutdown, leader)) = &self.signals else {
+            return std::future::pending().await;
+        };
+        let (mut shutdown, mut leader) = (shutdown.clone(), leader.clone());
+        tokio::select! {
+            _ = shutdown.wait_for(|stopping| *stopping) => {}
+            _ = leader.wait_for(|leading| !*leading) => {}
+        }
+    }
+}
+
+/// A Policy holding on one event because its command is busy (ADR-0036).
+///
+/// Lives for one delivery: it opens on the first busy attempt and closes on the first
+/// attempt that is anything else, so it is two [Narration] records however long it
+/// lasts.
+///
+/// [Narration]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#narration
+struct Hold {
+    since: Instant,
+    /// Busy attempts so far, which is what the backoff doubles on.
+    busy_attempts: u32,
+}
+
 /// Returns `true` for errors whose cause may be transient and worth retrying.
 fn is_retryable(kind: replay::ErrorKind) -> bool {
     use replay::ErrorKind::{Conflict, RateLimited, Unavailable};
@@ -2465,6 +2602,13 @@ impl DispatchFailure {
     /// the runner's, and the cursor advances past it.
     fn declined(&self) -> bool {
         matches!(self, Self::Returned(e) if e.kind() == replay::ErrorKind::BusinessRuleViolation)
+    }
+
+    /// A middleware (or the command handler) said not now: the runner holds the
+    /// reaction rather than spending its retry budget on it (ADR-0036). A timeout is
+    /// never busy — nothing came back to say so.
+    fn busy(&self) -> bool {
+        matches!(self, Self::Returned(e) if e.kind() == replay::ErrorKind::Busy)
     }
 
     /// A timeout is retryable by construction: the runner has no evidence the
@@ -2710,6 +2854,8 @@ struct ReactionSettlement {
     any_still_failing: bool,
     /// What the row a by-id retry asked about concluded.
     asked_about: Option<DeadLetterRetry>,
+    /// Whether the replay met a busy command and so settled nothing (ADR-0036).
+    busy: bool,
 }
 
 impl ReactionSettlement {
@@ -2720,7 +2866,7 @@ impl ReactionSettlement {
             DeadLetterRetry::StillFailing | DeadLetterRetry::Superseded => {
                 self.any_still_failing = true
             }
-            DeadLetterRetry::NotFound => {}
+            DeadLetterRetry::Busy | DeadLetterRetry::NotFound => {}
         }
         if asked_about == Some(id) {
             self.asked_about = Some(outcome);
@@ -3124,6 +3270,10 @@ struct Reporting<'a> {
     /// which polls once on the caller's command: a manual drain that opened a
     /// burst would leave a bracket nothing ever closes.
     narration: Option<&'a mut Narration>,
+    /// What tells a hold on a busy command that the worker is to stop leading.
+    /// Carried here because it arrives on the same channels as the reasons a
+    /// burst is abandoned ([`Narration::stood_down`]).
+    stand_down: StandDown,
 }
 
 impl Reporting<'_> {
@@ -3151,12 +3301,14 @@ async fn drain_policy_once(
     let checkpoint_size = resolve_checkpoint_batch_size(policy.settings());
     let read_batch = resolve_read_batch_size(policy.settings(), checkpoint_size);
     let dispatch_timeout = resolve_dispatch_timeout(policy.settings());
+    let stand_down = reporting.stand_down.clone();
     let delivery = Delivery {
         cqrs,
         pool,
         executors,
         policy_name: &name,
         dispatch_timeout,
+        stand_down: &stand_down,
     };
 
     // Asked once per poll, not once per stream: it is the Policy's own code, and the
@@ -3474,6 +3626,8 @@ struct Delivery<'a> {
     /// How long one dispatch may run before it is abandoned
     /// ([`resolve_dispatch_timeout`]).
     dispatch_timeout: Duration,
+    /// What calls off a hold on a busy command.
+    stand_down: &'a StandDown,
 }
 
 impl Delivery<'_> {
@@ -3561,6 +3715,7 @@ impl Delivery<'_> {
     /// |-------------------------------------|---------------------------------------|
     /// | `Ok`                                | count as executed, continue           |
     /// | `BusinessRuleViolation`             | log + advance (aggregate said no)     |
+    /// | `Busy`                              | hold: back-off + retry, indefinitely, outside the budget |
     /// | Retryable (`Unavailable`, `Conflict`, `RateLimited`, or a timeout) within retry budget | back-off + retry |
     /// | Permanent or retries exhausted      | write `policy_dead_letters`, advance  |
     ///
@@ -3581,6 +3736,16 @@ impl Delivery<'_> {
     /// Each dispatch is awaited for at most [`Delivery::dispatch_timeout`], so
     /// an event costs at most one timeout per dispatch per attempt.
     ///
+    /// **Holding** (ADR-0036): a dispatch that fails with `Busy` keeps the Policy on
+    /// this event. The reaction is tried again after a backoff that doubles up to
+    /// [`HOLD_MAX_BACKOFF`], for as long as it stays busy; busy attempts spend nothing
+    /// of the retry budget and park nothing. The first attempt that is anything else
+    /// ends the hold and is settled by the rows above with a fresh budget. The hold is
+    /// narrated as an edge, once on entering and once on leaving. Only the worker
+    /// being asked to stop leading cuts it short ([`StandDown`]): the delivery then
+    /// fails, nothing is parked or advanced, and the next leader delivers the event
+    /// again.
+    ///
     /// **Re-react safety**: on retry the policy's `react` is called again for the
     /// same event.  `react` is pure, and the same event yields the same dispatches —
     /// including the idempotency key the command carries — so a target that absorbs a
@@ -3593,11 +3758,14 @@ impl Delivery<'_> {
         pending: &PendingFailures,
     ) -> Result<usize, replay::Error> {
         let policy_name = self.policy_name;
-        for attempt in 0..=MAX_DISPATCH_RETRIES {
+        let mut attempt = 0;
+        let mut hold: Option<Hold> = None;
+        loop {
             pending.begin(attempt);
             let dispatches = policy.react_erased(raw);
             let mut executed = 0usize;
             let mut need_retry = false;
+            let mut busy = None;
 
             for (ordinal, dispatch) in dispatches.into_iter().enumerate() {
                 let identity = DispatchIdentity::of(ordinal, &dispatch);
@@ -3610,6 +3778,10 @@ impl Delivery<'_> {
                 match outcome {
                     Ok(()) => {
                         executed += 1;
+                    }
+                    Err(failure) if failure.busy() => {
+                        busy = Some((identity, failure));
+                        break; // the reaction is tried again whole, like a retry
                     }
                     Err(failure) if failure.declined() => {
                         tracing::info!(
@@ -3644,6 +3816,67 @@ impl Delivery<'_> {
                 }
             }
 
+            if let Some((identity, failure)) = busy {
+                // Whatever this attempt buffered is dropped with it when the next one
+                // begins: the reaction runs again whole, and the attempt that settles
+                // it is the one that parks.
+                let held = hold.get_or_insert_with(|| {
+                    tracing::info!(
+                        policy          = %policy_name,
+                        event_id        = %raw.id,
+                        stream_id       = %raw.stream_id,
+                        global_position,
+                        aggregate       = identity.aggregate_name,
+                        target          = %identity.target_stream_id,
+                        command         = identity.command_name,
+                        reason          = %failure,
+                        hold            = "entered",
+                        "policy dispatch is busy; holding on this event until it runs"
+                    );
+                    Hold {
+                        since: Instant::now(),
+                        busy_attempts: 0,
+                    }
+                });
+                let backoff = hold_backoff(held.busy_attempts);
+                held.busy_attempts = held.busy_attempts.saturating_add(1);
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = self.stand_down.signalled() => {
+                        tracing::info!(
+                            policy          = %policy_name,
+                            event_id        = %raw.id,
+                            global_position,
+                            busy_attempts   = held.busy_attempts,
+                            held_ms         = held.since.elapsed().as_millis(),
+                            hold            = "abandoned",
+                            "policy stopped leading while holding a busy command; \
+                             the event is delivered again by whoever leads next"
+                        );
+                        return Err(replay::Error::unavailable(
+                            "policy stopped leading while holding a busy command",
+                        )
+                        .with_operation("policy_drain")
+                        .with_context("policy", policy_name));
+                    }
+                }
+                // A fresh budget for whatever the reaction meets once it runs.
+                attempt = 0;
+                continue;
+            }
+
+            if let Some(held) = hold.take() {
+                tracing::info!(
+                    policy          = %policy_name,
+                    event_id        = %raw.id,
+                    global_position,
+                    busy_attempts   = held.busy_attempts,
+                    held_ms         = held.since.elapsed().as_millis(),
+                    hold            = "left",
+                    "policy dispatch is no longer busy; the hold is over"
+                );
+            }
+
             if !need_retry {
                 self.park(global_position, raw, pending.take()).await?;
                 return Ok(executed);
@@ -3652,9 +3885,8 @@ impl Delivery<'_> {
             // Exponential back-off: 100 ms, 200 ms, 400 ms, …
             let backoff = Duration::from_millis(100 * (1u64 << attempt.min(5)));
             tokio::time::sleep(backoff).await;
+            attempt += 1;
         }
-
-        Ok(0)
     }
 
     /// Write a dead letter for everything an attempt failed on, each row naming
@@ -5879,8 +6111,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        dispatch_timeout_or_default, merge_dispatch_metadata, panic_message, DispatchFailure,
-        DEFAULT_DISPATCH_TIMEOUT, TIMEOUT_ERROR_KIND,
+        dispatch_timeout_or_default, hold_backoff, merge_dispatch_metadata, panic_message,
+        DispatchFailure, DEFAULT_DISPATCH_TIMEOUT, HOLD_INITIAL_BACKOFF, HOLD_MAX_BACKOFF,
+        TIMEOUT_ERROR_KIND,
     };
 
     #[test]
@@ -5961,6 +6194,40 @@ mod tests {
             permanent.error_kind(),
             replay::ErrorKind::InvalidInput.to_string()
         );
+    }
+
+    /// Busy is told apart from every other failure: not a refusal to advance past,
+    /// and not a transient error to spend the retry budget on (ADR-0036).
+    #[test]
+    fn a_busy_dispatch_is_neither_declined_nor_retryable() {
+        let busy = DispatchFailure::Returned(replay::Error::busy("maintenance in progress"));
+        let timed_out = DispatchFailure::TimedOut {
+            limit: Duration::from_millis(10),
+        };
+
+        assert!(busy.busy());
+        assert!(!busy.declined());
+        assert!(!busy.retryable());
+        assert!(!timed_out.busy(), "a timeout says nothing about being busy");
+    }
+
+    /// A hold backs off the way the restart supervision does: doubling from the
+    /// first wait, and level at the ceiling for as long as it lasts — however long
+    /// that is, without overflowing.
+    #[test]
+    fn a_hold_backs_off_doubling_up_to_its_ceiling() {
+        let waits: Vec<Duration> = (0..4).map(hold_backoff).collect();
+        assert_eq!(
+            waits,
+            vec![
+                HOLD_INITIAL_BACKOFF,
+                HOLD_INITIAL_BACKOFF * 2,
+                HOLD_INITIAL_BACKOFF * 4,
+                HOLD_INITIAL_BACKOFF * 8,
+            ]
+        );
+        assert_eq!(hold_backoff(10), HOLD_MAX_BACKOFF);
+        assert_eq!(hold_backoff(u32::MAX), HOLD_MAX_BACKOFF);
     }
 
     #[test]

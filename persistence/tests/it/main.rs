@@ -28,6 +28,7 @@ mod inline_projection_catch_up;
 mod inline_projection_chunking;
 mod inline_projection_rebuild_chunking;
 mod integration_tests;
+mod policy_busy_hold;
 mod policy_cursor_backfill;
 mod policy_daemon;
 mod policy_dead_letter_identity;
