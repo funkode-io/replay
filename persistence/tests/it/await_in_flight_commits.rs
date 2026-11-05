@@ -433,14 +433,28 @@ async fn appends_that_ask_no_gate_take_no_lock_postgres_test() {
 }
 
 /// The commit gate's key collides with none of Replay's other advisory locks: with every
-/// one of them held elsewhere — a projection's, the projection registry's, and a one-key
-/// lock carrying the very same bits — `await_in_flight_commits` returns at once.
+/// one of them held elsewhere — a bulk claim's, a projection's, the projection registry's,
+/// and a one-key lock carrying the very same bits — `await_in_flight_commits` returns at once.
 #[tokio::test]
 async fn the_commit_gate_lock_is_apart_from_every_other_advisory_lock_postgres_test() {
     let (pool, _container) = flag_pool().await;
     let store = PostgresEventStore::new(pool.clone());
 
+    // The bulk lane's claim class is a hash, so the value the key inventory lists for it
+    // is the one the server computes.
+    let bulk_claim: i32 = sqlx::query_scalar("SELECT hashtext('replay.bulk_claim')")
+        .fetch_one(&pool)
+        .await
+        .expect("hashing the bulk claim's class must succeed");
+    assert_eq!(bulk_claim, 0x59C2_65A4_u32 as i32);
+
     let mut holder = pool.begin().await.expect("the holder must begin");
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtext('replay.bulk_claim'), hashtext('a_policy'))",
+    )
+    .execute(&mut *holder)
+    .await
+    .expect("the holder must take a bulk claim's lock");
     // `RPJC` over a projection name, `RPJR`, and the one-key form a Policy's leadership
     // takes, set to the bits the commit gate's two-key lock would read as.
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext('a_view'))")
