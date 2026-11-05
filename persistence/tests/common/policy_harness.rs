@@ -838,6 +838,7 @@ impl PolicyDaemonHarness {
             &self.policy_name,
             &escalations,
             SECOND_REPLICA,
+            self.poll_interval,
         );
         PolicyDaemonReplica {
             escalations,
