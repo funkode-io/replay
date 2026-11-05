@@ -7,6 +7,7 @@ use replay::{Compactable, Event};
 use urn::Urn;
 
 use super::{AggregateVersion, PersistedEvent};
+use crate::Next;
 
 pub trait EventSink<E: Event>: Send {
     fn on_event(&mut self, event: &PersistedEvent<E>);
@@ -29,8 +30,54 @@ impl<E: Event> EventSink<E> for NoSink {
     fn on_event(&mut self, _event: &PersistedEvent<E>) {}
 }
 
+/// The [commit gate] of one append: asked once, after the events and every inline
+/// projection write are in place and immediately before the commit, whether to commit.
+///
+/// A store commits only on [`Next::Continue`] and rolls the whole append back on anything
+/// else, returning [`Next::into_result`]'s error. [`Cqrs`](crate::Cqrs) passes a gate that
+/// runs every [command middleware](crate::CommandMiddleware)'s `before_commit`; every other
+/// append passes [`OpenGate`]
+/// ([ADR-0035](https://github.com/funkode-io/replay/blob/main/docs/adr/0035-a-command-passes-through-middleware-before-it-runs-and-before-it-commits.md)).
+///
+/// Any `FnOnce() -> impl Future<Output = Next>` is a gate.
+///
+/// [commit gate]: https://github.com/funkode-io/replay/blob/main/CONTEXT.md#commit-gate
+pub trait CommitGate: Send {
+    /// Whether the append may commit. A store calls it at most once per append.
+    fn check(self) -> impl Future<Output = Next> + Send;
+}
+
+impl<F, Fut> CommitGate for F
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Next> + Send,
+{
+    fn check(self) -> impl Future<Output = Next> + Send {
+        self()
+    }
+}
+
+/// The commit gate that always continues: what a direct append, a compaction, a stream
+/// deletion, a rebuild and a catch-up pass, so no command middleware runs on them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenGate;
+
+impl CommitGate for OpenGate {
+    fn check(self) -> impl Future<Output = Next> + Send {
+        std::future::ready(Next::Continue)
+    }
+}
+
 pub trait EventStore: Send + Sync {
-    fn store_events_stream<S, ES, Sink>(
+    /// Append the events `domain_events` yields to `stream_id`, all or nothing.
+    ///
+    /// `sink` sees each event as it is appended. `gate` is the append's [`CommitGate`]: the
+    /// store asks it once, after every event and every inline projection write is in
+    /// place and immediately before the commit, and commits only on [`Next::Continue`];
+    /// anything else rolls the append back, inline projection writes included, and
+    /// returns [`Next::into_result`]'s error. A direct append passes [`OpenGate`].
+    #[allow(clippy::too_many_arguments)]
+    fn store_events_stream<S, ES, Sink, Gate>(
         &self,
         stream_id: &S::StreamId,
         stream_type: String,
@@ -38,12 +85,16 @@ pub trait EventStore: Send + Sync {
         domain_events: ES,
         expected_version: Option<i64>,
         sink: Sink,
+        gate: Gate,
     ) -> impl Future<Output = Result<(), replay::Error>> + Send
     where
         S: replay::EventStream,
         ES: TryStream<Ok = S::Event, Error = replay::Error> + Send,
-        Sink: EventSink<S::Event> + Send;
+        Sink: EventSink<S::Event> + Send,
+        Gate: CommitGate;
 
+    /// Append `domain_events` to `stream_id`, all or nothing: a direct append, which
+    /// passes [`OpenGate`] and so runs no command middleware.
     fn store_events<S: replay::EventStream>(
         &self,
         stream_id: &S::StreamId,
@@ -53,13 +104,14 @@ pub trait EventStore: Send + Sync {
         expected_version: Option<i64>,
     ) -> impl Future<Output = Result<(), replay::Error>> + Send {
         let domain_events = stream::iter(domain_events.iter().cloned().map(Ok::<_, replay::Error>));
-        self.store_events_stream::<S, _, _>(
+        self.store_events_stream::<S, _, _, _>(
             stream_id,
             stream_type,
             metadata,
             domain_events,
             expected_version,
             NoSink,
+            OpenGate,
         )
     }
 

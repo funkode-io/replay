@@ -6,7 +6,7 @@ use replay::{Aggregate, Event};
 use urn::Urn;
 
 use super::{AggregateVersion, CompactionOutcome, EventStore, PersistedEvent, PostgresEventStore};
-use crate::{CommandContext, CommandContextMut, CommandMiddleware, Next, Outcome};
+use crate::{CommandContext, CommandContextMut, CommandMiddleware, CommitGate, Next, Outcome};
 
 /// An aggregate kept between commands, and the head of its stream its state is at.
 pub(crate) struct Loaded<A> {
@@ -24,6 +24,48 @@ struct StreamHead {
     version: i64,
     stream_seq: i64,
     event: Option<uuid::Uuid>,
+}
+
+/// The commit gate `Cqrs` hands every append it makes for a command: each middleware's
+/// `before_commit`, in registration order, on the context `before` left; the first that
+/// does not continue has the last word, and a `Busy` reason is kept for `after`
+/// (ADR-0035). Owned, so a command's append can carry it into the store whatever the path
+/// — online, bulk, or a bulk worker's grouped dispatch.
+pub(crate) struct MiddlewareGate {
+    middlewares: Arc<[Arc<dyn CommandMiddleware>]>,
+    /// `None` when no middleware is registered: the gate always continues.
+    context: Option<Arc<CommandContext>>,
+    busy: Arc<std::sync::OnceLock<String>>,
+}
+
+impl MiddlewareGate {
+    /// The gate of a `Cqrs` with no middleware.
+    fn open() -> Self {
+        Self {
+            middlewares: Arc::new([]),
+            context: None,
+            busy: Arc::default(),
+        }
+    }
+}
+
+impl CommitGate for MiddlewareGate {
+    async fn check(self) -> Next {
+        let Some(context) = self.context else {
+            return Next::Continue;
+        };
+        for middleware in self.middlewares.iter() {
+            match middleware.before_commit(&context).await {
+                Next::Continue => {}
+                Next::Busy(reason) => {
+                    let _ = self.busy.set(reason.clone());
+                    return Next::Busy(reason);
+                }
+                stop => return stop,
+            }
+        }
+        Next::Continue
+    }
 }
 
 /// Built-in default for [`Cqrs::compaction_chunk_size`].
@@ -155,6 +197,11 @@ impl<ES: EventStore> Cqrs<ES> {
     /// busy with the reason, or failed with the error this call returns. A middleware that
     /// stopped the command, and every one after it, runs no `after`. `after` only
     /// observes: what it does never changes what this call returns.
+    ///
+    /// Each middleware's `before_commit` then runs at the append's commit gate, in
+    /// registration order, after the events and every inline projection write are in
+    /// place: the first that does not continue rolls the whole append back and reaches the
+    /// caller the same way.
     pub async fn execute<A: Aggregate>(
         &self,
         id: &A::StreamId,
@@ -167,15 +214,16 @@ impl<ES: EventStore> Cqrs<ES> {
         A::Event: 'static,
         A::Error: 'static,
     {
-        self.through_middleware::<A, _, _, _>(id, metadata, |metadata| {
-            self.run::<A>(id, metadata, command, services, expected_version)
+        self.through_middleware::<A, _, _, _>(id, metadata, |metadata, gate| {
+            self.run::<A>(id, metadata, command, services, expected_version, gate)
         })
         .await
     }
 
     /// Pass a command through the middleware chain around `command`, which does the
-    /// work with the metadata the middlewares leave: what [`execute`](Self::execute)
-    /// documents, shared by every way a command is executed.
+    /// work with the metadata the middlewares leave and appends behind the
+    /// [`MiddlewareGate`] it is handed: what [`execute`](Self::execute) documents, shared
+    /// by every way a command is executed.
     async fn through_middleware<A, T, F, Fut>(
         &self,
         id: &A::StreamId,
@@ -185,17 +233,17 @@ impl<ES: EventStore> Cqrs<ES> {
     where
         A: Aggregate,
         A::Error: 'static,
-        F: FnOnce(replay::Metadata) -> Fut,
+        F: FnOnce(replay::Metadata, MiddlewareGate) -> Fut,
         Fut: std::future::Future<Output = Result<T, A::Error>>,
     {
         if self.middlewares.is_empty() {
-            return command(metadata).await;
+            return command(metadata, MiddlewareGate::open()).await;
         }
 
         let mut context = CommandContext::new::<A>(id, metadata);
         // How many middlewares answered `Continue`: the ones whose `after` runs.
         let mut continued = 0;
-        // The reason a middleware gave when it answered `Busy`.
+        // The reason a middleware gave when it answered `Busy`, in `before` or at the gate.
         let mut busy = None;
 
         let result = 'command: {
@@ -219,7 +267,17 @@ impl<ES: EventStore> Cqrs<ES> {
                     Next::Error(error) => break 'command Err(A::Error::from(error)),
                 }
             }
-            command(context.metadata().clone()).await
+            let gate = MiddlewareGate {
+                middlewares: Arc::clone(&self.middlewares),
+                // The context `before` left, owned by the gate so the append can hold it.
+                context: Some(Arc::new(context.clone())),
+                busy: Arc::default(),
+            };
+            let gate_busy = Arc::clone(&gate.busy);
+            let result = command(context.metadata().clone(), gate).await;
+            // A `Busy` at the commit gate is as busy as one in `before`.
+            busy = busy.or_else(|| gate_busy.get().cloned());
+            result
         };
 
         let outcome = match (&result, &busy) {
@@ -234,8 +292,8 @@ impl<ES: EventStore> Cqrs<ES> {
         result
     }
 
-    /// Load the aggregate, handle `command` and append what it produces, with no
-    /// middleware: what [`execute`](Self::execute) runs once every `before` continued.
+    /// Load the aggregate, handle `command` and append what it produces behind `gate`:
+    /// what [`execute`](Self::execute) runs once every `before` continued.
     async fn run<A: Aggregate>(
         &self,
         id: &A::StreamId,
@@ -243,6 +301,7 @@ impl<ES: EventStore> Cqrs<ES> {
         command: A::Command,
         services: &A::Services,
         expected_version: Option<i64>,
+        gate: MiddlewareGate,
     ) -> Result<A, A::Error>
     where
         A::Event: 'static,
@@ -259,14 +318,15 @@ impl<ES: EventStore> Cqrs<ES> {
             command,
             services,
             expected_version,
+            gate,
         )
         .await?;
 
         Ok(aggregate)
     }
 
-    /// Handle `command` on the loaded `aggregate` and append what it produces, folding
-    /// each persisted event back into it.
+    /// Handle `command` on the loaded `aggregate` and append what it produces behind
+    /// `gate`, folding each persisted event back into it.
     async fn handle_and_append<A: Aggregate>(
         &self,
         aggregate: &mut A,
@@ -274,6 +334,7 @@ impl<ES: EventStore> Cqrs<ES> {
         command: A::Command,
         services: &A::Services,
         expected_version: Option<i64>,
+        gate: MiddlewareGate,
     ) -> Result<Option<(i64, i64, uuid::Uuid)>, A::Error>
     where
         A::Event: 'static,
@@ -298,7 +359,7 @@ impl<ES: EventStore> Cqrs<ES> {
             .map_err(|e| replay::Error::internal("aggregate event producer failed").with_source(e));
 
         self.store
-            .store_events_stream::<A, _, _>(
+            .store_events_stream::<A, _, _, _>(
                 &id,
                 stream_type,
                 metadata,
@@ -309,6 +370,7 @@ impl<ES: EventStore> Cqrs<ES> {
                     appended = Some((event.version, count, event.id));
                     aggregate.apply(event.data.clone())
                 },
+                gate,
             )
             .await
             .map_err(A::Error::from)?;
@@ -489,7 +551,7 @@ impl Cqrs<PostgresEventStore> {
         A::Event: 'static,
         A::Error: 'static,
     {
-        self.through_middleware::<A, _, _, _>(id, metadata, |metadata| async move {
+        self.through_middleware::<A, _, _, _>(id, metadata, |metadata, gate| async move {
             let mut aggregate = self
                 .fetch_aggregate_at::<A>(id, AggregateVersion::Latest, expected_version, None)
                 .await?;
@@ -505,13 +567,14 @@ impl Cqrs<PostgresEventStore> {
                 });
 
             self.store
-                .store_bulk_events_stream::<A, _, _>(
+                .store_bulk_events_stream::<A, _, _, _>(
                     id,
                     stream_type,
                     metadata,
                     event_stream,
                     expected_version,
                     |event: &PersistedEvent<A::Event>| aggregate.apply(event.data.clone()),
+                    gate,
                 )
                 .await
                 .map_err(A::Error::from)?;
@@ -555,7 +618,7 @@ impl Cqrs<PostgresEventStore> {
         let reused = cached
             .take()
             .filter(|loaded| loaded.aggregate.get_id() == id);
-        self.through_middleware::<A, _, _, _>(id, metadata, |metadata| async move {
+        self.through_middleware::<A, _, _, _>(id, metadata, |metadata, gate| async move {
             let mut loaded = match reused {
                 Some(loaded) if self.head_of::<A>(id).await? == loaded.head => loaded,
                 _ => self.fetch_loaded::<A>(id).await?,
@@ -568,6 +631,7 @@ impl Cqrs<PostgresEventStore> {
                     command,
                     services,
                     expected,
+                    gate,
                 )
                 .await?;
             if let Some((version, count, event)) = appended {

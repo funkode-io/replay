@@ -44,7 +44,7 @@ pub use policy_status::{
 };
 pub use query::Query;
 pub use replay::{AggregatePolicy, Dispatch, ObservedEvent, Policy, TargetedCommand};
-pub use store::{CompactionOutcome, EventSink, EventStore, NoSink};
+pub use store::{CommitGate, CompactionOutcome, EventSink, EventStore, NoSink, OpenGate};
 pub use stream_scope::StreamScope;
 
 /// Convenience re-exports of the most commonly used types and traits across
@@ -66,11 +66,11 @@ pub mod prelude {
 
     // Persistence types from this crate
     pub use super::{
-        AggregateVersion, CommandContext, CommandMiddleware, CompactionOutcome, Cqrs, DeadLetter,
-        DeadLetterDiscard, DeadLetterFilter, DeadLetterRetry, DeadLetterRetrySummary,
+        AggregateVersion, CommandContext, CommandMiddleware, CommitGate, CompactionOutcome, Cqrs,
+        DeadLetter, DeadLetterDiscard, DeadLetterFilter, DeadLetterRetry, DeadLetterRetrySummary,
         DeletedStreams, Dispatch, Escalation, EscalationReason, EventSink, EventStore,
         InMemoryEventStore, InlineProjection, Lanes, Liveness, Next, NoSink, ObservedEvent,
-        PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
+        OpenGate, PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
         PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
         PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, StreamScope,
         WorkerLiveness, WorkerSupervision,

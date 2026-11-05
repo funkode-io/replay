@@ -590,7 +590,7 @@ async fn bank_account_multi_event_append_with_expected_version_postgres_test() {
     // Three events appended in one call, expecting the stream to start at version 0.
     let mut observed_versions = Vec::new();
     store
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &stream_id,
             "bank-account".to_string(),
             replay::Metadata::default(),
@@ -610,6 +610,7 @@ async fn bank_account_multi_event_append_with_expected_version_postgres_test() {
             ]),
             Some(0),
             |event: &PersistedEvent<BankAccountEvent>| observed_versions.push(event.version),
+            replay_persistence::OpenGate,
         )
         .await
         .expect("multi-event append with correct expected version must succeed");
@@ -658,7 +659,7 @@ async fn bank_account_store_events_stream_sink_postgres_test() {
 
     let mut observed = Vec::new();
     store
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &stream_id,
             "bank-account".to_string(),
             replay::Metadata::default(),
@@ -676,6 +677,7 @@ async fn bank_account_store_events_stream_sink_postgres_test() {
             |event: &PersistedEvent<BankAccountEvent>| {
                 observed.push((event.version, event.data.clone()));
             },
+            replay_persistence::OpenGate,
         )
         .await
         .expect("streaming append must succeed");
@@ -732,7 +734,7 @@ async fn bank_account_store_events_stream_producer_error_rolls_back_postgres_tes
     let mut observed = 0;
 
     let result = store
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &stream_id,
             "bank-account".to_string(),
             replay::Metadata::default(),
@@ -747,6 +749,7 @@ async fn bank_account_store_events_stream_producer_error_rolls_back_postgres_tes
             |_event: &PersistedEvent<BankAccountEvent>| {
                 observed += 1;
             },
+            replay_persistence::OpenGate,
         )
         .await;
 
@@ -844,7 +847,7 @@ async fn bulk_payments_csv_streams_end_to_end_postgres_test() {
     let mut rows = 0u64;
     let mut sink_total = 0.0f64;
     store
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &stream_id,
             "BankAccount".to_string(),
             replay::Metadata::default(),
@@ -856,6 +859,7 @@ async fn bulk_payments_csv_streams_end_to_end_postgres_test() {
                     sink_total += *amount;
                 }
             },
+            replay_persistence::OpenGate,
         )
         .await
         .expect("streaming csv append must succeed");
@@ -2047,7 +2051,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
             },
         ];
         store
-            .store_events_stream::<BankAccount, _, _>(
+            .store_events_stream::<BankAccount, _, _, _>(
                 stream,
                 BankAccount::stream_type(),
                 replay::Metadata::default(),
@@ -2058,6 +2062,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
                         expected.push(event.id)
                     }
                 },
+                replay_persistence::OpenGate,
             )
             .await
             .unwrap();
@@ -2094,7 +2099,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
     }
 
     rebuilt
-        .store_events_stream::<BankAccount, _, _>(
+        .store_events_stream::<BankAccount, _, _, _>(
             &account,
             BankAccount::stream_type(),
             replay::Metadata::default(),
@@ -2104,6 +2109,7 @@ async fn assert_inline_projection_rebuilds_true_log(filter: StreamFilter) {
             })]),
             None,
             |event: &PersistedEvent<BankAccountEvent>| expected.push(event.id),
+            replay_persistence::OpenGate,
         )
         .await
         .unwrap();
