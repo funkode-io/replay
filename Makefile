@@ -52,6 +52,10 @@ uninstall-hooks:
 	git config --unset core.hooksPath
 	@echo "Git hooks uninstalled."
 
+.PHONY: install-skills
+install-skills:
+	npx -y skills experimental_install
+
 .PHONY: wasm-test
 wasm-test:
 	wasm-pack test --headless --chrome macros-tests

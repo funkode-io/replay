@@ -57,32 +57,15 @@ with the size of the data it reads or writes. Every internal path must be:
 - **chunked** — a buffer of fixed maximum, flushed and cleared
   (`store_events_stream`'s projection flush, bounded by `projection_flush_size`).
 
-"Small in practice" is not a bound. A bound is a number in the code.
+"Small in practice" is not a bound. A bound is a number in the code, and a deliberate
+bounded buffer says what bounds it, in the code. The public API is stream-first for the
+same reason: a result that grows with the data is a stream, and a collecting `_all` twin
+is a convenience the library never calls itself
+([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)).
 
-This is a rule, not a preference: a `Vec<PersistedEvent>` in `store_events_stream` that
-grew with the append put 769 MB on a consuming service's heap and OOM-killed it roughly
-every nine minutes (#146). ADR-0005 scoped "stream-first" to the command → store write
-path; the inline-projection paths were written later and nobody asked whether the rule
-applied. It did — the rule is the whole library.
-
-When reviewing `es/` or `persistence/`, treat these as violations of a documented
-standard, not style notes:
-
-- `fetch_all`, `collect::<Vec<_>>()` or `try_collect()` whose length comes from the data;
-- a `Vec` accumulating in a loop over a stream without a flush;
-- a new internal seam taking `&[T]` or returning `Vec<T>` sized by the data — ask whether
-  it should stream, as `Compactable::compacted_events` does;
-- a doc comment promising bounded memory over code that buffers.
-
-When a buffer is a deliberate bounded one, say what bounds it, in the code. The
-allocation-budget tests (`*_allocations.rs`) pin specific paths in bytes, but they are a
-point defence: they cannot see a new path, which is why this section exists.
-
-The same rule shapes the public API: a public function whose result grows with the data
-returns a stream, a collecting `_all` twin is an optional convenience built on it, and
-the library never calls such twins itself
-([ADR-0029](docs/adr/0029-the-public-api-is-stream-first.md)). A new public `Vec` sized by
-data, or a page size chosen by the library, is a violation, not a style note.
+This is a rule, not a preference: an unbounded `Vec` OOM-killed a consuming service
+(#146). What counts as a violation when reviewing is in
+`docs/agents/review-standards.md`.
 
 ## Events record facts, not state
 
@@ -91,45 +74,18 @@ and docs must model events correctly. An event names an act in the past tense an
 carries that act's data; a status, ownership flag or any other derived value is
 decided in `apply`, never stored in the payload. The rules of thumb, including when
 a value is attested and therefore part of the fact, are in the README section
-*Events record facts, not state*.
-
-When reviewing, treat these as violations of a documented standard, not style
-notes:
-
-- an event or command carrying a status, flag or other value the domain derives;
-- an event named after the state it produces (`Promoted`, `MarkedFinal`) rather
-  than the act that caused it;
-- a correction modelled by re-emitting the original event, or carrying the
-  previous value the stream already holds;
-- a `compacted_events` that writes state into an event instead of emitting the
-  facts that rebuild it.
-
-Once an event is stored it cannot be fixed, which is why this is a rule.
+*Events record facts, not state*. Once an event is stored it cannot be fixed, which is
+why this is a rule; what counts as a violation when reviewing is in
+`docs/agents/review-standards.md`.
 
 ## Agent skills
 
-The skills themselves are vendored in `.github/skills/` so they travel with the repo
-and are picked up by the GitHub Copilot coding agent — no machine-local install
-needed. See `.github/skills/README.md`. They read their per-repo configuration from
-the files below.
-
-### Issue tracker
-
-Issues live in GitHub Issues on the `upstream` repo `funkode-io/replay`; the `origin`
-fork `carlos-verdes/replay` has issues disabled, so every `gh` call needs an explicit
-`--repo funkode-io/replay`. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-The default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`,
-`ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: one `CONTEXT.md` and one `docs/adr/` at the repo root, shared by all
-workspace crates. See `docs/agents/domain.md`.
-
-### Releases
-
-The upstream slug, the version policy, the four `Cargo.toml`s carrying the version, the
-ordered `cargo publish` set and the pre-flight gate. See `docs/agents/release.md`.
+Skills are installed, never vendored. `skills-lock.json` at the root names the ones this
+repo's workflow uses, from `mattpocock/skills` and `funkode-io/skills`; a global install
+of the same skills serves as well. `make install-skills` restores them from the lock, and
+the Copilot coding agent installs them itself in
+`.github/workflows/copilot-setup-steps.yml`. Their per-repo configuration lives in
+`docs/agents/`: `issue-tracker.md` (issues and PRs live on `funkode-io/replay`; the
+`origin` fork has issues disabled, so every `gh` call needs `--repo funkode-io/replay`),
+`triage-labels.md`, `domain.md` (read `context-digest.md` first), `release.md`,
+`review-standards.md` and `copilot-review.md`.

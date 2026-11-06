@@ -9,8 +9,15 @@ ubiquitous language.
 
 ## Before exploring, read these
 
+- **`docs/agents/context-digest.md`** first — a map of the glossary, the ADRs, the README
+  sections and the tunables, one line each with a pointer. It replaces reading the sources
+  end to end; read the sections it points you to.
 - **`CONTEXT.md`** at the repo root — the ubiquitous language for the `replay` event-sourcing library.
 - **`docs/adr/`** — read ADRs that touch the area you're about to work in.
+
+The digest is checked against its sources by `scripts/digest_check.py`: a stale one fails
+the pre-commit hook. Refresh it with the `context-digest` skill (`funkode-io/skills`).
+Env var prefix: `REPLAY_` (the tunables the digest must list).
 
 If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The `/domain-modeling` skill (reached via `/grill-with-docs` and `/improve-codebase-architecture`) creates them lazily when terms or decisions actually get resolved.
 

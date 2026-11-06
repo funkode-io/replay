@@ -27,6 +27,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: context digest is fresh
+        run: python3 -I scripts/digest_check.py check . docs/agents/context-digest.md
+
   msrv:
     name: builds on the declared rust-version
     runs-on: ubuntu-latest

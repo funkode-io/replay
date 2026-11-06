@@ -1,0 +1,32 @@
+name: Copilot Setup Steps
+
+# Installs the agent skills named in skills-lock.json into the Copilot coding agent's
+# environment, so nothing is vendored in the repo (AGENTS.md, Agent skills).
+on:
+  workflow_dispatch:
+  push:
+    paths: [.github/workflows/copilot-setup-steps.yml, skills-lock.json]
+  pull_request:
+    paths: [.github/workflows/copilot-setup-steps.yml, skills-lock.json]
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install skills from skills-lock.json
+        run: |
+          # one `npx skills add` per source, with one `-s` per skill (the CLI takes no comma list)
+          jq -r '.skills | to_entries[] | "\(.value.source) \(.key)"' skills-lock.json \
+            | sort | awk '{ a[$1] = a[$1] " -s " $2 } END { for (s in a) print s a[s] }' \
+            | while read -r source flags; do
+                # shellcheck disable=SC2086
+                npx -y skills add "$source" $flags -a '*' -y
+              done
