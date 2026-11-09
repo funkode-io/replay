@@ -22,3 +22,8 @@ Cargo.lock
 #.idea/
 
 .env
+
+# Agent skills are installed from skills-lock.json, never committed (AGENTS.md, Agent skills)
+.agents/
+.claude/skills/
+.github/skills/

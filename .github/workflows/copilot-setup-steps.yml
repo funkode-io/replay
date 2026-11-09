@@ -1,0 +1,27 @@
+name: Copilot Setup Steps
+
+# Installs the agent skills named in skills-lock.json into the Copilot coding agent's
+# environment, so nothing is vendored in the repo (AGENTS.md, Agent skills).
+on:
+  workflow_dispatch:
+  push:
+    paths: [.github/workflows/copilot-setup-steps.yml, skills-lock.json]
+  pull_request:
+    paths: [.github/workflows/copilot-setup-steps.yml, skills-lock.json]
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install skills from skills-lock.json
+        # Frozen restore: installs exactly the content the lock hashes, into .agents/skills/,
+        # the directory the skills CLI maps to GitHub Copilot. Fails if a source has changed.
+        run: npx -y skills@1.7.6 experimental_install --frozen-lockfile
