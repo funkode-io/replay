@@ -270,8 +270,8 @@ Rules of thumb:
   someone else's data grows with that input and every consumer has to read through it.
   The log records the decision: `RenamedByFile { name }` above is the product taking the
   name the file proposed, not the file row. A decision that is bulk by design, such as
-  an import's accepted records, goes through [the bulk lane](#the-bulk-lane) so it never
-  slows the Policies that react to everything else.
+  an import's accepted records, goes through [the bulk lane](#the-bulk-lane), so the
+  Policies that react to everything else never receive it.
 - **Compaction follows the same rule.** `compacted_events` returns events that rebuild the state through `apply`, so the rules stay in one place; it never writes the state itself into a made-up event.
 
 ### Compaction
@@ -3216,6 +3216,13 @@ The rules:
   after a segment committed never receives that segment, whatever its `StartAt`. A
   Policy is registered when its runner drains or its worker starts, not when the runner
   is built: on a fresh database, `drain` the runner once before the first `execute_bulk`.
+- **A bulk still costs something outside its own lane.** An online Policy tracking the
+  stream reads the bulk rows once, through its read budget, to move its place past them;
+  it reacts to none of them. A worker holds a connection and a transaction for each batch
+  while it dispatches, and each dispatch needs a connection of its own, so size the pool
+  for one of each per bulk Policy on top of the online load. A claim in progress also
+  holds the projection catch-up horizon back until it commits
+  ([ADR-0034](docs/adr/0034-a-bulk-append-reaches-policies-through-a-work-queue.md)).
 
 A command a bulk Policy dispatches is an ordinary online command, so its events reach
 online Policies as any other. A command that fails for good is a

@@ -129,11 +129,21 @@ online feed reads a stream that holds bulk events, it treats them as a `stream_f
 does: the [Stream place] advances past them and nothing fires (ADR-0013). Existing
 registrations, settings, places, dead letters and the reconciliation behave as before.
 
+Behaving as before leaves one cost. The reconciliation compares `streams.stream_seq` with
+the Policy's place, and a bulk event moves the stream's head, so the comparison names that
+stream to every online Policy tracking its type, and a later online event on the stream
+nominates it too. The read that follows fetches the bulk rows and charges them to that
+poll's read budget until the place has passed them, and an online event written after
+them waits for those reads. Once the place has passed them the stream is not named again.
+An online Policy therefore pays for a bulk once, per stream it tracks, and reacts to none
+of it.
+
 | Path | Online lane | Bulk lane |
 | --- | --- | --- |
 | Aggregate load, expected version | yes | yes |
 | Inline projections, catch-up, rebuild | yes | yes |
-| Sweep, late-write lookup, reconciliation | yes | no |
+| Sweep, late-write lookup | yes | no |
+| Reconciliation | yes | yes, by the stream's head, until the place has passed the rows |
 | Feed delivery to an online Policy | yes | no (passed, as a filtered row) |
 | Work rows for a bulk Policy | no | yes |
 
@@ -189,8 +199,20 @@ import drain. Pending bulk work keeps a Policy `Working`.
 - **Migration on a populated database:** a `lane` column with default `online` and two
   partial indexes built `CONCURRENTLY` (0039 to 0041), then two empty tables (0042). The
   0.16.0 release notes carry the runbook.
-- **ADR-0032's horizon is not held by a bulk**, because each segment ends and its marks
-  are applied per segment, inside the append.
+- **ADR-0032's horizon is not held by a bulk append**, because each segment ends and its
+  marks are applied per segment, inside the append. **A worker's claim does hold it.** Its
+  row locks give the claim a transaction id, and that transaction stays in progress while
+  the batch dispatches. Commits after it are still applied, by their marks, as with any
+  long transaction (ADR-0032), but the marks are kept and each catch-up round reads the
+  range above the horizon until the claim commits. No deadline covers a whole claim:
+  `read_batch_size` limits its events and the dispatch timeout limits each command
+  attempt, so a slow reaction or a large fan-out of commands prolongs the hold.
+- **A draining bulk Policy can hold two connections at once**: its claim, and the one a
+  dispatch needs to load and append. When the runner and the store share a pool, nothing
+  reserves capacity between them. If claims take every connection, dispatches and online
+  commands wait for the pool's acquire timeout. Size the pool for one claim and one
+  dispatch per bulk Policy on top of the online load. ADR-0008's constant footprint covers
+  leadership and the listener, not this.
 
 [Inline projection]: ../../CONTEXT.md#inline-projection
 [Policy]: ../../CONTEXT.md#policy
