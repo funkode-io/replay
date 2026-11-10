@@ -327,3 +327,53 @@ async fn plan_with_nothing_registered_is_empty() {
     assert!(plan.projections().is_empty());
     assert!(!plan.needs_build());
 }
+
+/// A name registered twice is planned as `build()` runs it: the second registration sees
+/// the version the first one records.
+#[tokio::test]
+async fn plan_follows_builds_order_for_a_name_registered_twice() {
+    let (pool, _container) = start_pool().await;
+
+    let first = Counted::new("twice", 1);
+    let again = Counted::new("twice", 1);
+    let newer = Counted::new("twice", 2);
+    let calls = [
+        first.calls.clone(),
+        again.calls.clone(),
+        newer.calls.clone(),
+    ];
+    let builder = PostgresEventStore::builder(pool.clone())
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(first)
+        .register(again)
+        .register(newer);
+
+    let plan = builder.plan().await.expect("plan must succeed");
+    let reported: Vec<_> = plan
+        .projections()
+        .iter()
+        .map(|p| (p.stored_version(), p.code_version(), p.action()))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            (None, 1, PlannedAction::Init),
+            (Some(1), 1, PlannedAction::Current),
+            (Some(1), 2, PlannedAction::Rebuild),
+        ]
+    );
+
+    let _store = builder.build().await.expect("build must succeed");
+
+    let done: Vec<_> = calls
+        .iter()
+        .map(|c| {
+            (
+                c.init.load(Ordering::SeqCst),
+                c.reset.load(Ordering::SeqCst),
+            )
+        })
+        .collect();
+    assert_eq!(done, vec![(1, 0), (0, 0), (0, 1)]);
+    assert_eq!(registry(&pool).await, vec![("twice".to_string(), 2)]);
+}

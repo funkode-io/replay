@@ -570,6 +570,9 @@ impl PostgresEventStoreBuilder {
     /// window — while the old release is serving. The builder is left as it was, so the
     /// same builder can go on to `build`.
     ///
+    /// Registrations are planned in order, as `build` runs them: a name registered twice
+    /// is planned against the version its first registration would record.
+    ///
     /// The plan is what the registry says when it is read. A `build` that runs after
     /// another process has built the same projections finds them current.
     pub async fn plan(&self) -> Result<BuildPlan, replay::Error> {
@@ -586,7 +589,7 @@ impl PostgresEventStoreBuilder {
             .map_err(crate::db_error)?;
         // Bounded by the registered names: at most one row per projection the caller
         // registered.
-        let stored: Vec<(String, i32)> =
+        let mut stored: Vec<(String, i32)> =
             sqlx::query_as("SELECT name, version FROM projections WHERE name = ANY($1)")
                 .bind(&names)
                 .fetch_all(&mut *tx)
@@ -594,18 +597,26 @@ impl PostgresEventStoreBuilder {
                 .map_err(|e| crate::db_error(e).with_operation("plan"))?;
         tx.commit().await.map_err(crate::db_error)?;
 
-        let planned = self
-            .projections
-            .iter()
-            .map(|projection| {
-                let name = projection.name();
-                let stored_version = stored
-                    .iter()
-                    .find(|(stored_name, _)| stored_name == name)
-                    .map(|(_, version)| *version);
-                PlannedProjection::new(name.to_string(), stored_version, projection.version())
-            })
-            .collect();
+        // Walk the registrations in order, as `build` does. `build` reads the registry
+        // after its own earlier writes, so a name registered twice sees the version the
+        // first registration recorded: carry each Init or Rebuild forward the same way.
+        let mut planned = Vec::with_capacity(self.projections.len());
+        for projection in &self.projections {
+            let name = projection.name();
+            let code = projection.version();
+            let entry = stored
+                .iter()
+                .position(|(stored_name, _)| stored_name == name);
+            let step =
+                PlannedProjection::new(name.to_string(), entry.map(|index| stored[index].1), code);
+            if step.action().is_build() {
+                match entry {
+                    Some(index) => stored[index].1 = code,
+                    None => stored.push((name.to_string(), code)),
+                }
+            }
+            planned.push(step);
+        }
 
         Ok(BuildPlan::new(planned))
     }
