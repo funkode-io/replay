@@ -1775,8 +1775,10 @@ let store = builder.build().await?;
 ```
 
 `needs_build()` is `true` when any projection is `Init` or `Rebuild`; `refuses()` is `true`
-when any is `Refuse`. The plan and `build()` decide by the same comparison, so the plan
-cannot disagree with what `build()` then does.
+when any is `Refuse`. A `build()` that refuses rolls back and changes nothing, so when
+`refuses()` the other entries say what `build()` will do once the refusal is cleared. The
+plan and `build()` decide by the same comparison, and the plan walks the registrations in
+`build()`'s order, so it cannot disagree with what `build()` then does.
 
 `plan()` is one `SELECT` of the registry in a `READ ONLY` transaction. It writes nothing,
 takes no advisory lock and runs no `init`, `reset` or `handle`, so a separate process — a

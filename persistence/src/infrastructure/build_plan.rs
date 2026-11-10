@@ -106,12 +106,17 @@ impl BuildPlan {
 
     /// Whether `build` would initialise or rebuild any projection: `true` when any entry is
     /// [`Init`](PlannedAction::Init) or [`Rebuild`](PlannedAction::Rebuild).
+    ///
+    /// Read it together with [`refuses`](Self::refuses): a `build` that refuses rolls back
+    /// and changes nothing, so the other entries say what it will do once the refusal is
+    /// cleared, not what this `build` does.
     pub fn needs_build(&self) -> bool {
         self.projections.iter().any(|p| p.action.is_build())
     }
 
     /// Whether `build` would refuse to start: `true` when any entry is
-    /// [`Refuse`](PlannedAction::Refuse).
+    /// [`Refuse`](PlannedAction::Refuse). Such a `build` returns an error and rolls back
+    /// whatever it had begun, so it initialises and rebuilds nothing.
     pub fn refuses(&self) -> bool {
         self.projections
             .iter()
