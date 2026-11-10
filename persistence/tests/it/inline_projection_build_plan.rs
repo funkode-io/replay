@@ -376,4 +376,33 @@ async fn plan_follows_builds_order_for_a_name_registered_twice() {
         .collect();
     assert_eq!(done, vec![(1, 0), (0, 0), (0, 1)]);
     assert_eq!(registry(&pool).await, vec![("twice".to_string(), 2)]);
+
+    // Stored at 2: registering 3 then 2 rebuilds to 3, and the second registration then
+    // finds a newer stored version, so `build()` refuses — and the plan says so.
+    let builder = PostgresEventStore::builder(pool.clone())
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(Counted::new("twice", 3))
+        .register(Counted::new("twice", 2));
+    let plan = builder.plan().await.expect("plan must succeed");
+    let reported: Vec<_> = plan
+        .projections()
+        .iter()
+        .map(|p| (p.stored_version(), p.code_version(), p.action()))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            (Some(2), 3, PlannedAction::Rebuild),
+            (Some(3), 2, PlannedAction::Refuse),
+        ]
+    );
+    assert!(plan.refuses());
+
+    let error = builder
+        .build()
+        .await
+        .err()
+        .expect("build must refuse the second registration");
+    assert_eq!(error.kind(), replay::ErrorKind::InvalidInput);
+    assert_eq!(registry(&pool).await, vec![("twice".to_string(), 2)]);
 }
