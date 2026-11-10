@@ -16,6 +16,7 @@ use urn::Urn;
 use uuid::Uuid;
 
 use super::advisory_keys::COMMIT_GATE_LOCK_CLASS;
+use super::build_plan::{BuildPlan, PlannedAction, PlannedProjection};
 use super::projection_catch_up::{self as catch_up, Cut, ErasedPostgresProjection, Scope};
 use super::stream_deletion::{self as deletion, DeletedStreams};
 use crate::inline_projection::InlineProjection;
@@ -427,7 +428,8 @@ impl PostgresEventStore {
 /// Builder for a [`PostgresEventStore`] with inline projections.
 ///
 /// Register projections with [`register`](Self::register), then call
-/// [`build`](Self::build) to run first-time `init` and freeze the registry.
+/// [`build`](Self::build) to run first-time `init` and freeze the registry, or
+/// [`plan`](Self::plan) to learn what `build` would do without doing it.
 pub struct PostgresEventStoreBuilder {
     pool: Pool<Postgres>,
     projections: Vec<Box<ErasedPostgresProjection>>,
@@ -546,6 +548,66 @@ impl PostgresEventStoreBuilder {
     {
         self.projections.push(Box::new(projection));
         self
+    }
+
+    /// Report what [`build`](Self::build) would do to each registered projection, without
+    /// doing it: a dry run of `build`.
+    ///
+    /// For each projection, in registration order, the plan gives its name, the version
+    /// the registry stores for it (if any), its code
+    /// [`version`](InlineProjection::version) and the [`PlannedAction`] `build` would
+    /// take — exactly `build`'s four branches, decided by the same comparison:
+    /// [`Init`](PlannedAction::Init) (first registration),
+    /// [`Rebuild`](PlannedAction::Rebuild) (`stored < code`),
+    /// [`Current`](PlannedAction::Current) (`stored == code`, catch-up only) and
+    /// [`Refuse`](PlannedAction::Refuse) (`stored > code`, `build` would return an error).
+    /// [`BuildPlan::needs_build`] is `true` when any projection would be initialised or
+    /// rebuilt.
+    ///
+    /// It is one `SELECT` in a `READ ONLY` transaction: it writes nothing, takes no
+    /// advisory lock and runs no `init`, `reset` or `handle`, so it is safe to run from a
+    /// separate process — a deploy job deciding whether a release needs a maintenance
+    /// window — while the old release is serving. The builder is left as it was, so the
+    /// same builder can go on to `build`.
+    ///
+    /// The plan is what the registry says when it is read. A `build` that runs after
+    /// another process has built the same projections finds them current.
+    pub async fn plan(&self) -> Result<BuildPlan, replay::Error> {
+        if self.projections.is_empty() {
+            return Ok(BuildPlan::new(Vec::new()));
+        }
+
+        let names: Vec<&str> = self.projections.iter().map(|p| p.name()).collect();
+
+        let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::db_error)?;
+        // Bounded by the registered names: at most one row per projection the caller
+        // registered.
+        let stored: Vec<(String, i32)> =
+            sqlx::query_as("SELECT name, version FROM projections WHERE name = ANY($1)")
+                .bind(&names)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| crate::db_error(e).with_operation("plan"))?;
+        tx.commit().await.map_err(crate::db_error)?;
+
+        let planned = self
+            .projections
+            .iter()
+            .map(|projection| {
+                let name = projection.name();
+                let stored_version = stored
+                    .iter()
+                    .find(|(stored_name, _)| stored_name == name)
+                    .map(|(_, version)| *version);
+                PlannedProjection::new(name.to_string(), stored_version, projection.version())
+            })
+            .collect();
+
+        Ok(BuildPlan::new(planned))
     }
 
     /// Run setup for the registered projections and freeze the store.
@@ -688,11 +750,15 @@ impl PostgresEventStoreBuilder {
 
             let code = projection.version();
 
-            match stored {
+            // The one comparison `plan` reports too, so the dry run cannot disagree. Only
+            // `Init` has no stored version, so the others read it as a plain number.
+            let action = PlannedAction::decide(stored, code);
+            let stored = stored.unwrap_or_default();
+            match action {
                 // First-time registration: create the view, replay existing history so the
                 // new projection catches up to the backlog, then record the version LAST so a
                 // crash mid-replay never marks a half-built view as current.
-                None => {
+                PlannedAction::Init => {
                     tracing::info!(
                         projection = %name,
                         version = code,
@@ -731,7 +797,7 @@ impl PostgresEventStoreBuilder {
                 // Version drift: the code is newer than the stored view. Reset and rebuild
                 // from history, then record the new version LAST so a crash mid-rebuild
                 // never marks a half-built view as current.
-                Some(stored) if stored < code => {
+                PlannedAction::Rebuild => {
                     tracing::info!(
                         projection = %name,
                         stored,
@@ -769,7 +835,7 @@ impl PostgresEventStoreBuilder {
                 }
                 // Stored version is newer than the code: refuse to start. A rolled-back or
                 // older deploy must not run against a view built by newer code.
-                Some(stored) if stored > code => {
+                PlannedAction::Refuse => {
                     return Err(replay::Error::invalid_input(
                         "inline projection stored version is newer than code version",
                     )
@@ -780,7 +846,7 @@ impl PostgresEventStoreBuilder {
                 }
                 // stored == code: no reset and no replay here. What transactions that did
                 // not apply this projection appended is caught up once the build commits.
-                Some(_) => {
+                PlannedAction::Current => {
                     current.push(registered.len());
                 }
             }
