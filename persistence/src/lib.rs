@@ -25,7 +25,8 @@ pub use cqrs::Cqrs;
 pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;
 pub use infrastructure::{
-    DeletedStreams, InMemoryEventStore, PostgresEventStore, PostgresInlineProjection,
+    BuildPlan, DeletedStreams, InMemoryEventStore, PlannedAction, PlannedProjection,
+    PostgresEventStore, PostgresInlineProjection,
 };
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;

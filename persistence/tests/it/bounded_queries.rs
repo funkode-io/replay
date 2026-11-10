@@ -168,6 +168,13 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/infrastructure/postgres.rs",
+        function: "plan",
+        justification: "name = ANY($names), the names the caller registered on the builder, \
+                        and name is the projections table's primary key: at most one row \
+                        per registered projection, never the whole registry.",
+    },
+    Reviewed {
+        file: "src/infrastructure/postgres.rs",
         function: "streams_needing_compaction_page",
         justification: "SQL carries LIMIT $limit, the caller's page size; one id per row. \
                         `Cqrs::streams_needing_compaction` calls it with \

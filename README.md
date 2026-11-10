@@ -1735,11 +1735,57 @@ named type, custom `init`, or more involved logic than a single handler closure.
 
 - `PostgresEventStore::builder(...).build().await?` runs first-time projection setup and records
   the current version in the `projections` table. At the same version it applies whatever
-  other processes appended without applying the projection (see the next section).
+  other processes appended without applying the projection (see
+  [Rolling deploys](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it)).
+  `builder.plan().await?` reports what `build()` would do without doing it
+  ([below](#planning-a-build-what-build-would-do)).
 - On each successful append, the store constructs `PersistedEvent`s from the metadata returned by
   `append_event(...)` and passes them to every registered projection.
 - Projection handlers run inside the **same Postgres transaction** as the event append.
 - If a projection handler returns an error, the whole append rolls back.
+
+### Planning a build: what `build()` would do
+
+`build()` takes one of four paths for each registered projection, by comparing the version
+the registry stores for it with its code `version()`. `plan()` reports those paths without
+taking them — a dry run of `build()` on the same builder:
+
+```rust
+use replay_persistence::{PlannedAction, PostgresEventStore};
+
+let builder = PostgresEventStore::builder(pg_pool.clone())
+    .register(AccountBalanceView)
+    .register(MonthlyStatementView);
+
+let plan = builder.plan().await?;
+for p in plan.projections() {
+    match p.action() {
+        PlannedAction::Init => {}    // no stored version: init, replay history
+        PlannedAction::Rebuild => {} // stored < code: reset, replay history
+        PlannedAction::Current => {} // stored == code: catch-up only
+        PlannedAction::Refuse => {}  // stored > code: build() returns an error
+    }
+    println!("{}: {:?} -> {} ({:?})", p.name(), p.stored_version(), p.code_version(), p.action());
+}
+
+if plan.needs_build() {
+    // A projection will be initialised or rebuilt: engage the maintenance window first.
+}
+let store = builder.build().await?;
+```
+
+`needs_build()` is `true` when any projection is `Init` or `Rebuild`; `refuses()` is `true`
+when any is `Refuse`. A `build()` that refuses rolls back and changes nothing, so when
+`refuses()` the other entries say what `build()` will do once the refusal is cleared. The
+plan and `build()` decide by the same comparison, and the plan walks the registrations in
+`build()`'s order, so it cannot disagree with what `build()` then does.
+
+`plan()` is one `SELECT` of the registry in a `READ ONLY` transaction. It writes nothing,
+takes no advisory lock and runs no `init`, `reset` or `handle`, so a separate process — a
+deploy job running the new release's image — can ask it while the old release is serving,
+without reading Replay's tables itself. It reports the registry as it reads it: a
+`build()` that runs after another process has built the same projections finds them
+`Current`.
 
 ### Batching: a single append may arrive as several calls
 
