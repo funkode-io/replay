@@ -1753,13 +1753,16 @@ the registry stores for it with its code `version()`. `plan()` reports those pat
 taking them — a dry run of `build()` on the same builder:
 
 ```rust
-use replay_persistence::{PlannedAction, PostgresEventStore};
+use replay_persistence::{PlannedAction, PostgresEventStore, PostgresEventStoreBuilder};
 
-let builder = PostgresEventStore::builder(pg_pool.clone())
-    .register(AccountBalanceView)
-    .register(MonthlyStatementView);
+/// One registration list for every caller: `plan()` in the deploy job, `build()` at startup.
+fn registered(pg_pool: PgPool) -> PostgresEventStoreBuilder {
+    PostgresEventStore::builder(pg_pool)
+        .register(AccountBalanceView)
+        .register(MonthlyStatementView)
+}
 
-let plan = builder.plan().await?;
+let plan = registered(pg_pool.clone()).plan().await?;
 for p in plan.projections() {
     match p.action() {
         PlannedAction::Init => {}    // no stored version: init, replay history
@@ -1773,14 +1776,16 @@ for p in plan.projections() {
 if plan.needs_build() {
     // A projection will be initialised or rebuilt: engage the maintenance window first.
 }
-let store = builder.build().await?;
+let store = registered(pg_pool).build().await?;
 ```
 
 `needs_build()` is `true` when any projection is `Init` or `Rebuild`; `refuses()` is `true`
 when any is `Refuse`. A `build()` that refuses rolls back and changes nothing, so when
 `refuses()` the other entries say what `build()` will do once the refusal is cleared. The
 plan and `build()` decide by the same comparison, and the plan walks the registrations in
-`build()`'s order, so it cannot disagree with what `build()` then does.
+`build()`'s order, so it cannot disagree with what `build()` then does. Keep the
+registrations in one function returning `PostgresEventStoreBuilder`, as above, so the deploy
+job and the process it deploys cannot register different lists.
 
 `plan()` is one `SELECT` of the registry in a `READ ONLY` transaction. It writes nothing,
 takes no advisory lock and runs no `init`, `reset` or `handle`, so a separate process — a
