@@ -42,6 +42,22 @@ impl PlannedAction {
     }
 }
 
+/// The events the next catch-up of a [`Current`](PlannedAction::Current) projection
+/// would apply, as counted by the store builder's `plan_with_owed_events`
+/// (funkode-io/replay#345).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OwedEvents {
+    /// The events a catch-up would apply now: committed at or above the projection's
+    /// catch-up horizon, visible in the plan's snapshot, of a type it declares, and from a
+    /// transaction that did not apply this projection version itself.
+    Count(u64),
+    /// The registry row has no catch-up horizon for this version yet. The next catch-up
+    /// adopts the log as it stands and applies nothing
+    /// ([ADR-0032](https://github.com/funkode-io/replay/blob/main/docs/adr/0032-an-inline-projection-catches-up-on-transactions-that-did-not-apply-it.md)).
+    NoHorizon,
+}
+
 /// One registered inline projection in a [`BuildPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedProjection {
@@ -49,6 +65,7 @@ pub struct PlannedProjection {
     stored_version: Option<i32>,
     code_version: i32,
     action: PlannedAction,
+    owed_events: Option<OwedEvents>,
 }
 
 impl PlannedProjection {
@@ -58,7 +75,13 @@ impl PlannedProjection {
             name,
             stored_version,
             code_version,
+            owed_events: None,
         }
+    }
+
+    pub(crate) fn with_owed_events(mut self, owed_events: OwedEvents) -> Self {
+        self.owed_events = Some(owed_events);
+        self
     }
 
     /// The projection's [`name`](crate::InlineProjection::name), its registry key.
@@ -80,6 +103,15 @@ impl PlannedProjection {
     /// What `build` would do to this projection.
     pub fn action(&self) -> PlannedAction {
         self.action
+    }
+
+    /// The events the next catch-up of this projection would apply.
+    ///
+    /// `None` when not counted: the plan came from `plan()`, or the action is not
+    /// [`Current`](PlannedAction::Current) — an `Init` or a `Rebuild` replays history and a
+    /// `Refuse` never starts.
+    pub fn owed_events(&self) -> Option<OwedEvents> {
+        self.owed_events
     }
 }
 
@@ -122,6 +154,16 @@ impl BuildPlan {
             .iter()
             .any(|p| p.action == PlannedAction::Refuse)
     }
+
+    /// Whether any counted projection owes at least one event: `true` when any entry's
+    /// [`owed_events`](PlannedProjection::owed_events) is `Count(n)` with `n > 0`. Always
+    /// `false` for a plan from `plan()`, which counts nothing; a `NoHorizon` entry owes
+    /// nothing, it adopts.
+    pub fn owes_events(&self) -> bool {
+        self.projections
+            .iter()
+            .any(|p| matches!(p.owed_events, Some(OwedEvents::Count(n)) if n > 0))
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +194,21 @@ mod tests {
         assert!(plan(&[(Some(1), 2)]).needs_build());
         assert!(plan(&[(Some(3), 2)]).refuses());
         assert!(!plan(&[(None, 2)]).refuses());
+    }
+
+    #[test]
+    fn owes_events_only_for_a_positive_count() {
+        let current = |owed: Option<OwedEvents>| {
+            let entry = PlannedProjection::new("p".into(), Some(1), 1);
+            BuildPlan::new(vec![match owed {
+                Some(owed) => entry.with_owed_events(owed),
+                None => entry,
+            }])
+        };
+        assert!(!current(None).owes_events());
+        assert!(!current(Some(OwedEvents::NoHorizon)).owes_events());
+        assert!(!current(Some(OwedEvents::Count(0))).owes_events());
+        assert!(current(Some(OwedEvents::Count(1))).owes_events());
+        assert_eq!(current(None).projections()[0].owed_events(), None);
     }
 }

@@ -599,6 +599,15 @@ or rebuilt by a release that does not know it — is **adopted**: the log is tak
 stands, not replayed.
 _Avoid_: checkpoint, high-water mark, offset.
 
+### Owed events
+
+What the next [Catch-up] of an [Inline projection] at its stored version would apply: the
+events committed at or above its [Catch-up horizon], visible in one snapshot, of a type it
+declares, from a transaction that did not apply that version itself. Counted by the build
+plan on request, without applying anything; a row without a horizon owes nothing because
+the catch-up adopts the log instead.
+_Avoid_: lag, backlog, pending events, unapplied events.
+
 ### Retire (an inline projection)
 
 Taking an [Inline projection] the code no longer registers out of the registry: its row,

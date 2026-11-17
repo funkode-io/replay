@@ -490,19 +490,7 @@ async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page
     }
 
     if let Scope::Gap { horizon } = query.scope {
-        builder
-            .push(" AND commit_txid >= ")
-            .push_bind(*horizon)
-            .push("::xid8 AND pg_visible_in_snapshot(commit_txid, ")
-            .push_bind(query.cut.snapshot.as_str())
-            .push(
-                "::pg_snapshot) AND NOT EXISTS (SELECT 1 FROM projection_applied_transactions a \
-                   WHERE a.projection = ",
-            )
-            .push_bind(query.name)
-            .push(" AND a.version = ")
-            .push_bind(query.version)
-            .push(" AND a.txid = events.commit_txid)");
+        push_gap_predicate(&mut builder, query.name, query.version, query.cut, horizon);
     }
 
     if let Some(after) = query.after {
@@ -535,6 +523,69 @@ async fn load_page(conn: &mut PgConnection, query: PageQuery<'_>) -> Result<Page
         events,
         last_position,
     })
+}
+
+/// Append the predicate of the events a catch-up owes `name` at `version` to a query over
+/// `events`: committed at or above `horizon`, visible in the cut, and from a transaction
+/// without an applied mark for this version. The one definition of "owed": the pages of
+/// [`apply_pages`] read it and [`count_owed`] counts it, so the two cannot disagree.
+fn push_gap_predicate(
+    builder: &mut QueryBuilder<Postgres>,
+    name: &str,
+    version: i32,
+    cut: &Cut,
+    horizon: &str,
+) {
+    builder
+        .push(" AND commit_txid >= ")
+        .push_bind(horizon.to_string())
+        .push("::xid8 AND pg_visible_in_snapshot(commit_txid, ")
+        .push_bind(cut.snapshot.clone())
+        .push(
+            "::pg_snapshot) AND NOT EXISTS (SELECT 1 FROM projection_applied_transactions a \
+               WHERE a.projection = ",
+        )
+        .push_bind(name.to_string())
+        .push(" AND a.version = ")
+        .push_bind(version)
+        .push(" AND a.txid = events.commit_txid)");
+}
+
+/// How many events a catch-up of `name` at `version` would apply now: the rows the pages
+/// of a [`Scope::Gap`] would read, narrowed by the declared `types` as they are, counted
+/// under `cut` without reading them (funkode-io/replay#345).
+///
+/// One scalar comes back, however wide the gap. The range it reads is the one a catch-up
+/// reads, the transactions at or above the horizon, so its cost grows with the gap since
+/// the last seal. Fenced with `OFFSET 0` and unnamed, as [`gap_start`] is, so the range on
+/// `commit_txid` is planned with the horizon in hand (#306).
+pub(crate) async fn count_owed(
+    conn: &mut PgConnection,
+    name: &str,
+    version: i32,
+    types: Option<&[String]>,
+    cut: &Cut,
+    horizon: &str,
+) -> Result<u64, replay::Error> {
+    let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT count(*) FROM (SELECT commit_txid, type, compacted_snapshot FROM events \
+          WHERE commit_txid >= ",
+    );
+    builder
+        .push_bind(horizon.to_string())
+        .push("::xid8 OFFSET 0) events WHERE compacted_snapshot = FALSE");
+    if let Some(types) = types {
+        builder.push(" AND type = ANY(").push_bind(types).push(")");
+    }
+    push_gap_predicate(&mut builder, name, version, cut, horizon);
+
+    let owed: i64 = builder
+        .build_query_scalar()
+        .persistent(false)
+        .fetch_one(conn)
+        .await
+        .map_err(crate::db_error)?;
+    Ok(u64::try_from(owed).unwrap_or(0))
 }
 
 #[cfg(test)]
