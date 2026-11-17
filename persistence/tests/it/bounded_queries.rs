@@ -168,7 +168,7 @@ const REVIEWED: &[Reviewed] = &[
     },
     Reviewed {
         file: "src/infrastructure/postgres.rs",
-        function: "plan",
+        function: "planned",
         justification: "name = ANY($names), the names the caller registered on the builder, \
                         and name is the projections table's primary key: at most one row \
                         per registered projection, never the whole registry.",

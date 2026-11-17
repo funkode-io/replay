@@ -14,7 +14,10 @@ use std::time::Duration;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 use replay_macros::define_aggregate;
-use replay_persistence::{InlineProjection, PersistedEvent, PlannedAction, PostgresEventStore};
+use replay_persistence::{
+    EventStore, InlineProjection, OwedEvents, PersistedEvent, PlannedAction, PostgresEventStore,
+    PostgresEventStoreBuilder,
+};
 
 use crate::common;
 use common::postgres_image::{postgres_database, TestDatabase};
@@ -30,6 +33,7 @@ define_aggregate! {
         },
         events: {
             Lit {},
+            Dimmed {},
         }
     }
 }
@@ -44,6 +48,7 @@ impl replay::EventStream for Lamp {
     fn apply(&mut self, event: Self::Event) {
         match event {
             LampEvent::Lit => self.lit = true,
+            LampEvent::Dimmed => self.lit = false,
         }
     }
 }
@@ -60,6 +65,7 @@ struct Counted {
     name: &'static str,
     version: i32,
     calls: Arc<Calls>,
+    types: Option<Vec<String>>,
 }
 
 impl Counted {
@@ -68,7 +74,14 @@ impl Counted {
             name,
             version,
             calls: Arc::default(),
+            types: None,
         }
+    }
+
+    /// The same projection, declaring that it handles `types` only.
+    fn only(mut self, types: &[&str]) -> Self {
+        self.types = Some(types.iter().map(|t| t.to_string()).collect());
+        self
     }
 }
 
@@ -82,6 +95,10 @@ impl InlineProjection for Counted {
 
     fn version(&self) -> i32 {
         self.version
+    }
+
+    fn event_types(&self) -> Option<Vec<String>> {
+        self.types.clone()
     }
 
     async fn init(&mut self, _conn: &mut Self::Exec) -> Result<(), replay::Error> {
@@ -134,6 +151,40 @@ async fn registry(pool: &PgPool) -> Vec<(String, i32)> {
         .fetch_all(pool)
         .await
         .expect("reading the registry must succeed")
+}
+
+/// Append `events` to one lamp through `store`, which applies the projections it registers.
+async fn append(store: &PostgresEventStore, lamp: &str, events: &[LampEvent]) {
+    let events: Vec<Result<LampEvent, replay::Error>> =
+        events.iter().map(|event| Ok(event.clone())).collect();
+    store
+        .store_events_stream::<Lamp, _, _, _>(
+            &LampUrn::new(lamp).unwrap(),
+            "Lamp".to_string(),
+            replay::Metadata::default(),
+            futures::stream::iter(events),
+            None,
+            |_: &PersistedEvent<LampEvent>| {},
+            replay_persistence::OpenGate,
+        )
+        .await
+        .expect("append must succeed");
+}
+
+/// How many applied marks the registry holds, for every projection.
+async fn marks(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM projection_applied_transactions")
+        .fetch_one(pool)
+        .await
+        .expect("counting the marks must succeed")
+}
+
+/// What the plan reports each projection owes, in registration order.
+fn owed(plan: &replay_persistence::BuildPlan) -> Vec<(&str, PlannedAction, Option<OwedEvents>)> {
+    plan.projections()
+        .iter()
+        .map(|p| (p.name(), p.action(), p.owed_events()))
+        .collect()
 }
 
 /// The plan reports each of `build()`'s four branches, with the versions it decided them
@@ -328,6 +379,38 @@ async fn plan_with_nothing_registered_is_empty() {
     assert!(!plan.needs_build());
 }
 
+/// One function holds the registrations for every caller (funkode-io/replay#346): the type
+/// it returns is nameable, and `plan()` then `build()` on two calls of it agree.
+#[tokio::test]
+async fn one_function_registers_for_plan_and_build() {
+    fn registered(pool: PgPool) -> PostgresEventStoreBuilder {
+        PostgresEventStore::builder(pool)
+            .projection_catch_up_interval(Duration::ZERO)
+            .register(Counted::new("balance", 1))
+            .register(Counted::new("statement", 1))
+    }
+    let (pool, _container) = start_pool().await;
+
+    let plan = registered(pool.clone())
+        .plan()
+        .await
+        .expect("plan must succeed");
+    assert!(plan.needs_build());
+    assert_eq!(plan.projections().len(), 2);
+
+    registered(pool.clone())
+        .build()
+        .await
+        .expect("build must succeed");
+    assert_eq!(
+        registry(&pool).await,
+        vec![("balance".to_string(), 1), ("statement".to_string(), 1)]
+    );
+
+    let plan = registered(pool).plan().await.expect("plan must succeed");
+    assert!(!plan.needs_build());
+}
+
 /// A name registered twice is planned as `build()` runs it: the second registration sees
 /// the version the first one records.
 #[tokio::test]
@@ -405,4 +488,193 @@ async fn plan_follows_builds_order_for_a_name_registered_twice() {
         .expect("build must refuse the second registration");
     assert_eq!(error.kind(), replay::ErrorKind::InvalidInput);
     assert_eq!(registry(&pool).await, vec![("twice".to_string(), 2)]);
+}
+
+/// The count is what a catch-up then applies: events a process without the projection
+/// appended are owed, `catch_up_projections()` reads that many, and nothing is owed after.
+#[tokio::test]
+async fn owed_events_count_what_a_catch_up_then_applies() {
+    let (pool, _container) = start_pool().await;
+    let new_pod = PostgresEventStore::builder(pool.clone())
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(Counted::new("view", 1))
+        .build()
+        .await
+        .expect("build must succeed");
+
+    let old_pod = PostgresEventStore::new(pool.clone());
+    append(&old_pod, "l-1", &[LampEvent::Lit, LampEvent::Dimmed]).await;
+    append(&old_pod, "l-2", &[LampEvent::Lit]).await;
+
+    let check = PostgresEventStore::builder(pool.clone()).register(Counted::new("view", 1));
+    let plan = check
+        .plan_with_owed_events()
+        .await
+        .expect("plan must succeed");
+    assert_eq!(
+        owed(&plan),
+        vec![("view", PlannedAction::Current, Some(OwedEvents::Count(3)))]
+    );
+    assert!(plan.owes_events());
+
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), 3);
+
+    let plan = check
+        .plan_with_owed_events()
+        .await
+        .expect("plan must succeed");
+    assert_eq!(
+        owed(&plan),
+        vec![("view", PlannedAction::Current, Some(OwedEvents::Count(0)))]
+    );
+    assert!(!plan.owes_events());
+}
+
+/// Not owed: what the appending store applied itself, and events of a type the projection
+/// does not declare.
+#[tokio::test]
+async fn owed_events_skip_applied_appends_and_undeclared_types() {
+    let (pool, _container) = start_pool().await;
+    let new_pod = PostgresEventStore::builder(pool.clone())
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(Counted::new("view", 1).only(&["Lit"]))
+        .build()
+        .await
+        .expect("build must succeed");
+    let old_pod = PostgresEventStore::new(pool.clone());
+
+    append(&new_pod, "l-1", &[LampEvent::Lit, LampEvent::Lit]).await; // applied live
+    append(&old_pod, "l-2", &[LampEvent::Dimmed]).await; // not declared
+    append(&old_pod, "l-3", &[LampEvent::Lit]).await; // owed
+
+    let plan = PostgresEventStore::builder(pool.clone())
+        .register(Counted::new("view", 1).only(&["Lit"]))
+        .plan_with_owed_events()
+        .await
+        .expect("plan must succeed");
+    assert_eq!(
+        owed(&plan),
+        vec![("view", PlannedAction::Current, Some(OwedEvents::Count(1)))]
+    );
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), 1);
+}
+
+/// A row without a horizon for its version is not counted: the catch-up that follows adopts
+/// the log and applies nothing, and the plan says so rather than reporting a number.
+#[tokio::test]
+async fn a_row_without_a_horizon_reports_no_horizon() {
+    let (pool, _container) = start_pool().await;
+    let new_pod = PostgresEventStore::builder(pool.clone())
+        .projection_catch_up_interval(Duration::ZERO)
+        .register(Counted::new("view", 1))
+        .build()
+        .await
+        .expect("build must succeed");
+    sqlx::query("UPDATE projections SET caught_up_below = NULL, caught_up_version = NULL")
+        .execute(&pool)
+        .await
+        .expect("clearing the horizon must succeed");
+    append(
+        &PostgresEventStore::new(pool.clone()),
+        "l-1",
+        &[LampEvent::Lit],
+    )
+    .await;
+
+    let plan = PostgresEventStore::builder(pool.clone())
+        .register(Counted::new("view", 1))
+        .plan_with_owed_events()
+        .await
+        .expect("plan must succeed");
+    assert_eq!(
+        owed(&plan),
+        vec![("view", PlannedAction::Current, Some(OwedEvents::NoHorizon))]
+    );
+    assert!(!plan.owes_events());
+    assert_eq!(new_pod.catch_up_projections().await.unwrap(), 0);
+}
+
+/// Only a `Current` entry is counted, and only by `plan_with_owed_events()`.
+#[tokio::test]
+async fn only_current_entries_of_an_owed_events_plan_are_counted() {
+    let (pool, _container) = start_pool().await;
+    build_at(&pool, &[("rebuilt", 1), ("current", 2), ("refused", 3)]).await;
+
+    let registered = || {
+        PostgresEventStore::builder(pool.clone())
+            .register(Counted::new("fresh", 1))
+            .register(Counted::new("rebuilt", 2))
+            .register(Counted::new("current", 2))
+            .register(Counted::new("refused", 2))
+    };
+
+    let plan = registered()
+        .plan_with_owed_events()
+        .await
+        .expect("plan must succeed");
+    assert_eq!(
+        owed(&plan),
+        vec![
+            ("fresh", PlannedAction::Init, None),
+            ("rebuilt", PlannedAction::Rebuild, None),
+            (
+                "current",
+                PlannedAction::Current,
+                Some(OwedEvents::Count(0))
+            ),
+            ("refused", PlannedAction::Refuse, None),
+        ]
+    );
+
+    let plan = registered().plan().await.expect("plan must succeed");
+    assert!(plan.projections().iter().all(|p| p.owed_events().is_none()));
+    assert!(!plan.owes_events());
+}
+
+/// Counting takes no lock and writes nothing either: it returns while another session
+/// holds every lock `build()` and a catch-up would wait for, and leaves the registry, the
+/// marks and the projection untouched.
+#[tokio::test]
+async fn plan_with_owed_events_takes_no_lock_and_writes_nothing() {
+    let (pool, _container) = start_pool().await;
+    build_at(&pool, &[("view", 1)]).await;
+    append(
+        &PostgresEventStore::new(pool.clone()),
+        "l-1",
+        &[LampEvent::Lit],
+    )
+    .await;
+    let marks_before = marks(&pool).await;
+
+    let mut holder = pool.acquire().await.expect("acquire the lock holder");
+    sqlx::query("SELECT pg_advisory_lock(x'52504A52'::int, 0)")
+        .execute(&mut *holder)
+        .await
+        .expect("hold the registry lock");
+    sqlx::query("SELECT pg_advisory_lock(x'52504A43'::int, hashtext('view'))")
+        .execute(&mut *holder)
+        .await
+        .expect("hold the projection lock");
+
+    let view = Counted::new("view", 1);
+    let calls = view.calls.clone();
+    let builder = PostgresEventStore::builder(pool.clone()).register(view);
+    let plan = tokio::time::timeout(Duration::from_secs(10), builder.plan_with_owed_events())
+        .await
+        .expect("plan must not wait on an advisory lock")
+        .expect("plan must succeed");
+    assert_eq!(
+        owed(&plan),
+        vec![("view", PlannedAction::Current, Some(OwedEvents::Count(1)))]
+    );
+
+    assert_eq!(registry(&pool).await, vec![("view".to_string(), 1)]);
+    assert_eq!(marks(&pool).await, marks_before);
+    assert_eq!(calls.init.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.reset.load(Ordering::SeqCst), 0);
+
+    sqlx::query("SELECT pg_advisory_unlock_all()")
+        .execute(&mut *holder)
+        .await
+        .expect("release the locks");
 }
