@@ -29,22 +29,23 @@ Before opening or updating a PR:
 
 ## Preserving Review History
 
-Squash merge collapses each PR into a single commit, so messy intermediate
-history on a branch is fine — but it MUST stay reviewable while the PR is open.
+Squash merge collapses each PR into a single commit, so messy intermediate history on
+a branch is fine. While the PR is open, one thing is protected: a reviewer sees only
+this PR's delta, and what they have already reviewed never changes under them.
 
-Rules while a PR is under review:
+What follows from that:
 
-- NEVER force-push (`git push --force` / `--force-with-lease`) to a branch that
-  has an open PR. Force-pushing rewrites history and breaks reviewers'
-  incremental "changes since last review" diffs.
-- Address review feedback with NEW commits on top, even for fixups. The squash
-  merge flattens them at the end, so extra commits cost nothing.
-- To bring in changes from `main`/upstream, use a MERGE commit
-  (`git merge upstream/main`), never a rebase. A merge commit keeps previously
-  reviewed commits unchanged so reviewers only see the new delta.
+- Pushed commits are never rewritten; review feedback lands as NEW commits, even
+  fixups. The squash flattens them at the end.
+- Changes from `main`/upstream come in as a MERGE commit (`git merge upstream/main`),
+  never a rebase.
+- In a stack, when the PR below squash-merges, this PR's commits are replayed
+  unchanged onto the squash commit (`gh stack rebase`). Without it the PR's diff would
+  show the lower PR's code again; a replay that alters this PR's own commits is still a
+  rewrite.
 
-The only time history may be rewritten is before a branch has ever been pushed
-or before any PR exists for it.
+History may be rewritten freely before a branch has ever been pushed or before any PR
+exists for it.
 
 ## Bounded memory: no unbounded collections in library code
 
