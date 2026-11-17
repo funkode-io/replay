@@ -78,6 +78,14 @@ a value is attested and therefore part of the fact, are in the README section
 why this is a rule; what counts as a violation when reviewing is in
 `docs/agents/review-standards.md`.
 
+## Rollout effect
+
+A PR that changes a migration, the projection registry or the event log states in its
+body whether the upgrade rolls with writes flowing or needs a write freeze, as a
+`**Rollout:**` line, and a new migration says in its header comment whether it is
+online-safe. The release notes copy that line (`docs/agents/release.md`); what a reviewer
+treats as a violation is in `docs/agents/review-standards.md`.
+
 ## Agent skills
 
 Skills are installed, never vendored. `skills-lock.json` at the root names the ones this
