@@ -1806,28 +1806,36 @@ predicate the catch-up pages through, so it cannot disagree with what
 use replay_persistence::{OwedEvents, PlannedAction};
 
 let plan = registered(pg_pool).plan_with_owed_events().await?;
+let mut healthy = true;
 for p in plan.projections() {
     match (p.action(), p.owed_events()) {
         (PlannedAction::Current, Some(OwedEvents::Count(0))) => {}
         (PlannedAction::Current, Some(OwedEvents::Count(owed))) => {
-            eprintln!("{} owes {owed} events", p.name()); // behind: fail the check
+            healthy = false;
+            eprintln!("{} owes {owed} events", p.name()); // behind
         }
         (PlannedAction::Current, Some(OwedEvents::NoHorizon)) => {
+            healthy = false;
             eprintln!("{} has no catch-up horizon yet", p.name()); // adopts, applies nothing
         }
-        (action, _) => eprintln!("{}: {action:?}", p.name()), // not Current: not counted
+        (action, _) => {
+            healthy = false;
+            eprintln!("{}: {action:?}", p.name()); // not Current: not counted
+        }
     }
 }
-if plan.owes_events() {
+if !healthy {
     std::process::exit(1);
 }
 ```
 
+Healthy is every entry `Current` with `Count(0)`; the check above fails on anything else.
 `owed_events()` is `None` for anything `plan()` reported and for every entry that is not
 `Current`: an `Init` or `Rebuild` replays history and a `Refuse` never starts.
-`owes_events()` is `true` when any count is above zero. A row without a horizon for its
-version reports `NoHorizon`: the next catch-up adopts the log as it stands and applies
-nothing (see [Rolling deploys](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it)).
+`owes_events()` is the shortcut for "any count above zero" when that is all a caller asks.
+A row without a horizon for its version reports `NoHorizon`: the next catch-up adopts the
+log as it stands and applies nothing (see
+[Rolling deploys](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it)).
 
 Like `plan()`, it writes nothing and takes no advisory lock; everything is read under one
 `READ ONLY` snapshot and one scalar comes back per projection. Its read cost is the
