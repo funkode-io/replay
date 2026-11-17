@@ -49,6 +49,9 @@ tables, or the `events` log and its functions, these are violations:
   unsafe while the previous release serves and appends (a first `build()` of a
   non-idempotent handler, a horizon the old release cannot read);
 - a new migration whose header comment does not say whether it is online-safe, or that
-  claims it is while rewriting a populated table, validating a constraint with a scan,
-  or taking `ACCESS EXCLUSIVE` for longer than an instant;
+  claims it is while rewriting a populated table or holding a write-blocking lock for
+  longer than an instant — including a scan, such as a constraint validation, run in
+  the same transaction as the `ALTER` whose `ACCESS EXCLUSIVE` it then keeps (a
+  standalone `VALIDATE CONSTRAINT` takes `SHARE UPDATE EXCLUSIVE` and lets appends run,
+  as 0.16.0's migration 0039 did);
 - a `docs/releases/<version>.md` whose Migration table lacks the Online-safe column.
