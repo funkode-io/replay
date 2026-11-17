@@ -16,7 +16,7 @@ use urn::Urn;
 use uuid::Uuid;
 
 use super::advisory_keys::COMMIT_GATE_LOCK_CLASS;
-use super::build_plan::{BuildPlan, PlannedAction, PlannedProjection};
+use super::build_plan::{BuildPlan, OwedEvents, PlannedAction, PlannedProjection};
 use super::projection_catch_up::{self as catch_up, Cut, ErasedPostgresProjection, Scope};
 use super::projection_retirement::{self as retirement, RetiredProjection};
 use super::stream_deletion::{self as deletion, DeletedStreams};
@@ -601,47 +601,122 @@ impl PostgresEventStoreBuilder {
     /// The plan is what the registry says when it is read. A `build` that runs after
     /// another process has built the same projections finds them current.
     pub async fn plan(&self) -> Result<BuildPlan, replay::Error> {
+        self.planned(false).await
+    }
+
+    /// [`plan`](Self::plan), plus, for every [`Current`](PlannedAction::Current)
+    /// projection, the events a catch-up would apply now
+    /// ([`owed_events`](PlannedProjection::owed_events), funkode-io/replay#345).
+    ///
+    /// The count is the predicate a catch-up pages through — committed at or above the
+    /// projection's catch-up horizon, visible in the plan's snapshot, of a declared event
+    /// type, from a transaction that did not apply this version itself — so it is what
+    /// [`PostgresEventStore::catch_up_projections`] then applies. A row without a horizon
+    /// for its version reports [`NoHorizon`](crate::OwedEvents::NoHorizon): the next
+    /// catch-up adopts the log and applies nothing. `Init`, `Rebuild` and `Refuse` entries
+    /// are not counted.
+    ///
+    /// Like `plan`, it writes nothing and takes no advisory lock: a nightly check can ask
+    /// it from a separate process while the release serves. Everything is read under one
+    /// `REPEATABLE READ`, `READ ONLY` snapshot, and what comes back is one scalar per
+    /// registered projection. The read cost is the catch-up's: it grows with the gap since
+    /// each projection's last seal — with the background task disabled, since the last
+    /// `build()` or on-demand catch-up — rather than with the log.
+    pub async fn plan_with_owed_events(&self) -> Result<BuildPlan, replay::Error> {
+        self.planned(true).await
+    }
+
+    /// The plan, counting what each `Current` projection owes when `count_owed`.
+    async fn planned(&self, count_owed: bool) -> Result<BuildPlan, replay::Error> {
         if self.projections.is_empty() {
             return Ok(BuildPlan::new(Vec::new()));
         }
 
+        let operation = if count_owed {
+            "plan_with_owed_events"
+        } else {
+            "plan"
+        };
         let names: Vec<&str> = self.projections.iter().map(|p| p.name()).collect();
 
+        // One snapshot for the registry, the cut and every count, so a count is of the
+        // gap the registry row's horizon describes; and a single statement for `plan`.
         let mut tx = self.pool.begin().await.map_err(crate::db_error)?;
-        sqlx::query("SET TRANSACTION READ ONLY")
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx)
             .await
             .map_err(crate::db_error)?;
         // Bounded by the registered names: at most one row per projection the caller
-        // registered.
-        let mut stored: Vec<(String, i32)> =
-            sqlx::query_as("SELECT name, version FROM projections WHERE name = ANY($1)")
-                .bind(&names)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| crate::db_error(e).with_operation("plan"))?;
-        tx.commit().await.map_err(crate::db_error)?;
+        // registered. The horizon is read as a catch-up reads it: only for the version it
+        // was sealed at (migration 0038).
+        let stored: Vec<(String, i32, Option<String>)> = sqlx::query_as(
+            "SELECT name, version, \
+                    CASE WHEN caught_up_version = version THEN caught_up_below::text END \
+               FROM projections WHERE name = ANY($1)",
+        )
+        .bind(&names)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| crate::db_error(e).with_operation(operation))?;
+        let cut = if count_owed {
+            Some(Cut::current(&mut tx).await?)
+        } else {
+            None
+        };
 
         // Walk the registrations in order, as `build` does. `build` reads the registry
         // after its own earlier writes, so a name registered twice sees the version the
         // first registration recorded: carry each Init or Rebuild forward the same way.
+        let mut versions: Vec<(&str, i32)> = stored
+            .iter()
+            .map(|(name, version, _)| (name.as_str(), *version))
+            .collect();
         let mut planned = Vec::with_capacity(self.projections.len());
         for projection in &self.projections {
             let name = projection.name();
             let code = projection.version();
-            let entry = stored
-                .iter()
-                .position(|(stored_name, _)| stored_name == name);
-            let step =
-                PlannedProjection::new(name.to_string(), entry.map(|index| stored[index].1), code);
+            let entry = versions.iter().position(|(stored, _)| *stored == name);
+            let mut step = PlannedProjection::new(
+                name.to_string(),
+                entry.map(|index| versions[index].1),
+                code,
+            );
             if step.action().is_build() {
                 match entry {
-                    Some(index) => stored[index].1 = code,
-                    None => stored.push((name.to_string(), code)),
+                    Some(index) => versions[index].1 = code,
+                    None => versions.push((name, code)),
                 }
+            }
+            if let (Some(cut), PlannedAction::Current) = (&cut, step.action()) {
+                // The horizon of the row as the registry holds it, for the code version: a
+                // row another registration of the same name would first build has none.
+                let horizon = stored
+                    .iter()
+                    .find(|(stored, version, _)| stored == name && *version == code)
+                    .and_then(|(_, _, horizon)| horizon.as_deref());
+                let owed = match horizon {
+                    Some(horizon) => OwedEvents::Count(
+                        catch_up::count_owed(
+                            &mut tx,
+                            name,
+                            code,
+                            projection.event_types().as_deref(),
+                            cut,
+                            horizon,
+                        )
+                        .await
+                        .map_err(|e| {
+                            e.with_operation(operation)
+                                .with_context("projection", name.to_string())
+                        })?,
+                    ),
+                    None => OwedEvents::NoHorizon,
+                };
+                step = step.with_owed_events(owed);
             }
             planned.push(step);
         }
+        tx.commit().await.map_err(crate::db_error)?;
 
         Ok(BuildPlan::new(planned))
     }

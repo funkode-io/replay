@@ -1794,6 +1794,46 @@ without reading Replay's tables itself. It reports the registry as it reads it: 
 `build()` that runs after another process has built the same projections finds them
 `Current`.
 
+#### A nightly health check: what each `Current` projection owes
+
+With the background catch-up disabled, a projection that missed appends stays behind until
+the next `build()` or `catch_up_projections()`. `plan_with_owed_events()` is `plan()` plus,
+for every `Current` projection, the events a catch-up would apply now, counted by the same
+predicate the catch-up pages through, so it cannot disagree with what
+`catch_up_projections()` then reads:
+
+```rust
+use replay_persistence::{OwedEvents, PlannedAction};
+
+let plan = registered(pg_pool).plan_with_owed_events().await?;
+for p in plan.projections() {
+    match (p.action(), p.owed_events()) {
+        (PlannedAction::Current, Some(OwedEvents::Count(0))) => {}
+        (PlannedAction::Current, Some(OwedEvents::Count(owed))) => {
+            eprintln!("{} owes {owed} events", p.name()); // behind: fail the check
+        }
+        (PlannedAction::Current, Some(OwedEvents::NoHorizon)) => {
+            eprintln!("{} has no catch-up horizon yet", p.name()); // adopts, applies nothing
+        }
+        (action, _) => eprintln!("{}: {action:?}", p.name()), // not Current: not counted
+    }
+}
+if plan.owes_events() {
+    std::process::exit(1);
+}
+```
+
+`owed_events()` is `None` for anything `plan()` reported and for every entry that is not
+`Current`: an `Init` or `Rebuild` replays history and a `Refuse` never starts.
+`owes_events()` is `true` when any count is above zero. A row without a horizon for its
+version reports `NoHorizon`: the next catch-up adopts the log as it stands and applies
+nothing (see [Rolling deploys](#rolling-deploys-catching-up-on-appends-that-did-not-apply-it)).
+
+Like `plan()`, it writes nothing and takes no advisory lock; everything is read under one
+`READ ONLY` snapshot and one scalar comes back per projection. Its read cost is the
+catch-up's: the transactions since each projection's last seal, so with the background
+task off it grows with the gap since the last `build()` or on-demand catch-up.
+
 ### Batching: a single append may arrive as several calls
 
 A streamed append pulls its producer one event at a time, so a bulk import never has to fit
