@@ -14,7 +14,9 @@ use std::time::Duration;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 use replay_macros::define_aggregate;
-use replay_persistence::{InlineProjection, PersistedEvent, PlannedAction, PostgresEventStore};
+use replay_persistence::{
+    InlineProjection, PersistedEvent, PlannedAction, PostgresEventStore, PostgresEventStoreBuilder,
+};
 
 use crate::common;
 use common::postgres_image::{postgres_database, TestDatabase};
@@ -325,6 +327,38 @@ async fn plan_with_nothing_registered_is_empty() {
         .expect("plan must succeed");
 
     assert!(plan.projections().is_empty());
+    assert!(!plan.needs_build());
+}
+
+/// One function holds the registrations for every caller (funkode-io/replay#346): the type
+/// it returns is nameable, and `plan()` then `build()` on two calls of it agree.
+#[tokio::test]
+async fn one_function_registers_for_plan_and_build() {
+    fn registered(pool: PgPool) -> PostgresEventStoreBuilder {
+        PostgresEventStore::builder(pool)
+            .projection_catch_up_interval(Duration::ZERO)
+            .register(Counted::new("balance", 1))
+            .register(Counted::new("statement", 1))
+    }
+    let (pool, _container) = start_pool().await;
+
+    let plan = registered(pool.clone())
+        .plan()
+        .await
+        .expect("plan must succeed");
+    assert!(plan.needs_build());
+    assert_eq!(plan.projections().len(), 2);
+
+    registered(pool.clone())
+        .build()
+        .await
+        .expect("build must succeed");
+    assert_eq!(
+        registry(&pool).await,
+        vec![("balance".to_string(), 1), ("statement".to_string(), 1)]
+    );
+
+    let plan = registered(pool).plan().await.expect("plan must succeed");
     assert!(!plan.needs_build());
 }
 

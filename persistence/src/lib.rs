@@ -26,7 +26,7 @@ pub use error::{concurrency_error, db_error, deser_error, ser_error};
 pub use filters::StreamFilter;
 pub use infrastructure::{
     BuildPlan, DeletedStreams, InMemoryEventStore, PlannedAction, PlannedProjection,
-    PostgresEventStore, PostgresInlineProjection, RetiredProjection,
+    PostgresEventStore, PostgresEventStoreBuilder, PostgresInlineProjection, RetiredProjection,
 };
 pub use inline_projection::InlineProjection;
 pub use persisted_event::PersistedEvent;
@@ -73,7 +73,7 @@ pub mod prelude {
         InMemoryEventStore, InlineProjection, Lanes, Liveness, Next, NoSink, ObservedEvent,
         OpenGate, PersistedEvent, Policy, PolicyCondition, PolicyRunner, PolicyRunnerBuilder,
         PolicyRunnerDaemon, PolicySettings, PolicyStatus, PolicyStatusStore, PostgresEventStore,
-        PostgresInlineProjection, Query, StartAt, StoppedWorker, StreamFilter, StreamScope,
-        WorkerLiveness, WorkerSupervision,
+        PostgresEventStoreBuilder, PostgresInlineProjection, Query, StartAt, StoppedWorker,
+        StreamFilter, StreamScope, WorkerLiveness, WorkerSupervision,
     };
 }
