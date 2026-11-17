@@ -1,6 +1,6 @@
 # Context digest: replay
 
-<!-- built from ad6b89c fingerprint 6967427e820ee89c on 2026-11-17; refresh: run the context-digest skill -->
+<!-- built from 087a0da fingerprint 48a176b937187b4d on 2026-11-17; refresh: run the context-digest skill -->
 
 A map, not a summary: one line per term, decision, section and tunable, each pointing at
 the authoritative text. Read this, then only the sections your ticket touches.
@@ -21,6 +21,7 @@ the authoritative text. Read this, then only the sections your ticket touches.
 - [Preserving Review History](../../AGENTS.md#preserving-review-history)
 - [Bounded memory: no unbounded collections in library code](../../AGENTS.md#bounded-memory-no-unbounded-collections-in-library-code)
 - [Events record facts, not state](../../AGENTS.md#events-record-facts-not-state)
+- [Rollout effect](../../AGENTS.md#rollout-effect)
 - [Agent skills](../../AGENTS.md#agent-skills)
 
 ## Crate and module map
@@ -183,14 +184,14 @@ Numbers 0018 and 0021 are each used twice; cite by file name.
 - Hooks: `make install-hooks` sets `core.hooksPath` to `.githooks`. CI (`.github/workflows/ci.yml`) is `workflow_dispatch` only; the hooks are the gate.
 - WASM: `make wasm-test` (`wasm-pack test --headless --chrome macros-tests`) when `es` or `macros` change; CI builds `es-replay` for `wasm32-unknown-unknown`.
 - Allocation budgets: `persistence/tests/*_allocations.rs` pin paths in bytes; a release never ships with them failing.
-- Release: [`docs/agents/release.md`](release.md): version policy, the four `Cargo.toml`s, publish order `es-replay`, `es-replay-macros`, `es-replay-persistence`; notes in `docs/releases/<version>.md`.
-- Issues: [`docs/agents/issue-tracker.md`](issue-tracker.md). Labels: [`docs/agents/triage-labels.md`](triage-labels.md). Domain docs: [`docs/agents/domain.md`](domain.md). Review checklists: [`docs/agents/review-standards.md`](review-standards.md). Copilot: [`docs/agents/copilot-review.md`](copilot-review.md).
+- Release: [`docs/agents/release.md`](release.md): version policy, the four `Cargo.toml`s, publish order `es-replay`, `es-replay-macros`, `es-replay-persistence`; notes in `docs/releases/<version>.md`, first line `**Rollout:**`.
+- Issues: [`docs/agents/issue-tracker.md`](issue-tracker.md). Labels: [`docs/agents/triage-labels.md`](triage-labels.md). Domain docs: [`docs/agents/domain.md`](domain.md). Review: [`docs/agents/review-standards.md`](review-standards.md). Copilot: [`docs/agents/copilot-review.md`](copilot-review.md).
 - Digest check: `python3 scripts/digest_check.py check . docs/agents/context-digest.md` (pre-commit hook and CI). Skills: installed from `skills-lock.json` (`make install-skills`), never vendored.
 
 ## Traps
 
 - `origin` (`carlos-verdes/replay`) has issues disabled: every `gh` call needs `--repo funkode-io/replay` (`docs/agents/issue-tracker.md`).
-- `CLAUDE.md` is a symlink to `AGENTS.md`: edit `AGENTS.md` only.
+- `CLAUDE.md` symlinks `AGENTS.md`: edit `AGENTS.md` only.
 - ADR numbers 0018 and 0021 are each taken twice; link by file name, not number. The next ADR number is 0037.
 - Migrations are numbered independently of ADRs (`persistence/tests/migrations/0034_…` is not ADR-0034) and live under `tests/`, where consumers copy them from (README, Migrations).
 - A zero `REPLAY_STREAM_LOCK_WAIT_MS` disables the bound; a zero `REPLAY_DISPATCH_TIMEOUT_MS` reads as unset and keeps the 30 s default (README, Stream lock wait).
@@ -199,5 +200,5 @@ Numbers 0018 and 0021 are each used twice; cite by file name.
 - An online Policy never sees a bulk-lane event; `Lanes::Online` is the default at registration (CONTEXT, Lane).
 - The `Makefile` targets `gitRebase` and `gitAmmend` force-push: forbidden on a branch with an open PR (`AGENTS.md`, Preserving Review History).
 - `Cargo.lock` is gitignored in this library workspace; do not commit it (`docs/agents/release.md`).
-- `es-replay-macros-tests` is never published; the `0.1.1` on crates.io is a historical accident.
-- `[profile.test]` keeps `debug = "line-tables-only"` on purpose (`Cargo.toml`, #247).
+- `es-replay-macros-tests` is never published; its `0.1.1` on crates.io is an accident.
+- `[profile.test]` keeps `debug = "line-tables-only"` (`Cargo.toml`, #247).

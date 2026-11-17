@@ -83,8 +83,25 @@ A release whose migration is non-trivial carries a draft in `docs/releases/<vers
 written by the PR that breaks the API; the published page is assembled from it.
 
 Match the house style of the previous release page (`gh release view v<prev> --repo
-funkode-io/replay`): Highlights, Breaking changes, New API, Migration, Changes since
-`<prev>`, and a `**Full diff:**` compare link. Sample code uses this repo's own example
+funkode-io/replay`): the Rollout line, Highlights, Breaking changes, New API, Migration,
+Changes since `<prev>`, and a `**Full diff:**` compare link. Sample code uses this repo's own example
 domain — `BankAccountUrn`, `BranchUrn`, `BankAccountEvent` — so the snippets read like the
 README a consumer already has open. Compile-check non-trivial snippets in a scratch test
 under `macros-tests/tests/`, then delete it.
+
+### Rollout: can the upgrade roll with writes flowing?
+
+A consumer's deploy automation reads this; a page that says nothing reads as "safe"
+(#347). Both are mandatory, and the PR that causes the effect states it (see `Rollout
+effect` in `AGENTS.md`), so the release inherits it rather than reconstructing it.
+
+- **The body's first line** is one of:
+  `**Rollout:** rolling, writes may flow.`
+  `**Rollout:** needs a write freeze — <why, and during which step>.`
+  A freeze is needed when a step is unsafe while the previous release serves and
+  appends: a first `build()` of a non-idempotent projection, a registry change the old
+  release misreads, a migration that is not online-safe.
+- **The Migration table** has an **Online-safe** column for every migration the release
+  adds: `yes`, or `no — <why>`. Online-safe means applying it while the previous release
+  serves and writes. A consumer vendors these migrations verbatim, so this column is the
+  only marker it has.

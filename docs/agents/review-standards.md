@@ -37,3 +37,18 @@ These are violations:
   previous value the stream already holds;
 - a `compacted_events` that writes state into an event instead of emitting the
   facts that rebuild it.
+
+## Rollout effect
+
+A consumer freezes writes for a Replay upgrade only when the release notes say so
+(#347); the notes say so because the PR did. When reviewing a PR that touches
+`persistence/tests/migrations/`, the `projections` or `projection_applied_transactions`
+tables, or the `events` log and its functions, these are violations:
+
+- a PR body without a `Rollout:` line, or one that says `rolling` for a step that is
+  unsafe while the previous release serves and appends (a first `build()` of a
+  non-idempotent handler, a horizon the old release cannot read);
+- a new migration whose header comment does not say whether it is online-safe, or that
+  claims it is while rewriting a populated table, validating a constraint with a scan,
+  or taking `ACCESS EXCLUSIVE` for longer than an instant;
+- a `docs/releases/<version>.md` whose Migration table lacks the Online-safe column.
